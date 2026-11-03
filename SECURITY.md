@@ -29,10 +29,6 @@ In scope is anything a hostile input can cause in the library or the
   cost of a parse grow super-linearly in its size.
 - **Unbounded memory**: an allocation driven by a file-supplied length or
   count, or a decompression that ignores its cap.
-- **rizin sandbox escapes**: the optional rizin subprocess outliving its
-  timeout or resource limits, escaping its process group or job, inheriting
-  environment or descriptors it should not, or writing outside its temporary
-  input.
 - **Signature verdict errors**: a code-signing result (Authenticode, CMS,
   Mach-O code signature, APK, CRX, JAR and similar) reported as verified or
   trusted when the signature, digest or chain does not support it.
@@ -46,7 +42,6 @@ Out of scope:
 
 - Facts that are merely incomplete or imprecise on unusual but benign input.
   These are ordinary bugs; open an issue.
-- Behaviour of rizin itself, beyond the containment filefacts applies to it.
 - Vulnerabilities in dependencies that filefacts does not reach; report those
   upstream. We track advisories with `cargo audit` in CI, and the accepted
   exceptions, with their reasons, are in `.cargo/audit.toml`.

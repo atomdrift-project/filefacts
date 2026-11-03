@@ -1,168 +1,9 @@
 use super::{
-    LARGE_RIZIN_INPUT, MAX_PLIST_DEPTH, NativeFormat, RizinDecision, RizinProfile, XorScan,
-    basename, cfb_entry_path, decide_rizin, extract_text_strings, format_guid, has_xor_intent,
-    hex_encode, plist_to_json, read_uleb128, section_entropy, stem,
+    MAX_PLIST_DEPTH, XorScan, apply_native, basename, cfb_entry_path, extract_text_strings,
+    format_guid, has_xor_intent, hex_encode, plist_to_json, read_uleb128, section_entropy, stem,
 };
 use crate::output::Strings;
 use serde_json::Value as JsonValue;
-
-fn transparent_profile(format: NativeFormat) -> RizinProfile {
-    RizinProfile {
-        format,
-        size: 64 << 20,
-        function_count: 0,
-        section_count: 8,
-        stripped: Some(false),
-        go_function_metadata: false,
-        string_count: 10_000,
-        string_bytes: 4 << 20,
-        code_entropy: Some(6.2),
-        overall_entropy: 6.5,
-    }
-}
-
-#[test]
-fn rizin_policy_is_consistent_across_native_formats() {
-    for format in [NativeFormat::Elf, NativeFormat::MachO, NativeFormat::Pe] {
-        assert!(matches!(
-            decide_rizin(transparent_profile(format)),
-            RizinDecision::Skip("static facts show a transparent binary")
-        ));
-
-        let mut no_strings = transparent_profile(format);
-        no_strings.string_count = 0;
-        no_strings.string_bytes = 0;
-        assert!(matches!(
-            decide_rizin(no_strings),
-            RizinDecision::Analyze("printable strings are sparse")
-        ));
-
-        let mut packed_code = transparent_profile(format);
-        packed_code.code_entropy = Some(7.3);
-        assert!(matches!(
-            decide_rizin(packed_code),
-            RizinDecision::Analyze("executable code has high entropy")
-        ));
-    }
-}
-
-#[test]
-fn static_function_inventory_wins_over_expensive_signals() {
-    for format in [NativeFormat::Elf, NativeFormat::MachO, NativeFormat::Pe] {
-        let mut profile = transparent_profile(format);
-        profile.function_count = 1;
-        profile.stripped = Some(true);
-        profile.string_count = 0;
-        profile.string_bytes = 0;
-        profile.code_entropy = Some(8.0);
-        assert!(matches!(
-            decide_rizin(profile),
-            RizinDecision::Skip("static function inventory available")
-        ));
-    }
-}
-
-#[test]
-fn go_without_typed_functions_is_admitted_on_every_platform() {
-    for format in [NativeFormat::Elf, NativeFormat::MachO, NativeFormat::Pe] {
-        let mut profile = transparent_profile(format);
-        profile.go_function_metadata = true;
-        profile.stripped = Some(true);
-        profile.string_count = 0;
-        profile.string_bytes = 0;
-        profile.code_entropy = Some(8.0);
-        assert!(matches!(
-            decide_rizin(profile),
-            RizinDecision::Analyze("Go function inventory needs recovery")
-        ));
-
-        profile.function_count = 1;
-        assert!(matches!(
-            decide_rizin(profile),
-            RizinDecision::Skip("typed Go function inventory available")
-        ));
-    }
-}
-
-#[test]
-fn stripped_size_budget_has_an_explicit_boundary() {
-    for format in [NativeFormat::Elf, NativeFormat::MachO] {
-        let mut profile = transparent_profile(format);
-        profile.stripped = Some(true);
-        profile.size = LARGE_RIZIN_INPUT;
-        assert!(matches!(
-            decide_rizin(profile),
-            RizinDecision::Analyze("stripped binary within deep-analysis budget")
-        ));
-
-        profile.size += 1;
-        assert!(matches!(
-            decide_rizin(profile),
-            RizinDecision::Skip("static facts show a transparent binary")
-        ));
-    }
-}
-
-#[test]
-fn string_density_and_count_are_both_admission_signals() {
-    let mut profile = transparent_profile(NativeFormat::Elf);
-    profile.string_count = 64;
-    profile.string_bytes = profile.size / 1024;
-    assert!(!decide_rizin(profile).runs());
-
-    profile.string_bytes -= 1;
-    assert!(matches!(
-        decide_rizin(profile),
-        RizinDecision::Analyze("printable strings are sparse")
-    ));
-
-    profile.string_bytes = profile.size;
-    profile.string_count = 63;
-    assert!(matches!(
-        decide_rizin(profile),
-        RizinDecision::Analyze("printable strings are sparse")
-    ));
-}
-
-#[test]
-fn pe_exceptions_are_narrow_and_explicit() {
-    let mut malformed = transparent_profile(NativeFormat::Pe);
-    malformed.section_count = 0;
-    assert!(matches!(
-        decide_rizin(malformed),
-        RizinDecision::Analyze("PE section table needs recovery")
-    ));
-
-    let mut importless = transparent_profile(NativeFormat::Pe);
-    importless.size = 5 * 1024 * 1024;
-    assert!(matches!(
-        decide_rizin(importless),
-        RizinDecision::Analyze("small importless PE")
-    ));
-
-    importless.size += 1;
-    assert!(!decide_rizin(importless).runs());
-}
-
-#[test]
-fn failing_workerd_macho_is_recognized_as_transparent() {
-    let profile = RizinProfile {
-        format: NativeFormat::MachO,
-        size: 119_799_896,
-        function_count: 0,
-        section_count: 20,
-        stripped: Some(false),
-        go_function_metadata: false,
-        string_count: 330_028,
-        string_bytes: 40 << 20,
-        code_entropy: Some(6.39),
-        overall_entropy: 6.70,
-    };
-    assert!(matches!(
-        decide_rizin(profile),
-        RizinDecision::Skip("static facts show a transparent binary")
-    ));
-}
 
 #[test]
 fn xor_intent_detects_operator_and_keyword() {
@@ -389,4 +230,53 @@ fn affix_checks_ignore_ascii_case() {
     assert!(super::ends_with_ci("é.SF", ".sf"));
     assert!(super::starts_with_ci("meta-inf/CERT.SF", "META-INF/"));
     assert!(!super::starts_with_ci("META", "META-INF/"));
+}
+
+/// binform's layout fills only the views the format parser left empty, and
+/// an import by ordinal from a DLL with stable ordinals goes by its name.
+#[test]
+fn binform_layout_fills_only_empty_views() {
+    use crate::output::{Section, SectionFlag, Symbol, SymbolKind};
+    let native = || crate::functions::Native {
+        imports: vec![binform::Import {
+            name: "Ordinal_3".into(),
+            library: Some("WS2_32.dll".into()),
+            ordinal: Some(3),
+            slot: Some(0x1000),
+        }],
+        exports: vec![binform::Export {
+            name: "Run".into(),
+            addr: 0x2000,
+            forward: None,
+        }],
+        sections: vec![binform::Section {
+            name: ".text".into(),
+            addr: 0x1000,
+            size: 0x1000,
+            offset: 0x400,
+            file_size: 0x200,
+            readable: true,
+            writable: false,
+            executable: true,
+        }],
+        ..crate::functions::Native::default()
+    };
+    let mut symbols = crate::Symbols::new();
+    let mut sections = Vec::new();
+    let mut metrics = crate::output::Metrics::default();
+    let counts = apply_native(native(), &mut symbols, Some(&mut sections), &mut metrics);
+    assert_eq!((counts.imports, counts.exports, counts.sections), (1, 1, 1));
+    let import = symbols.iter().find(|s| s.kind() == SymbolKind::Import);
+    assert!(matches!(
+        import,
+        Some(Symbol::Import { name, ordinal: Some(3), offset: Some(0x1000), .. }) if name == "closesocket"
+    ));
+    assert!(matches!(
+        sections.as_slice(),
+        [Section { name, vaddr: 0x1000, file_offset: 0x400, flags, .. }]
+            if name == ".text" && flags == &[SectionFlag::Readable, SectionFlag::Executable]
+    ));
+    // A second answer adds nothing: every view is filled.
+    let counts = apply_native(native(), &mut symbols, Some(&mut sections), &mut metrics);
+    assert_eq!((counts.imports, counts.exports, counts.sections), (0, 0, 0));
 }

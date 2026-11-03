@@ -88,6 +88,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
+name = "binform"
+version = "0.1.0"
+dependencies = [
+ "gimli",
+ "iced-x86",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -527,6 +535,7 @@ dependencies = [
  "aes",
  "aho-corasick",
  "base64 0.22.1",
+ "binform",
  "cab",
  "cfb",
  "cms",
@@ -556,7 +565,6 @@ dependencies = [
  "sha2 0.10.9",
  "signal-hook",
  "stng",
- "stng-process",
  "tar",
  "tempfile",
  "thiserror",

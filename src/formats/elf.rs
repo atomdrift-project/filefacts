@@ -21,8 +21,8 @@ use goblin::elf::{Elf, SectionHeader, header};
 use serde_json::Value as JsonValue;
 
 use crate::formats::common::{
-    NativeFormat, RizinTarget, XorScan, extract_binary_strings, extract_binary_strings_from_object,
-    put_str, put_u64, rizin_fallback, section_entropy,
+    XorScan, extract_binary_strings, extract_binary_strings_from_object, put_str, put_u64,
+    section_entropy,
 };
 use crate::formats::goblin_safe;
 use crate::metric;
@@ -160,7 +160,6 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
         symbols: symbols_out,
         errors: errors_out,
         image_end,
-        ref rizin,
         ..
     } = ctx;
     // goblin's dynamic-section walker has panicked on malformed `DT_*`
@@ -238,7 +237,6 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
     dynamic::verdef(&elf, bytes.len(), values, errors_out);
     dynamic::init_arrays(&elf, bytes, values, metrics);
     dynamic::dynsym_funcs(&elf, bytes.len(), values);
-    syscalls::emit(&elf, bytes, values, metrics);
     if !section_headers_truncated {
         metrics::absent_metadata(&elf, values, metrics);
     }
@@ -289,22 +287,24 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
     if code.is_some() {
         symbols::static_function_fallback(&elf, bytes.len(), code, symbols_out);
     }
-    if has_present_load_or_code_bytes(&elf, bytes.len()) {
-        rizin_fallback(
-            RizinTarget {
-                format: NativeFormat::Elf,
-                bytes,
-                strings,
-                go_function_metadata: pclntab.is_some(),
-                settings: rizin,
-            },
-            sections_out,
-            symbols_out,
-            metrics,
-        );
+    // One binform recovery feeds both the function inventory (filled only
+    // when the symbol tables held none) and the syscall sites (always).
+    if has_present_load_or_code_bytes(&elf, bytes.len())
+        && let Some(native) = crate::functions::recover(bytes)
+    {
+        let indirect = elf.dynsyms.iter().any(|sym| {
+            sym.st_shndx == 0 && elf.dynstrtab.get_at(sym.st_name) == Some("syscall")
+        });
+        syscalls::emit(&native.syscalls, native.arch, indirect, values, metrics);
+        let has_function = symbols_out
+            .iter()
+            .any(|symbol| symbol.kind() == crate::SymbolKind::Function);
+        if !has_function {
+            super::common::apply_native(native, symbols_out, None, metrics);
+        }
     }
     // Symbol-table names for a binary whose `.symtab` covers too little to
-    // stand in for disassembly, kept when rizin supplied no functions.
+    // stand in for disassembly, kept when binform supplied no functions.
     symbols::static_function_fallback(&elf, bytes.len(), None, symbols_out);
     linker_family(&elf, values);
     comment_fingerprint(values);

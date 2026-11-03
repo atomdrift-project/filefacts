@@ -23,40 +23,6 @@ pub(super) fn table_fits(narches: usize, len: usize) -> bool {
             / goblin::mach::fat::SIZEOF_FAT_ARCH
 }
 
-/// Byte range of the host-native architecture slice within a fat Mach-O, used to
-/// hand rizin only the slice that can run on this host. Matches on `cputype` so
-/// `arm64` and `arm64e` (same cputype, different subtype) both resolve on Apple
-/// silicon. Returns `None` for an unknown host arch or when no slice matches —
-/// callers fall back to the whole input.
-pub(super) fn native_slice_range(bytes: &[u8], arches: &[FatArch]) -> Option<(usize, usize)> {
-    // CPU_TYPE_* constants (mach/machine.h). The CPU_ARCH_ABI64 bit (0x0100_0000)
-    // is set on the 64-bit variants we target.
-    #[cfg(target_arch = "aarch64")]
-    const NATIVE_CPU_TYPE: u32 = 0x0100_000C; // CPU_TYPE_ARM64
-    #[cfg(target_arch = "x86_64")]
-    const NATIVE_CPU_TYPE: u32 = 0x0100_0007; // CPU_TYPE_X86_64
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    const NATIVE_CPU_TYPE: u32 = 0;
-
-    if NATIVE_CPU_TYPE == 0 {
-        return None;
-    }
-    for arch in arches {
-        if arch.cputype != NATIVE_CPU_TYPE {
-            continue;
-        }
-        let start = arch.offset as usize;
-        if start >= bytes.len() {
-            return None;
-        }
-        let end = start.saturating_add(arch.size as usize).min(bytes.len());
-        if end > start {
-            return Some((start, end));
-        }
-    }
-    None
-}
-
 /// What the top level needs from a fat binary's analysis.
 pub(super) struct Analysed {
     /// The end of the furthest slice's image in whole-file offsets (see

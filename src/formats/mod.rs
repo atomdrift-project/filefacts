@@ -46,9 +46,6 @@ pub(crate) struct ExtractCtx<'a> {
     /// The repeating XOR key identification recovered (see
     /// [`crate::FileId::xor_pe_key`]), recorded as the `xor.*` facts.
     pub(crate) xor_pe_key: Option<stng::RepeatingXorKey>,
-    /// This open's rizin settings, for the native-binary extractors' symbol
-    /// recovery (see [`common::rizin_fallback`]).
-    pub(crate) rizin: crate::rizin::Settings,
 }
 
 impl ExtractCtx<'_> {
@@ -67,7 +64,6 @@ impl ExtractCtx<'_> {
             image_end: self.image_end,
             basename: self.basename,
             xor_pe_key: self.xor_pe_key,
-            rizin: self.rizin,
         }
     }
 }
@@ -103,7 +99,6 @@ impl Sinks {
             image_end: &mut self.image_end,
             basename: None,
             xor_pe_key: None,
-            rizin: crate::rizin::Settings::default(),
         }
     }
 }

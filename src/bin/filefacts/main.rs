@@ -51,7 +51,6 @@ mod alloc {
 
 use std::ffi::{OsStr, OsString};
 use std::io::{self, IsTerminal as _, Write};
-use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -131,13 +130,6 @@ fn main() -> ExitCode {
         }
     };
 
-    match rizin_concurrency(std::env::var_os("FILEFACTS_RIZIN_CONCURRENCY").as_deref()) {
-        Ok(limit) => filefacts::rizin::set_max_concurrent_runs(limit),
-        Err(value) => eprintln!(
-            "filefacts: ignoring FILEFACTS_RIZIN_CONCURRENCY={}: not a positive integer",
-            escape_controls(&value)
-        ),
-    }
     let cache = !args.no_cache && filefacts::cache::env_override().unwrap_or(true);
     let options = args.options(cache);
     // Drops superseded schema versions and bounds the cache on a background
@@ -176,20 +168,6 @@ fn main() -> ExitCode {
 /// other tools read it, and it must not make this one chatty.
 fn debug_requested(value: Option<&OsStr>) -> bool {
     value.is_some_and(|v| !(v.is_empty() || v == "0" || v.eq_ignore_ascii_case("false")))
-}
-
-/// The rizin concurrency limit a `FILEFACTS_RIZIN_CONCURRENCY` value asks
-/// for: unset or empty is no limit, a positive integer is that limit, and
-/// anything else is returned as an error to report.
-fn rizin_concurrency(value: Option<&OsStr>) -> Result<Option<NonZeroUsize>, String> {
-    let Some(value) = value.filter(|v| !v.is_empty()) else {
-        return Ok(None);
-    };
-    value
-        .to_str()
-        .and_then(|v| v.trim().parse::<NonZeroUsize>().ok())
-        .map(Some)
-        .ok_or_else(|| value.to_string_lossy().into_owned())
 }
 
 /// On SIGINT, SIGTERM or SIGHUP, kill in-flight rizin process groups and
@@ -458,6 +436,7 @@ fn parse_args(
             "-h" | "--help" => return Ok(ParseOutcome::Help),
             "-V" | "--version" => return Ok(ParseOutcome::Version),
             "--no-cache" => parsed.no_cache = true,
+            // Accepted for old scripts; filefacts no longer runs rizin.
             "--no-rizin" => parsed.no_rizin = true,
             "-f" | "--format" => {
                 let value = iter.next().ok_or("--format requires terminal or json")?;
@@ -548,15 +527,12 @@ an existing file is read as that file):
     for view in View::ALL {
         msg.push_str(&format!("  {:<17}  {}\n", view.name(), view.description()));
     }
-    msg.push_str(&format!(
+    msg.push_str(
         "
 options:
   -f, --format <terminal|json>
                      Output format. Default: terminal.
   --no-cache         Do not read or write the extraction cache.
-  --no-rizin         Do not run rizin, even when it is installed.
-  --rizin-timeout <seconds>
-                     Wall-clock budget for one rizin run. Default: {timeout}.
   --                 Read every later argument as a path.
   -h, --help         Show this help and exit.
   -V, --version      Print version and exit.
@@ -565,10 +541,7 @@ environment:
   FILEFACTS_CACHE    0 or false turns the extraction cache off; it is on by
                      default.
   FILEFACTS_DEBUG    Any value but empty, 0 or false prints diagnostics and
-                     rizin statistics to stderr.
-  FILEFACTS_RIZIN_CONCURRENCY
-                     Most rizin runs at once in this process. Default: no
-                     limit.
+                     function-recovery statistics to stderr.
   NO_COLOR           Any non-empty value turns terminal colour off. Colour is
                      only ever used when stdout is a terminal.
   COLUMNS            Width of the rule under each file header. Default: 100.
@@ -577,10 +550,9 @@ exit status:
   0    every file was analysed.
   1    some file could not be read or serialised, or output failed.
   2    the command line could not be parsed.
-  128+N  killed by signal N; in-flight rizin runs are killed with it.
+  128+N  killed by signal N.
 ",
-        timeout = filefacts::rizin::DEFAULT_RIZIN_TIMEOUT_SECS,
-    ));
+    );
     msg
 }
 
@@ -628,12 +600,9 @@ mod tests {
         for name in [
             "FILEFACTS_CACHE",
             "FILEFACTS_DEBUG",
-            "FILEFACTS_RIZIN_CONCURRENCY",
             "NO_COLOR",
             "COLUMNS",
             "--no-cache",
-            "--no-rizin",
-            "--rizin-timeout",
         ] {
             assert!(help.contains(name), "{name} not in usage");
         }
@@ -654,23 +623,6 @@ mod tests {
             assert!(!debug_requested(Some(OsStr::new(off))), "{off:?}");
         }
         assert!(!debug_requested(None));
-    }
-
-    #[test]
-    fn rizin_concurrency_accepts_only_positive_integers() {
-        assert_eq!(rizin_concurrency(None), Ok(None));
-        assert_eq!(rizin_concurrency(Some(OsStr::new(""))), Ok(None));
-        assert_eq!(
-            rizin_concurrency(Some(OsStr::new("4"))),
-            Ok(NonZeroUsize::new(4))
-        );
-        for bad in ["0", "-1", "many", "1.5"] {
-            assert_eq!(
-                rizin_concurrency(Some(OsStr::new(bad))),
-                Err(bad.to_string()),
-                "{bad}"
-            );
-        }
     }
 
     #[test]

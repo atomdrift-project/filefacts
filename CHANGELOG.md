@@ -66,6 +66,37 @@ is listed under **Changed** with the new value.
 
 ### Changed
 
+- PE, ELF and Mach-O function recovery runs in-process through binform
+  instead of rizin, on every binary without a function inventory, and binform
+  fills the section, import and export views of a PE goblin cannot read in
+  full. filefacts no longer starts rizin: the `rizin` module, the
+  `OpenOptions::rizin*` settings, `--no-rizin`, `--rizin-timeout` and
+  `FILEFACTS_RIZIN_CONCURRENCY` are accepted and ignored until hosts drop
+  them, `rizin::available` is `false`, and `rizin_recovery_incomplete` is
+  always `false`. Binaries of an instruction set binform does not decode
+  (eBPF, M*Core, Nios II, IA-64 and the like) keep their layout facts and get
+  no functions.
+- ELF `elf.syscalls_direct` is projected from `binform::calls`, which tracks
+  register and stack values through each recovered function, rather than a
+  fixed-window scan. This extends direct-syscall extraction from x86-64 and
+  AArch64 to 32-bit Arm and x86, resolves numbers and arguments built across
+  blocks (a `connect` whose number is `mov r7,0x100; add r7,0x1b`, which rizin
+  and the old scan both miss), and no longer reports `0f05` bytes that fall
+  inside other instructions. The syscall number-to-name tables move to
+  binform (`binform::Binary::syscall`, generated from the `libc` crate). New:
+  a `connect`/`bind` argument that points at a `sockaddr_in`/`sockaddr_in6`
+  gets a `decoded` field with the IP and port, and a call through the libc
+  `syscall()` wrapper carries `via: "syscall"`. A call to the libc `connect()`
+  import is projected the same way, carrying `via: "connect"` with the socket
+  syscall number for the architecture (from the new
+  `binform::Binary::syscall_number`). In a statically linked binary, where
+  `connect` reaches the kernel through an in-image wrapper (`mov eax, 42;
+  syscall`), a direct call to that wrapper is projected from the caller with
+  its arguments and carries `via: "wrapper"`. The decoded destinations are also
+  surfaced as a first-class network IOC in `elf.network_endpoints` — one
+  `{ip, port, kind, offset, syscall, via?}` per `sockaddr` a syscall points
+  at — with the count in the `elf.network_endpoint_count` metric.
+
 - **`SCHEMA_VERSION` is now `11`.** Renamed or reshaped keys:
   - PNG `image.*` statistics normalize palette and 16-bit samples rather than
     counting palette indices or alternating bytes as color samples.

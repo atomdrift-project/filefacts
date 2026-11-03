@@ -372,24 +372,3 @@ fn several_paths_are_each_analysed() {
         .collect();
     assert_eq!(types, ["python", "json"]);
 }
-
-/// A malformed `FILEFACTS_RIZIN_CONCURRENCY` is reported and ignored, not
-/// fatal.
-#[test]
-fn malformed_rizin_concurrency_is_reported_and_ignored() {
-    let dir = scratch("rizin-concurrency");
-    let file = dir.join("a.py");
-    fs::write(&file, SOURCE).unwrap();
-    let out = filefacts()
-        .env("FILEFACTS_RIZIN_CONCURRENCY", "lots")
-        .args(["--format", "json", "fileid"])
-        .arg(&file)
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "{:?}", out.status);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("FILEFACTS_RIZIN_CONCURRENCY=lots"),
-        "{stderr}"
-    );
-}

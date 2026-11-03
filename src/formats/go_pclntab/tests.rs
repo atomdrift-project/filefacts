@@ -417,8 +417,8 @@ fn code_spans_its_executable_ranges() {
 }
 
 // ------------------------------------------------------------------
-// Real Go binaries: their inventory comes from the pclntab and rizin
-// never starts.
+// Real Go binaries: their inventory comes from the pclntab and binform's
+// recovery never starts.
 // ------------------------------------------------------------------
 
 fn fixture(name: &str) -> Vec<u8> {
@@ -427,44 +427,15 @@ fn fixture(name: &str) -> Vec<u8> {
     zstd::decode_all(compressed.as_slice()).expect("fixture decompresses")
 }
 
-/// Opened with a one-millisecond rizin budget, so a rizin run that starts at
-/// all — where rizin is installed — leaves the result incomplete.
-fn open_with_rizin_tripwire(bytes: &[u8]) -> crate::ParsedFile<'_> {
-    let _lock = crate::rizin::tests::rizin_test_lock();
-    crate::OpenOptions::new()
-        .cache(false)
-        .rizin_timeout(std::time::Duration::from_millis(1))
-        .open(bytes)
-}
-
-/// Function names and their count, with rizin shown not to have run.
+/// Function names, with binform's recovery shown not to have run.
 fn go_inventory(bytes: &[u8]) -> Vec<String> {
-    let parsed = open_with_rizin_tripwire(bytes);
-    assert!(
-        !parsed.rizin_recovery_incomplete(),
-        "rizin ran on a Go binary"
-    );
+    let parsed = crate::OpenOptions::new().cache(false).open(bytes);
     assert!(parsed.metrics().get("binary.avg_complexity").is_none());
     parsed
         .symbols()
         .iter_kind(SymbolKind::Function)
         .filter_map(|symbol| symbol.name().map(str::to_owned))
         .collect()
-}
-
-#[test]
-fn the_tripwire_catches_a_binary_rizin_does_analyse() {
-    // The control: a stripped C binary within budget is admitted, so the
-    // tripwire must fire wherever rizin is installed.
-    if !crate::rizin::available() {
-        return;
-    }
-    let bytes = std::fs::read(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/test.elf"
-    ))
-    .unwrap();
-    assert!(open_with_rizin_tripwire(&bytes).rizin_recovery_incomplete());
 }
 
 #[test]
@@ -495,7 +466,7 @@ fn a_stripped_go_pe_finds_its_pclntab_in_rdata() {
     let names = go_inventory(&bytes);
     assert_eq!(names.len(), 1415);
     assert!(names.iter().any(|n| n == "main.main"));
-    let parsed = open_with_rizin_tripwire(&bytes);
+    let parsed = crate::OpenOptions::new().cache(false).open(&bytes);
     assert_eq!(parsed.symbols().iter_kind(SymbolKind::Export).count(), 0);
 }
 

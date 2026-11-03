@@ -1217,22 +1217,18 @@ fn a_symtab_covering_little_of_the_code_waits_for_disassembly() {
     let mut out = crate::Symbols::default();
     static_function_fallback(&elf, bytes.len(), Some(larger), &mut out);
     assert_eq!(out.iter_kind(SymbolKind::Function).count(), 0);
-    // Without the requirement, as after rizin found nothing, they are kept.
+    // Without the requirement, as after binform found nothing, they are kept.
     static_function_fallback(&elf, bytes.len(), None, &mut out);
     assert_eq!(out.iter_kind(SymbolKind::Function).count(), 32);
 }
 
 #[test]
-fn an_unstripped_elf_skips_rizin() {
-    // End to end: with its `.symtab` in before the admission decision, a
-    // one-millisecond rizin budget never trips (where rizin is installed).
+fn an_unstripped_elf_keeps_its_symbol_table_functions() {
+    // End to end: its `.symtab` names the functions, so binform's recovery,
+    // which would add complexity metrics, does not run.
     let bytes = read_fixture("elf-syscall-wrapper-static.elf");
-    let _lock = crate::rizin::tests::rizin_test_lock();
-    let parsed = crate::OpenOptions::new()
-        .cache(false)
-        .rizin_timeout(std::time::Duration::from_millis(1))
-        .open(&bytes);
-    assert!(!parsed.rizin_recovery_incomplete(), "rizin ran");
+    let parsed = crate::OpenOptions::new().cache(false).open(&bytes);
+    assert!(parsed.metrics().get("binary.avg_complexity").is_none());
     assert_eq!(parsed.symbols().iter_kind(SymbolKind::Function).count(), 32);
 }
 

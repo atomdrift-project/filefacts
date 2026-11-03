@@ -290,6 +290,7 @@ pub const VALUE_CATALOG: &[&str] = &[
     "elf.machine",
     "elf.needed",
     "elf.needed_versions",
+    "elf.network_endpoints",
     "elf.osabi",
     "elf.overlapping_segments",
     "elf.package",

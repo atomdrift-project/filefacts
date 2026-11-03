@@ -85,6 +85,12 @@ fn imphash(imports: &[Import<'_>]) -> Option<String> {
 /// pefile's `ordlookup.ordLookup(dll, ordinal, make_name=True)` for a
 /// lowercased `dll`.
 fn ordinal_name(dll: &str, ordinal: u16) -> String {
+    known_ordinal(dll, ordinal).map_or_else(|| format!("ord{ordinal}"), str::to_owned)
+}
+
+/// The name `dll` (lowercase, with its extension) exports at `ordinal`, for
+/// the DLLs whose ordinals are stable across Windows releases.
+pub(in crate::formats) fn known_ordinal(dll: &str, ordinal: u16) -> Option<&'static str> {
     let table = match dll {
         "ws2_32.dll" => ordinals::WS2_32,
         "wsock32.dll" => ordinals::WSOCK32,
@@ -95,7 +101,7 @@ fn ordinal_name(dll: &str, ordinal: u16) -> String {
         .binary_search_by_key(&ordinal, |&(n, _)| n)
         .ok()
         .and_then(|i| table.get(i))
-        .map_or_else(|| format!("ord{ordinal}"), |&(_, name)| name.to_string())
+        .map(|&(_, name)| name)
 }
 
 /// `lib` without one trailing `.dll`, `.ocx` or `.sys`, the extensions the

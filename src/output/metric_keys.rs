@@ -383,6 +383,7 @@ pub const CATALOG: &[&str] = &[
     "elf.load_segment_max_memory_size",
     "elf.load_segments_without_member_bytes",
     "elf.multiple_pt_interp",
+    "elf.network_endpoint_count",
     "elf.no_gnu_stack",
     "elf.note_count",
     "elf.nx_enabled",

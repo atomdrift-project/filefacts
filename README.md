@@ -30,7 +30,7 @@ make install                                    # from source: Rust 1.97+, C/C++
 filefacts suspect.bin                  # default facts bundle in the terminal
 filefacts --format json ./samples      # recurse a directory, emit JSON
 filefacts imports a.exe b.dll          # one view, for several files
-filefacts --no-rizin --no-cache x.elf  # no subprocess, no disk cache
+filefacts --no-cache x.elf             # no disk cache
 ```
 
 Views include `fileid`, `identity`, `values`, `text`, `literals`, `metrics`,
@@ -40,20 +40,16 @@ Views include `fileid`, `identity`, `values`, `text`, `literals`, `metrics`,
 | Option | Effect |
 |---|---|
 | `-f`, `--format <terminal\|json>` | Output format (default `terminal`) |
-| `--no-rizin` | Never run rizin |
-| `--rizin-timeout <secs>` | Wall-clock budget per rizin run (default 600) |
 | `--no-cache` | Neither read nor write the disk cache |
 
 | Environment | Effect |
 |---|---|
 | `FILEFACTS_CACHE=0` | Disable the disk cache (`~/.cache/atomdrift/filefacts` or the platform equivalent) |
 | `FILEFACTS_DEBUG=1` | Print extractor diagnostics to stderr |
-| `FILEFACTS_RIZIN_CONCURRENCY=<n>` | Run at most `n` rizin processes at once |
 
-For PE, ELF, and Mach-O, filefacts uses an installed
-[rizin](https://rizin.re) for deeper symbol recovery on stripped binaries. It
-runs as a resource-limited subprocess with a scrubbed environment and a hard
-timeout; without it, those views come from filefacts' own parsers.
+For PE, ELF, and Mach-O, filefacts recovers the functions of a binary with
+no symbol table, and the sections, imports and exports goblin cannot read,
+in-process with [binform](../funktion). It starts no subprocess.
 
 ## Library
 
@@ -63,8 +59,8 @@ println!("{:?}", parsed.fileid().file_type());
 let metrics = parsed.metrics(); // views are computed lazily and cached
 ```
 
-`OpenOptions` sets the path, a known type, cancellation, caching, and rizin
-limits per file; the library reads no environment variables. filefacts is not
+`OpenOptions` sets the path, a known type, cancellation, and caching per
+file; the library reads no environment variables. filefacts is not
 on crates.io yet, so depend on it via git with `default-features = false` (the
 default features build the CLI) and copy the `[patch.crates-io]` block from
 `Cargo.toml`: `[patch]` applies only in the root of a build, and without it

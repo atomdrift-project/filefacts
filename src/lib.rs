@@ -57,8 +57,7 @@
 //! ## Configuration
 //!
 //! [`open`] uses the library defaults. [`OpenOptions`] supplies a path, a
-//! known type or [`FileId`], a cancellation flag, and the cache and rizin
-//! settings. Every setting belongs to the [`ParsedFile`] it opens, so one
+//! known type or [`FileId`], a cancellation flag, and the cache settings. Every setting belongs to the [`ParsedFile`] it opens, so one
 //! process can open files under different settings at once.
 //!
 //! ```no_run
@@ -67,16 +66,13 @@
 //! let bytes = std::fs::read("sample.exe").unwrap();
 //! let parsed = filefacts::OpenOptions::new()
 //!     .path(Path::new("sample.exe"))
-//!     .rizin(false)
 //!     .open(&bytes);
 //! ```
 //!
 //! ## Side effects
 //!
 //! Opening a file only identifies it. The first view access runs the
-//! extraction, which may spawn an installed rizin: once per process to read
-//! its version, and per file to recover symbols from PE, ELF and Mach-O
-//! binaries (see [`rizin`]). Turn that off with [`OpenOptions::rizin`].
+//! extraction, in-process: filefacts starts no subprocess.
 //!
 //! The disk cache in [`cache`] is off unless the host opts in with
 //! [`OpenOptions::cache`]. When on, the first view access reads a matching
@@ -115,6 +111,7 @@ pub(crate) use derived_metrics::is_well_known_section_name;
 mod embedded_sources;
 mod error;
 mod formats;
+mod functions;
 mod go_dependency_context;
 mod go_package_context;
 mod identity;
@@ -152,21 +149,13 @@ pub mod rc4_container;
 
 pub mod cache;
 pub mod fileid;
-mod tools;
 pub mod values;
 
-/// Optional rizin integration with hardened subprocess
-/// discipline (RLIMIT, PR_SET_PDEATHSIG, process-group SIGKILL on
-/// timeout / output-cap overflow). Configured per file through
-/// [`OpenOptions`]; exposed as a public module only for what is genuinely
-/// process-wide: reaping in-flight workers (`kill_all_rizin_groups`) from a
-/// signal-handling thread (e.g. `ctrlc`), not an async signal handler, the
-/// concurrency limit (`set_max_concurrent_runs`), and `tracing` telemetry
-/// (`stats`, `log_stats`).
 /// Ren'Py RPA archive members, for hosts that extract them.
 pub mod rpa {
     pub use crate::formats::rpa::{Chunk, Member, members};
 }
+/// No-op rizin settings and controls, kept until hosts stop calling them.
 pub mod rizin;
 
 mod bundle;
@@ -268,8 +257,7 @@ pub const SCHEMA_VERSION: &str = "11";
 /// path-aware variants; [`from_path`] reads the bytes from disk first.
 ///
 /// Views are computed on first access and cached for the lifetime of
-/// the `ParsedFile`. That first access may spawn rizin, and reads and
-/// writes the disk cache when the host enabled it; see the crate-level
+/// the `ParsedFile`. That first access reads and writes the disk cache when the host enabled it; see the crate-level
 /// "Side effects" section.
 ///
 /// Typed fact families such as strings, sections, symbols, AST
@@ -351,9 +339,9 @@ impl std::fmt::Debug for ParsedFile<'_> {
 }
 
 /// Everything one extraction produces. Round-trips through the disk cache
-/// ([`crate::cache`]) so the expensive recovery — chiefly the rizin
-/// disassembly pass folded into `symbols`/`sections`/`metrics` — is computed
-/// once per `(content, filefacts build, rizin config)` and reused across
+/// ([`crate::cache`]) so the expensive recovery — chiefly function recovery
+/// folded into `symbols`/`sections`/`metrics` — is computed once per
+/// `(content, filefacts build, binform policy)` and reused across
 /// processes rather than re-run on every `open`.
 ///
 /// The byte-scan `text` rows are cached in extraction order (see
@@ -468,8 +456,8 @@ impl<'a> ParsedFile<'a> {
     /// Unified named-entity facts about this file.
     ///
     /// Every row is a [`Symbol`] tagged by [`SymbolKind`]: imports,
-    /// exports, locally-defined functions (with CFG metrics when rizin
-    /// disassembled), source call sites, dotted member-access chains,
+    /// exports, locally-defined functions (with CFG metrics when binform
+    /// recovered them), source call sites, dotted member-access chains,
     /// static bindings, and bare identifiers. Which kinds populate
     /// depends on the file type. Filter with [`Symbols::iter_kind`].
     pub fn symbols(&self) -> &Symbols {
@@ -529,23 +517,11 @@ impl<'a> ParsedFile<'a> {
         &self.extracted().errors
     }
 
-    /// Whether rizin symbol recovery was attempted but did not complete
-    /// on this run.
-    ///
-    /// `true` means rizin is installed (so the symbol/section views would
-    /// normally be rizin-grade) yet this particular run produced nothing
-    /// — it timed out, was killed on the output cap, or had turned itself
-    /// off after too many abandoned output readers. The bytes are
-    /// unchanged, so a later run may succeed; a caller caching analysis
-    /// output keyed by content **must not persist a payload while this is
-    /// `true`**, or the degraded result would be served to every future
-    /// run. Key such a cache with [`OpenOptions::rizin_fingerprint`].
-    /// Always `false` when rizin is not
-    /// installed, turned off with [`OpenOptions::rizin`], or skipped the
-    /// input under [`OpenOptions::rizin_max_bytes`]: those results are
-    /// correct for that environment and those settings, and keyed as such.
+    /// Always `false`: filefacts no longer runs rizin, and binform's
+    /// in-process recovery has no run that can fail to complete. Kept until
+    /// hosts stop calling it.
     pub fn rizin_recovery_incomplete(&self) -> bool {
-        rizin_incomplete(self.metrics())
+        false
     }
 
     /// Whether the source parse was cut short by something other than the
@@ -553,7 +529,7 @@ impl<'a> ParsedFile<'a> {
     /// machine was, or cancellation.
     ///
     /// The AST facts are then missing for this run only. As with
-    /// [`Self::rizin_recovery_incomplete`], a caller caching analysis output
+    /// any cached result, a caller caching analysis output
     /// keyed by content **must not persist a payload while this is `true`**.
     /// Every other reason a source file has no AST — its size, a scanner
     /// guard, a work budget — follows from the bytes and is safe to cache.
@@ -633,14 +609,14 @@ impl<'a> ParsedFile<'a> {
                 return self.run_pipeline();
             }
             // The disk cache is keyed by (content, filefacts build, detected
-            // type, basename, rizin settings). Type belongs in the key because detection
+            // type, basename, binform policy). Type belongs in the key because detection
             // may use the logical filename: identical gzip bytes named
             // `package.tgz` and `hash.sample` are npm and generic gzip inputs,
             // respectively, and expose different identity/structure views.
             // Basename also produces facts independent of detected type:
             // `build.rs` and `lib.rs` must not share `file.basename`, nor may
             // Go workspace and module metadata inherit one another's context.
-            // A degraded rizin run, or a source parse stopped by the
+            // A source parse stopped by the
             // wall-clock backstop or cancellation, is returned but not
             // persisted, so a later healthy run still gets to fill the entry.
             let variant = extraction_cache_variant(
@@ -653,11 +629,10 @@ impl<'a> ParsedFile<'a> {
             );
             cache::open_with_cache(self.cache_dir.as_deref(), self.bytes, &variant, || {
                 let extracted = self.run_pipeline();
-                let transient = rizin_incomplete(&extracted.metrics)
-                    || self
-                        .tree_parse()
-                        .and_then(formats::source::TreeParse::diagnostic)
-                        .is_some_and(formats::source::TreeSitterDiagnostic::is_transient);
+                let transient = self
+                    .tree_parse()
+                    .and_then(formats::source::TreeParse::diagnostic)
+                    .is_some_and(formats::source::TreeSitterDiagnostic::is_transient);
                 if transient {
                     cache::Computed::Transient(extracted)
                 } else {
@@ -679,7 +654,6 @@ impl<'a> ParsedFile<'a> {
             self.tree_cache(),
             self.tree_parse()
                 .and_then(formats::source::TreeParse::diagnostic),
-            self.rizin,
         );
         match self.cfml_outcome() {
             Some(Ok(parsed)) => {
@@ -719,15 +693,6 @@ fn guarded<T>(stage: &'static str, work: impl FnOnce() -> T) -> Result<T, PanicM
     };
     tracing::warn!(stage, %message, "caught panic; stage facts lost");
     Err(PanicMessage(message))
-}
-
-/// Whether a rizin run that should have recovered symbols did not complete.
-/// Both the public predicate and the don't-persist decision read it here, so
-/// they cannot disagree; `metric!` checks the key against the catalog.
-fn rizin_incomplete(metrics: &Metrics) -> bool {
-    metrics
-        .get(metric!("binary.rizin_incomplete").as_str())
-        .is_some()
 }
 
 /// Everything besides the bytes and the build that a cached extraction
@@ -771,7 +736,6 @@ fn run_extraction(
     basename: Option<&str>,
     tree_cache: Option<&formats::source::TreeCache<'_>>,
     tree_diagnostic: Option<&formats::source::TreeSitterDiagnostic>,
-    rizin: rizin::Settings,
 ) -> Extracted {
     let file_type = fileid.file_type();
     let extension_mismatch = fileid.extension_mismatch();
@@ -847,7 +811,6 @@ fn run_extraction(
                 image_end: &mut image_end,
                 basename,
                 xor_pe_key,
-                rizin,
             },
         )
     });
@@ -1027,8 +990,8 @@ enum Identification {
 ///
 /// Every setting belongs to the `ParsedFile` it opens. Nothing here is
 /// process-wide, so one process can open files under different settings at
-/// the same time — rizin on for one and off for another, the disk cache on
-/// for one and off for another — without either seeing the other's.
+/// the same time — the disk cache on for one and off for another — without
+/// either seeing the other's.
 ///
 /// [`OpenOptions::new`] gives the library defaults; [`open`] is shorthand
 /// for opening with them. Setters consume and return the options, and
@@ -1037,9 +1000,8 @@ enum Identification {
 ///
 /// ```no_run
 /// use std::path::Path;
-/// use std::time::Duration;
 ///
-/// let options = filefacts::OpenOptions::new().rizin_timeout(Duration::from_secs(60));
+/// let options = filefacts::OpenOptions::new().cache(true);
 /// for name in ["a.exe", "b.so"] {
 ///     let bytes = std::fs::read(name)?;
 ///     let parsed = options.clone().path(Path::new(name)).open(&bytes);
@@ -1072,10 +1034,7 @@ impl<'a> OpenOptions<'a> {
     ///   is given);
     /// * no cancellation flag;
     /// * the disk cache off, and the per-user cache directory as its root
-    ///   once [`cache`](Self::cache) turns it on;
-    /// * rizin on when it is installed, with a
-    ///   [`rizin::DEFAULT_RIZIN_TIMEOUT_SECS`] budget per run, no size cap,
-    ///   and every slice of a fat Mach-O analysed.
+    ///   once [`cache`](Self::cache) turns it on.
     pub fn new() -> Self {
         Self {
             path: None,
@@ -1144,9 +1103,6 @@ impl<'a> OpenOptions<'a> {
     /// only ever reads it, never sets it, which is what makes it safe to
     /// share across threads without an `Arc` here.
     ///
-    /// Rizin is deliberately *not* wired to this: it enforces its own hard
-    /// wall-clock budget ([`rizin_timeout`](Self::rizin_timeout)) and kills
-    /// its process group, so it is already bounded.
     pub fn cancellation(mut self, flag: &'a AtomicBool) -> Self {
         self.cancellation = Some(flag);
         self
@@ -1156,10 +1112,10 @@ impl<'a> OpenOptions<'a> {
     ///
     /// When on, the first view access reads a matching entry from the cache
     /// directory, or writes one after computing the views; a later open of
-    /// the same bytes, under the same settings, skips the extraction (and its
-    /// rizin run). The key covers the bytes, the filefacts build, the
-    /// detected type, the basename and
-    /// [`rizin_fingerprint`](Self::rizin_fingerprint). Off by default.
+    /// the same bytes, under the same settings, skips the extraction. The key
+    /// covers the bytes, the filefacts build, the detected type, the
+    /// basename and [`rizin_fingerprint`](Self::rizin_fingerprint). Off by
+    /// default.
     pub fn cache(mut self, enabled: bool) -> Self {
         self.cache = enabled;
         self
@@ -1189,56 +1145,40 @@ impl<'a> OpenOptions<'a> {
         self
     }
 
-    /// Run an installed rizin to recover symbols, functions and sections
-    /// from PE, ELF and Mach-O binaries the static parse leaves thin (see
-    /// [`rizin`]). On by default; turn it off to keep extraction free of
-    /// subprocesses.
+    /// Ignored: filefacts no longer runs rizin. Kept until hosts stop
+    /// calling it.
     pub fn rizin(mut self, enabled: bool) -> Self {
         self.rizin.enabled = enabled;
         self
     }
 
-    /// Wall-clock budget for one rizin run; a run past it is killed with its
-    /// process group and the file keeps its static facts.
-    /// [`rizin::DEFAULT_RIZIN_TIMEOUT_SECS`] by default. Latency-sensitive
-    /// hosts lower it.
+    /// Ignored, like [`rizin`](Self::rizin).
     pub fn rizin_timeout(mut self, timeout: Duration) -> Self {
         self.rizin.timeout = timeout;
         self
     }
 
-    /// Retry a timed-out native file once with this larger deadline. Other
-    /// recovery failures keep their static facts and incomplete diagnostics.
+    /// Ignored, like [`rizin`](Self::rizin).
     pub fn rizin_retry_timeout(mut self, timeout: Duration) -> Self {
         self.rizin.retry_timeout = Some(timeout);
         self
     }
 
-    /// Skip rizin for inputs larger than `max_bytes`. A full analysis of a
-    /// 100 MB+ stripped binary costs minutes, so a latency-sensitive host
-    /// caps it to keep one giant from dominating a scan. No cap by default.
+    /// Ignored, like [`rizin`](Self::rizin).
     pub fn rizin_max_bytes(mut self, max_bytes: usize) -> Self {
         self.rizin.max_bytes = Some(max_bytes);
         self
     }
 
-    /// Hand rizin only the host-native slice of a fat Mach-O instead of the
-    /// whole universal binary: the other slices never run on this host, and
-    /// analysing each is the bulk of the cost. Off by default, so a
-    /// filesystem scan covers every slice.
+    /// Ignored, like [`rizin`](Self::rizin).
     pub fn rizin_native_arch_only(mut self, enabled: bool) -> Self {
         self.rizin.native_arch_only = enabled;
         self
     }
 
-    /// The rizin part of the disk-cache key for files opened with these
-    /// options: whether rizin runs (installed and enabled), its version,
-    /// native-arch slicing and the size cap — every rizin setting that
-    /// changes a persisted extraction. The timeout is not part of it: a run
-    /// that completes is the same under any budget, and one that times out
-    /// is never persisted (see [`ParsedFile::rizin_recovery_incomplete`]).
-    ///
-    /// For a host keying its own cache of results derived from filefacts.
+    /// The function-recovery part of the disk-cache key: binform's policy,
+    /// whatever the rizin settings. For a host keying its own cache of
+    /// results derived from filefacts.
     #[must_use]
     pub fn rizin_fingerprint(&self) -> String {
         rizin::cache_fingerprint(&self.rizin)
@@ -1249,7 +1189,7 @@ impl<'a> OpenOptions<'a> {
     /// Identification falls back to [`FileType::Unknown`] rather than
     /// failing, so this cannot fail. No filesystem access happens here; the
     /// first view access runs the extraction, which may use the disk cache
-    /// and spawn rizin as these options allow.
+    /// as these options allow.
     pub fn open<'b>(&self, bytes: &'b [u8]) -> ParsedFile<'b>
     where
         'a: 'b,
@@ -1272,7 +1212,7 @@ impl<'a> OpenOptions<'a> {
 
 /// Open `bytes` with the default [`OpenOptions`]: identified from content
 /// alone (magic bytes, shebang, lightweight pattern matching), with the
-/// library's default cache and rizin settings. Use [`OpenOptions`] to supply
+/// library's default cache settings. Use [`OpenOptions`] to supply
 /// a path, a known type, a cancellation flag or other settings.
 ///
 /// The returned [`ParsedFile`] borrows the slice for its lifetime. No

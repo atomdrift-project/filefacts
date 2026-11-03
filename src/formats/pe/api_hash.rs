@@ -23,9 +23,8 @@ use serde_json::Value as JsonValue;
 
 use super::layout::va_to_file_offset;
 use crate::formats::common::bytes_at::u32_le;
-use crate::formats::common::{RizinTarget, rizin_decision};
 use crate::metric;
-use crate::output::{Metrics, Section, Values};
+use crate::output::{Metrics, Values};
 use crate::value_key;
 
 /// Cap on the site records [`native_resolver_signals`] emits per kind. One
@@ -332,70 +331,34 @@ impl<'a> Site<'a> {
     }
 }
 
-/// Recover function facts and correlate manual export walkers with their
-/// concrete callsites for small importless PEs. This turns "there is an API
-/// hash loop somewhere" into the more useful fact "this call requested this
-/// hash, which exactly matches this known API under the recovered profile".
-pub(super) fn rizin_importless_analysis(
-    pe: &PE<'_>,
-    target: RizinTarget<'_>,
-    native: &NativeSignals,
-    values: &mut Values,
-    sections: &[Section],
-    symbols: &mut crate::Symbols,
-    metrics: &mut Metrics,
-) {
-    let RizinTarget {
-        bytes,
-        go_function_metadata,
-        settings: rizin,
-        ..
-    } = target;
+/// Whether `bytes` is a compact PE with no imports: the shape of a
+/// resolver or hash stub, whose calls are worth correlating with the
+/// API-hash walkers (see [`recover_api_hash_requests`]).
+pub(super) fn is_importless(bytes: &[u8], symbols: &crate::Symbols) -> bool {
     const MAX_IMPORTLESS_ANALYSIS_BYTES: usize = 5 * 1024 * 1024;
-    if bytes.len() > MAX_IMPORTLESS_ANALYSIS_BYTES
-        || symbols
+    bytes.len() <= MAX_IMPORTLESS_ANALYSIS_BYTES
+        && !symbols
             .iter()
             .any(|symbol| symbol.kind() == crate::SymbolKind::Import)
-    {
-        return;
-    }
-    if !rizin_decision(&target, sections, symbols, metrics).runs() || !rizin.admits(bytes) {
-        return;
-    }
-    let Some(recovery) =
-        crate::rizin::recover_with_symbols(bytes, symbols.len(), go_function_metadata, rizin)
-    else {
-        return;
-    };
-    recover_api_hash_requests(pe, bytes, native, values, metrics, &recovery);
-    let recovery = if super::declares_export_directory(pe.header.optional_header.as_ref()) {
-        recovery
-    } else {
-        recovery.without_exports()
-    };
-    let counts = recovery.apply(symbols, metrics);
-    metrics.insert(metric!("pe.rizin_importless_analysis"), 1.0);
-    if counts.functions > 0 {
-        metrics.insert(
-            metric!("pe.rizin_importless_function_count"),
-            f64::from(counts.functions),
-        );
-    }
 }
 
-fn recover_api_hash_requests(
+/// Correlate manual export walkers with their concrete callsites. This
+/// turns "there is an API hash loop somewhere" into the more useful fact
+/// "this call requested this hash, which exactly matches this known API
+/// under the recovered profile".
+pub(super) fn recover_api_hash_requests(
     pe: &PE<'_>,
     bytes: &[u8],
     native: &NativeSignals,
     values: &mut Values,
     metrics: &mut Metrics,
-    recovery: &crate::rizin::RizinRecovery,
+    functions: &crate::functions::Functions,
 ) {
     if native.walk_vas.is_empty() {
         return;
     }
-    let ranges = recovery.function_ranges();
-    let call_edges = recovery.direct_call_edges();
+    let ranges = functions.ranges();
+    let call_edges = functions.call_edges();
     let resolved = resolver_calls(
         &ranges,
         &call_edges,

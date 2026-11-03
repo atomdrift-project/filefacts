@@ -19,9 +19,6 @@ make fix        # apply clippy's fixes, then rustfmt
 make release    # optimized binary in out/
 ```
 
-rizin is optional. Tests that need it skip themselves when it is not
-installed; install it to exercise them.
-
 ## Before you send a change
 
 `make lint` and `make test` must pass; CI runs both on Linux, macOS and

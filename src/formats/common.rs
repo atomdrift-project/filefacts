@@ -1,5 +1,6 @@
 //! Helpers shared across format extractors.
 
+use crate::functions::RecoveryCounts;
 use crate::metric;
 use serde_json::Value as JsonValue;
 
@@ -263,326 +264,126 @@ pub(super) fn put_i64(values: &mut Values, key: ValueKey, n: i64) {
 // numeric/string value) instead — never a bare boolean that mirrors
 // presence/absence.
 
-/// Native executable formats sharing the Rizin admission policy.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum NativeFormat {
-    Elf,
-    MachO,
-    Pe,
-}
-
-/// Inputs to the deliberately small Rizin admission policy. Keeping this a
-/// plain fact bundle makes the decision table testable without spawning a
-/// disassembler or manufacturing three kinds of executable fixture.
-#[derive(Clone, Copy, Debug)]
-struct RizinProfile {
-    format: NativeFormat,
-    size: usize,
-    function_count: usize,
-    section_count: usize,
-    stripped: Option<bool>,
-    go_function_metadata: bool,
-    string_count: usize,
-    string_bytes: usize,
-    code_entropy: Option<f64>,
-    overall_entropy: f64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum RizinDecision {
-    Skip(&'static str),
-    Analyze(&'static str),
-}
-
-impl RizinDecision {
-    pub(super) fn runs(self) -> bool {
-        matches!(self, Self::Analyze(_))
-    }
-
-    fn reason(self) -> &'static str {
-        match self {
-            Self::Skip(reason) | Self::Analyze(reason) => reason,
-        }
-    }
-}
-
-/// Above this size, stripping alone is not enough reason to spend minutes in
-/// `aaa`: large release binaries are commonly stripped but otherwise fully
-/// transparent. String poverty or high code entropy still admits a binary of
-/// any size, so this is not a blanket size cap.
-const LARGE_RIZIN_INPUT: usize = 32 << 20;
-const FEW_STRINGS: usize = 64;
-const HIGH_CODE_ENTROPY: f64 = 7.2;
-
-/// One explicit, cross-platform decision table. There is intentionally no
-/// weighted score to tune: each branch states the fact that justifies paying
-/// for deep recovery.
-fn decide_rizin(profile: RizinProfile) -> RizinDecision {
-    if profile.go_function_metadata && profile.function_count > 0 {
-        return RizinDecision::Skip("typed Go function inventory available");
-    }
-
-    // Go build metadata / pclntab identifies a binary whose function names
-    // are recoverable, but the string extractor's PclntabSymbol rows are a
-    // mixed name pool (packages, types, fields, paths, and functions), not a
-    // typed function inventory. If no typed functions made it into `symbols`,
-    // let Rizin provide the actual function table.
-    if profile.go_function_metadata {
-        return RizinDecision::Analyze("Go function inventory needs recovery");
-    }
-
-    // A PE whose native parser could not recover even its section table needs
-    // Rizin for structural recovery, not merely function metrics. ELF/Mach-O
-    // parse failures return before this policy and retain their typed errors.
-    if profile.format == NativeFormat::Pe && profile.section_count == 0 {
-        return RizinDecision::Analyze("PE section table needs recovery");
-    }
-
-    // Imports and exports do not constitute a function inventory. A stripped
-    // ELF with libc imports still benefits from CFG recovery. Conversely, once
-    // native parsing supplied functions, `RizinRecovery::apply` deliberately
-    // preserves them instead of replacing them, so a deep run cannot add the
-    // function-level metrics this policy exists to obtain.
-    if profile.function_count > 0 {
-        return RizinDecision::Skip("static function inventory available");
-    }
-
-    // Importless PEs are a useful platform-specific exception: a compact PE
-    // with no symbol projection is often a resolver/hash stub, and the PE
-    // analyzer correlates Rizin's call graph with its native API-hash facts.
-    if profile.format == NativeFormat::Pe && profile.size <= 5 * 1024 * 1024 {
-        return RizinDecision::Analyze("small importless PE");
-    }
-
-    // "No obvious strings" means either genuinely few runs, or printable
-    // content occupying less than roughly 0.1% of the file. The density test
-    // catches a huge packed payload with a small loader banner.
-    let strings_are_sparse = profile.string_count < FEW_STRINGS
-        || profile.string_bytes.saturating_mul(1024) < profile.size;
-    if strings_are_sparse {
-        return RizinDecision::Analyze("printable strings are sparse");
-    }
-
-    // Prefer the size-weighted executable-section entropy. Whole-file entropy
-    // is only a fallback for formats/fixtures without executable sections, so
-    // a compressed resource or installer overlay does not admit an otherwise
-    // transparent program.
-    let entropy = profile.code_entropy.unwrap_or(profile.overall_entropy);
-    if entropy >= HIGH_CODE_ENTROPY {
-        return RizinDecision::Analyze("executable code has high entropy");
-    }
-
-    if profile.stripped == Some(true) && profile.size <= LARGE_RIZIN_INPUT {
-        return RizinDecision::Analyze("stripped binary within deep-analysis budget");
-    }
-
-    RizinDecision::Skip("static facts show a transparent binary")
-}
-
-fn weighted_code_entropy(sections: &[Section]) -> Option<f64> {
-    let (weighted, bytes) = sections
-        .iter()
-        .filter(|section| section.is_code())
-        .filter_map(|section| {
-            section
-                .entropy
-                .map(|entropy| (entropy * section.file_size as f64, section.file_size))
-        })
-        .fold((0.0, 0_u64), |(sum, size), (part, part_size)| {
-            (sum + part, size.saturating_add(part_size))
-        });
-    (bytes > 0).then_some(weighted / bytes as f64)
-}
-
-/// What a rizin recovery would look at: the bytes, the static facts that
-/// decide whether it is worth running, and this open's settings.
-#[derive(Clone, Copy)]
-pub(super) struct RizinTarget<'a> {
-    pub(super) format: NativeFormat,
-    pub(super) bytes: &'a [u8],
-    pub(super) strings: &'a Strings,
-    /// Go function metadata (a pclntab) is present, so a native parse that
-    /// found no typed functions still has an inventory worth recovering.
-    pub(super) go_function_metadata: bool,
-    pub(super) settings: &'a crate::rizin::Settings,
-}
-
-pub(super) fn rizin_decision(
-    target: &RizinTarget<'_>,
-    sections: &[Section],
-    symbols: &crate::Symbols,
-    metrics: &crate::output::Metrics,
-) -> RizinDecision {
-    let RizinTarget {
-        format,
-        bytes,
-        strings,
-        go_function_metadata,
-        ..
-    } = *target;
-    let string_bytes = strings.text.iter().fold(0_usize, |total, string| {
-        total.saturating_add(string.value.len())
-    });
-    decide_rizin(RizinProfile {
-        format,
-        size: bytes.len(),
-        function_count: symbols
-            .iter()
-            .filter(|symbol| symbol.kind() == crate::SymbolKind::Function)
-            .count(),
-        section_count: sections.len(),
-        stripped: metrics
-            .get_key(&metric!("binary.is_stripped"))
-            .map(|value| value != 0.0),
-        go_function_metadata,
-        string_count: strings.text.len(),
-        string_bytes,
-        code_entropy: weighted_code_entropy(sections),
-        overall_entropy: metrics.get_key(&metric!("file.entropy")).unwrap_or(0.0),
-    })
-}
-
-/// Run full Rizin recovery only when the static facts say it is likely to add
-/// useful function metrics and the target's settings admit its bytes. Shared
-/// by ELF and Mach-O; PE uses the extended helper below so malformed images
-/// can recover sections too.
-pub(super) fn rizin_fallback(
-    target: RizinTarget<'_>,
-    sections: &[Section],
+/// Recover with binform what the format parser did not supply: the
+/// functions and calls of a binary whose function view is empty, and the
+/// import, export and section views goblin left empty (`sections` is given
+/// only by PE, the one format where goblin can fail to read the table and
+/// still extract). Returns what it added; `None` when the binary already
+/// has functions or binform cannot read it.
+pub(super) fn recover_natively(
+    bytes: &[u8],
     symbols: &mut crate::Symbols,
+    sections: Option<&mut Vec<Section>>,
     metrics: &mut crate::output::Metrics,
-) {
-    let decision = rizin_decision(&target, sections, symbols, metrics);
-    let RizinTarget {
-        format,
-        bytes,
-        go_function_metadata,
-        settings,
-        ..
-    } = target;
-    tracing::debug!(
-        ?format,
-        bytes = bytes.len(),
-        run = decision.runs(),
-        reason = decision.reason(),
-        "rizin admission decision"
-    );
-    if !decision.runs() || !settings.admits(bytes) {
-        return;
-    }
-    match crate::rizin::recover_with_symbols(bytes, symbols.len(), go_function_metadata, settings) {
-        Some(recovery) => {
-            recovery.apply(symbols, metrics);
-        }
-        None => note_incomplete_recovery(metrics),
-    }
+) -> Option<RecoveryCounts> {
+    Some(apply_native(
+        native(bytes, symbols)?,
+        symbols,
+        sections,
+        metrics,
+    ))
 }
 
-/// Record that rizin *should* have recovered symbols here but its run
-/// didn't complete. Fires only when rizin is on PATH and the settings
-/// admitted the input — i.e. the cache key (via
-/// [`crate::rizin::cache_fingerprint`]) claims rizin-grade recovery, yet
-/// this run produced nothing because rizin timed out, was killed on the
-/// output cap, or had latched itself off. The empty table is an artefact
-/// of this run, not of the bytes, so the `binary.rizin_incomplete` marker
-/// lets a cache consumer treat the
-/// payload as [`crate::cache::Computed::Transient`] and refuse to persist
-/// a poisoned entry (see [`crate::ParsedFile::rizin_recovery_incomplete`]).
-/// When rizin is absent, turned off, or skipped by the size cap, the
-/// no-rizin result is correct for the environment and settings — and keyed
-/// as such — so nothing is recorded.
-fn note_incomplete_recovery(metrics: &mut crate::output::Metrics) {
-    if crate::rizin::available() {
-        metrics.insert(metric!("binary.rizin_incomplete"), 1.0);
-    }
-}
-
-/// Extended rizin fallback for PE: tries to recover sections as well
-/// as symbols, and emits `*.recovered_*_count` metrics under the supplied
-/// prefix so callers can attribute the recovered counts in trait
-/// rules.
-///
-/// The caller passes the metric prefix (`"pe"`, `"elf"`, `"macho"`)
-/// so the emitted keys are `{prefix}.recovered_section_count` etc. The
-/// path stays tool-agnostic — if the disassembler ever swaps from
-/// rizin to radare2 / Ghidra the schema doesn't ripple.
-pub(super) fn rizin_fallback_with_sections(
-    target: RizinTarget<'_>,
-    declares_exports: bool,
-    symbols: &mut crate::Symbols,
-    sections: &mut Vec<crate::output::Section>,
-    metrics: &mut crate::output::Metrics,
-) {
-    let RizinTarget {
-        bytes,
-        go_function_metadata,
-        settings,
-        ..
-    } = target;
-    // Normally goblin's native symbols or sections are enough to avoid an
-    // expensive disassembly. Go is the exception: its native parser can
-    // expose sections and imports while still having no typed functions;
-    // allow Rizin to fill that missing function inventory.
-    let has_functions = symbols
+/// binform's answer for `bytes`, or `None` when `symbols` already holds a
+/// function inventory (a symbol table, Go's pclntab) or binform cannot read
+/// the binary.
+pub(super) fn native(bytes: &[u8], symbols: &crate::Symbols) -> Option<crate::functions::Native> {
+    if symbols
         .iter()
-        .any(|symbol| symbol.kind() == crate::SymbolKind::Function);
-    let has_native_inventory = !symbols.is_empty() || !sections.is_empty();
-    let needs_go_function_recovery = go_function_metadata && !has_functions;
-    if has_native_inventory && !needs_go_function_recovery {
-        return;
+        .any(|symbol| symbol.kind() == crate::SymbolKind::Function)
+    {
+        return None;
     }
-    let decision = rizin_decision(&target, sections, symbols, metrics);
-    tracing::debug!(
-        format = ?target.format,
-        bytes = bytes.len(),
-        run = decision.runs(),
-        reason = decision.reason(),
-        "rizin admission decision"
-    );
-    if !decision.runs() || !settings.admits(bytes) {
-        return;
-    }
-    let recovery = match crate::rizin::recover_with_symbols(
-        bytes,
-        symbols.len(),
-        go_function_metadata,
-        settings,
-    ) {
-        Some(recovery) => recovery,
-        None => {
-            note_incomplete_recovery(metrics);
-            return;
+    crate::functions::recover(bytes)
+}
+
+/// Fill the typed views the format parser left empty from binform's
+/// answer: imports when it found none, exports likewise, the functions and
+/// their calls, and the section table when `sections_out` is given and
+/// empty (a PE whose section table the native parser could not read).
+pub(super) fn apply_native(
+    native: crate::functions::Native,
+    symbols: &mut crate::Symbols,
+    sections_out: Option<&mut Vec<Section>>,
+    metrics: &mut crate::output::Metrics,
+) -> RecoveryCounts {
+    use crate::output::{SectionFlag, Symbol, SymbolKind};
+    let mut counts = RecoveryCounts::default();
+    let had_imports = symbols.iter().any(|s| s.kind() == SymbolKind::Import);
+    let had_exports = symbols.iter().any(|s| s.kind() == SymbolKind::Export);
+    if !had_imports {
+        for import in native.imports {
+            // An import by ordinal from a DLL whose ordinals are stable goes
+            // by the name the DLL exports there.
+            let name = import
+                .ordinal
+                .zip(import.library.as_deref())
+                .and_then(|(ordinal, dll)| {
+                    super::pe::imports::known_ordinal(&dll.to_ascii_lowercase(), ordinal)
+                })
+                .map_or(import.name, str::to_owned);
+            symbols.push(Symbol::Import {
+                name,
+                alias: None,
+                library: import.library,
+                offset: import.slot,
+                ordinal: import.ordinal.map(u32::from),
+            });
+            counts.imports = counts.imports.saturating_add(1);
         }
-    };
-    let recovery = if declares_exports {
-        recovery
-    } else {
-        recovery.without_exports()
-    };
-    let counts = recovery.apply_with_sections(symbols, sections, metrics);
-    if counts.imports > 0 {
-        metrics.insert(
-            metric!("pe.recovered_import_count"),
-            f64::from(counts.imports),
-        );
     }
-    if counts.exports > 0 {
-        metrics.insert(
-            metric!("pe.recovered_export_count"),
-            f64::from(counts.exports),
-        );
+    if !had_exports {
+        for export in native.exports {
+            symbols.push(Symbol::Export {
+                name: export.name,
+                offset: Some(export.addr),
+                ordinal: None,
+                forward_to: export.forward,
+            });
+            counts.exports = counts.exports.saturating_add(1);
+        }
     }
-    if counts.functions > 0 {
-        metrics.insert(
-            metric!("pe.recovered_function_count"),
-            f64::from(counts.functions),
-        );
+    counts.functions = native.functions.apply(symbols, metrics);
+    if let Some(sections_out) = sections_out
+        && sections_out.is_empty()
+    {
+        for section in native.sections {
+            let flags = [
+                (section.readable, SectionFlag::Readable),
+                (section.writable, SectionFlag::Writable),
+                (section.executable, SectionFlag::Executable),
+            ]
+            .into_iter()
+            .filter_map(|(set, flag)| set.then_some(flag))
+            .collect();
+            sections_out.push(Section {
+                name: section.name,
+                vaddr: section.addr,
+                vsize: section.size,
+                file_offset: section.offset,
+                file_size: section.file_size,
+                flags,
+                flags_raw: None,
+                entropy: None,
+            });
+            counts.sections = counts.sections.saturating_add(1);
+        }
     }
-    if counts.sections > 0 {
-        metrics.insert(
-            metric!("pe.recovered_section_count"),
-            f64::from(counts.sections),
-        );
+    counts
+}
+
+/// Emit the `pe.recovered_*_count` metrics: how many entries of each view
+/// came from binform rather than goblin.
+pub(super) fn recovered_counts(counts: RecoveryCounts, metrics: &mut crate::output::Metrics) {
+    for (key, count) in [
+        (metric!("pe.recovered_import_count"), counts.imports),
+        (metric!("pe.recovered_export_count"), counts.exports),
+        (metric!("pe.recovered_function_count"), counts.functions),
+        (metric!("pe.recovered_section_count"), counts.sections),
+    ] {
+        if count > 0 {
+            metrics.insert(key, f64::from(count));
+        }
     }
 }
 

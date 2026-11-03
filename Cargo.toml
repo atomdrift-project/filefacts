@@ -80,6 +80,13 @@ gimli = { version = "0.32", default-features = false, features = ["read", "std"]
 # library.
 stng = { git = "https://github.com/atomdrift-project/stng.git", default-features = false }
 
+# Function recovery from machine code: boundaries, basic blocks, complexity
+# and calls, in-process; also the sections, imports and exports of a PE
+# goblin cannot read (see `src/functions.rs`). Bump `POLICY` in
+# `src/functions.rs` whenever the commit in Cargo.lock changes: the disk
+# cache keys on it.
+binform = { path = "../funktion" }
+
 # Archive index readers. Members are only ever read through a size cap, and
 # only for manifests and signature blocks: stored and deflated are the only
 # methods ZIP-family packages use for those, so no other codec is compiled in.
@@ -176,7 +183,7 @@ md-5 = "0.10"
 # Static PyArmor container and nested instruction recovery.
 aes = "0.9"
 
-# Structured logging for extractor, cache and rizin subprocess events. The
+# Structured logging for extractor and cache events. The
 # library only emits; the host installs a subscriber.
 tracing = "0.1"
 # The CLI's stderr subscriber for `FILEFACTS_DEBUG` (binary only, `cli`).
@@ -192,8 +199,7 @@ zstd = "0.14.3"
 # (Windows).
 dirs = "6"
 
-# Temp file handling for rizin input materialisation and atomic disk-cache
-# writes. `tempfile` cleans up properly on Drop and avoids races.
+# Temp file handling for atomic disk-cache writes. `tempfile` cleans up properly on Drop and avoids races.
 tempfile = "3"
 
 [dev-dependencies]
@@ -202,14 +208,10 @@ uuid = "1"
 # Test fixtures for the LZMA/xz readers are compressed on the fly.
 lzma-rust2 = { version = "0.24", default-features = false, features = ["std", "xz", "encoder"] }
 
-# Process group / RLIMIT / PR_SET_PDEATHSIG hooks for the hardened
-# rizin subprocess. Unix only — the gates in `rizin.rs` are
-# `#[cfg(unix)]`.
+# The cache sweep's ownership check (geteuid/getegid) and non-blocking
+# opens (O_NONBLOCK). Unix only.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-# The rizin watchdog (process-group kill on parent death). Same source as stng
-# (a bare git URL) so both resolve to one copy.
-stng-process = { git = "https://github.com/atomdrift-project/stng.git" }
 # The CLI's SIGINT/SIGTERM cleanup thread (binary only, `cli`).
 signal-hook = { version = "0.3", optional = true }
 
@@ -240,10 +242,8 @@ jemalloc = ["dep:tikv-jemallocator"]
 jemalloc-prof = ["jemalloc", "tikv-jemallocator?/profiling"]
 
 [lints.rust]
-# rizin subprocess hardening (libc::setrlimit pre_exec, libc::kill on the
-# rizin process group, prctl PR_SET_PDEATHSIG on Linux) requires `unsafe`, as
-# does the cache sweep's ownership check (libc::geteuid/getegid). These are
-# tightly scoped to the rizin and cache_sweep modules, and wrapped in
+# The cache sweep's ownership check (libc::geteuid/getegid) requires
+# `unsafe`. It is tightly scoped to the cache_sweep module, and wrapped in
 # per-block `#[allow(unsafe_code)]`. Setting "deny" here means
 # any new unsafe outside that scope becomes a hard error rather than a
 # warning that can drift past review.

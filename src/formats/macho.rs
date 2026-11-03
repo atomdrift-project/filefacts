@@ -20,8 +20,8 @@ use serde_json::Value as JsonValue;
 
 use crate::bytes;
 use crate::formats::common::{
-    NativeFormat, RizinTarget, XorScan, extract_binary_strings, extract_binary_strings_from_object,
-    plist_to_json, put_str, put_u64, rizin_fallback, section_entropy,
+    XorScan, extract_binary_strings, extract_binary_strings_from_object, plist_to_json, put_str,
+    put_u64, recover_natively, section_entropy,
 };
 use crate::formats::goblin_safe;
 use crate::metric;
@@ -37,7 +37,6 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
         symbols: symbols_out,
         errors: errors_out,
         image_end,
-        ref rizin,
         ..
     } = ctx;
     // goblin has panicked on fat-header arithmetic overflow in malformed
@@ -88,13 +87,7 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
     let goblin::Object::Mach(parsed) = object else {
         unreachable!("constructed as Object::Mach")
     };
-    // When the open asked for native-arch-only, hand rizin just the
-    // host-native slice of a fat binary instead of the whole universal file:
-    // the other slices never run here, and full analysis of each is the bulk
-    // of the per-binary cost. Thin binaries, and fat ones with no native
-    // slice, hand rizin the whole input.
-    let mut native_rizin_range: Option<(usize, usize)> = None;
-    let has_go_pclntab = match parsed {
+    match parsed {
         Mach::Binary(macho) => {
             single_arch(
                 &macho,
@@ -106,7 +99,7 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
                 errors_out,
             );
             *image_end = Some(image_end_of(&macho));
-            go_build_info(&macho, bytes, values, symbols_out)
+            go_build_info(&macho, bytes, values, symbols_out);
         }
         Mach::Fat(fat) => {
             // goblin reads the arch table lazily; walk it once, guarded.
@@ -128,29 +121,10 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
                 errors_out,
             );
             *image_end = analysed.image_end;
-            if rizin.native_arch_only {
-                native_rizin_range = fat::native_slice_range(bytes, &arches);
-            }
-            analysed.has_go_pclntab
         }
-    };
-    let rizin_bytes = match native_rizin_range {
-        Some((start, end)) => bytes.get(start..end).unwrap_or(bytes),
-        None => bytes,
-    };
+    }
     if fat_table_fits {
-        rizin_fallback(
-            RizinTarget {
-                format: NativeFormat::MachO,
-                bytes: rizin_bytes,
-                strings,
-                go_function_metadata: has_go_pclntab,
-                settings: rizin,
-            },
-            sections_out,
-            symbols_out,
-            metrics,
-        );
+        recover_natively(bytes, symbols_out, None, metrics);
     }
     super::upx::detect(bytes, values);
 }

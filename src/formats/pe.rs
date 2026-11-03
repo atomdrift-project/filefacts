@@ -17,7 +17,7 @@ mod clr;
 mod debug;
 mod exports;
 mod headers;
-mod imports;
+pub(super) mod imports;
 pub(super) mod layout;
 mod load_config;
 mod manifest;
@@ -29,12 +29,11 @@ mod signature;
 mod version_info;
 
 use goblin::pe::PE;
-use goblin::pe::optional_header::OptionalHeader;
 
 use crate::error::Error;
 use crate::formats::common::{
-    NativeFormat, RizinTarget, XorScan, extract_binary_strings, extract_binary_strings_from_object,
-    rizin_fallback_with_sections,
+    XorScan, apply_native, extract_binary_strings, extract_binary_strings_from_object, native,
+    recover_natively, recovered_counts,
 };
 use crate::formats::goblin_safe;
 use crate::metric;
@@ -105,7 +104,6 @@ fn parsed(pe: PE<'_>, bytes: &[u8], ctx: super::ExtractCtx<'_>) {
         sections: sections_out,
         symbols: symbols_out,
         errors: errors_out,
-        ref rizin,
         ..
     } = ctx;
     // One stng pass covers ASCII, section names and the UTF-16 resource and
@@ -125,7 +123,7 @@ fn parsed(pe: PE<'_>, bytes: &[u8], ctx: super::ExtractCtx<'_>) {
     }
     headers::sections(pe, bytes, sections_out);
     imports::imports(pe, values, metrics, symbols_out);
-    let native = api_hash::native_resolver_signals(pe, bytes, values, metrics);
+    let signals = api_hash::native_resolver_signals(pe, bytes, values, metrics);
     exports::exports(pe, bytes, values, metrics, symbols_out);
     resources::extract(pe, bytes, values, metrics, errors_out);
     if let Some(ref dbg) = pe.debug_data {
@@ -168,33 +166,37 @@ fn parsed(pe: PE<'_>, bytes: &[u8], ctx: super::ExtractCtx<'_>) {
         go_functions(pe, &go_sections, has_go_pclntab, symbols_out);
     }
     super::build_toolchain::from_pe_rich(values);
-    let target = RizinTarget {
-        format: NativeFormat::Pe,
-        bytes,
-        strings,
-        go_function_metadata: has_go_function_metadata,
-        settings: rizin,
+    let Some(recovered) = native(bytes, symbols_out) else {
+        return;
     };
-    api_hash::rizin_importless_analysis(
-        pe,
-        target,
-        &native,
-        values,
-        sections_out,
-        symbols_out,
-        metrics,
-    );
-    rizin_fallback_with_sections(
-        target,
-        declares_export_directory(pe.header.optional_header.as_ref()),
-        symbols_out,
-        sections_out,
-        metrics,
-    );
+    // A compact PE with no imports is often a resolver stub: correlate its
+    // calls with the API-hash walkers the native scan found.
+    let importless = api_hash::is_importless(bytes, symbols_out);
+    if importless {
+        api_hash::recover_api_hash_requests(
+            pe,
+            bytes,
+            &signals,
+            values,
+            metrics,
+            &recovered.functions,
+        );
+    }
+    let counts = apply_native(recovered, symbols_out, Some(sections_out), metrics);
+    if importless {
+        metrics.insert(metric!("pe.rizin_importless_analysis"), 1.0);
+        if counts.functions > 0 {
+            metrics.insert(
+                metric!("pe.rizin_importless_function_count"),
+                f64::from(counts.functions),
+            );
+        }
+    }
+    recovered_counts(counts, metrics);
 }
 
 /// Add the functions a Go PE's pclntab names (see [`super::go_pclntab`]),
-/// which then spare it the rizin fallback. The table is the `.gopclntab`
+/// which then spare it binform's recovery. The table is the `.gopclntab`
 /// section when there is one; Go's linker otherwise folds it into `.rdata`,
 /// where a candidate must pass the same validation to count.
 fn go_functions(
@@ -248,7 +250,6 @@ fn header_only(goblin_bytes: &[u8], bytes: &[u8], ctx: super::ExtractCtx<'_>) ->
         sections: sections_out,
         symbols: symbols_out,
         errors: errors_out,
-        ref rizin,
         ..
     } = ctx;
     // stng parses the bytes itself, tolerating the malformed structure.
@@ -275,33 +276,12 @@ fn header_only(goblin_bytes: &[u8], bytes: &[u8], ctx: super::ExtractCtx<'_>) ->
     errors_out.record_fallback(crate::Stage::PeParse, "header-only fallback");
     metrics.insert(metric!("pe.partial_parse"), 1.0);
     anomalies::partial_section_overflows(bytes, &header, values, metrics);
-    // goblin parsed no section table or import directory, so the section and
-    // symbol views are empty: the case rizin recovery exists for, since a
-    // malformed or packed PE that rizin parses fine would otherwise surface
-    // zero sections and imports.
-    rizin_fallback_with_sections(
-        RizinTarget {
-            format: NativeFormat::Pe,
-            bytes,
-            strings,
-            go_function_metadata: false,
-            settings: rizin,
-        },
-        declares_export_directory(header.optional_header.as_ref()),
-        symbols_out,
-        sections_out,
-        metrics,
-    );
+    // goblin parsed no section table or import directory, so binform, which
+    // reads a malformed or packed PE leniently, supplies them.
+    if let Some(counts) = recover_natively(bytes, symbols_out, Some(sections_out), metrics) {
+        recovered_counts(counts, metrics);
+    }
     Ok(())
-}
-
-/// Whether the optional header points at an export directory. Without one
-/// the loader resolves no exports, so any a disassembler recovers are other
-/// global symbols (Go's `gopclntab`) and must not reach the export view.
-/// Unset and zeroed slots both mean absent, as in `pe.data_directories`.
-fn declares_export_directory(opt: Option<&OptionalHeader>) -> bool {
-    opt.and_then(|opt| opt.data_directories.get_export_table())
-        .is_some_and(|dir| dir.virtual_address != 0 || dir.size != 0)
 }
 
 #[cfg(test)]
