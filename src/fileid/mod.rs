@@ -1214,6 +1214,7 @@ fn headerless_program(data: &[u8]) -> Option<FileType> {
         Some(FileType::DosCom)
     } else if commodore::has_basic_sys_loader(data)
         || prodos::has_prodos_system_code(data)
+        || prodos::has_prodos_boot_code(data)
         || sign_of_misery::looks_like_script(data)
         || unix_aout16::looks_like_image(data)
     {

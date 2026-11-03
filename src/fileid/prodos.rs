@@ -38,9 +38,27 @@ pub(super) fn has_prodos_system_code(data: &[u8]) -> bool {
     open && io && close
 }
 
+/// A two-block universal ProDOS/SOS boot image with its device-loader code
+/// and both operating-system names. It may be either clean or modified.
+pub(super) fn has_prodos_boot_code(data: &[u8]) -> bool {
+    if data.len() != 1024 || data.get(..5) != Some(&[0x01, 0x38, 0xb0, 0x03, 0x4c]) {
+        return false;
+    }
+    let Some(&[lo, hi]) = data.get(5..7) else {
+        return false;
+    };
+    let destination = usize::from(u16::from_le_bytes([lo, hi]));
+    (0x0800..0x0c00).contains(&destination)
+        && data.windows(6).any(|w| w == b"PRODOS")
+        && data.windows(10).any(|w| w == b"SOS.KERNEL")
+        && data
+            .windows(6)
+            .any(|w| w == [0xa5, 0x60, 0x85, 0x44, 0xa5, 0x61])
+}
+
 #[cfg(test)]
 mod tests {
-    use super::has_prodos_system_code;
+    use super::{has_prodos_boot_code, has_prodos_system_code};
 
     fn sample() -> Vec<u8> {
         let mut b = vec![0u8; 512];
@@ -50,6 +68,22 @@ mod tests {
             0xbf, 0xcc, 0x20, 0x30,
         ]);
         b
+    }
+
+    #[test]
+    fn recognizes_universal_boot_structure_without_claiming_behavior() {
+        let mut data = vec![0u8; 1024];
+        data[..7].copy_from_slice(&[0x01, 0x38, 0xb0, 0x03, 0x4c, 0x1c, 0x09]);
+        data[100..106].copy_from_slice(b"PRODOS");
+        data[110..120].copy_from_slice(b"SOS.KERNEL");
+        data[120..126].copy_from_slice(&[0xa5, 0x60, 0x85, 0x44, 0xa5, 0x61]);
+        assert!(has_prodos_boot_code(&data));
+        for offset in [0, 6, 100, 110, 120] {
+            let mut changed = data.clone();
+            changed[offset] ^= 0xff;
+            assert!(!has_prodos_boot_code(&changed), "offset {offset}");
+        }
+        assert!(!has_prodos_boot_code(&data[..512]));
     }
 
     #[test]
