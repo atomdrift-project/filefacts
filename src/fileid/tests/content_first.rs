@@ -2,6 +2,31 @@
 
 use super::*;
 
+#[test]
+fn ftp_command_file_overrides_misleading_source_extension() {
+    let ftp = b"open ftp.example.test\r\nuser\r\npassword\r\nbinary\r\nget setup.exe\r\nbye\r\n";
+    let detected = detect(Path::new("download.cs"), ftp).unwrap();
+    assert_eq!(detected.file_type, FileType::Text);
+    assert!(detected.extension_mismatch());
+    let with_port = b"open ftp.example.test 2121\nbinary\nget setup.exe\nquit\n";
+    assert_detect("download.cs", with_port, FileType::Text);
+    assert_detect(
+        "download.cs",
+        b"// open ftp.example.test\nclass Demo { }\n",
+        FileType::CSharp,
+    );
+    assert_detect(
+        "download.cs",
+        b"class Demo { void Open() { } }\n",
+        FileType::CSharp,
+    );
+    let mixed = b"open ftp.example.test\nbinary\nget setup.exe\nbye\nclass Demo { }\n";
+    assert_ne!(
+        detect(Path::new("download.cs"), mixed).unwrap().file_type,
+        FileType::Text
+    );
+}
+
 // ── Content-first detection beats extension-only fallback ────────
 
 #[test]

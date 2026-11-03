@@ -1,6 +1,25 @@
 use super::*;
 
 #[test]
+fn extensionless_abap_report_is_scannable_text() {
+    let source = b"REPORT demo.\nREAD REPORT name INTO src.\nLOOP AT src INTO row.\nENDLOOP.\n";
+    assert_detect("opaque", source, FileType::Text);
+    assert_detect("report.txt", source, FileType::Text);
+}
+
+#[test]
+fn cms_rexx_exec_is_scannable_text_under_an_opaque_name() {
+    let code = b"/* REXX */\nsay 'hello'\npull name\n\"EXECIO * DISKR FILE NAMES A (FIFO\"\ndo while queued() > 0\n say name\nend\n";
+    assert_detect("opaque", code, FileType::Text);
+    assert_detect("renamed.txt", code, FileType::Text);
+    let comment = b"/*\nsay x\npull y\n\"EXECIO * DISKR\"\ndo while x\nend\n*/\n";
+    assert_ne!(
+        detect(Path::new("opaque"), comment).map(|d| d.file_type),
+        Some(FileType::Text)
+    );
+}
+
+#[test]
 fn renamed_pep621_document_requires_structured_project_fields() {
     let data = b"[project]\nname = 'lab'\nrequires-python = '>=3.12'\ndependencies = ['impacket==0.12.0']\n";
     assert_detect("pyproject.abc123.toml", data, FileType::PyProjectToml);

@@ -186,3 +186,125 @@ fn has_dos_service_call(data: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests;
+
+/// Recognize a structurally coherent MZ-format 16-bit DOS executable. MZ is
+/// not enough by itself: page geometry, relocation table and CS:IP must all
+/// fit. PE/NE and other stronger formats are classified before this fallback.
+pub(super) fn looks_like_dos_mz(data: &[u8]) -> bool {
+    if data.len() < 32 || !data.starts_with(b"MZ") {
+        return false;
+    }
+    let word = |at: usize| -> Option<usize> {
+        let &[lo, hi] = data.get(at..at.checked_add(2)?)? else {
+            return None;
+        };
+        Some(u16::from_le_bytes([lo, hi]) as usize)
+    };
+    let (
+        Some(tail),
+        Some(pages),
+        Some(relocations),
+        Some(paragraphs),
+        Some(ip),
+        Some(cs),
+        Some(table),
+    ) = (
+        word(2),
+        word(4),
+        word(6),
+        word(8),
+        word(20),
+        word(22),
+        word(24),
+    )
+    else {
+        return false;
+    };
+    if pages == 0 || tail > 511 || paragraphs < 2 {
+        return false;
+    }
+    let Some(size) = (pages - 1)
+        .checked_mul(512)
+        .and_then(|n| n.checked_add(if tail == 0 { 512 } else { tail }))
+    else {
+        return false;
+    };
+    let Some(header) = paragraphs.checked_mul(16) else {
+        return false;
+    };
+    let Some(entry) = cs
+        .checked_mul(16)
+        .and_then(|n| n.checked_add(ip))
+        .and_then(|n| n.checked_add(header))
+    else {
+        return false;
+    };
+    if size > data.len() || header >= size || entry >= size {
+        return false;
+    }
+    if relocations > 0 {
+        let Some(end) = relocations
+            .checked_mul(4)
+            .and_then(|n| table.checked_add(n))
+        else {
+            return false;
+        };
+        if table < 28 || end > header {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod mz_header_tests {
+    use super::looks_like_dos_mz;
+    fn example() -> Vec<u8> {
+        let mut b = vec![0u8; 96];
+        b[..2].copy_from_slice(b"MZ");
+        b[2..4].copy_from_slice(&96u16.to_le_bytes());
+        b[4..6].copy_from_slice(&1u16.to_le_bytes());
+        b[8..10].copy_from_slice(&2u16.to_le_bytes());
+        b[24..26].copy_from_slice(&28u16.to_le_bytes());
+        b[32..34].copy_from_slice(&[0xcd, 0x20]);
+        b
+    }
+    #[test]
+    fn valid_header_and_nonzero_entry() {
+        let mut b = example();
+        assert!(looks_like_dos_mz(&b));
+        b[20..22].copy_from_slice(&20u16.to_le_bytes());
+        assert!(looks_like_dos_mz(&b));
+    }
+    #[test]
+    fn file_identification_preserves_extended_formats() {
+        let mut b = example();
+        let path = std::path::Path::new("legacy.exe");
+        assert_eq!(
+            super::super::detect(path, &b).unwrap().file_type,
+            crate::FileType::Data
+        );
+        b[0x3c..0x40].copy_from_slice(&64u32.to_le_bytes());
+        b[64..68].copy_from_slice(b"PE\0\0");
+        assert_eq!(
+            super::super::detect(path, &b).unwrap().file_type,
+            crate::FileType::Pe
+        );
+    }
+    #[test]
+    fn rejects_incoherent_geometry() {
+        let b = example();
+        assert!(!looks_like_dos_mz(&b[..31]));
+        for (at, value) in [(0, 0), (4, 0), (8, 0), (20, 255), (22, 255)] {
+            let mut changed = b.clone();
+            changed[at] = value;
+            assert!(!looks_like_dos_mz(&changed), "offset {at}");
+        }
+        let mut changed = b.clone();
+        changed[2..4].copy_from_slice(&512u16.to_le_bytes());
+        assert!(!looks_like_dos_mz(&changed));
+        let mut changed = b;
+        changed[6..8].copy_from_slice(&2u16.to_le_bytes());
+        assert!(!looks_like_dos_mz(&changed));
+    }
+}
