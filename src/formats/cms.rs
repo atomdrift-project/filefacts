@@ -349,7 +349,17 @@ pub(crate) fn encapsulated_plist(bytes: &[u8]) -> Option<::plist::Value> {
         return None;
     }
     let content: OctetString = encap.econtent?.decode_as().ok()?;
-    super::plist_guard::parse(content.as_bytes()).ok()
+    let raw = content.as_bytes().trim_ascii_start();
+    if !(raw.starts_with(b"bplist00")
+        || raw.starts_with(b"<?xml")
+        || raw.starts_with(b"<plist")
+        || raw.starts_with(b"<!DOCTYPE plist"))
+    {
+        return None;
+    }
+    super::plist_guard::parse(content.as_bytes())
+        .ok()
+        .filter(|v| matches!(v, ::plist::Value::Dictionary(_)))
 }
 
 /// [`parse_cms_blob`] for a detached signature over `content`. The Mach-O

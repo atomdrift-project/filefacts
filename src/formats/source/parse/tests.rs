@@ -741,3 +741,40 @@ fn a_long_ambiguous_cast_chain_does_not_overflow_the_stack() {
         .join()
         .unwrap();
 }
+
+/// `tree-sitter-python`'s external scanner rescans all remaining lines of a
+/// consecutive `#` comment block on every line of the block (`O(k²)` bytes
+/// fetched). Three 1,500-line comment blocks (~200 chars/line) previously
+/// fetched >500 MB from the lexer and tripped `lexer_fetch_budget`, dropping
+/// all AST facts. Coalescing long comment runs in `parser_source` keeps the
+/// parse linear while `visit::Comments` reconstructs every individual comment
+/// line against `source`.
+#[test]
+fn python_long_comment_runs_do_not_exhaust_lexer_budget() {
+    let comment_line = format!("    # {}\n", "x".repeat(194));
+    let block = comment_line.repeat(1_500);
+    let source = format!(
+        "def f():\n{block}    a = 1\n{block}    b = 2\n{block}    return os.system('id')\n"
+    );
+    let parsed = TreeCache::parse(source.as_bytes(), FileType::Python, None);
+    let cache = parsed.cache().expect("comment-padded Python should parse");
+    assert!(!cache.tree().root_node().has_error());
+
+    let mut collectors = super::super::visit::Collectors {
+        comments: Some(super::super::visit::Comments::default()),
+        ..Default::default()
+    };
+    super::super::visit::walk(
+        cache.tree().root_node(),
+        cache.source(),
+        cache.config(),
+        &mut collectors,
+    );
+    let comments = collectors.comments.unwrap().found;
+    assert_eq!(comments.len(), 4_500);
+    for &(offset, text) in &comments {
+        assert_eq!(text.len(), 196);
+        assert!(text.starts_with("# xx"));
+        assert_eq!(&source[offset..offset + text.len()], text);
+    }
+}

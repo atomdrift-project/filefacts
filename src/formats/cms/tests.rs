@@ -103,6 +103,11 @@ mod plist_envelopes {
                 "1.2.840.113549.1.7.1",
                 Some(&b"not a plist"[..]),
             ),
+            (
+                "1.2.840.113549.1.7.2",
+                "1.2.840.113549.1.7.1",
+                Some(&b"Version:1\n\n2.16.840.1.101.3.4.2.1-Hash:6DCptvDnfm2brhlEnDEAWGg9HESmpEyfANxEb+2Jprg=\n\n"[..]),
+            ),
         ] {
             assert!(super::super::encapsulated_plist(&envelope(content, outer, inner)).is_none());
         }

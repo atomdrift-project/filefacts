@@ -935,6 +935,16 @@ fn first_byte_signature(p: &Probe<'_, '_>) -> Option<Found> {
                 None
             }
         }
+        0xAC => {
+            // Java Object Serialization Stream Protocol: STREAM_MAGIC (0xACED),
+            // STREAM_VERSION (0x0005), followed by a valid leading stream tag
+            // (TC_NULL..=TC_MAX: 0x70..=0x7E).
+            if matches!(data, [0xAC, 0xED, 0x00, 0x05, 0x70..=0x7E, ..]) {
+                Some((FileType::Data, DetectionSource::Magic))
+            } else {
+                None
+            }
+        }
         0x1F => {
             // Gzip: 1F 8B, then CM 8 (deflate), the only method ever defined.
             // What it wraps is read, not guessed from the name: packages in

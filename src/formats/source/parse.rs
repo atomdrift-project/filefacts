@@ -694,10 +694,19 @@ impl<'a> TreeCache<'a> {
             // source retained by TreeCache. This is syntax-only: FileFacts
             // does not evaluate the expansion, and source-backed facts keep
             // seeing the exact original operator bytes.
-            let normalized_shell = (file_type == FileType::Shell)
-                .then(|| normalize_bash_case_modification(source))
-                .flatten();
-            let parser_source = normalized_shell.as_deref().unwrap_or(source);
+            //
+            // Likewise, tree-sitter-python 0.25's external scanner rescans all
+            // remaining lines of a consecutive `#` comment run on every line of
+            // the run (`O(k²)` lexer bytes). Coalescing long runs of full-line
+            // `#` comments in `parser_source` preserves byte offsets while
+            // keeping the scan linear; `visit::Comments` splits coalesced
+            // comment nodes back into individual lines against `source`.
+            let normalized = match file_type {
+                FileType::Shell => normalize_bash_case_modification(source),
+                FileType::Python => normalize_python_comment_runs(source),
+                _ => None,
+            };
+            let parser_source = normalized.as_deref().unwrap_or(source);
             let mut read = |offset: usize, _: tree_sitter::Point| -> &[u8] {
                 // Past the budget the lexer sees end of input, so a scanner
                 // mid-way through a long scan stops at once, and the next
@@ -944,6 +953,81 @@ fn bash_case_modification_operator(
     // contain nested expansions; this check only rejects obviously truncated
     // input and does not parse that pattern.
     (last_close >= index + operator_len).then_some((index, operator_len))
+}
+
+/// Minimum consecutive full-line `#` comments before
+/// [`normalize_python_comment_runs`] coalesces their interior newlines.
+const PYTHON_COMMENT_RUN_MIN: usize = 32;
+
+/// Coalesce runs of `>= PYTHON_COMMENT_RUN_MIN` consecutive full-line `#`
+/// comments in Python by replacing their interior `\n` bytes with spaces.
+///
+/// In `tree-sitter-python` 0.25 (`scanner.c`), `NEWLINE` is in `extras`. After
+/// every line the scanner calls `lexer->mark_end(lexer)` before the newline and
+/// then scans forward past all consecutive `# ...\n` comment lines to compare
+/// the next statement's indentation against `first_comment_indent_length`.
+/// Because `mark_end` precedes the first comment line, the lexer rewinds after
+/// each `comment` token and re-scans the remaining `k - i` comment lines on
+/// every line `i` of a `k`-line comment block — fetching `O(k²)` bytes and
+/// tripping `lexer_fetch_budget` on comment-padded scripts.
+///
+/// Replacing the interior `\n` bytes of a long comment run with spaces keeps
+/// `parser_source` identical in byte length, preserves
+/// `first_comment_indent_length` on the first line of the run, and turns the
+/// `O(k²)` scan into `O(k)`. [`super::visit::Comments`] splits any `#` comment
+/// whose slice in the original `source` spans `\n` back into individual lines.
+fn normalize_python_comment_runs(source: &str) -> Option<String> {
+    let bytes = source.as_bytes();
+    let mut line_start = 0usize;
+    let mut prev_ended_with_backslash = false;
+    let mut run_start = 0usize;
+    let mut run_last_nl = 0usize;
+    let mut run_count = 0usize;
+    let mut normalized: Option<Vec<u8>> = None;
+
+    let flush_run =
+        |run_start: usize, run_last_nl: usize, run_count: usize, out: &mut Option<Vec<u8>>| {
+            if run_count >= PYTHON_COMMENT_RUN_MIN {
+                let buf = out.get_or_insert_with(|| bytes.to_vec());
+                if let Some(run) = buf.get_mut(run_start..run_last_nl) {
+                    for b in run {
+                        if *b == b'\n' {
+                            *b = b' ';
+                        }
+                    }
+                }
+            }
+        };
+
+    for nl in memchr::memchr_iter(b'\n', bytes) {
+        let line = &source[line_start..nl];
+        let trimmed_end = line.strip_suffix('\r').unwrap_or(line);
+        let ends_with_backslash = trimmed_end.ends_with('\\');
+        let trimmed_start = trimmed_end.trim_start_matches([' ', '\t']);
+        let coalescible = !prev_ended_with_backslash
+            && !ends_with_backslash
+            && trimmed_start.starts_with('#')
+            && !trimmed_start.contains("\"\"\"")
+            && !trimmed_start.contains("'''");
+
+        if coalescible {
+            if run_count == 0 {
+                run_start = line_start;
+            }
+            run_last_nl = nl;
+            run_count += 1;
+        } else {
+            flush_run(run_start, run_last_nl, run_count, &mut normalized);
+            run_count = 0;
+        }
+
+        prev_ended_with_backslash = ends_with_backslash;
+        line_start = nl + 1;
+    }
+    flush_run(run_start, run_last_nl, run_count, &mut normalized);
+
+    let normalized = normalized?;
+    Some(String::from_utf8(normalized).expect("ASCII newline replacement preserves UTF-8"))
 }
 
 /// Pre-check input that could overflow a tree-sitter external scanner's

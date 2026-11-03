@@ -422,6 +422,11 @@ fn source_alias_extensions() {
         Some(FileType::Ruby)
     );
     assert_eq!(
+        detect_from_path(Path::new("Rakefile")),
+        Some(FileType::Ruby)
+    );
+    assert_eq!(detect_from_path(Path::new("Gemfile")), Some(FileType::Ruby));
+    assert_eq!(
         detect_from_path(Path::new("shell.phtml")),
         Some(FileType::Php)
     );

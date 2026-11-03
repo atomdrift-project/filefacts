@@ -39,6 +39,11 @@ pub(super) struct Collector {
     /// The tree reached [`MAX_AST_DEPTH`], below which no function is
     /// collected.
     capped: bool,
+    /// Monotonic byte offset in `source` and 0-based line number up to that
+    /// byte, so function line ranges reflect the original `source` even when
+    /// `parser_source` coalesced comment-run newlines.
+    line_byte: usize,
+    line_row: u32,
 }
 
 impl Collector {
@@ -65,9 +70,37 @@ impl Collector {
         }
         if visit.depth < MAX_AST_DEPTH {
             let nesting_depth = u32::try_from(self.open.len()).unwrap_or(u32::MAX);
+            let bytes = source.as_bytes();
+            let start_byte = visit.node.start_byte().min(bytes.len());
+            let end_byte = visit.node.end_byte().min(bytes.len());
+            let start_line = if start_byte >= self.line_byte {
+                let delta = memchr::memchr_iter(
+                    b'\n',
+                    bytes.get(self.line_byte..start_byte).unwrap_or_default(),
+                )
+                .count();
+                self.line_row = self.line_row.saturating_add(crate::bytes::sat_u32(delta));
+                self.line_byte = start_byte;
+                self.line_row
+            } else {
+                crate::bytes::sat_u32(visit.node.start_position().row)
+            };
+            let body_newlines = memchr::memchr_iter(
+                b'\n',
+                bytes
+                    .get(start_byte..end_byte.max(start_byte))
+                    .unwrap_or_default(),
+            )
+            .count();
+            let end_line = start_line.saturating_add(crate::bytes::sat_u32(body_newlines));
             self.open.push((self.functions.len(), visit.depth));
-            self.functions
-                .push(build_info(visit.node, source, nesting_depth));
+            self.functions.push(build_info(
+                visit.node,
+                source,
+                nesting_depth,
+                start_line,
+                end_line,
+            ));
         }
     }
 
@@ -104,7 +137,13 @@ pub(super) fn emit(collector: Collector, total_lines: u32, metrics: &mut Metrics
 
 /// A function's info, without [`FunctionInfo::contains_nested_functions`],
 /// which the walk sets when it meets a nested function.
-fn build_info(node: Node<'_>, source: &str, depth: u32) -> FunctionInfo {
+fn build_info(
+    node: Node<'_>,
+    source: &str,
+    depth: u32,
+    start_line: u32,
+    end_line: u32,
+) -> FunctionInfo {
     let bytes = source.as_bytes();
     let name = node
         .child_by_field_name("name")
@@ -113,8 +152,6 @@ fn build_info(node: Node<'_>, source: &str, depth: u32) -> FunctionInfo {
         .unwrap_or_default();
     let is_anonymous = name.is_empty();
 
-    let start_line = crate::bytes::sat_u32(node.start_position().row);
-    let end_line = crate::bytes::sat_u32(node.end_position().row);
     let line_count = end_line.saturating_sub(start_line) + 1;
 
     // Every grammar here names the list `parameters`. A shell function has

@@ -396,7 +396,20 @@ impl<'t> Comments<'t> {
         if self.inside.is_none() && ids.comment.contains(visit.kind_id) {
             self.inside = Some(visit.depth);
             if let Ok(text) = visit.node.utf8_text(source.as_bytes()) {
-                self.found.push((visit.node.start_byte(), text));
+                let start = visit.node.start_byte();
+                if text.starts_with('#') && text.contains('\n') {
+                    let mut offset = start;
+                    for line in text.split('\n') {
+                        let indent = line
+                            .bytes()
+                            .take_while(|b| matches!(b, b' ' | b'\t'))
+                            .count();
+                        self.found.push((offset + indent, &line[indent..]));
+                        offset += line.len() + 1;
+                    }
+                } else {
+                    self.found.push((start, text));
+                }
             }
         }
     }
