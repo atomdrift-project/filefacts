@@ -30,7 +30,7 @@ pub(super) fn has_prodos_system_code(data: &[u8]) -> bool {
         }
         match command {
             0xc8 => open = true,
-            0xc9 | 0xca => io = true,
+            0xca | 0xcb => io = true,
             0xcc => close = true,
             _ => {}
         }
@@ -70,8 +70,8 @@ mod tests {
         for (at, value) in [
             (0, 0xea),
             (2, 0x40),
-            (27, 0xc9),
-            (33, 0xc5),
+            (27, 0xc7),
+            (33, 0xc9),
             (39, 0xcd),
             (29, 0x00),
         ] {
