@@ -264,7 +264,6 @@ pub fn python_containers(source: &[u8]) -> Vec<Vec<u8>> {
     }
     let parsed = crate::OpenOptions::new()
         .file_type(crate::FileType::Python)
-        .rizin(false)
         .open(source);
     let Some(ast) = parsed.source_ast() else {
         return Vec::new();
@@ -400,7 +399,6 @@ mod wrapper_tests {
         let pyc = decoded.pyc().unwrap().data;
         let parsed = crate::OpenOptions::new()
             .file_type(crate::FileType::PythonBytecode)
-            .rizin(false)
             .open(&pyc);
         assert!(parsed.errors().is_empty(), "{:?}", parsed.errors());
         assert!(parsed.symbols().iter().any(|s| s.name() == Some("message")));

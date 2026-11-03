@@ -153,7 +153,6 @@ fn validate_source_query_reports_invalid_query_with_its_cause() {
 #[test]
 fn cache_variant_separates_extension_transitions() {
     let as_font = extraction_cache_variant(
-        &rizin::Settings::default(),
         None,
         FileType::Shell,
         true,
@@ -161,7 +160,6 @@ fn cache_variant_separates_extension_transitions() {
         None,
     );
     let as_unknown = extraction_cache_variant(
-        &rizin::Settings::default(),
         None,
         FileType::Shell,
         true,
@@ -169,7 +167,6 @@ fn cache_variant_separates_extension_transitions() {
         None,
     );
     let consistent = extraction_cache_variant(
-        &rizin::Settings::default(),
         None,
         FileType::Shell,
         false,
@@ -184,7 +181,6 @@ fn cache_variant_separates_extension_transitions() {
     assert_eq!(
         as_font,
         extraction_cache_variant(
-            &rizin::Settings::default(),
             None,
             FileType::Shell,
             true,
@@ -200,7 +196,6 @@ fn cache_variant_separates_extension_transitions() {
 fn cache_variant_separates_unnamed_mismatch() {
     assert_ne!(
         extraction_cache_variant(
-            &rizin::Settings::default(),
             None,
             FileType::Shell,
             true,
@@ -208,7 +203,6 @@ fn cache_variant_separates_unnamed_mismatch() {
             None
         ),
         extraction_cache_variant(
-            &rizin::Settings::default(),
             None,
             FileType::Shell,
             false,
@@ -224,7 +218,6 @@ fn cache_variant_separates_unnamed_mismatch() {
 fn cache_variant_separates_host_namespaces() {
     let key = |namespace| {
         extraction_cache_variant(
-            &rizin::Settings::default(),
             namespace,
             FileType::Elf,
             false,
@@ -244,7 +237,6 @@ fn cache_variant_separates_basename_facts() {
     // basename happened to populate the content cache first.
     let key = |name| {
         extraction_cache_variant(
-            &rizin::Settings::default(),
             None,
             FileType::Rust,
             false,
@@ -338,7 +330,6 @@ fn chm_overlay_uses_archive_data_and_directory_extents() {
 fn extraction_cache_separates_path_dependent_file_types() {
     assert_ne!(
         extraction_cache_variant(
-            &rizin::Settings::default(),
             None,
             FileType::Gz,
             false,
@@ -346,7 +337,6 @@ fn extraction_cache_separates_path_dependent_file_types() {
             None
         ),
         extraction_cache_variant(
-            &rizin::Settings::default(),
             None,
             FileType::Npm,
             false,
@@ -356,7 +346,6 @@ fn extraction_cache_separates_path_dependent_file_types() {
     );
     assert_eq!(
         extraction_cache_variant(
-            &rizin::Settings::default(),
             None,
             FileType::Npm,
             false,
@@ -364,7 +353,6 @@ fn extraction_cache_separates_path_dependent_file_types() {
             None
         ),
         extraction_cache_variant(
-            &rizin::Settings::default(),
             None,
             FileType::Npm,
             false,
@@ -405,7 +393,7 @@ fn pe_instruction_xor_strings_keep_provenance_across_the_cache() {
     // Synthetic PE containing only a decoder and inert API-name strings.
     // Names recovered from content must not be promoted into PE imports.
     let bytes = include_bytes!("../tests/fixtures/pe-xor-decoder.exe");
-    let extracted = OpenOptions::new().rizin(false).open(bytes).run_pipeline();
+    let extracted = OpenOptions::new().open(bytes).run_pipeline();
     let check = |e: &Extracted| {
         let network = e
             .strings
@@ -598,16 +586,13 @@ fn unique_script(tag: &str) -> Vec<u8> {
 fn cache_setting_belongs_to_each_parsed_file() {
     let bytes = unique_script("cache-setting");
     let dir = tempfile::tempdir().unwrap();
-    let cached = OpenOptions::new()
-        .cache(true)
-        .cache_dir(dir.path())
-        .rizin(false);
+    let cached = OpenOptions::new().cache(true).cache_dir(dir.path());
 
     let first = cached.open(&bytes);
     let _ = first.metrics();
     assert_eq!(first.parse_count(), 1, "nothing cached yet");
 
-    let uncached = OpenOptions::new().cache(false).rizin(false).open(&bytes);
+    let uncached = OpenOptions::new().cache(false).open(&bytes);
     let _ = uncached.metrics();
     assert_eq!(uncached.parse_count(), 1, "cache off: must not read it");
 
@@ -618,44 +603,29 @@ fn cache_setting_belongs_to_each_parsed_file() {
         serde_json::to_value(second.values()).unwrap(),
         serde_json::to_value(first.values()).unwrap()
     );
-
-    // Rizin settings are part of the key: with rizin installed, a
-    // rizin-on open must not be served the rizin-off entry. Without it
-    // the two extractions are identical and rightly share one.
-    let rizin_on = OpenOptions::new()
-        .cache(true)
-        .cache_dir(dir.path())
-        .open(&bytes);
-    let _ = rizin_on.metrics();
-    assert_eq!(rizin_on.parse_count(), u32::from(rizin::available()));
 }
 
-/// The cache key changes with every option that changes a persisted
-/// extraction — rizin on/off, native-arch slicing, the size cap — and
-/// not with the timeout, which only ever yields an unpersisted result.
+/// The cache key starts with the recovery fingerprint and changes with every
+/// keyed input that changes a persisted extraction — the detected type, a
+/// content/extension mismatch, the host namespace, the basename.
 #[test]
-fn cache_key_tracks_every_output_affecting_option() {
-    let variant = |options: &OpenOptions<'_>| {
-        extraction_cache_variant(&options.rizin, None, FileType::Elf, false, None, None)
-    };
+fn cache_key_tracks_every_output_affecting_input() {
     let base = OpenOptions::new();
-    let slower = base.clone().rizin_timeout(Duration::from_secs(5));
-    assert_eq!(variant(&base), variant(&slower));
-    assert!(variant(&base).starts_with(&base.rizin_fingerprint()));
+    let key = |file_type, mismatch, basename| {
+        extraction_cache_variant(None, file_type, mismatch, None, basename)
+    };
+    assert!(key(FileType::Elf, false, None).starts_with(&base.recovery_fingerprint()));
 
     let distinct: std::collections::HashSet<String> = [
-        base.clone(),
-        base.clone().rizin(false),
-        base.clone().rizin_native_arch_only(true),
-        base.clone().rizin_max_bytes(1 << 20),
+        key(FileType::Elf, false, None),
+        key(FileType::Pe, false, None),
+        key(FileType::Elf, true, None),
+        key(FileType::Elf, false, Some("a.out")),
+        extraction_cache_variant(Some("ns"), FileType::Elf, false, None, None),
     ]
-    .iter()
-    .map(variant)
+    .into_iter()
     .collect();
-    // Without rizin installed none of these changes the output, and
-    // all four share the `rizin=none` key.
-    let expected = if rizin::available() { 4 } else { 1 };
-    assert_eq!(distinct.len(), expected, "{distinct:?}");
+    assert_eq!(distinct.len(), 5, "every keyed input is distinct: {distinct:?}");
 }
 
 /// A raised cancellation flag abandons the source parse of the file it

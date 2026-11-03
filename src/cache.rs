@@ -1,10 +1,10 @@
 //! Disk cache for filefacts analysis output.
 //!
 //! The canonical store for an [`crate::ParsedFile`]'s extraction. Its reason
-//! to exist is the rizin disassembly pass: full `aaa` recovery on a stripped
-//! binary costs seconds to minutes, and the recovered imports, exports,
-//! functions and sections land in the cached payload, so a second `open` of
-//! the same bytes never re-runs rizin.
+//! to exist is the binform disassembly pass: function recovery on a stripped
+//! binary costs real time, and the recovered imports, exports, functions and
+//! sections land in the cached payload, so a second `open` of the same bytes
+//! never re-runs recovery.
 //!
 //! The cache is off unless the host turns it on with
 //! [`crate::OpenOptions::cache`]. Nothing here reads the environment on its
@@ -46,8 +46,8 @@
 //!   consuming binary was built, copied or packaged.
 //! * **variant** — what else the extraction depends on: for a
 //!   [`crate::ParsedFile`], the detected type, the basename and
-//!   [`crate::OpenOptions::rizin_fingerprint`] (whether rizin runs, its
-//!   version, native-arch slicing, the size cap).
+//!   [`crate::OpenOptions::recovery_fingerprint`] (the binform recovery
+//!   policy).
 //!
 //! `CACHE_SCHEMA_VERSION` is the manual lever on top, reserved for deliberate
 //! format breaks; a sweep removes superseded version directories.
@@ -164,9 +164,9 @@ fn hex(bytes: &[u8]) -> String {
 /// * the filefacts build fingerprint — extraction logic changes between
 ///   builds, so a stale entry from an older filefacts must not be reused;
 /// * the caller's `variant` — the detected file type plus
-///   [`crate::OpenOptions::rizin_fingerprint`], since the *same* bytes yield
-///   different extraction under different path-assisted types or rizin
-///   configurations.
+///   [`crate::OpenOptions::recovery_fingerprint`], since the *same* bytes yield
+///   different extraction under different path-assisted types or recovery
+///   policies.
 fn cache_key(bytes: &[u8], variant: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -437,13 +437,10 @@ fn maybe_trigger_sweep(root: &Path, key: &str) {
 /// A freshly computed payload, tagged with whether it may be persisted.
 ///
 /// Content addressing is only sound when the computation is reproducible
-/// from the key. Most degradation in optional disassembly is *stable* for a
-/// given environment and settings (rizin absent or turned off, a specific
-/// version, native-arch slicing, the size cap) and is handled by the cache
-/// key's `variant`. What remains are *transient* conditions — rizin timed
-/// out, was killed on the output cap, or turned itself off after too many
-/// abandoned output readers; a source parse stopped by its wall-clock
-/// backstop or cancelled. A payload produced under one of those is still
+/// from the key. Most degradation in disassembly is *stable* for a given
+/// recovery policy, which is handled by the cache key's `variant`. What
+/// remains are *transient* conditions — a source parse stopped by its
+/// wall-clock backstop or cancelled. A payload produced under one of those is still
 /// usable for the current call but must not be written: persisting it would
 /// poison the entry for every later run.
 #[derive(Debug)]

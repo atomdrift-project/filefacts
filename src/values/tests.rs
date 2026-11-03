@@ -6,14 +6,12 @@ use crate::{FileType, OpenOptions, ParsedFile};
 fn open<'a>(name: &str, bytes: &'a [u8]) -> ParsedFile<'a> {
     OpenOptions::new()
         .path(std::path::Path::new(name))
-        .rizin(false)
         .open(bytes)
 }
 
 fn batch(source: &str) -> ParsedFile<'_> {
     OpenOptions::new()
         .file_type(FileType::Batch)
-        .rizin(false)
         .open(source.as_bytes())
 }
 
@@ -35,7 +33,7 @@ fn facts(values: &Values) -> (Option<String>, Vec<(&str, String)>, Vec<String>, 
 fn basename_is_the_name_without_its_directory() {
     let parsed = open("stubs/types.pyi", b"import os\n");
     assert_eq!(basename(parsed.values()), Some("types.pyi"));
-    let unnamed = OpenOptions::new().rizin(false).open(b"import os\n");
+    let unnamed = OpenOptions::new().open(b"import os\n");
     assert_eq!(basename(unnamed.values()), None);
 }
 

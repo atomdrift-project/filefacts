@@ -14,7 +14,6 @@
 //! ```
 //! let parsed = filefacts::OpenOptions::new()
 //!     .path(std::path::Path::new("package.json"))
-//!     .rizin(false)
 //!     .open(br#"{"name": "x", "scripts": {"postinstall": "node setup.js"}}"#);
 //! let retained = serde_json::to_string(parsed.values()).unwrap();
 //! let values: filefacts::Values = serde_json::from_str(&retained).unwrap();

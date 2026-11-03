@@ -16,9 +16,9 @@ use std::path::Path;
 
 use filefacts::{OpenOptions, ParsedFile, Symbol, SymbolKind};
 
-/// Options for a hermetic open: no disk cache and no rizin subprocess.
+/// Options for a hermetic open: no disk cache.
 pub(crate) fn options() -> OpenOptions<'static> {
-    OpenOptions::new().cache(false).rizin(false)
+    OpenOptions::new().cache(false)
 }
 
 /// `bytes` opened hermetically, without a path.

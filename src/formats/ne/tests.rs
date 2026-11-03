@@ -53,7 +53,7 @@ fn resolves_known_ordinals_and_retains_unknown_and_named_imports() {
 #[test]
 fn normal_filefacts_pipeline_exposes_imports() {
     let bytes = fixture();
-    let parsed = crate::OpenOptions::new().rizin(false).open(&bytes);
+    let parsed = crate::OpenOptions::new().open(&bytes);
     assert_eq!(parsed.fileid().file_type(), crate::FileType::Ne);
     let extracted = parsed.run_pipeline();
     assert!(extracted.symbols.iter().any(

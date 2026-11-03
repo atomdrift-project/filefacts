@@ -270,7 +270,6 @@ mod tests {
     fn hermetic<'a>(path: &str, bytes: &'a [u8]) -> ParsedFile<'a> {
         crate::OpenOptions::new()
             .cache(false)
-            .rizin(false)
             .path(std::path::Path::new(path))
             .open(bytes)
     }

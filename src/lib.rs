@@ -155,8 +155,11 @@ pub mod values;
 pub mod rpa {
     pub use crate::formats::rpa::{Chunk, Member, members};
 }
-/// No-op rizin settings and controls, kept until hosts stop calling them.
-pub mod rizin;
+/// Emit binform's cumulative recovery statistics as a `tracing::info!` line.
+/// Host CLIs call this at shutdown for telemetry.
+pub fn log_stats() {
+    functions::log_stats();
+}
 
 mod bundle;
 pub use bundle::{Bundle, View, ViewData};
@@ -182,7 +185,6 @@ pub use output::{
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
 
 pub use embedded_sources::EmbeddedSource;
 pub use error::Error;
@@ -293,8 +295,6 @@ pub struct ParsedFile<'a> {
     cache_dir: Option<Arc<Path>>,
     // The host's addition to every disk-cache key (`OpenOptions::cache_namespace`).
     cache_namespace: Option<Arc<str>>,
-    // This file's rizin settings, carried into the extraction.
-    rizin: rizin::Settings,
     extracted: OnceLock<Extracted>,
     // How many times this `ParsedFile` ran its extraction pipeline.
     // A correctly-implemented `ParsedFile` never reports more than 1
@@ -517,10 +517,10 @@ impl<'a> ParsedFile<'a> {
         &self.extracted().errors
     }
 
-    /// Always `false`: filefacts no longer runs rizin, and binform's
-    /// in-process recovery has no run that can fail to complete. Kept until
-    /// hosts stop calling it.
-    pub fn rizin_recovery_incomplete(&self) -> bool {
+    /// Always `false`: binform's in-process recovery has no run that can fail
+    /// to complete, so a view is never built from a cut-short recovery. Kept
+    /// so a host can treat recovery completeness uniformly.
+    pub fn recovery_incomplete(&self) -> bool {
         false
     }
 
@@ -620,7 +620,6 @@ impl<'a> ParsedFile<'a> {
             // wall-clock backstop or cancellation, is returned but not
             // persisted, so a later healthy run still gets to fill the entry.
             let variant = extraction_cache_variant(
-                &self.rizin,
                 self.cache_namespace.as_deref(),
                 self.fileid.file_type(),
                 self.fileid.extension_mismatch(),
@@ -699,7 +698,6 @@ fn guarded<T>(stage: &'static str, work: impl FnOnce() -> T) -> Result<T, PanicM
 /// depends on (see [`ParsedFile::extracted`]); the cache key folds in the
 /// rest.
 fn extraction_cache_variant(
-    rizin: &rizin::Settings,
     namespace: Option<&str>,
     file_type: FileType,
     extension_mismatch: bool,
@@ -724,7 +722,7 @@ fn extraction_cache_variant(
     };
     format!(
         "{};namespace={namespace:?};file_type={};mismatch={};basename={basename:?}",
-        rizin::cache_fingerprint(rizin),
+        crate::functions::POLICY,
         file_type.label(),
         transition
     )
@@ -959,7 +957,6 @@ impl<'a> ParsedFile<'a> {
             cache: false,
             cache_dir: None,
             cache_namespace: None,
-            rizin: rizin::Settings::default(),
             extracted: OnceLock::new(),
             parse_count: AtomicU32::new(0),
         }
@@ -1018,7 +1015,6 @@ pub struct OpenOptions<'a> {
     cache: bool,
     cache_dir: Option<Arc<Path>>,
     cache_namespace: Option<Arc<str>>,
-    rizin: rizin::Settings,
 }
 
 impl Default for OpenOptions<'_> {
@@ -1043,7 +1039,6 @@ impl<'a> OpenOptions<'a> {
             cache: false,
             cache_dir: None,
             cache_namespace: None,
-            rizin: rizin::Settings::default(),
         }
     }
 
@@ -1114,8 +1109,8 @@ impl<'a> OpenOptions<'a> {
     /// directory, or writes one after computing the views; a later open of
     /// the same bytes, under the same settings, skips the extraction. The key
     /// covers the bytes, the filefacts build, the detected type, the
-    /// basename and [`rizin_fingerprint`](Self::rizin_fingerprint). Off by
-    /// default.
+    /// basename and [`recovery_fingerprint`](Self::recovery_fingerprint). Off
+    /// by default.
     pub fn cache(mut self, enabled: bool) -> Self {
         self.cache = enabled;
         self
@@ -1145,43 +1140,12 @@ impl<'a> OpenOptions<'a> {
         self
     }
 
-    /// Ignored: filefacts no longer runs rizin. Kept until hosts stop
-    /// calling it.
-    pub fn rizin(mut self, enabled: bool) -> Self {
-        self.rizin.enabled = enabled;
-        self
-    }
-
-    /// Ignored, like [`rizin`](Self::rizin).
-    pub fn rizin_timeout(mut self, timeout: Duration) -> Self {
-        self.rizin.timeout = timeout;
-        self
-    }
-
-    /// Ignored, like [`rizin`](Self::rizin).
-    pub fn rizin_retry_timeout(mut self, timeout: Duration) -> Self {
-        self.rizin.retry_timeout = Some(timeout);
-        self
-    }
-
-    /// Ignored, like [`rizin`](Self::rizin).
-    pub fn rizin_max_bytes(mut self, max_bytes: usize) -> Self {
-        self.rizin.max_bytes = Some(max_bytes);
-        self
-    }
-
-    /// Ignored, like [`rizin`](Self::rizin).
-    pub fn rizin_native_arch_only(mut self, enabled: bool) -> Self {
-        self.rizin.native_arch_only = enabled;
-        self
-    }
-
-    /// The function-recovery part of the disk-cache key: binform's policy,
-    /// whatever the rizin settings. For a host keying its own cache of
-    /// results derived from filefacts.
+    /// The function-recovery part of the disk-cache key: binform's policy.
+    /// For a host keying its own cache of results derived from filefacts, so
+    /// an upgrade that changes recovery invalidates it.
     #[must_use]
-    pub fn rizin_fingerprint(&self) -> String {
-        rizin::cache_fingerprint(&self.rizin)
+    pub fn recovery_fingerprint(&self) -> String {
+        crate::functions::POLICY.to_owned()
     }
 
     /// Identify `bytes` and return a [`ParsedFile`] that borrows them.
@@ -1205,7 +1169,6 @@ impl<'a> OpenOptions<'a> {
         parsed.cache = self.cache;
         parsed.cache_dir.clone_from(&self.cache_dir);
         parsed.cache_namespace.clone_from(&self.cache_namespace);
-        parsed.rizin = self.rizin;
         parsed
     }
 }

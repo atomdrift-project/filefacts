@@ -57,7 +57,6 @@ mod plist_envelopes {
         ] {
             let parsed = crate::OpenOptions::new()
                 .path(Path::new(name))
-                .rizin(false)
                 .open(&bytes);
             assert_eq!(parsed.fileid().file_type(), crate::FileType::Plist);
             if name != "renamed.bin" {
@@ -123,7 +122,6 @@ mod plist_envelopes {
 <key>cms_wrapped</key><true/></dict></dict></plist>"#;
         let parsed = crate::OpenOptions::new()
             .path(Path::new("forged.plist"))
-            .rizin(false)
             .open(bytes);
         assert_eq!(
             parsed.values().get("plist.cms_wrapped"),

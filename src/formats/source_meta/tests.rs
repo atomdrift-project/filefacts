@@ -233,7 +233,6 @@ fn zip_plugin_takes_slug_from_the_top_level_directory() {
     // Probed from the archive the zip walk opened.
     let parsed = crate::OpenOptions::new()
         .path(std::path::Path::new("apex-notification-bar-lite.zip"))
-        .rizin(false)
         .open(&buf);
     let v = parsed.values();
     // The WordPress.org distribution slug is the archive directory, which

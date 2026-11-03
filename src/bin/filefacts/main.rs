@@ -87,11 +87,10 @@ impl Args {
     /// files, so `main` turns the extraction cache on unless `--no-cache` or
     /// `FILEFACTS_CACHE` turns it off.
     fn options(&self, cache: bool) -> OpenOptions<'static> {
-        let mut options = OpenOptions::new().cache(cache).rizin(!self.no_rizin);
-        if let Some(timeout) = self.rizin_timeout {
-            options = options.rizin_timeout(timeout);
-        }
-        options
+        // `--no-rizin` and `--rizin-timeout` are still parsed for old scripts
+        // (see `parse`), but filefacts no longer runs rizin, so they do
+        // nothing here.
+        OpenOptions::new().cache(cache)
     }
 }
 
@@ -109,7 +108,6 @@ fn main() -> ExitCode {
             .without_time()
             .try_init();
     }
-    install_signal_cleanup();
     let args = match parse_args(std::env::args_os().skip(1), |p| {
         std::fs::symlink_metadata(p).is_ok()
     }) {
@@ -158,7 +156,7 @@ fn main() -> ExitCode {
         }
     }
     if debug {
-        filefacts::rizin::log_stats();
+        filefacts::log_stats();
     }
     exit_code(result)
 }
@@ -169,40 +167,6 @@ fn main() -> ExitCode {
 fn debug_requested(value: Option<&OsStr>) -> bool {
     value.is_some_and(|v| !(v.is_empty() || v == "0" || v.eq_ignore_ascii_case("false")))
 }
-
-/// On SIGINT, SIGTERM or SIGHUP, kill in-flight rizin process groups and
-/// delete their temp inputs, then exit `128 + signal` like a shell would.
-/// rizin runs in its own process group, so the terminal's SIGINT never
-/// reaches it, and on macOS — which has no parent-death signal — it would
-/// otherwise outlive this process. A dedicated thread does the work, since
-/// the reaper locks and allocates (see `kill_all_rizin_groups`).
-#[cfg(unix)]
-fn install_signal_cleanup() {
-    use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
-    let mut signals = match signal_hook::iterator::Signals::new([SIGINT, SIGTERM, SIGHUP]) {
-        Ok(signals) => signals,
-        Err(error) => {
-            tracing::warn!(target: LOG_TARGET, %error, "cannot install signal cleanup");
-            return;
-        }
-    };
-    let spawned = std::thread::Builder::new()
-        .name("filefacts-signals".into())
-        .spawn(move || {
-            if let Some(signal) = signals.forever().next() {
-                filefacts::rizin::kill_all_rizin_groups();
-                std::process::exit(128 + signal);
-            }
-        });
-    if let Err(error) = spawned {
-        tracing::warn!(target: LOG_TARGET, %error, "cannot start the signal cleanup thread");
-    }
-}
-
-/// Windows: rizin's job object is closed, killing it, when this process
-/// exits, so the default Ctrl-C handling already cleans up.
-#[cfg(not(unix))]
-fn install_signal_cleanup() {}
 
 /// Exit status for a run: `Ok(false)` means some file failed and was
 /// reported; `Err` means stdout itself failed.
@@ -716,7 +680,7 @@ mod tests {
     }
 
     fn hermetic() -> OpenOptions<'static> {
-        OpenOptions::new().cache(false).rizin(false)
+        OpenOptions::new().cache(false)
     }
 
     const PLAIN: Style = Style {

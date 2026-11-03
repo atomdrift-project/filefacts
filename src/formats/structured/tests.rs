@@ -778,7 +778,6 @@ fn native_entitlement_requests_require_top_level_boolean_true() {
 fn document_keys_cannot_forge_filefacts_roots() {
     let parsed = crate::OpenOptions::new()
         .path(std::path::Path::new("config.json"))
-        .rizin(false)
         .open(br#"{"file":{"basename":"evil.exe"},"npm":{"name":"x"},"name":"ok"}"#);
     let values = parsed.values();
     assert_eq!(
@@ -804,7 +803,6 @@ fn document_keys_cannot_forge_filefacts_roots() {
 fn ordinary_manifest_roots_are_kept() {
     let parsed = crate::OpenOptions::new()
         .path(std::path::Path::new("settings.json"))
-        .rizin(false)
         .open(br#"{"source":{"url":"https://example.invalid/x.tgz"},"build":{"number":1},"pkg":{"scripts":"a.js"}}"#);
     let values = parsed.values();
     assert_eq!(

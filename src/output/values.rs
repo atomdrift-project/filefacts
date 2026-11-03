@@ -37,7 +37,6 @@ use super::value_keys::ValueKey;
 /// let bytes = br#"{"scripts": {"postinstall": "node setup.js"}}"#;
 /// let parsed = filefacts::OpenOptions::new()
 ///     .path(std::path::Path::new("config.json"))
-///     .rizin(false)
 ///     .open(bytes);
 /// let script = parsed.values().get("scripts.postinstall");
 /// assert_eq!(script.and_then(|x| x.as_str()), Some("node setup.js"));

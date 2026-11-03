@@ -7,7 +7,6 @@ use std::io::Write as _;
 fn open<'a>(path: &Path, bytes: &'a [u8]) -> ParsedFile<'a> {
     OpenOptions::new()
         .cache(false)
-        .rizin(false)
         .path(path)
         .open(bytes)
 }
