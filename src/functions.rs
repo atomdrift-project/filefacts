@@ -16,7 +16,7 @@ use crate::output::Metrics;
 /// The disk-cache key's part for function recovery. Bump it whenever the
 /// binform commit in Cargo.lock, or what filefacts takes from it, changes:
 /// either changes what a cached extraction holds.
-pub(crate) const POLICY: &str = "binform=v4";
+pub(crate) const POLICY: &str = "binform=v5";
 
 /// Recovered functions, and names for the call targets that are no
 /// recovered function (an import's slot or stub).

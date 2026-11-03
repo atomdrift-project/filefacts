@@ -1,6 +1,6 @@
 //! The dynamic and static symbol tables: typed imports and exports, the
 //! symbol-kind histograms, hardening markers (FORTIFY, stack canary), and the
-//! `.symtab` function fallback for binaries no disassembler covered.
+//! `.symtab` function fallback for binaries binform could not recover.
 
 use goblin::elf::Elf;
 use serde_json::Value as JsonValue;
@@ -10,26 +10,17 @@ use crate::metric;
 use crate::output::{Metrics, Values};
 use crate::value_key;
 
-/// Recover functions defined in this file from `.symtab` when nothing else
-/// supplied any.
+/// Name the `.symtab` functions that lie in executable sections: the last
+/// resort when binform recovered no inventory (an instruction set it does not
+/// decode) and there was no pclntab. A no-op when `out` already holds any
+/// function. These names carry no complexity or call graph.
 ///
 /// Every binding counts: a static executable keeps its libc entry points
 /// (`execve`, `fexecve`, `syscall`) as `.symtab` globals and weaks with no
 /// `.dynsym` to export them, so a local-only walk hides exactly the calls a
 /// symbol rule looks for. Functions `.dynsym` already exports stay exports
 /// only, so a dynamic object reports each name once, in the same view it did.
-///
-/// With `required`, the functions are kept only when their sizes cover most
-/// of that code: run before the rizin admission decision, an inventory that
-/// passes makes disassembly redundant, while a token `.symtab` — a stray
-/// `main`, or one grafted on to dodge disassembly — leaves the decision to
-/// the static facts.
-pub(super) fn static_function_fallback(
-    elf: &Elf<'_>,
-    file_len: usize,
-    required: Option<crate::formats::go_pclntab::Code>,
-    out: &mut crate::Symbols,
-) {
+pub(super) fn static_function_fallback(elf: &Elf<'_>, file_len: usize, out: &mut crate::Symbols) {
     use crate::output::{Symbol, SymbolKind};
     if out
         .iter()
@@ -37,8 +28,6 @@ pub(super) fn static_function_fallback(
     {
         return;
     }
-    let mut functions = Vec::new();
-    let mut covered: u64 = 0;
     let exported: std::collections::HashSet<&str> = elf
         .dynsyms
         .iter()
@@ -56,9 +45,6 @@ pub(super) fn static_function_fallback(
         if section.sh_flags & u64::from(goblin::elf::section_header::SHF_EXECINSTR) == 0 {
             continue;
         }
-        // Exported functions count toward coverage too: the export view
-        // holds them, so they are inventory all the same.
-        covered = covered.saturating_add(sym.st_size.min(section.sh_size));
         let Some(name) = elf.strtab.get_at(sym.st_name).filter(|name| {
             !name.is_empty()
                 && (sym.st_bind() == goblin::elf::sym::STB_LOCAL || !exported.contains(name))
@@ -68,20 +54,12 @@ pub(super) fn static_function_fallback(
         if !names.take(name.len()) {
             break;
         }
-        functions.push(Symbol::Function {
+        out.push(Symbol::Function {
             name: name.to_string(),
             offset: Some(sym.st_value),
             complexity: None,
             callees: Vec::new(),
         });
-    }
-    if let Some(code) = required
-        && !code.mostly_covered_by(covered)
-    {
-        return;
-    }
-    for function in functions {
-        out.push(function);
     }
 }
 

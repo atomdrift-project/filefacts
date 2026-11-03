@@ -257,21 +257,17 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
     notes::segment_coverage(&elf, bytes, metrics, errors_out);
     metrics::section_file_anomalies(&elf, bytes, metrics);
     metrics::member_layout(&elf, bytes.len(), metrics);
-    // Split firmware header members declare segments stored in sibling files.
-    // Disassembling such a member invents an entry function in an unmapped
-    // range. Keep its header facts, but recover code only from present bytes.
-    // A function inventory that covers the code is all rizin's recovery would
-    // add, so it goes in before the admission decision, which then skips the
-    // disassembler: Go's pclntab first (exact names, present even when
-    // stripped), else a `.symtab` that covers the code.
+    // Go's pclntab is the exact inventory for a Go binary — the names and
+    // boundaries binform's generic recovery cannot match on Go's code (it
+    // over-extends `.text` into mega-functions) — so it goes in first and
+    // pre-empts binform's function list. binform still runs below for the
+    // syscall sites. A decoy `.gopclntab` cannot pass: the magic is checked.
     let code = super::go_pclntab::Code::of(
         elf.section_headers
             .iter()
             .filter(|sh| sh.sh_flags & u64::from(goblin::elf::section_header::SHF_EXECINSTR) != 0)
             .map(|sh| (sh.sh_addr, sh.sh_size)),
     );
-    // A real pclntab magic, not just the section name: no non-Go toolchain
-    // writes one, so a decoy `.gopclntab` cannot pass for Go.
     let pclntab = read_section(&elf, bytes, ".gopclntab")
         .filter(|table| super::go_buildinfo::has_pclntab_magic(table));
     let text = section_header(&elf, ".text").map(|sh| sh.sh_addr);
@@ -284,11 +280,14 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
             symbols_out.push(function);
         }
     }
-    if code.is_some() {
-        symbols::static_function_fallback(&elf, bytes.len(), code, symbols_out);
-    }
-    // One binform recovery feeds both the function inventory (filled only
-    // when the symbol tables held none) and the syscall sites (always).
+    // binform is the authority for every non-Go inventory: one recovery feeds
+    // both the function list (named from the symbol-table seeds it reads, with
+    // complexity and a call graph a bare `.symtab` cannot give) and the syscall
+    // sites (always). It subsumes the symtab, which now stands in only for code
+    // binform cannot reach — an instruction set it does not decode, or a split
+    // firmware member whose code lives in a sibling file (disassembling an
+    // unmapped range would invent entries, so recovery runs on present bytes
+    // only).
     if has_present_load_or_code_bytes(&elf, bytes.len())
         && let Some(native) = crate::functions::recover(bytes)
     {
@@ -303,9 +302,11 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
             super::common::apply_native(native, symbols_out, None, metrics);
         }
     }
-    // Symbol-table names for a binary whose `.symtab` covers too little to
-    // stand in for disassembly, kept when binform supplied no functions.
-    symbols::static_function_fallback(&elf, bytes.len(), None, symbols_out);
+    // Symbol-table names when nothing above produced a function inventory:
+    // binform recovered none (an instruction set it does not decode) and there
+    // was no pclntab. No coverage requirement now that binform, not rizin, is
+    // the disassembler it would otherwise wait for.
+    symbols::static_function_fallback(&elf, bytes.len(), symbols_out);
     linker_family(&elf, values);
     comment_fingerprint(values);
     hashes::emit(&elf, bytes.len(), values, symbols_out);

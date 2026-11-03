@@ -1126,7 +1126,7 @@ fn static_function_fallback_recovers_only_defined_executable_functions() {
     );
     let elf = Elf::parse(&bytes).unwrap();
     let mut out = crate::Symbols::default();
-    static_function_fallback(&elf, bytes.len(), None, &mut out);
+    static_function_fallback(&elf, bytes.len(), &mut out);
     let functions: Vec<_> = out
         .iter()
         .filter(|s| s.kind() == SymbolKind::Function)
@@ -1143,7 +1143,7 @@ fn static_function_fallback_recovers_only_defined_executable_functions() {
         complexity: Some(3),
         callees: vec!["target".into()],
     });
-    static_function_fallback(&elf, bytes.len(), None, &mut rich);
+    static_function_fallback(&elf, bytes.len(), &mut rich);
     assert_eq!(
         rich.iter()
             .filter(|s| s.kind() == SymbolKind::Function)
@@ -1161,7 +1161,7 @@ fn fallback_function_names(fixture: &str) -> Vec<String> {
     let bytes = read_fixture(fixture);
     let elf = Elf::parse(&bytes).unwrap();
     let mut out = crate::Symbols::default();
-    static_function_fallback(&elf, bytes.len(), None, &mut out);
+    static_function_fallback(&elf, bytes.len(), &mut out);
     out.iter()
         .filter_map(|s| match s {
             Symbol::Function { name, .. } => Some(name.clone()),
@@ -1180,56 +1180,37 @@ fn static_function_fallback_keeps_static_executable_globals() {
     }
 }
 
-/// The executable code of `elf`, as the extractor measures it.
-fn executable_code(elf: &Elf<'_>) -> crate::formats::go_pclntab::Code {
-    crate::formats::go_pclntab::Code::of(
-        elf.section_headers
-            .iter()
-            .filter(|sh| sh.sh_flags & u64::from(goblin::elf::section_header::SHF_EXECINSTR) != 0)
-            .map(|sh| (sh.sh_addr, sh.sh_size)),
-    )
-    .unwrap()
-}
-
 #[test]
-fn a_symtab_covering_the_code_stands_in_for_disassembly() {
-    // The static musl binary's `.symtab` sizes cover its code, so its
-    // functions go in ahead of the rizin decision.
+fn the_symtab_fallback_names_the_executable_section_functions() {
+    // The last-resort path (binform recovered nothing, no pclntab): every
+    // `.symtab` function in an executable section is named. No coverage
+    // requirement now that binform, not rizin, is the disassembler.
     let bytes = read_fixture("elf-syscall-wrapper-static.elf");
     let elf = Elf::parse(&bytes).unwrap();
-    let code = executable_code(&elf);
     let mut out = crate::Symbols::default();
-    static_function_fallback(&elf, bytes.len(), Some(code), &mut out);
-    assert_eq!(out.iter_kind(SymbolKind::Function).count(), 32);
-}
-
-#[test]
-fn a_symtab_covering_little_of_the_code_waits_for_disassembly() {
-    // The same `.symtab` against ten times the code: a token symbol table
-    // (a lone `main`, or one grafted on to dodge rizin) must not stand in.
-    let bytes = read_fixture("elf-syscall-wrapper-static.elf");
-    let elf = Elf::parse(&bytes).unwrap();
-    let code = executable_code(&elf);
-    let larger = crate::formats::go_pclntab::Code {
-        bytes: code.bytes * 10,
-        ..code
-    };
-    let mut out = crate::Symbols::default();
-    static_function_fallback(&elf, bytes.len(), Some(larger), &mut out);
-    assert_eq!(out.iter_kind(SymbolKind::Function).count(), 0);
-    // Without the requirement, as after binform found nothing, they are kept.
-    static_function_fallback(&elf, bytes.len(), None, &mut out);
+    static_function_fallback(&elf, bytes.len(), &mut out);
     assert_eq!(out.iter_kind(SymbolKind::Function).count(), 32);
 }
 
 #[test]
 fn an_unstripped_elf_keeps_its_symbol_table_functions() {
-    // End to end: its `.symtab` names the functions, so binform's recovery,
-    // which would add complexity metrics, does not run.
+    // End to end: binform is the authority for the inventory. It seeds from the
+    // `.symtab`, so the functions keep their names, and it adds the complexity
+    // and call-graph a bare symbol table cannot — the symtab fallback no longer
+    // stands in ahead of it.
     let bytes = read_fixture("elf-syscall-wrapper-static.elf");
     let parsed = crate::OpenOptions::new().cache(false).open(&bytes);
-    assert!(parsed.metrics().get("binary.avg_complexity").is_none());
-    assert_eq!(parsed.symbols().iter_kind(SymbolKind::Function).count(), 32);
+    let names: Vec<&str> = parsed
+        .symbols()
+        .iter_kind(SymbolKind::Function)
+        .filter_map(crate::output::Symbol::name)
+        .collect();
+    // Named from the symbol table binform seeded from, not anonymised.
+    for named in ["_start", "main", "memcpy", "syscall"] {
+        assert!(names.contains(&named), "{named} missing from {names:?}");
+    }
+    // Complexity is present now that binform recovers the bodies.
+    assert!(parsed.metrics().get("binary.avg_complexity").is_some());
 }
 
 #[test]
@@ -1325,7 +1306,7 @@ fn static_function_fallback_keeps_every_binding_of_defined_functions() {
     );
     let elf = Elf::parse(&bytes).unwrap();
     let mut out = crate::Symbols::default();
-    static_function_fallback(&elf, bytes.len(), None, &mut out);
+    static_function_fallback(&elf, bytes.len(), &mut out);
     let mut names: Vec<_> = out
         .iter()
         .filter_map(|s| match s {

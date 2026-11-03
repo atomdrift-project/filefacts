@@ -158,9 +158,9 @@ fn parsed(pe: PE<'_>, bytes: &[u8], ctx: super::ExtractCtx<'_>) {
         .is_some_and(super::go_buildinfo::has_pclntab_magic);
     super::go_buildinfo::detect(bytes, values, value_key!("pe.go"), None, &go_sections);
     // A Go PE may fold `.gopclntab` into `.rdata` and omit a literal
-    // `.gopclntab` section. Build-info is still authoritative Go
-    // evidence, and in that layout the native parser supplies no typed
-    // function inventory for the Rizin fallback to skip over.
+    // `.gopclntab` section. Build-info is still authoritative Go evidence, and
+    // in that layout the native parser supplies the function inventory binform
+    // would otherwise recover.
     let has_go_function_metadata = has_go_pclntab || values.get_key(value_key!("pe.go")).is_some();
     if has_go_function_metadata {
         go_functions(pe, &go_sections, has_go_pclntab, symbols_out);

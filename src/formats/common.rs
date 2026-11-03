@@ -312,7 +312,7 @@ pub(super) fn apply_native(
     let had_imports = symbols.iter().any(|s| s.kind() == SymbolKind::Import);
     let had_exports = symbols.iter().any(|s| s.kind() == SymbolKind::Export);
     if !had_imports {
-        for import in native.imports {
+        for import in native.imports.into_iter().filter(|i| !i.name.is_empty()) {
             // An import by ordinal from a DLL whose ordinals are stable goes
             // by the name the DLL exports there.
             let name = import
@@ -333,7 +333,7 @@ pub(super) fn apply_native(
         }
     }
     if !had_exports {
-        for export in native.exports {
+        for export in native.exports.into_iter().filter(|e| !e.name.is_empty()) {
             symbols.push(Symbol::Export {
                 name: export.name,
                 offset: Some(export.addr),
