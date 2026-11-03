@@ -414,6 +414,12 @@ fn detect_from_filename(path: &Path) -> Option<FileType> {
     if name.eq_ignore_ascii_case("Makefile.PL") {
         return Some(FileType::Perl);
     }
+    // Ruby's Rake build recipe and Bundler dependency manifest are Ruby DSLs
+    // with no file extension; short recipes (`require` + `task`) carry too few
+    // language keywords for content scoring to identify them without the name.
+    if name.eq_ignore_ascii_case("Rakefile") || name.eq_ignore_ascii_case("Gemfile") {
+        return Some(FileType::Ruby);
+    }
     if name.starts_with("Makefile") || name.starts_with("GNUmakefile") {
         return Some(FileType::Makefile);
     }
@@ -731,9 +737,10 @@ fn detect_from_extension(path: &Path) -> Option<Claim> {
             });
         }
         // Generic data suffixes that do not imply a more specific format.
-        // Includes opaque payload blobs and common database filenames; content
-        // signatures still take precedence over this path-based fallback.
-        "dat" | "bin" | "db" | "payload" | "raw" => FileType::Data,
+        // Includes opaque payload blobs, Java serialized object streams, and
+        // common database filenames; content signatures still take precedence
+        // over this path-based fallback.
+        "dat" | "bin" | "db" | "payload" | "raw" | "ser" => FileType::Data,
         _ => return None,
     };
     Some(Claim::of(file_type))
