@@ -1708,7 +1708,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stng"
 version = "3.0.0"
-source = "git+https://github.com/atomdrift-project/stng.git#b1e9ce719cf38b56a976314d1b5643b2f5287139"
+source = "git+https://github.com/atomdrift-project/stng.git#00026f7a60b1a20cba2c31c4b64561736ac17be3"
 dependencies = [
  "aho-corasick",
  "base64 0.22.1",
@@ -1733,7 +1733,7 @@ dependencies = [
 [[package]]
 name = "stng-process"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/stng.git#b1e9ce719cf38b56a976314d1b5643b2f5287139"
+source = "git+https://github.com/atomdrift-project/stng.git#00026f7a60b1a20cba2c31c4b64561736ac17be3"
 dependencies = [
  "libc",
 ]
