@@ -85,7 +85,7 @@ stng = { git = "https://github.com/atomdrift-project/stng.git", default-features
 # goblin cannot read (see `src/functions.rs`). Bump `POLICY` in
 # `src/functions.rs` whenever the commit in Cargo.lock changes: the disk
 # cache keys on it.
-binform = { path = "../funktion" }
+binform = { git = "https://github.com/atomdrift-project/binform.git", default-features = false }
 
 # Archive index readers. Members are only ever read through a size cap, and
 # only for manifests and signature blocks: stored and deflated are the only

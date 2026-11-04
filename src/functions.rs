@@ -128,9 +128,12 @@ fn syscall_facts(image: &binform::Binary<'_>, recovery: &binform::Functions) -> 
             Target::Syscall(number) => (number, image.syscall(number), None, call.args),
             // A direct call to the connect wrapper: the socket syscall it
             // issues, with the caller's arguments (the sockaddr among them).
-            Target::Addr(to) if wrappers.contains(&to) => {
-                (connect.unwrap_or_default(), Some("connect"), Some("wrapper"), call.args)
-            }
+            Target::Addr(to) if wrappers.contains(&to) => (
+                connect.unwrap_or_default(),
+                Some("connect"),
+                Some("wrapper"),
+                call.args,
+            ),
             // A libc `syscall(number, a0, a1, …)` call: the number is the
             // first C argument, the rest are the syscall's arguments.
             Target::Import(index) if import(index) == Some("syscall") => {
@@ -150,7 +153,13 @@ fn syscall_facts(image: &binform::Binary<'_>, recovery: &binform::Functions) -> 
             }
             _ => continue,
         };
-        facts.push(SyscallFact { addr: call.addr, number, name, via, args });
+        facts.push(SyscallFact {
+            addr: call.addr,
+            number,
+            name,
+            via,
+            args,
+        });
     }
     facts
 }

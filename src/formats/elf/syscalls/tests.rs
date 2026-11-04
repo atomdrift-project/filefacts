@@ -3,11 +3,20 @@ use crate::output::Metrics;
 use binform::Value;
 
 fn fact(addr: u64, number: u64, name: Option<&'static str>, args: Vec<Value>) -> SyscallFact {
-    SyscallFact { addr, number, name, via: None, args }
+    SyscallFact {
+        addr,
+        number,
+        name,
+        via: None,
+        args,
+    }
 }
 
 fn mem(bytes: &[u8]) -> Value {
-    Value::Mem { addr: None, bytes: bytes.iter().map(|&b| Some(b)).collect() }
+    Value::Mem {
+        addr: None,
+        bytes: bytes.iter().map(|&b| Some(b)).collect(),
+    }
 }
 
 /// The bytes kimwolf builds on the stack: `AF_INET`, port 8082 (big-endian),
@@ -21,7 +30,12 @@ fn site_json_carries_fields_and_trims_trailing_unknown_args() {
         0x4a,
         10,
         Some("mprotect"),
-        vec![Value::Unknown, Value::Unknown, Value::Int(7), Value::Unknown],
+        vec![
+            Value::Unknown,
+            Value::Unknown,
+            Value::Int(7),
+            Value::Unknown,
+        ],
     );
     let json = site_json(&site);
     assert_eq!(json["name"], "mprotect");
@@ -84,18 +98,32 @@ fn a_pointer_with_an_unknown_family_byte_is_not_decoded() {
 fn emit_publishes_sites_with_arch_and_counts_direct() {
     let facts = vec![
         fact(0x20, 41, Some("socket"), vec![Value::Int(2)]),
-        fact(0x30, 203, Some("connect"), vec![Value::Unknown, mem(KIMWOLF_SOCKADDR)]),
+        fact(
+            0x30,
+            203,
+            Some("connect"),
+            vec![Value::Unknown, mem(KIMWOLF_SOCKADDR)],
+        ),
     ];
     let mut values = Values::default();
     let mut metrics = Metrics::default();
-    emit(&facts, Some(binform::Arch::Arm), false, &mut values, &mut metrics);
+    emit(
+        &facts,
+        Some(binform::Arch::Arm),
+        false,
+        &mut values,
+        &mut metrics,
+    );
 
     let sites = values
         .get("elf.syscalls_direct")
         .and_then(|v| v.as_array())
         .expect("sites published");
     assert_eq!(sites.len(), 2);
-    assert_eq!(values.get("elf.syscalls_arch").and_then(|v| v.as_str()), Some("arm"));
+    assert_eq!(
+        values.get("elf.syscalls_arch").and_then(|v| v.as_str()),
+        Some("arm")
+    );
     assert_eq!(metrics.get("elf.direct_syscall_count"), Some(2.0));
     assert_eq!(metrics.get("elf.has_indirect_syscall"), None);
 }
@@ -109,9 +137,18 @@ fn emit_dedupes_by_offset_and_sorts() {
     ];
     let mut values = Values::default();
     let mut metrics = Metrics::default();
-    emit(&facts, Some(binform::Arch::X86_64), true, &mut values, &mut metrics);
+    emit(
+        &facts,
+        Some(binform::Arch::X86_64),
+        true,
+        &mut values,
+        &mut metrics,
+    );
 
-    let sites = values.get("elf.syscalls_direct").and_then(|v| v.as_array()).unwrap();
+    let sites = values
+        .get("elf.syscalls_direct")
+        .and_then(|v| v.as_array())
+        .unwrap();
     assert_eq!(sites.len(), 2, "the repeated offset collapses");
     assert_eq!(sites[0]["offset"], 0x10);
     assert_eq!(sites[1]["offset"], 0x30);
@@ -120,11 +157,22 @@ fn emit_dedupes_by_offset_and_sorts() {
 
 #[test]
 fn emit_publishes_decoded_destinations_as_network_endpoints() {
-    let mut site = fact(0x80f8, 203, Some("connect"), vec![Value::Unknown, mem(KIMWOLF_SOCKADDR)]);
+    let mut site = fact(
+        0x80f8,
+        203,
+        Some("connect"),
+        vec![Value::Unknown, mem(KIMWOLF_SOCKADDR)],
+    );
     site.via = Some("connect");
     let mut values = Values::default();
     let mut metrics = Metrics::default();
-    emit(&[site], Some(binform::Arch::Arm), false, &mut values, &mut metrics);
+    emit(
+        &[site],
+        Some(binform::Arch::Arm),
+        false,
+        &mut values,
+        &mut metrics,
+    );
 
     let endpoints = values
         .get("elf.network_endpoints")
@@ -149,7 +197,13 @@ fn a_site_with_no_sockaddr_publishes_no_endpoints() {
     let facts = vec![fact(0x20, 41, Some("socket"), vec![Value::Int(2)])];
     let mut values = Values::default();
     let mut metrics = Metrics::default();
-    emit(&facts, Some(binform::Arch::Arm), false, &mut values, &mut metrics);
+    emit(
+        &facts,
+        Some(binform::Arch::Arm),
+        false,
+        &mut values,
+        &mut metrics,
+    );
     assert!(values.get("elf.network_endpoints").is_none());
     assert_eq!(metrics.get("elf.network_endpoint_count"), None);
 }
@@ -158,7 +212,13 @@ fn a_site_with_no_sockaddr_publishes_no_endpoints() {
 fn nothing_published_without_sites() {
     let mut values = Values::default();
     let mut metrics = Metrics::default();
-    emit(&[], Some(binform::Arch::X86_64), false, &mut values, &mut metrics);
+    emit(
+        &[],
+        Some(binform::Arch::X86_64),
+        false,
+        &mut values,
+        &mut metrics,
+    );
     assert!(values.get("elf.syscalls_direct").is_none());
     assert!(values.get("elf.syscalls_arch").is_none());
 }

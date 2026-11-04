@@ -291,9 +291,10 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
     if has_present_load_or_code_bytes(&elf, bytes.len())
         && let Some(native) = crate::functions::recover(bytes)
     {
-        let indirect = elf.dynsyms.iter().any(|sym| {
-            sym.st_shndx == 0 && elf.dynstrtab.get_at(sym.st_name) == Some("syscall")
-        });
+        let indirect = elf
+            .dynsyms
+            .iter()
+            .any(|sym| sym.st_shndx == 0 && elf.dynstrtab.get_at(sym.st_name) == Some("syscall"));
         syscalls::emit(&native.syscalls, native.arch, indirect, values, metrics);
         let has_function = symbols_out
             .iter()

@@ -81,7 +81,7 @@ impl Args {
     /// The open options these arguments ask for. The CLI rescans the same
     /// files, so `main` turns the extraction cache on unless `--no-cache` or
     /// `FILEFACTS_CACHE` turns it off.
-    fn options(&self, cache: bool) -> OpenOptions<'static> {
+    fn options(cache: bool) -> OpenOptions<'static> {
         OpenOptions::new().cache(cache)
     }
 }
@@ -121,7 +121,7 @@ fn main() -> ExitCode {
     };
 
     let cache = !args.no_cache && filefacts::cache::env_override().unwrap_or(true);
-    let options = args.options(cache);
+    let options = Args::options(cache);
     // Drops superseded schema versions and bounds the cache on a background
     // thread, without blocking: a short run may exit before it finishes and
     // the next run resumes. A run told to leave the cache alone must not
