@@ -39,9 +39,11 @@ pub(super) struct Analysed {
 /// top-level values, metrics, sections and symbols, and its `macho.*`
 /// subtree is its slice entry. What any slice's extraction records in
 /// `errors` is kept.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn analyse(
     bytes: &[u8],
     arches: &[FatArch],
+    layouts: &[(u64, binform::Binary<'_>)],
     values: &mut Values,
     metrics: &mut Metrics,
     sections_out: &mut Vec<Section>,
@@ -67,6 +69,7 @@ pub(super) fn analyse(
         // the file. Validate the start before slicing; `.min(end)`
         // alone only clamps the upper bound.
         let start = arch.offset as usize;
+        let layout = layout_at(layouts, arch.offset);
         if start >= bytes.len() {
             errors_out.record_malformed(
                 Stage::MachoParse,
@@ -103,7 +106,7 @@ pub(super) fn analyse(
         let slice_end = u64::from(arch.offset).saturating_add(image_end_of(&macho));
         out.image_end = out.image_end.max(Some(slice_end));
         let mut entry = if primary_seen {
-            analyse_slice(&macho, slice_bytes, errors_out)
+            analyse_slice(&macho, layout, slice_bytes, errors_out)
         } else {
             primary_seen = true;
             let (first_section, imports, exports) = (
@@ -113,6 +116,7 @@ pub(super) fn analyse(
             );
             single_arch(
                 &macho,
+                layout,
                 slice_bytes,
                 values,
                 metrics,
@@ -153,16 +157,20 @@ pub(super) fn analyse(
 /// own, and return its `macho.*` subtree as the slice's entry. The slice's
 /// metrics, sections and symbols are counted into the entry and otherwise
 /// dropped: the top-level views describe the primary slice.
-fn analyse_slice(macho: &MachO<'_>, slice_bytes: &[u8], errors: &mut Errors) -> JsonValue {
+fn analyse_slice(
+    macho: &MachO<'_>,
+    layout: Option<&binform::Binary<'_>>,
+    slice_bytes: &[u8],
+    errors: &mut Errors,
+) -> JsonValue {
     let mut values = Values::new();
     let mut metrics = Metrics::new();
     let mut sections: Vec<Section> = Vec::new();
     let mut slice_symbols = Symbols::new();
-    let layout = super::super::common::layout(slice_bytes, crate::Stage::MachoParse, errors);
     super::record_forged_binds(macho, slice_bytes, errors);
-    extract_sections(layout.as_ref(), slice_bytes, &mut sections);
+    extract_sections(layout, slice_bytes, &mut sections);
     extract_header_and_loads(macho, slice_bytes, &mut values, &mut metrics);
-    symbols::extract(macho, layout.as_ref(), slice_bytes, &mut slice_symbols);
+    symbols::extract(macho, layout, slice_bytes, &mut slice_symbols);
     super::hashes::emit(macho, slice_bytes, &mut values, &slice_symbols);
     slice_entry(
         values.into_json().get_mut("macho").map(JsonValue::take),
@@ -170,6 +178,74 @@ fn analyse_slice(macho: &MachO<'_>, slice_bytes: &[u8], errors: &mut Errors) -> 
         slice_symbols.iter_kind(SymbolKind::Export).count(),
         sections.len(),
     )
+}
+
+/// binform's layout of each slice [`analyse`] will visit, by the slice's file
+/// offset, read once for every pass over it. The slices it skips (one
+/// starting past the end of the file, or overlapping one before it) are
+/// skipped here too, without a record: `analyse` records them.
+pub(super) fn layouts<'a>(
+    bytes: &'a [u8],
+    arches: &[FatArch],
+    errors: &mut Errors,
+) -> Vec<(u64, binform::Binary<'a>)> {
+    let mut seen: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut layouts = Vec::new();
+    for arch in arches {
+        let start = arch.offset as usize;
+        let end = start.saturating_add(arch.size as usize).min(bytes.len());
+        let Some(slice) = bytes.get(start..end).filter(|_| start < bytes.len()) else {
+            continue;
+        };
+        if seen.iter().any(|r| r.start < end && start < r.end) {
+            continue;
+        }
+        seen.push(start..end);
+        // `analyse` takes only slices that are Mach-O images; a universal
+        // static library's slices are `ar` archives, no error of the file's.
+        let image = matches!(
+            slice.get(..4),
+            Some([0xfe, 0xed, 0xfa, 0xce | 0xcf] | [0xce | 0xcf, 0xfa, 0xed, 0xfe])
+        );
+        if !image {
+            continue;
+        }
+        if let Some(layout) = super::super::common::layout(slice, Stage::MachoParse, errors) {
+            layouts.push((u64::from(arch.offset), layout));
+        }
+    }
+    layouts
+}
+
+/// The layout read from the slice at file offset `offset`.
+fn layout_at<'l, 'a>(
+    layouts: &'l [(u64, binform::Binary<'a>)],
+    offset: u32,
+) -> Option<&'l binform::Binary<'a>> {
+    layouts
+        .iter()
+        .find(|(at, _)| *at == u64::from(offset))
+        .map(|(_, layout)| layout)
+}
+
+/// The layout functions are recovered from: a thin file's own; of a
+/// universal file's slices, the one a 64-bit x86 host runs, else Apple
+/// silicon's, else the first of an instruction set binform decodes, else the
+/// first. Header order breaks ties.
+pub(super) fn recovery_layout<'l, 'a>(
+    layouts: &'l [(u64, binform::Binary<'a>)],
+) -> Option<&'l binform::Binary<'a>> {
+    let rank = |layout: &binform::Binary<'_>| match layout.arch {
+        Some(binform::Arch::X86_64) => 0,
+        Some(binform::Arch::Arm64) => 1,
+        Some(_) => 2,
+        None => 3,
+    };
+    // `min_by_key` keeps the first of equals.
+    layouts
+        .iter()
+        .map(|(_, layout)| layout)
+        .min_by_key(|layout| rank(layout))
 }
 
 /// A slice's `macho.*` subtree with its unified-view counts added, mirroring

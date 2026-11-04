@@ -76,7 +76,11 @@ is listed under **Changed** with the new value.
   resolves long PE section names (`/4`) through the COFF string table. PE
   imports by ordinal from msi, comctl32, cabinet, mfc42(u), and Windows CE's
   coredll (per CPU) and commctrl are named from those DLLs' own export
-  tables; the imphash still names ordinals only as pefile does.
+  tables; the imphash still names ordinals only as pefile does. binform
+  reads each binary, or each slice of a universal one, once: the views,
+  function recovery and stng's string passes share that read. Mach-O
+  strings no longer come from a copy with forged bind streams emptied,
+  since stng no longer runs goblin's bind interpreter.
 - PE, ELF and Mach-O function recovery runs in-process through binform
   instead of rizin, on every binary without a function inventory, and binform
   fills the section, import and export views of a PE goblin cannot read in

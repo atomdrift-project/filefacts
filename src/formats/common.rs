@@ -125,15 +125,20 @@ pub(super) fn append_decoded_strings(bytes: &[u8], strings: &mut Strings, xor: X
 /// binary isn't parsed a second time inside stng. stng re-parses only for
 /// `Object::Unknown`; filefacts only ever passes a recognised Mach-O / ELF / PE
 /// object here, so the parse is genuinely skipped.
-pub(super) fn extract_binary_strings_from_object(
+///
+/// `layouts` are the binform layouts already read from `bytes`, each with the
+/// file offset of the bytes it was read from (a universal Mach-O's slices), so
+/// stng need not read any of them again.
+pub(super) fn extract_binary_strings_from_object<'d>(
     object: &goblin::Object<'_>,
-    bytes: &[u8],
+    layouts: &[stng::Layout<'_, 'd>],
+    bytes: &'d [u8],
     strings: &mut Strings,
     xor: XorScan,
 ) {
     let opts = string_opts_for(xor, bytes);
     push_stng_strings(
-        stng::extract_strings_from_object(object, bytes, &opts),
+        stng::extract_strings_from_parsed(object, layouts, bytes, &opts),
         strings,
     );
 }
@@ -263,28 +268,32 @@ pub(super) fn put_i64(values: &mut Values, key: ValueKey, n: i64) {
 // numeric/string value) instead — never a bare boolean that mirrors
 // presence/absence.
 
-/// Recover with binform the functions and calls of a binary whose function
-/// view is empty. Returns how many functions it added; `None` when the
-/// binary already has functions or binform cannot read it.
+/// Recover with binform, from the `layout` it read, the functions and calls
+/// of a binary whose function view is empty. Returns how many functions it
+/// added; `None` when the binary already has functions or binform cannot read
+/// it.
 pub(super) fn recover_natively(
-    bytes: &[u8],
+    layout: Option<&binform::Binary<'_>>,
     symbols: &mut crate::Symbols,
     metrics: &mut crate::output::Metrics,
 ) -> Option<u32> {
-    Some(apply_native(&native(bytes, symbols)?, symbols, metrics))
+    Some(apply_native(&native(layout, symbols)?, symbols, metrics))
 }
 
-/// binform's answer for `bytes`, or `None` when `symbols` already holds a
-/// function inventory (a symbol table, Go's pclntab) or binform cannot read
-/// the binary.
-pub(super) fn native(bytes: &[u8], symbols: &crate::Symbols) -> Option<crate::functions::Native> {
+/// binform's answer for the binary `layout` describes, or `None` when
+/// `symbols` already holds a function inventory (a symbol table, Go's
+/// pclntab) or binform cannot read the binary.
+pub(super) fn native(
+    layout: Option<&binform::Binary<'_>>,
+    symbols: &crate::Symbols,
+) -> Option<crate::functions::Native> {
     if symbols
         .iter()
         .any(|symbol| symbol.kind() == crate::SymbolKind::Function)
     {
         return None;
     }
-    crate::functions::recover(bytes)
+    crate::functions::recover(layout)
 }
 
 /// Add binform's functions and their calls to the typed views; returns how
@@ -307,8 +316,10 @@ pub(super) fn recovered_function_count(functions: u32, metrics: &mut crate::outp
 }
 
 /// The layout binform reads from `bytes`: the section, import and export
-/// tables every binary extractor takes. `None`, with the reason recorded,
-/// when binform cannot read it.
+/// tables every binary extractor takes, the functions binform recovers and
+/// the tables stng reads. Read once per binary (per slice of a universal
+/// one) and shared by all of them. `None`, with the reason recorded, when
+/// binform cannot read it.
 pub(super) fn layout<'a>(
     bytes: &'a [u8],
     stage: crate::Stage,

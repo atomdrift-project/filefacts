@@ -68,21 +68,39 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
         Mach::Fat(fat) => fat::table_fits(fat.narches, bytes.len()),
         Mach::Binary(_) => true,
     };
-    // stng's ARM64 stack-XOR scan calls goblin's `imports()` itself, outside
-    // the bind budget `extract_symbols` enforces, and a forged repeat count
-    // has goblin push billions of imports there. Where a slice's bind
-    // streams fail that budget, stng gets a copy with them emptied; every
-    // other byte, and so every string offset, is the file's own.
-    let defused = bind_defused_copy(&parsed, bytes);
-    // Otherwise reuse this parse for string extraction instead of having stng
-    // parse the binary a second time.
-    let object = goblin::Object::Mach(parsed);
-    match &defused {
-        Some(copy) => extract_binary_strings(copy, strings, XorScan::Yes),
-        None if fat_table_fits => {
-            extract_binary_strings_from_object(&object, bytes, strings, XorScan::Yes);
+    // goblin reads a fat arch table lazily; walk it once, guarded. Entries
+    // are contiguous, so the first unreadable one ends it.
+    let arches = match &parsed {
+        Mach::Fat(fat) => goblin_safe::drain_or_record(
+            fat.iter_arches()
+                .take(fat::MAX_ARCHES)
+                .map_while(Result::ok),
+            errors_out,
+            crate::Stage::MachoParse,
+        ),
+        Mach::Binary(_) => Vec::new(),
+    };
+    // binform reads each image once, a thin file or each slice of a
+    // universal one: the section, import and export views, stng's string
+    // passes and function recovery all take that one layout.
+    let layouts = match &parsed {
+        Mach::Binary(_) => {
+            super::common::layout(bytes, crate::Stage::MachoParse, errors_out)
+                .map(|layout| (0, layout))
+                .into_iter()
+                .collect()
         }
-        None => extract_binary_strings(bytes, strings, XorScan::Yes),
+        Mach::Fat(_) => fat::layouts(bytes, &arches, errors_out),
+    };
+    // Reuse this parse for string extraction instead of having stng parse
+    // the binary a second time.
+    let object = goblin::Object::Mach(parsed);
+    if fat_table_fits {
+        let shared: Vec<stng::Layout<'_, '_>> =
+            layouts.iter().map(|(at, layout)| (*at, layout)).collect();
+        extract_binary_strings_from_object(&object, &shared, bytes, strings, XorScan::Yes);
+    } else {
+        extract_binary_strings(bytes, strings, XorScan::Yes);
     }
     let goblin::Object::Mach(parsed) = object else {
         unreachable!("constructed as Object::Mach")
@@ -91,6 +109,7 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
         Mach::Binary(macho) => {
             single_arch(
                 &macho,
+                layouts.first().map(|(_, layout)| layout),
                 bytes,
                 values,
                 metrics,
@@ -101,19 +120,11 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
             *image_end = Some(image_end_of(&macho));
             go_build_info(&macho, bytes, values, symbols_out);
         }
-        Mach::Fat(fat) => {
-            // goblin reads the arch table lazily; walk it once, guarded.
-            // Entries are contiguous, so the first unreadable one ends it.
-            let arches = goblin_safe::drain_or_record(
-                fat.iter_arches()
-                    .take(fat::MAX_ARCHES)
-                    .map_while(Result::ok),
-                errors_out,
-                crate::Stage::MachoParse,
-            );
+        Mach::Fat(_) => {
             let analysed = fat::analyse(
                 bytes,
                 &arches,
+                &layouts,
                 values,
                 metrics,
                 sections_out,
@@ -124,7 +135,7 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
         }
     }
     if fat_table_fits {
-        recover_natively(bytes, symbols_out, metrics);
+        recover_natively(fat::recovery_layout(&layouts), symbols_out, metrics);
     }
     super::upx::detect(bytes, values);
 }
@@ -226,61 +237,6 @@ fn go_build_info(
     true
 }
 
-/// A copy of `bytes` in which every slice whose bind streams
-/// [`goblin_safe::validate_bind_opcodes`] rejects has its `LC_DYLD_INFO`
-/// bind and lazy-bind sizes zeroed, so goblin's `imports()` finds nothing to
-/// interpret there. Zero reads the same in either byte order. `None` when no
-/// slice needs it.
-fn bind_defused_copy(parsed: &Mach<'_>, bytes: &[u8]) -> Option<Vec<u8>> {
-    use mach::load_command::CommandVariant;
-    // `bind_size` and `lazy_bind_size` within a `dyld_info_command`.
-    const SIZE_FIELDS: [usize; 2] = [20, 36];
-    let mut patches: Vec<usize> = Vec::new();
-    let mut defuse = |macho: &MachO<'_>, slice: &[u8], base: usize| {
-        if goblin_safe::validate_bind_opcodes(macho, slice).is_ok() {
-            return;
-        }
-        for lc in &macho.load_commands {
-            if let CommandVariant::DyldInfo(_) | CommandVariant::DyldInfoOnly(_) = lc.command {
-                patches.extend(SIZE_FIELDS.iter().map(|field| base + lc.offset + field));
-            }
-        }
-    };
-    match parsed {
-        Mach::Binary(macho) => defuse(macho, bytes, 0),
-        Mach::Fat(fat) => {
-            let arches = crate::panic_guard::catch_infallible(|| {
-                fat.iter_arches()
-                    .take(fat::MAX_ARCHES)
-                    .map_while(Result::ok)
-                    .collect::<Vec<_>>()
-            })
-            .ok()
-            .unwrap_or_default();
-            for arch in arches {
-                let start = arch.offset as usize;
-                let end = start.saturating_add(arch.size as usize).min(bytes.len());
-                if let Some(slice) = bytes.get(start..end)
-                    && let goblin_safe::GoblinOutcome::Ok(macho) =
-                        goblin_safe::parse_macho_slice(slice)
-                {
-                    defuse(&macho, slice, start);
-                }
-            }
-        }
-    }
-    if patches.is_empty() {
-        return None;
-    }
-    let mut copy = bytes.to_vec();
-    for at in patches {
-        if let Some(field) = copy.get_mut(at..at.saturating_add(4)) {
-            field.fill(0);
-        }
-    }
-    Some(copy)
-}
-
 /// File offset one past the last byte the image itself accounts for:
 /// the load-command area, every segment's on-disk extent (including
 /// `__LINKEDIT`, which has no sections yet holds the symbol/string
@@ -352,8 +308,10 @@ fn image_end_of(macho: &MachO<'_>) -> u64 {
 /// The full single-arch extraction of one Mach-O image into the top-level
 /// outputs: sections, header and load commands, symbols, similarity hashes
 /// and toolchain attribution.
+#[allow(clippy::too_many_arguments)]
 fn single_arch(
     macho: &MachO<'_>,
+    layout: Option<&binform::Binary<'_>>,
     bytes: &[u8],
     values: &mut Values,
     metrics: &mut Metrics,
@@ -361,11 +319,10 @@ fn single_arch(
     symbols_out: &mut crate::Symbols,
     errors_out: &mut Errors,
 ) {
-    let layout = super::common::layout(bytes, crate::Stage::MachoParse, errors_out);
     record_forged_binds(macho, bytes, errors_out);
-    extract_sections(layout.as_ref(), bytes, sections_out);
+    extract_sections(layout, bytes, sections_out);
     extract_header_and_loads(macho, bytes, values, metrics);
-    symbols::extract(macho, layout.as_ref(), bytes, symbols_out);
+    symbols::extract(macho, layout, bytes, symbols_out);
     hashes::emit(macho, bytes, values, symbols_out);
     super::build_toolchain::from_macho(values, sections_out);
 }

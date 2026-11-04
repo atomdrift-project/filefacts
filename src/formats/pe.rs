@@ -171,7 +171,9 @@ fn parsed(pe: PE<'_>, bytes: &[u8], tables: &Tables<'_, '_>, ctx: super::Extract
     // version-info runs, at absolute file offsets. It takes the parse as an
     // Object, moved in and back out, so the binary is not parsed twice.
     let object = goblin::Object::PE(pe);
-    extract_binary_strings_from_object(&object, bytes, strings, XorScan::Yes);
+    let shared: Vec<stng::Layout<'_, '_>> =
+        tables.layout.iter().map(|layout| (0, *layout)).collect();
+    extract_binary_strings_from_object(&object, &shared, bytes, strings, XorScan::Yes);
     // Constructed as `Object::PE` two lines up.
     let goblin::Object::PE(pe) = object else {
         return;
@@ -234,7 +236,7 @@ fn parsed(pe: PE<'_>, bytes: &[u8], tables: &Tables<'_, '_>, ctx: super::Extract
         go_functions(pe, &go_sections, has_go_pclntab, symbols_out);
     }
     super::build_toolchain::from_pe_rich(values);
-    let Some(recovered) = native(bytes, symbols_out) else {
+    let Some(recovered) = native(tables.layout, symbols_out) else {
         return;
     };
     // A compact PE with no imports is often a resolver stub: correlate its
@@ -363,7 +365,7 @@ fn header_only(
         sections_out,
         symbols_out,
     );
-    if let Some(functions) = recover_natively(bytes, symbols_out, metrics) {
+    if let Some(functions) = recover_natively(tables.layout, symbols_out, metrics) {
         recovered_function_count(functions, metrics);
     }
     Ok(())

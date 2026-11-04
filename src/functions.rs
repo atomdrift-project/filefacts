@@ -51,20 +51,17 @@ pub(crate) struct SyscallFact {
     pub(crate) args: Vec<binform::Value>,
 }
 
-/// binform's answer for `bytes`: the functions of an instruction set it
-/// decodes (none otherwise). `None` when
-/// it cannot read the file at all. A recovery its work budget cut short
-/// still holds every function found within it, which is kept.
-pub(crate) fn recover(bytes: &[u8]) -> Option<Native> {
-    let image = match binform::parse(bytes) {
-        Ok(image) => image,
-        Err(error) => {
-            count(&STATS.unreadable);
-            tracing::debug!(%error, bytes = bytes.len(), "binform: unreadable");
-            return None;
-        }
+/// binform's answer for the binary `image` is the layout of: the functions
+/// of an instruction set it decodes (none otherwise). `None` when binform
+/// could not read the file at all, and so there is no layout. A recovery its
+/// work budget cut short still holds every function found within it, which
+/// is kept.
+pub(crate) fn recover(image: Option<&binform::Binary<'_>>) -> Option<Native> {
+    let Some(image) = image else {
+        count(&STATS.unreadable);
+        return None;
     };
-    let recovery = binform::functions(&image, &binform::Limits::DEFAULT);
+    let recovery = binform::functions(image, &binform::Limits::DEFAULT);
     if image.arch.is_none() {
         count(&STATS.layout_only);
     } else if recovery.truncated {
@@ -83,7 +80,7 @@ pub(crate) fn recover(bytes: &[u8]) -> Option<Native> {
             }
         }
     }
-    let syscalls = syscall_facts(&image, &recovery);
+    let syscalls = syscall_facts(image, &recovery);
     Some(Native {
         functions: Functions { recovery, targets },
         syscalls,

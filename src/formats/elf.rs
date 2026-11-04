@@ -215,7 +215,8 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
     // Reuse this parse for string extraction (move into an Object for stng,
     // then move back out) so the binary isn't parsed a second time.
     let object = goblin::Object::Elf(elf);
-    extract_binary_strings_from_object(&object, bytes, strings, XorScan::Yes);
+    let shared: Vec<stng::Layout<'_, '_>> = layout.iter().map(|layout| (0, layout)).collect();
+    extract_binary_strings_from_object(&object, &shared, bytes, strings, XorScan::Yes);
     let goblin::Object::Elf(elf) = object else {
         unreachable!("constructed as Object::Elf")
     };
@@ -301,7 +302,7 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
     // unmapped range would invent entries, so recovery runs on present bytes
     // only).
     if has_present_load_or_code_bytes(&elf, bytes.len())
-        && let Some(native) = crate::functions::recover(bytes)
+        && let Some(native) = crate::functions::recover(layout.as_ref())
     {
         let indirect = elf
             .dynsyms
