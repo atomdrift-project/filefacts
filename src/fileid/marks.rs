@@ -295,12 +295,15 @@ fn looks_like_makefile(head: &[u8]) -> bool {
             if pair != b"$(" {
                 return false;
             }
-            let rest = &trimmed[at + 2..];
+            let Some(rest) = trimmed.get(at + 2..) else {
+                return false;
+            };
             rest.iter().position(|&b| b == b')').is_some_and(|end| {
                 end > 0
-                    && rest[..end]
-                        .iter()
-                        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || *b == b'_')
+                    && rest.get(..end).is_some_and(|name| {
+                        name.iter()
+                            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || *b == b'_')
+                    })
             })
         }) {
             make_variable_lines += 1;
@@ -367,32 +370,6 @@ fn looks_like_makefile(head: &[u8]) -> bool {
         || target_with_recipe
 }
 
-#[cfg(test)]
-mod makefile_regression_tests {
-    use super::looks_like_makefile;
-
-    #[test]
-    fn target_and_recipe_must_be_related_text() {
-        assert!(looks_like_makefile(b"all:\n\tcc main.c\n"));
-        assert!(looks_like_makefile(b"all:\n# comment\n\n\tcc main.c\n"));
-        assert!(looks_like_makefile(
-            b"OUT := out\nSOURCES := $(OUT)/a $(OUT)/b\nDATA := $(OUT)/c\n"
-        ));
-        assert!(!looks_like_makefile(
-            b"<%@ Page Language=\"C#\"%>\nlabel:\n<script>\n\tcode();\n"
-        ));
-        assert!(!looks_like_makefile(
-            b"Content-Type: text/html;\n\tcharset=\"utf-8\"\n"
-        ));
-        assert!(!looks_like_makefile(
-            b"-(void)handle:(id)sender {\n\t[self process];\n}"
-        ));
-        assert!(!looks_like_makefile(
-            b"title:\n\x00\x01\x02\x03\x04\x05\x06\x07\n\tcommand\n"
-        ));
-    }
-}
-
 fn looks_like_asp_directive(head: &[u8]) -> bool {
     // Classic ASP's own directives. `<%@codepage=936%>` opens a good share of
     // the Chinese-language webshells.
@@ -438,4 +415,30 @@ fn looks_like_yara(head: &[u8]) -> bool {
             || line.starts_with(b"global rule ")
     });
     rule && contains(head, b"strings:") && contains(head, b"condition:")
+}
+
+#[cfg(test)]
+mod makefile_regression_tests {
+    use super::looks_like_makefile;
+
+    #[test]
+    fn target_and_recipe_must_be_related_text() {
+        assert!(looks_like_makefile(b"all:\n\tcc main.c\n"));
+        assert!(looks_like_makefile(b"all:\n# comment\n\n\tcc main.c\n"));
+        assert!(looks_like_makefile(
+            b"OUT := out\nSOURCES := $(OUT)/a $(OUT)/b\nDATA := $(OUT)/c\n"
+        ));
+        assert!(!looks_like_makefile(
+            b"<%@ Page Language=\"C#\"%>\nlabel:\n<script>\n\tcode();\n"
+        ));
+        assert!(!looks_like_makefile(
+            b"Content-Type: text/html;\n\tcharset=\"utf-8\"\n"
+        ));
+        assert!(!looks_like_makefile(
+            b"-(void)handle:(id)sender {\n\t[self process];\n}"
+        ));
+        assert!(!looks_like_makefile(
+            b"title:\n\x00\x01\x02\x03\x04\x05\x06\x07\n\tcommand\n"
+        ));
+    }
 }

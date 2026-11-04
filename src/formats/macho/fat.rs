@@ -127,9 +127,7 @@ pub(super) fn analyse(
         let layout = layout_at(layouts, u64::from(arch.offset));
         let slice_end = u64::from(arch.offset).saturating_add(image_end_of(&macho));
         out.image_end = out.image_end.max(Some(slice_end));
-        let mut entry = if i != primary {
-            analyse_slice(&macho, layout, slice_bytes, errors_out)
-        } else {
+        let mut entry = if i == primary {
             out.primary = Some(u64::from(arch.offset));
             let (first_section, imports, exports) = (
                 sections_out.len(),
@@ -163,6 +161,8 @@ pub(super) fn analyse(
                 }
             }
             entry
+        } else {
+            analyse_slice(&macho, layout, slice_bytes, errors_out)
         };
         if let JsonValue::Object(ref mut obj) = entry {
             obj.insert("file_offset".into(), JsonValue::Number(arch.offset.into()));
