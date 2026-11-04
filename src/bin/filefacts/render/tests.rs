@@ -2,7 +2,7 @@ use super::*;
 use filefacts::OpenOptions;
 use std::io::Write as _;
 
-/// Hermetic open: no disk cache and no rizin, so `parse_count() == 1` holds
+/// Hermetic open: no disk cache, so `parse_count() == 1` holds
 /// and the result does not depend on the host.
 fn open<'a>(path: &Path, bytes: &'a [u8]) -> ParsedFile<'a> {
     OpenOptions::new()

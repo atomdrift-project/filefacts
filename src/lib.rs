@@ -517,13 +517,6 @@ impl<'a> ParsedFile<'a> {
         &self.extracted().errors
     }
 
-    /// Always `false`: binform's in-process recovery has no run that can fail
-    /// to complete, so a view is never built from a cut-short recovery. Kept
-    /// so a host can treat recovery completeness uniformly.
-    pub fn recovery_incomplete(&self) -> bool {
-        false
-    }
-
     /// Whether the source parse was cut short by something other than the
     /// bytes: the wall-clock backstop, which depends on how loaded the
     /// machine was, or cancellation.

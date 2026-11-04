@@ -304,8 +304,7 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
     }
     // Symbol-table names when nothing above produced a function inventory:
     // binform recovered none (an instruction set it does not decode) and there
-    // was no pclntab. No coverage requirement now that binform, not rizin, is
-    // the disassembler it would otherwise wait for.
+    // was no pclntab.
     symbols::static_function_fallback(&elf, bytes.len(), symbols_out);
     linker_family(&elf, values);
     comment_fingerprint(values);

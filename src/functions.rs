@@ -16,7 +16,7 @@ use crate::output::Metrics;
 /// The disk-cache key's part for function recovery. Bump it whenever the
 /// binform commit in Cargo.lock, or what filefacts takes from it, changes:
 /// either changes what a cached extraction holds.
-pub(crate) const POLICY: &str = "binform=v5";
+pub(crate) const POLICY: &str = "binform=v6";
 
 /// Recovered functions, and names for the call targets that are no
 /// recovered function (an import's slot or stub).
@@ -194,8 +194,8 @@ fn connect_wrappers(
 /// past the budget stay unnamed.
 pub(crate) const MAX_RESOLVED_NAME_BYTES: usize = 64 * 1024 * 1024;
 
-/// The name a function without a symbol goes by: rizin's spelling, so the
-/// typed function view reads the same whichever tool recovered it.
+/// The name a function without a symbol goes by: rizin's spelling
+/// (`fcn.<hex>`), which cached reports and traits already use.
 fn anonymous(entry: u64) -> String {
     format!("fcn.{entry:08x}")
 }

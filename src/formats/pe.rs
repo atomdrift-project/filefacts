@@ -184,10 +184,10 @@ fn parsed(pe: PE<'_>, bytes: &[u8], ctx: super::ExtractCtx<'_>) {
     }
     let counts = apply_native(recovered, symbols_out, Some(sections_out), metrics);
     if importless {
-        metrics.insert(metric!("pe.rizin_importless_analysis"), 1.0);
+        metrics.insert(metric!("pe.importless_analysis"), 1.0);
         if counts.functions > 0 {
             metrics.insert(
-                metric!("pe.rizin_importless_function_count"),
+                metric!("pe.importless_function_count"),
                 f64::from(counts.functions),
             );
         }

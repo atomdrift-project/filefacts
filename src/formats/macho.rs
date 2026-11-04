@@ -62,7 +62,7 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
     };
     // A fat header claiming more entries than the file can hold is not a
     // universal binary anything downstream can use, and walks that trust the
-    // count (rizin; stng's walk of a parsed object) visit every claimed entry,
+    // count (stng's walk of a parsed object) visit every claimed entry,
     // up to `u32::MAX` of them.
     let fat_table_fits = match &parsed {
         Mach::Fat(fat) => fat::table_fits(fat.narches, bytes.len()),

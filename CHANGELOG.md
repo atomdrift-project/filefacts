@@ -69,11 +69,10 @@ is listed under **Changed** with the new value.
 - PE, ELF and Mach-O function recovery runs in-process through binform
   instead of rizin, on every binary without a function inventory, and binform
   fills the section, import and export views of a PE goblin cannot read in
-  full. filefacts no longer starts rizin: the `rizin` module, the
-  `OpenOptions::rizin*` settings, `--no-rizin`, `--rizin-timeout` and
-  `FILEFACTS_RIZIN_CONCURRENCY` are accepted and ignored until hosts drop
-  them, `rizin::available` is `false`, and `rizin_recovery_incomplete` is
-  always `false`. Binaries of an instruction set binform does not decode
+  full. filefacts no longer starts rizin, and its surface is gone: the
+  `rizin` module, the `OpenOptions::rizin*` settings, `rizin::available`,
+  `rizin_recovery_incomplete`, `FILEFACTS_RIZIN_CONCURRENCY`, and the CLI's
+  `--no-rizin` and `--rizin-timeout` (now unknown flags). Binaries of an instruction set binform does not decode
   (eBPF, M*Core, Nios II, IA-64 and the like) keep their layout facts and get
   no functions.
 - ELF `elf.syscalls_direct` is projected from `binform::calls`, which tracks
@@ -98,6 +97,9 @@ is listed under **Changed** with the new value.
   at — with the count in the `elf.network_endpoint_count` metric.
 
 - **`SCHEMA_VERSION` is now `11`.** Renamed or reshaped keys:
+  - `pe.rizin_importless_analysis` → `pe.importless_analysis`,
+    `pe.rizin_importless_function_count` → `pe.importless_function_count`;
+    `binary.rizin_incomplete`, which nothing set, is gone.
   - PNG `image.*` statistics normalize palette and 16-bit samples rather than
     counting palette indices or alternating bytes as color samples.
   - `cert_chain_depth` → `cert_bag_size` in every signature object;

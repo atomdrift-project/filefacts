@@ -51,7 +51,7 @@ fn round_trip_stores_and_loads_payload() {
     }
     let original = Payload {
         n: 42,
-        name: "rizin-out".into(),
+        name: "recovery-out".into(),
     };
     let tmp = tempfile::tempdir().expect("tempdir");
     let path = entry_path(tmp.path(), &unique_bytes("round_trip"), "");
@@ -158,14 +158,14 @@ fn variant_partitions_the_key() {
     // the bare content hash — that is what invalidates stale entries
     // when filefacts itself changes.
     assert_ne!(cache_key(&bytes, ""), sha256_hex(&bytes));
-    // Distinct variants (e.g. rizin present vs. absent) yield
+    // Distinct variants (e.g. two recovery policies) yield
     // distinct keys, so one never serves the other's payload.
-    let with_rizin = cache_key(&bytes, "rizin=0.7.2");
-    let without = cache_key(&bytes, "rizin=none");
-    assert_ne!(with_rizin, without);
-    assert_ne!(with_rizin, cache_key(&bytes, ""));
+    let newer = cache_key(&bytes, "binform=v5");
+    let without = cache_key(&bytes, "binform=v4");
+    assert_ne!(newer, without);
+    assert_ne!(newer, cache_key(&bytes, ""));
     // Stable for a fixed (bytes, variant) pair within a build.
-    assert_eq!(with_rizin, cache_key(&bytes, "rizin=0.7.2"));
+    assert_eq!(newer, cache_key(&bytes, "binform=v5"));
 }
 
 #[test]
@@ -174,13 +174,13 @@ fn distinct_variants_do_not_share_entries() {
     struct Payload(u32);
     let bytes = unique_bytes("variant_isolation");
     let tmp = tempfile::tempdir().expect("tempdir");
-    let a = open_with_cache_in(tmp.path(), &bytes, "rizin=none", || {
+    let a = open_with_cache_in(tmp.path(), &bytes, "binform=v4", || {
         Computed::Cacheable(Payload(10))
     });
     assert_eq!(a, Payload(10));
     // A run under a different fingerprint must miss and recompute,
-    // not reuse the no-rizin payload.
-    let b = open_with_cache_in(tmp.path(), &bytes, "rizin=0.7.2", || {
+    // not reuse the other policy's payload.
+    let b = open_with_cache_in(tmp.path(), &bytes, "binform=v5", || {
         Computed::Cacheable(Payload(20))
     });
     assert_eq!(b, Payload(20));

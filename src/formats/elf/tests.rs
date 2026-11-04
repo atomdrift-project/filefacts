@@ -1183,8 +1183,7 @@ fn static_function_fallback_keeps_static_executable_globals() {
 #[test]
 fn the_symtab_fallback_names_the_executable_section_functions() {
     // The last-resort path (binform recovered nothing, no pclntab): every
-    // `.symtab` function in an executable section is named. No coverage
-    // requirement now that binform, not rizin, is the disassembler.
+    // `.symtab` function in an executable section is named.
     let bytes = read_fixture("elf-syscall-wrapper-static.elf");
     let elf = Elf::parse(&bytes).unwrap();
     let mut out = crate::Symbols::default();

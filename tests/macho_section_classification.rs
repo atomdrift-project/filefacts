@@ -6,8 +6,7 @@
 )]
 mod common;
 
-// The section views under test come from the static parse alone: the
-// hermetic open turns rizin off, so an installed one cannot add to them.
+// The section views under test come from the static parse alone.
 use common::open;
 use filefacts::SectionFlag;
 use sha2::{Digest, Sha256};

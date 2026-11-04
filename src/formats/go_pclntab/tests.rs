@@ -204,7 +204,7 @@ fn read_all(table: &[u8], code: Code) -> Vec<(String, u64)> {
     entries(functions(table, code, TEXT).expect("the table reads"))
 }
 
-/// Each function's name and entry; none carries rizin's metrics.
+/// Each function's name and entry; none carries recovery metrics.
 fn entries(functions: Vec<Symbol>) -> Vec<(String, u64)> {
     functions
         .into_iter()
@@ -253,7 +253,7 @@ fn go118_entries_count_from_the_image_text_not_the_header_word() {
 #[test]
 fn a_table_covering_little_of_the_code_is_a_decoy() {
     // A real Go text section is nearly all functions. A tiny table grafted
-    // onto a payload, to keep rizin out, spans a sliver of its code.
+    // onto a payload, to keep recovery out, spans a sliver of its code.
     let table = build(GO120, &FUNCTIONS, END);
     let payload = Code::of([(TEXT, 0x10_0000)]).unwrap();
     assert_eq!(

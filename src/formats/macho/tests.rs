@@ -175,8 +175,8 @@ fn fat_table_must_fit_the_file() {
 fn fat_header_arch_count_is_bounded_by_the_buffer() {
     // nfat_arch = u32::MAX over a 1 KiB file. goblin's `iter_arches`
     // does not check the count against the buffer, so the walk must.
-    // Rizin and stng's object walk both trust the count and would run for
-    // minutes; `fat_table_fits` keeps this input away from them. (stng
+    // stng's object walk trusts the count and would run for
+    // minutes; `fat_table_fits` keeps this input away from it. (stng
     // caches strings on disk, so a warm cache can hide a regression here;
     // `fat_table_must_fit_the_file` pins the guard itself.)
     let mut bytes = vec![0xCA, 0xFE, 0xBA, 0xBE, 0xFF, 0xFF, 0xFF, 0xFF];

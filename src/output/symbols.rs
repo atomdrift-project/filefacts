@@ -9,7 +9,7 @@
 //! - `Export` — locally-defined symbol this file publishes.
 //! - `Function` — function / method / sub defined inside this file;
 //!   carries CFG metrics (`complexity`, `basic_blocks`, `callees`, …)
-//!   when rizin disassembled it.
+//!   when binform recovered it.
 //! - `Call` — one source-code call site with target + arg shapes.
 //! - `Member` — one dotted member-access chain observed in source.
 //! - `Bind` — one static name = value binding observed in source.
@@ -185,8 +185,8 @@ pub enum Symbol {
 
     /// Function / method / subroutine defined inside this file.
     ///
-    /// `complexity` and `callees` are populated only when rizin's `aflj`
-    /// analysis ran; absent for entries sourced from symbol tables alone
+    /// `complexity` and `callees` are populated only when binform recovered
+    /// the function; absent for entries sourced from symbol tables alone
     /// (PE imports, ELF `.dynsym`, source ASTs, VBA declarations, etc.).
     Function {
         /// Function name. Empty when the format records by address only.
@@ -195,10 +195,10 @@ pub enum Symbol {
         /// disassembly-recovered native functions.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         offset: Option<u64>,
-        /// Cyclomatic complexity (McCabe), when rizin disassembled it.
+        /// Cyclomatic complexity (McCabe), when binform recovered it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         complexity: Option<u32>,
-        /// Names of resolved outgoing call edges (rizin).
+        /// Names of resolved outgoing call edges (binform).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         callees: Vec<String>,
     },

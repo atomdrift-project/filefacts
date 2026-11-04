@@ -1,8 +1,8 @@
 //! Helpers shared by the integration test binaries.
 //!
-//! Every open here is hermetic: the disk cache and rizin are off, so a
-//! result depends on the bytes alone — not on `FILEFACTS_CACHE`, a warm
-//! entry from an earlier run, or whether rizin is installed — and
+//! Every open here is hermetic: the disk cache is off, so a result depends
+//! on the bytes alone — not on `FILEFACTS_CACHE` or a warm entry from an
+//! earlier run — and
 //! `parse_count() == 1` holds wherever a test asserts it.
 #![allow(
     dead_code,

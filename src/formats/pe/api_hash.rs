@@ -1,6 +1,6 @@
 //! Manual Windows API resolution in native code: the PEB reads, checked
 //! export-directory walks and byte-hash loops an importless loader uses to
-//! find its APIs by hash and, when rizin recovers the call graph, the hash
+//! find its APIs by hash and, from the call graph binform recovers, the hash
 //! each call into the resolver requests.
 //!
 //! These are mechanics, not a claim that a binary communicates over the
@@ -36,7 +36,7 @@ const MAX_NATIVE_SITES: usize = 4096;
 const SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 
 /// The resolver mechanics [`native_resolver_signals`] located, for the call
-/// graph correlation in [`rizin_importless_analysis`]: the same records it
+/// graph correlation in [`recover_api_hash_requests`]: the same records it
 /// published, capped alike.
 pub(super) struct NativeSignals {
     /// VAs of the checked export-directory walks.
@@ -448,8 +448,8 @@ pub(super) fn recover_api_hash_requests(
 /// A resolver is a function holding a checked export walk (`walk_sites`). Its
 /// profile is the lowest-addressed one inside it or, failing that, inside the
 /// first function it calls that holds one. Everything is indexed up front, so
-/// the cost is the edge count times a logarithm: rizin may report a million
-/// call edges for a few megabytes of `call` instructions.
+/// the cost is the edge count times a logarithm: recovery may report a
+/// million call edges for a few megabytes of `call` instructions.
 fn resolver_calls<'p>(
     ranges: &[(u64, u64)],
     call_edges: &[(u64, u64, u64)],

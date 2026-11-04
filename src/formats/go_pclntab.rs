@@ -3,9 +3,9 @@
 //! The runtime needs the table to unwind stacks and print tracebacks, so even
 //! a stripped Go binary (`-ldflags="-s -w"`) keeps it whole: every function's
 //! name and entry address. Reading it takes a fraction of a second; asking
-//! rizin to rediscover the same functions took a 75 MB Kubernetes controller
-//! more than half an hour. A typed function inventory is what lets the rizin
-//! admission policy skip the disassembler for Go.
+//! a disassembler to rediscover the same functions (rizin, once) took a 75 MB
+//! Kubernetes controller more than half an hour. A typed function inventory
+//! is what lets a Go binary skip binform's recovery.
 //!
 //! The layouts, as Go's `debug/gosym` reads them. Offsets count from the
 //! table's start; `P` is the pointer size, and a functab field is `P` wide
@@ -29,7 +29,7 @@
 //! word: the word may be unrelocated, and Go 1.27's linker writes it as zero.
 //!
 //! In a hostile binary the table is attacker-controlled bytes, and a table
-//! that parses keeps rizin from disassembling the file. So a table is believed
+//! that parses keeps binform from recovering the file's functions. So a table is believed
 //! only whole: functab entries ascending, every `_func` record agreeing with
 //! the functab on its entry, every name in bounds, and an address span inside
 //! the executable code that covers most of it. A decoy grafted onto a payload

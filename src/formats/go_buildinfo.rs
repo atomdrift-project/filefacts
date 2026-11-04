@@ -98,9 +98,9 @@ pub(super) const PCLNTAB_MAGICS: [[u8; 4]; 8] = [
 ];
 
 /// True when `data` begins with a recognized Go pclntab magic — proof the
-/// section is a genuine Go function table, not a same-named decoy. Used by the
-/// admission controller to skip Rizin entirely: Go's pclntab already provides a
-/// complete function inventory. Validating the magic, not just the section name,
+/// section is a genuine Go function table, not a same-named decoy. A Go
+/// binary skips binform's recovery: its pclntab already provides a complete
+/// function inventory. Validating the magic, not just the section name,
 /// stops a hand-added empty `.gopclntab`/`__gopclntab` from making a stripped
 /// payload look like a Go binary and suppressing deep recovery.
 pub(super) fn has_pclntab_magic(data: &[u8]) -> bool {

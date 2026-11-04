@@ -20,8 +20,8 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
-/// The binary, independent of the host: the extraction cache and rizin are
-/// off by flag, and every directory a cache path is derived from — `HOME`
+/// The binary, independent of the host: the extraction cache is off by
+/// flag, and every directory a cache path is derived from — `HOME`
 /// (macOS puts caches in `~/Library/Caches`, ignoring `XDG_CACHE_HOME`) and
 /// `XDG_CACHE_HOME` — points into a private directory, which the background
 /// cache cleanup then sweeps instead of the user's. Every `FILEFACTS_*` and
@@ -29,7 +29,7 @@ fn scratch(name: &str) -> PathBuf {
 fn filefacts() -> Command {
     let home = Path::new(env!("CARGO_TARGET_TMPDIR")).join("cli-home");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_filefacts"));
-    cmd.args(["--no-cache", "--no-rizin"])
+    cmd.args(["--no-cache"])
         .env("HOME", &home)
         .env("XDG_CACHE_HOME", home.join(".cache"))
         .env("NO_COLOR", "1");

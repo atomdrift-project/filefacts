@@ -340,7 +340,7 @@ fn resolver_calls_pair_each_call_with_its_resolvers_profile() {
     );
 }
 
-/// Rizin can report a million call edges for a few megabytes of `call`
+/// Recovery can report a million call edges for a few megabytes of `call`
 /// instructions; resolving every edge into a resolver with no hash loop must
 /// not rescan all edges for a helper.
 #[test]

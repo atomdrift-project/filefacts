@@ -53,7 +53,6 @@ use std::ffi::{OsStr, OsString};
 use std::io::{self, IsTerminal as _, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
 
 use filefacts::{OpenOptions, ParsedFile, View};
 use render::{Style, escape_controls};
@@ -76,10 +75,6 @@ struct Args {
     view: Option<View>,
     /// `--no-cache`: never read or write the extraction cache.
     no_cache: bool,
-    /// `--no-rizin`: never run rizin.
-    no_rizin: bool,
-    /// `--rizin-timeout`: the budget for one rizin run.
-    rizin_timeout: Option<Duration>,
 }
 
 impl Args {
@@ -87,9 +82,6 @@ impl Args {
     /// files, so `main` turns the extraction cache on unless `--no-cache` or
     /// `FILEFACTS_CACHE` turns it off.
     fn options(&self, cache: bool) -> OpenOptions<'static> {
-        // `--no-rizin` and `--rizin-timeout` are still parsed for old scripts
-        // (see `parse`), but filefacts no longer runs rizin, so they do
-        // nothing here.
         OpenOptions::new().cache(cache)
     }
 }
@@ -400,24 +392,13 @@ fn parse_args(
             "-h" | "--help" => return Ok(ParseOutcome::Help),
             "-V" | "--version" => return Ok(ParseOutcome::Version),
             "--no-cache" => parsed.no_cache = true,
-            // Accepted for old scripts; filefacts no longer runs rizin.
-            "--no-rizin" => parsed.no_rizin = true,
             "-f" | "--format" => {
                 let value = iter.next().ok_or("--format requires terminal or json")?;
                 parsed.format = parse_format(&value.to_string_lossy())?;
             }
-            "--rizin-timeout" => {
-                let value = iter
-                    .next()
-                    .ok_or("--rizin-timeout requires a number of seconds")?;
-                parsed.rizin_timeout = Some(parse_timeout(&value.to_string_lossy())?);
-            }
             "--" => parsed.paths.extend(iter.by_ref().map(PathBuf::from)),
             s if s.starts_with("--format=") => {
                 parsed.format = parse_format(&s["--format=".len()..])?;
-            }
-            s if s.starts_with("--rizin-timeout=") => {
-                parsed.rizin_timeout = Some(parse_timeout(&s["--rizin-timeout=".len()..])?);
             }
             s if s.starts_with('-') => {
                 let view = s.strip_prefix("--").and_then(View::from_name);
@@ -461,15 +442,6 @@ fn parse_format(value: &str) -> Result<Format, String> {
         "terminal" | "term" => Ok(Format::Terminal),
         "json" => Ok(Format::Json),
         other => Err(format!("unknown format: {other}")),
-    }
-}
-
-fn parse_timeout(value: &str) -> Result<Duration, String> {
-    match value.parse::<u64>() {
-        Ok(secs) if secs > 0 => Ok(Duration::from_secs(secs)),
-        _ => Err(format!(
-            "--rizin-timeout requires a positive number of seconds, not {value}"
-        )),
     }
 }
 
@@ -603,22 +575,11 @@ mod tests {
 
     #[test]
     fn options_flags_parse_and_reach_the_open_options() {
-        let args = parse(
-            &["--no-cache", "--no-rizin", "--rizin-timeout", "30", "x"],
-            &[],
-        )
-        .unwrap();
-        assert!(args.no_cache && args.no_rizin);
-        assert_eq!(args.rizin_timeout, Some(Duration::from_secs(30)));
-        let args = parse(&["--rizin-timeout=5", "x"], &[]).unwrap();
-        assert_eq!(args.rizin_timeout, Some(Duration::from_secs(5)));
-        for bad in [
-            &["--rizin-timeout", "0", "x"][..],
-            &["--rizin-timeout=soon", "x"],
-        ] {
-            assert!(parse(bad, &[]).is_err(), "{bad:?}");
-        }
-        assert!(parse(&["--rizin-timeout"], &[]).is_err());
+        let args = parse(&["--no-cache", "x"], &[]).unwrap();
+        assert!(args.no_cache);
+        // rizin's flags went with rizin.
+        assert!(parse(&["--no-rizin", "x"], &[]).is_err());
+        assert!(parse(&["--rizin-timeout", "30", "x"], &[]).is_err());
         assert!(parse(&["--pretty", "x"], &[]).is_err());
     }
 
