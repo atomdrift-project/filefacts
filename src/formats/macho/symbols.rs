@@ -1,152 +1,97 @@
-//! Typed imports and exports: dyld bind imports, the `LC_SYMTAB` fallback
-//! for chained-fixup binaries, and the export trie, with Darwin `$VARIANT`
-//! spellings folded to their base symbol.
+//! Typed imports and exports, from binform's layout, with Darwin `$VARIANT`
+//! spellings folded to their base symbol and imports anchored at their
+//! `LC_SYMTAB` names.
 
 use goblin::mach::{self, MachO};
 
 use crate::bytes;
 use crate::formats::goblin_safe;
-use crate::output::{Errors, Symbols};
+use crate::output::Symbols;
 
-/// Walk Mach-O's dyld bind-info (imports) and export trie (exports)
-/// and surface them as typed `Import`/`Export` symbols.
+/// The typed imports and exports, from binform: one import per undefined
+/// external symbol, bound to the library its two-level ordinal, its bind
+/// opcodes or its chained-fixup import table name; one export per defined
+/// external symbol and export-trie entry.
 ///
-/// Bind imports carry the resolving dylib's stem as their library; imports
-/// recovered from `LC_SYMTAB` for chained-fixup binaries carry none. A bind
-/// stream or export trie refused as hostile yields no entries and is
-/// recorded in `errors`.
+/// Library names are normalised to the bare stem (lowercased, basename only,
+/// `.dylib`/`.tbd` suffix stripped) so trait authors can match against
+/// `"libsystem.b"` rather than `"/usr/lib/libSystem.B.dylib"`. A flat
+/// namespace or flat-lookup import binds to no library in particular, and
+/// carries none.
 pub(super) fn extract(
     macho: &MachO<'_>,
+    layout: Option<&binform::Binary<'_>>,
     bytes: &[u8],
     symbols_out: &mut Symbols,
-    errors: &mut Errors,
 ) {
-    // Map each undefined external symbol to the file offset of its name in
-    // the `LC_SYMTAB` string table. goblin's `Import::offset` is the dyld
-    // *bind* slot (a pointer in `__got`/`__DATA`, binary data), but every
-    // other consumer anchors a symbol at its human-readable name — ELF
+    let Some(layout) = layout else {
+        return;
+    };
+    // Each undefined external symbol's name in the `LC_SYMTAB` string table.
+    // Every consumer anchors a symbol at its human-readable name — ELF
     // imports point into `.dynstr`, and the hex/context view expects to
-    // render the name's ASCII. Anchoring imports at the name string keeps
-    // Mach-O consistent with ELF and makes the annotated bytes readable.
+    // render the name's ASCII — so Mach-O imports do too.
     let name_offsets = import_name_offsets(macho, bytes);
-
-    // Imports — dylib stems are normalised to the bare library name
-    // (lowercased, basename only, `.dylib`/`.tbd` suffix stripped) so
-    // trait authors can match against `"libsystem.b"` rather than
-    // `"/usr/lib/libSystem.B.dylib"`.
-    let mut bind_imports = 0usize;
-    // `imports()` walks dyld bind opcodes lazily, after `parse_mach` has
-    // already returned, so the parse-time guard does not cover it. goblin
-    // indexes the libs table with an unchecked ordinal (mach/imports.rs) and
-    // panics on a malformed one; a panic here yields no imports and is
-    // recorded in `errors`.
-    // The opcodes are counted first: a forged repeat count makes goblin
-    // allocate billions of imports, and `catch` cannot stop an out-of-memory
-    // abort (see `validate_bind_opcodes`).
-    let imports = match goblin_safe::validate_bind_opcodes(macho, bytes) {
-        Ok(()) => goblin_safe::catch(|| macho.imports()),
-        Err(reason) => {
-            errors.record_malformed(crate::Stage::MachoParse, reason.to_string());
-            goblin_safe::GoblinOutcome::Failed(goblin::error::Error::Malformed(reason.to_string()))
-        }
-    };
-    if let goblin_safe::GoblinOutcome::Panicked(msg) = &imports {
-        errors.record_panic(crate::Stage::MachoParse, msg.clone());
-    }
-    if let goblin_safe::GoblinOutcome::Ok(imports) = imports {
-        for imp in &imports {
-            let library = normalize_dylib_path(imp.dylib);
-            // Prefer the name-string offset; fall back to the bind slot
-            // when the symbol has no `LC_SYMTAB` entry (rare, e.g.
-            // dyld-info-only binaries).
-            let offset = name_offsets.get(imp.name).copied().unwrap_or(imp.offset);
-            bind_imports += 1;
-            symbols_out.push(crate::Symbol::Import {
-                // Record the base symbol, not the Darwin `$VARIANT` spelling,
-                // so anchored trait matchers and imphash see `popen` rather
-                // than `popen$DARWIN_EXTSN`. The offset lookup above still uses
-                // the raw name — that is how it is keyed in `LC_SYMTAB`.
-                name: strip_darwin_symbol_variant(imp.name).to_string(),
-                alias: None,
-                library: Some(library),
-                offset: Some(offset),
-                ordinal: None,
-            });
-        }
-        // Import count flows through cross-format `imports.count`.
+    for imp in &layout.imports {
+        symbols_out.push(crate::Symbol::Import {
+            // Record the base symbol, not the Darwin `$VARIANT` spelling,
+            // so anchored trait matchers and imphash see `popen` rather
+            // than `popen$DARWIN_EXTSN`. The offset lookup still uses the
+            // raw name — that is how it is keyed in `LC_SYMTAB`.
+            name: strip_darwin_symbol_variant(&imp.name).to_string(),
+            alias: None,
+            library: imp.library.as_deref().map(normalize_dylib_path),
+            offset: name_offsets.get(imp.name.as_str()).copied(),
+            ordinal: None,
+        });
     }
 
-    // Chained-fixups fallback.
-    //
-    // `macho.imports()` reads dyld *bind opcodes* (`LC_DYLD_INFO`). Binaries
-    // linked for macOS 12 and later carry `LC_DYLD_CHAINED_FIXUPS` instead and
-    // have no bind opcodes at all, so that call returns an empty list for
-    // every current macOS build.
-    //
-    // The undefined external symbols in `LC_SYMTAB` are those same imports,
-    // and `import_name_offsets` has already walked them to build the offset
-    // map above, so recovering them costs nothing extra. The dylib each one
-    // resolves to lives in the fixup chains rather than the symbol table, so
-    // `library` is left unset here instead of guessed at -- trait matchers key
-    // on the symbol name, and a wrong library is worse than none.
-    if bind_imports == 0 && !name_offsets.is_empty() {
-        let mut names: Vec<(&str, u64)> = name_offsets.iter().map(|(n, o)| (*n, *o)).collect();
-        names.sort_unstable();
-        for (name, offset) in names {
-            symbols_out.push(crate::Symbol::Import {
-                name: strip_darwin_symbol_variant(name).to_string(),
-                alias: None,
-                library: None,
-                offset: Some(offset),
-                ordinal: None,
-            });
-        }
+    // Exports at their offset from the Mach header (the `__TEXT` segment's
+    // start), as the export trie records them. Re-exports (e.g. `libSystem`
+    // forwarding to `libdyld`) have no address of their own; they carry
+    // their target in `forward_to` as `<library stem>.<symbol>`, the shape
+    // PE forwards take.
+    let base = macho
+        .segments
+        .iter()
+        .find(|segment| segment.name().is_ok_and(|name| name == "__TEXT"))
+        .map_or(0, |segment| segment.vmaddr);
+    for exp in &layout.exports {
+        symbols_out.push(crate::Symbol::Export {
+            // Normalize the same Darwin `$VARIANT` suffix as imports: these
+            // markers are *defined* in libSystem, so a library re-exporting
+            // libc carries them here. The allow-list leaves a binary's own
+            // `_OBJC_CLASS_$_…` exports intact.
+            name: strip_darwin_symbol_variant(&exp.name).to_string(),
+            offset: match exp.forward {
+                Some(_) => None,
+                None => exp.addr.checked_sub(base),
+            },
+            ordinal: None,
+            forward_to: exp
+                .forward
+                .as_deref()
+                .map(|forward| reexport_target(&macho.libs, forward)),
+        });
     }
+}
 
-    // Exports — recovered from the dyld export trie. Re-exports
-    // (e.g. `libSystem` forwarding to `libdyld`) carry their target in
-    // `forward_to` as `<library stem>.<symbol>`, the shape PE forwards take.
-    // Same exposure as `imports()` above: the export trie is walked lazily and
-    // goblin indexes it unchecked (mach/exports.rs:99). Worse than a panic, a
-    // trie with an edge back to an ancestor walks forever, and `catch` cannot
-    // interrupt a walk that never faults — so the trie is checked for loops
-    // first and a malformed one yields no exports (see `validate_export_trie`).
-    let exports = match goblin_safe::validate_export_trie(macho, bytes) {
-        Ok(()) => goblin_safe::catch(|| macho.exports()),
-        Err(reason) => {
-            errors.record_malformed(crate::Stage::MachoParse, reason.to_string());
-            goblin_safe::GoblinOutcome::Failed(goblin::error::Error::Malformed(reason.to_string()))
-        }
-    };
-    if let goblin_safe::GoblinOutcome::Panicked(msg) = &exports {
-        errors.record_panic(crate::Stage::MachoParse, msg.clone());
-    }
-    if let goblin_safe::GoblinOutcome::Ok(exports) = exports {
-        for exp in &exports {
-            symbols_out.push(crate::Symbol::Export {
-                // Normalize the same Darwin `$VARIANT` suffix as imports: these
-                // markers are *defined* in libSystem, so a library re-exporting
-                // libc carries them here. The allow-list leaves a binary's own
-                // `_OBJC_CLASS_$_…` exports intact.
-                name: strip_darwin_symbol_variant(&exp.name).to_string(),
-                offset: Some(exp.offset),
-                ordinal: None,
-                forward_to: match exp.info {
-                    goblin::mach::exports::ExportInfo::Reexport {
-                        lib,
-                        lib_symbol_name,
-                        ..
-                    } => Some(format!(
-                        "{}.{}",
-                        normalize_dylib_path(lib),
-                        lib_symbol_name.unwrap_or(&exp.name)
-                    )),
-                    _ => None,
-                },
-            });
-        }
-        // Export count flows through cross-format `exports.count`.
-    }
+/// A re-export's `<library stem>.<symbol>` with the stem normalised as
+/// imports' libraries are. binform keeps the stem's case, and the stem
+/// itself may hold dots (`libSystem.B`), so it is matched against the
+/// binary's own dylibs rather than split.
+fn reexport_target(libs: &[&str], forward: &str) -> String {
+    libs.iter()
+        .find_map(|lib| {
+            let base = lib.rsplit_once('/').map_or(*lib, |(_, base)| base);
+            let stem = base
+                .strip_suffix(".dylib")
+                .or_else(|| base.strip_suffix(".tbd"))
+                .unwrap_or(base);
+            let symbol = forward.strip_prefix(stem)?.strip_prefix('.')?;
+            Some(format!("{}.{symbol}", normalize_dylib_path(lib)))
+        })
+        .unwrap_or_else(|| forward.to_owned())
 }
 
 /// Build a map from undefined-external symbol name to the file offset of

@@ -1,12 +1,11 @@
 //! The import directory, its imphash, bound imports, and delay-load imports.
 
 use goblin::pe::PE;
-use goblin::pe::import::Import;
 use goblin::pe::optional_header::MAGIC_64;
 use serde_json::Value as JsonValue;
 
 use super::layout::rva_to_file_offset;
-use super::ordinals;
+use super::{ordinal_names, ordinals};
 use crate::formats::common::bytes_at::{u16_le, u32_le, u64_le};
 use crate::formats::common::{hex_encode, put_str};
 use crate::metric;
@@ -14,42 +13,69 @@ use crate::output::{Metrics, Values};
 use crate::value_key;
 
 pub(super) fn imports(
-    pe: &PE<'_>,
+    layout: &binform::Binary<'_>,
+    image_base: u64,
+    machine: u16,
+    table_skipped: bool,
     values: &mut Values,
     metrics: &mut Metrics,
     symbols_out: &mut crate::Symbols,
 ) {
-    // goblin's `imports` is flat: one entry per imported symbol with the DLL
-    // name attached. The library lands in the typed view as its lowercase
-    // stem (no `.dll` / `.ocx` / `.sys`), so consumers match
-    // `library == "kernel32"` without case or extension juggling.
+    // binform reads the import table and then the delay-load table, one
+    // entry per slot, the DLL name as the binary spells it. The library lands
+    // in the typed view as its lowercase stem (no `.dll` / `.ocx` / `.sys`),
+    // so consumers match `library == "kernel32"` without case or extension
+    // juggling. An import table too large to walk (see
+    // `goblin_safe::prepare_pe`) contributes nothing, as it never did.
+    let cpu = Cpu::of_machine(machine);
     let mut libraries = std::collections::BTreeSet::new();
-    for imp in &pe.imports {
-        libraries.insert(imp.dll);
+    let mut table = Vec::new();
+    let mut delayed = 0_u64;
+    for imp in &layout.imports {
+        if imp.delayed {
+            // Descriptors may share one name table; real binaries delay-load
+            // tens to hundreds of functions.
+            if delayed >= MAX_DELAY_IMPORTS {
+                continue;
+            }
+            delayed += 1;
+        } else if table_skipped {
+            continue;
+        } else {
+            libraries.insert(imp.library.as_deref().unwrap_or(""));
+            table.push(imp);
+        }
+        let dll = imp.library.as_deref().unwrap_or("").to_ascii_lowercase();
+        // An import by ordinal from a DLL whose ordinals are known goes by
+        // the name the DLL exports there; `ordinal` keeps the number.
+        let name = match imp.ordinal {
+            Some(ordinal) => known_ordinal(&dll, ordinal, cpu)
+                .map_or_else(|| format!("ORDINAL {ordinal}"), str::to_owned),
+            None => imp.name.clone(),
+        };
         symbols_out.push(crate::Symbol::Import {
-            name: imp.name.to_string(),
+            name,
             alias: None,
-            library: Some(strip_lib_ext(&imp.dll.to_ascii_lowercase()).to_string()),
-            offset: Some(imp.offset as u64),
-            ordinal: by_ordinal(imp).then_some(u32::from(imp.ordinal)),
+            library: Some(strip_lib_ext(&dll).to_string()),
+            // The RVA of the slot the loader fills.
+            offset: imp.slot.map(|slot| slot.wrapping_sub(image_base)),
+            ordinal: imp.ordinal.map(u32::from),
         });
     }
     // DLL dependencies (the libraries imports are bound to) flow through the
     // cross-format `dependencies.count`; the symbol total is `imports.count`.
     metrics.insert(metric!("dependencies.count"), libraries.len() as f64);
 
-    if let Some(hash) = imphash(&pe.imports) {
+    if let Some(hash) = imphash(&table) {
         put_str(values, value_key!("pe.hashes.imphash"), hash);
     }
 }
 
-/// Whether goblin synthesized this import's name from its ordinal, which it
-/// does for an ordinal-only lookup entry (`ORDINAL n`).
-fn by_ordinal(imp: &Import<'_>) -> bool {
-    imp.name
-        .strip_prefix("ORDINAL ")
-        .is_some_and(|n| n.parse() == Ok(imp.ordinal))
-}
+/// The most delay-load imports counted, and taken into the symbol view,
+/// across every descriptor. Descriptors may all share one name table, so
+/// a few kilobytes can claim half a million symbols; real binaries
+/// delay-load tens to hundreds of functions.
+const MAX_DELAY_IMPORTS: u64 = 16 * 1024;
 
 /// The *imphash* as pefile and VirusTotal compute it: the MD5 of the
 /// comma-joined, lowercased `library.function` list in import-table order,
@@ -61,7 +87,7 @@ fn by_ordinal(imp: &Import<'_>) -> bool {
 /// The hash was popularised by Mandiant and remains the standard
 /// per-import-table fingerprint for malware-family clustering; it only
 /// clusters with other tools' output when it is computed the same way.
-fn imphash(imports: &[Import<'_>]) -> Option<String> {
+fn imphash(imports: &[&binform::Import]) -> Option<String> {
     use md5::{Digest, Md5};
 
     if imports.is_empty() {
@@ -70,11 +96,10 @@ fn imphash(imports: &[Import<'_>]) -> Option<String> {
     let parts: Vec<String> = imports
         .iter()
         .map(|imp| {
-            let dll = imp.dll.to_ascii_lowercase();
-            let function = if by_ordinal(imp) {
-                ordinal_name(&dll, imp.ordinal)
-            } else {
-                imp.name.to_string()
+            let dll = imp.library.as_deref().unwrap_or("").to_ascii_lowercase();
+            let function = match imp.ordinal {
+                Some(ordinal) => ordinal_name(&dll, ordinal),
+                None => imp.name.clone(),
             };
             format!("{}.{}", strip_lib_ext(&dll), function.to_ascii_lowercase())
         })
@@ -83,20 +108,90 @@ fn imphash(imports: &[Import<'_>]) -> Option<String> {
 }
 
 /// pefile's `ordlookup.ordLookup(dll, ordinal, make_name=True)` for a
-/// lowercased `dll`.
+/// lowercased `dll`: its three tables only, so the imphash matches pefile's.
 fn ordinal_name(dll: &str, ordinal: u16) -> String {
-    known_ordinal(dll, ordinal).map_or_else(|| format!("ord{ordinal}"), str::to_owned)
+    pefile_ordinal(dll, ordinal).map_or_else(|| format!("ord{ordinal}"), str::to_owned)
+}
+
+/// The name pefile's `ordlookup` gives `dll`'s (lowercase, with its
+/// extension) export at `ordinal`.
+fn pefile_ordinal(dll: &str, ordinal: u16) -> Option<&'static str> {
+    lookup(
+        match dll {
+            "ws2_32.dll" => ordinals::WS2_32,
+            "wsock32.dll" => ordinals::WSOCK32,
+            "oleaut32.dll" => ordinals::OLEAUT32,
+            _ => &[],
+        },
+        ordinal,
+    )
 }
 
 /// The name `dll` (lowercase, with its extension) exports at `ordinal`, for
-/// the DLLs whose ordinals are stable across Windows releases.
-pub(in crate::formats) fn known_ordinal(dll: &str, ordinal: u16) -> Option<&'static str> {
-    let table = match dll {
-        "ws2_32.dll" => ordinals::WS2_32,
-        "wsock32.dll" => ordinals::WSOCK32,
-        "oleaut32.dll" => ordinals::OLEAUT32,
+/// the DLLs whose ordinals are stable across Windows releases: pefile's, and
+/// those programs import by ordinal from `ordinal_names.rs`. For naming
+/// imports; the imphash takes pefile's alone.
+pub(in crate::formats) fn known_ordinal(
+    dll: &str,
+    ordinal: u16,
+    cpu: Option<Cpu>,
+) -> Option<&'static str> {
+    // Windows CE's coredll numbers some exports differently per CPU: those
+    // ordinals are named only when the CPU is known.
+    let per_cpu = match (dll, cpu) {
+        ("coredll.dll", Some(Cpu::X86)) => ordinal_names::COREDLL_X86,
+        ("coredll.dll", Some(Cpu::Arm)) => ordinal_names::COREDLL_ARM,
+        ("coredll.dll", Some(Cpu::Mips)) => ordinal_names::COREDLL_MIPS,
+        ("coredll.dll", Some(Cpu::SuperH)) => ordinal_names::COREDLL_SH,
         _ => &[],
     };
+    pefile_ordinal(dll, ordinal)
+        .or_else(|| lookup(per_cpu, ordinal))
+        .or_else(|| {
+            lookup(
+                match dll {
+                    "msi.dll" => ordinal_names::MSI,
+                    "comctl32.dll" => ordinal_names::COMCTL32,
+                    "cabinet.dll" => ordinal_names::CABINET,
+                    "mfc42.dll" => ordinal_names::MFC42,
+                    "mfc42u.dll" => ordinal_names::MFC42U,
+                    "coredll.dll" => ordinal_names::COREDLL,
+                    "commctrl.dll" => ordinal_names::COMMCTRL,
+                    _ => &[],
+                },
+                ordinal,
+            )
+        })
+}
+
+/// The CPU families whose DLLs number exports differently: Windows CE's
+/// coredll, built for each.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::formats) enum Cpu {
+    X86,
+    Arm,
+    Mips,
+    SuperH,
+}
+
+impl Cpu {
+    /// The family of a PE's COFF `Machine`.
+    pub(in crate::formats) fn of_machine(machine: u16) -> Option<Self> {
+        match machine {
+            0x014c => Some(Self::X86),
+            // ARM, Thumb (Windows CE's ARMV4I).
+            0x01c0 | 0x01c2 => Some(Self::Arm),
+            // R4000, WCEMIPSV2, MIPS16, MIPSFPU, MIPSFPU16.
+            0x0166 | 0x0169 | 0x0266 | 0x0366 | 0x0466 => Some(Self::Mips),
+            // SH3, SH3DSP, SH3E, SH4.
+            0x01a2..=0x01a4 | 0x01a6 => Some(Self::SuperH),
+            _ => None,
+        }
+    }
+}
+
+/// `table`'s name for `ordinal`; the table is sorted by ordinal.
+fn lookup(table: &'static [(u16, &'static str)], ordinal: u16) -> Option<&'static str> {
     table
         .binary_search_by_key(&ordinal, |&(n, _)| n)
         .ok()
@@ -231,17 +326,10 @@ pub(super) fn bound_imports(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metr
 /// delay-load table so a static IAT scan misses them.
 ///
 /// Emits `pe.delay_imports[]` (one descriptor per DLL with timestamp,
-/// rva_based flag, and import count) and pushes each resolved symbol into
-/// the typed [`crate::Symbols`] view as `Symbol::Import`, located at its
-/// lookup-table entry, so the flattened import set matches what
-/// `dumpbin /dependents` would show.
-pub(super) fn delay_imports(
-    pe: &PE<'_>,
-    bytes: &[u8],
-    values: &mut Values,
-    metrics: &mut Metrics,
-    symbols_out: &mut crate::Symbols,
-) {
+/// rva_based flag, and import count). The imports themselves reach the
+/// typed [`crate::Symbols`] view from binform's table, with the rest (see
+/// [`imports`]).
+pub(super) fn delay_imports(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Metrics) {
     let Some(opt) = pe.header.optional_header.as_ref() else {
         return;
     };
@@ -267,12 +355,6 @@ pub(super) fn delay_imports(
     const DESC_SIZE: usize = 32; // IMAGE_DELAYLOAD_DESCRIPTOR is 8 DWORDs
     const MAX_DESCRIPTORS: usize = 128;
     const MAX_FUNCTIONS_PER_DLL: usize = 4096;
-    // Symbols recovered across every descriptor. The per-table caps alone
-    // multiply out to half a million symbols, each with up to 512-byte name
-    // and library strings, from descriptors that may all share one name
-    // table: half a gigabyte from a few kilobytes. Real binaries delay-load
-    // tens to hundreds of functions.
-    const MAX_DELAY_IMPORTS: u64 = 16 * 1024;
 
     let mut entries_out: Vec<JsonValue> = Vec::new();
     let mut total_imports = 0_u64;
@@ -306,22 +388,12 @@ pub(super) fn delay_imports(
         if dll.is_empty() {
             continue;
         }
-        let library = strip_lib_ext(&dll.to_ascii_lowercase()).to_string();
-
-        // Walk the Import Name Table — array of pointer-sized entries.
-        // High bit = ordinal-only (low 16 bits is the ordinal); else
-        // RVA pointing at an IMAGE_IMPORT_BY_NAME { hint:WORD, name:cstr }.
+        // Count the Import Name Table's pointer-sized entries, up to the
+        // zero that ends it.
         let mut function_count = 0_u64;
         if let Some(mut int_off) = rva_to_file_offset(pe, to_rva(int_va)) {
-            let ordinal_mask: u64 = if is_64 {
-                0x8000_0000_0000_0000
-            } else {
-                0x8000_0000
-            };
             let budget = MAX_DELAY_IMPORTS - total_imports;
             for _ in 0..MAX_FUNCTIONS_PER_DLL.min(crate::bytes::sat_usize(budget)) {
-                // The lookup entry's own file offset locates the symbol.
-                let entry_off = int_off;
                 let entry = if is_64 {
                     u64_le(bytes, int_off)
                 } else {
@@ -333,32 +405,6 @@ pub(super) fn delay_imports(
                 int_off += ptr_size;
                 if entry == 0 {
                     break;
-                }
-                if entry & ordinal_mask != 0 {
-                    let ordinal = (entry & 0xFFFF) as u32;
-                    symbols_out.push(crate::Symbol::Import {
-                        name: format!("ORDINAL {ordinal}"),
-                        alias: None,
-                        library: Some(library.clone()),
-                        offset: Some(entry_off as u64),
-                        ordinal: Some(ordinal),
-                    });
-                } else {
-                    // IMAGE_IMPORT_BY_NAME: the name follows a two-byte hint.
-                    let name = rva_to_file_offset(pe, (entry & 0xffff_ffff) as u32)
-                        .and_then(|off| off.checked_add(2))
-                        .filter(|&off| off < bytes.len())
-                        .map(|off| cstring_at(bytes, off))
-                        .unwrap_or_default();
-                    if !name.is_empty() {
-                        symbols_out.push(crate::Symbol::Import {
-                            name,
-                            alias: None,
-                            library: Some(library.clone()),
-                            offset: Some(entry_off as u64),
-                            ordinal: None,
-                        });
-                    }
                 }
                 function_count += 1;
             }

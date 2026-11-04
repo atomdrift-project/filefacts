@@ -158,9 +158,11 @@ fn analyse_slice(macho: &MachO<'_>, slice_bytes: &[u8], errors: &mut Errors) -> 
     let mut metrics = Metrics::new();
     let mut sections: Vec<Section> = Vec::new();
     let mut slice_symbols = Symbols::new();
-    extract_sections(macho, slice_bytes, &mut sections);
+    let layout = super::super::common::layout(slice_bytes, crate::Stage::MachoParse, errors);
+    super::record_forged_binds(macho, slice_bytes, errors);
+    extract_sections(layout.as_ref(), slice_bytes, &mut sections);
     extract_header_and_loads(macho, slice_bytes, &mut values, &mut metrics);
-    symbols::extract(macho, slice_bytes, &mut slice_symbols, errors);
+    symbols::extract(macho, layout.as_ref(), slice_bytes, &mut slice_symbols);
     super::hashes::emit(macho, slice_bytes, &mut values, &slice_symbols);
     slice_entry(
         values.into_json().get_mut("macho").map(JsonValue::take),

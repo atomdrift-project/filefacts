@@ -124,7 +124,7 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
         }
     }
     if fat_table_fits {
-        recover_natively(bytes, symbols_out, None, metrics);
+        recover_natively(bytes, symbols_out, metrics);
     }
     super::upx::detect(bytes, values);
 }
@@ -361,87 +361,96 @@ fn single_arch(
     symbols_out: &mut crate::Symbols,
     errors_out: &mut Errors,
 ) {
-    extract_sections(macho, bytes, sections_out);
+    let layout = super::common::layout(bytes, crate::Stage::MachoParse, errors_out);
+    record_forged_binds(macho, bytes, errors_out);
+    extract_sections(layout.as_ref(), bytes, sections_out);
     extract_header_and_loads(macho, bytes, values, metrics);
-    symbols::extract(macho, bytes, symbols_out, errors_out);
+    symbols::extract(macho, layout.as_ref(), bytes, symbols_out);
     hashes::emit(macho, bytes, values, symbols_out);
     super::build_toolchain::from_macho(values, sections_out);
 }
 
-/// Walk `LC_SEGMENT` / `LC_SEGMENT_64` and surface each named
-/// section. Mach-O nests sections inside segments; we flatten the
-/// hierarchy with the canonical `__SEGMENT,__section` naming so
-/// `__TEXT,__text` etc. survives to the output.
-fn extract_sections(macho: &MachO<'_>, bytes: &[u8], sections_out: &mut Vec<Section>) {
+/// Record bind opcodes whose repeat counts or indexes goblin's interpreter
+/// could not survive: binform reads each symbol once, but a forged stream is
+/// a fact about the sample.
+pub(super) fn record_forged_binds(macho: &MachO<'_>, bytes: &[u8], errors: &mut Errors) {
+    if let Err(reason) = goblin_safe::validate_bind_opcodes(macho, bytes) {
+        errors.record_malformed(crate::Stage::MachoParse, reason.to_string());
+    }
+}
+
+/// The section table, from binform: Mach-O nests sections inside segments;
+/// they are flattened with the canonical `__SEGMENT,__section` naming so
+/// `__TEXT,__text` etc. survives to the output. An object file's sections
+/// are named by their own segment field, as the linker reads them.
+fn extract_sections(
+    layout: Option<&binform::Binary<'_>>,
+    bytes: &[u8],
+    sections_out: &mut Vec<Section>,
+) {
+    let Some(layout) = layout else {
+        return;
+    };
     // Bytes left to measure entropy over. A real image's sections are
     // disjoint, so measuring each costs one pass over the file; section
     // headers are 80 bytes apiece and may all claim the whole file, which
     // would cost sections × file size. Sections past the budget go unmeasured.
     let mut unmeasured = bytes.len();
-    for segment in &macho.segments {
-        let segment_name = segment.name().unwrap_or("").to_owned();
-        let flags = macho_segment_flags(segment.initprot);
-        let initprot = u64::from(segment.initprot);
-        let Some(secs) = segment_sections(segment) else {
-            continue;
+    for section in &layout.sections {
+        let display = match section.name.split_once('.') {
+            Some((segment, "")) => segment.to_owned(),
+            Some((segment, name)) => format!("{segment},{name}"),
+            None => section.name.clone(),
         };
-        for (section, _data) in secs {
-            let section_name = section.name().unwrap_or("").to_owned();
-            let display = if section_name.is_empty() {
-                segment_name.clone()
+        // The segment's `initprot`, as binform reports it.
+        let initprot = u32::from(section.readable)
+            | u32::from(section.writable) << 1
+            | u32::from(section.executable) << 2;
+        let flags_word = u32::try_from(section.flags).unwrap_or(0);
+        let zero_filled = matches!(
+            flags_word & mach::constants::SECTION_TYPE,
+            mach::constants::S_ZEROFILL
+                | mach::constants::S_GB_ZEROFILL
+                | mach::constants::S_THREAD_LOCAL_ZEROFILL
+        );
+        let file_offset = if zero_filled { 0 } else { section.offset };
+        let file_size = if zero_filled { 0 } else { section.file_size };
+        let in_file = bytes
+            .len()
+            .saturating_sub(bytes::sat_usize(file_offset))
+            .min(bytes::sat_usize(file_size));
+        let entropy = match unmeasured.checked_sub(in_file) {
+            Some(left) if file_size > 0 => {
+                unmeasured = left;
+                Some(section_entropy(bytes, file_offset, file_size))
+            }
+            _ => None,
+        };
+        // __TEXT also holds constants and unwind metadata. Segment execute
+        // permission must not make those bytes count as instruction code.
+        let contains_instructions = flags_word
+            & (mach::constants::S_ATTR_PURE_INSTRUCTIONS
+                | mach::constants::S_ATTR_SOME_INSTRUCTIONS)
+            != 0
+            || flags_word & mach::constants::SECTION_TYPE == mach::constants::S_SYMBOL_STUBS;
+        let section_flags = macho_segment_flags(initprot)
+            .into_iter()
+            .chain(std::iter::once(if contains_instructions {
+                SectionFlag::Code
             } else {
-                format!("{segment_name},{section_name}")
-            };
-            let zero_filled = matches!(
-                section.flags & mach::constants::SECTION_TYPE,
-                mach::constants::S_ZEROFILL
-                    | mach::constants::S_GB_ZEROFILL
-                    | mach::constants::S_THREAD_LOCAL_ZEROFILL
-            );
-            let file_offset = if zero_filled {
-                0
-            } else {
-                u64::from(section.offset)
-            };
-            let file_size = if zero_filled { 0 } else { section.size };
-            let in_file = bytes
-                .len()
-                .saturating_sub(bytes::sat_usize(file_offset))
-                .min(bytes::sat_usize(file_size));
-            let entropy = match unmeasured.checked_sub(in_file) {
-                Some(left) if file_size > 0 => {
-                    unmeasured = left;
-                    Some(section_entropy(bytes, file_offset, file_size))
-                }
-                _ => None,
-            };
-            // __TEXT also holds constants and unwind metadata. Segment execute
-            // permission must not make those bytes count as instruction code.
-            let contains_instructions = section.flags
-                & (mach::constants::S_ATTR_PURE_INSTRUCTIONS
-                    | mach::constants::S_ATTR_SOME_INSTRUCTIONS)
-                != 0
-                || section.flags & mach::constants::SECTION_TYPE == mach::constants::S_SYMBOL_STUBS;
-            let section_flags = flags
-                .iter()
-                .copied()
-                .chain(std::iter::once(if contains_instructions {
-                    SectionFlag::Code
-                } else {
-                    SectionFlag::Data
-                }))
-                .collect();
-            sections_out.push(Section {
-                name: display,
-                vaddr: section.addr,
-                vsize: section.size,
-                file_offset,
-                file_size,
-                flags: section_flags,
-                flags_raw: Some(initprot),
-                entropy,
-            });
-        }
+                SectionFlag::Data
+            }))
+            .collect();
+        sections_out.push(Section {
+            name: display,
+            vaddr: section.addr,
+            vsize: section.size,
+            file_offset,
+            file_size,
+            flags: section_flags,
+            flags_raw: Some(u64::from(initprot)),
+            entropy,
+        });
     }
 }
 

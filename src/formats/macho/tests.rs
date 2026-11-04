@@ -539,22 +539,29 @@ fn oversized_bind_stream_is_recorded_as_malformed() {
     );
 }
 
-/// An export trie too deep for goblin's recursive walk is refused, and the
-/// refusal is recorded.
+/// An export trie deeper than any real symbol name is long costs a bounded
+/// walk and yields nothing past that length: binform reads it, with no
+/// recursion for the depth to overflow.
 #[test]
-fn deep_export_trie_is_recorded_as_malformed() {
+fn deep_export_trie_yields_no_overlong_export() {
     let file = crate::formats::goblin_safe::tests::macho_with_dyld_info(
         &[],
         &crate::formats::goblin_safe::tests::chain_trie(5000),
     );
-    let errors = errors_on_worker_stack(file);
-    assert!(
-        errors
+    let layout = binform::parse(&file).expect("binform reads the fixture");
+    assert!(layout.exports.iter().all(|e| e.name.len() <= 1 << 12));
+    let shallow = crate::formats::goblin_safe::tests::macho_with_dyld_info(
+        &[],
+        &crate::formats::goblin_safe::tests::chain_trie(200),
+    );
+    let layout = binform::parse(&shallow).expect("binform reads the fixture");
+    assert_eq!(
+        layout
+            .exports
             .iter()
-            .any(|e| e.kind == crate::output::DiagnosticKind::Malformed
-                && e.stage == crate::Stage::MachoParse
-                && e.message.contains("export trie")),
-        "{errors:?}"
+            .map(|e| e.name.len())
+            .collect::<Vec<_>>(),
+        [200]
     );
 }
 
@@ -681,9 +688,9 @@ fn overlapping_sections_share_one_entropy_pass() {
         command.extend([0, 0, 0x1000, 0, 0, 0, 0, 0, 0x8000_0400, 0, 0, 0]);
     }
     let file = thin_macho(&[&command], &[0x90; 0x1000]);
-    let macho = MachO::parse(&file, 0).expect("Mach-O with sections");
+    let layout = binform::parse(&file).ok();
     let mut sections = Vec::new();
-    extract_sections(&macho, &file, &mut sections);
+    extract_sections(layout.as_ref(), &file, &mut sections);
     assert_eq!(sections.len(), nsects as usize);
     let measured = sections.iter().filter(|s| s.entropy.is_some()).count();
     assert!(

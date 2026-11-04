@@ -66,6 +66,17 @@ is listed under **Changed** with the new value.
 
 ### Changed
 
+- The section, import and export views of PE, ELF and Mach-O come from
+  binform rather than goblin; goblin still reads the rest (headers,
+  resources, Authenticode, load config, CLR, notes, the dynamic section).
+  binform reads the ELF and Mach-O files goblin rejects, binds each
+  chained-fixup Mach-O import to its library, lists each Mach-O import once
+  rather than once per bind, adds ELF exports goblin's type filter dropped
+  (`_end`, `_edata`, TLS) and ordinal-only PE exports (`Ordinal_n`), and
+  resolves long PE section names (`/4`) through the COFF string table. PE
+  imports by ordinal from msi, comctl32, cabinet, mfc42(u), and Windows CE's
+  coredll (per CPU) and commctrl are named from those DLLs' own export
+  tables; the imphash still names ordinals only as pefile does.
 - PE, ELF and Mach-O function recovery runs in-process through binform
   instead of rizin, on every binary without a function inventory, and binform
   fills the section, import and export views of a PE goblin cannot read in
@@ -97,6 +108,15 @@ is listed under **Changed** with the new value.
   at — with the count in the `elf.network_endpoint_count` metric.
 
 - **`SCHEMA_VERSION` is now `11`.** Renamed or reshaped keys:
+  - A PE delay-load import's `offset` is its address-table slot's RVA, as
+    every other PE import's is, rather than its lookup entry's file offset.
+    The ELF section view no longer lists the null section at index 0; a
+    relocatable object's sections are at the addresses its functions are
+    recovered at. An executable's `.symtab`-only globals (`main`, `_start`)
+    are functions, not exports: ELF exports are what other images can bind
+    to. A Mach-O re-export has no `offset`. `pe.recovered_import_count`,
+    `pe.recovered_export_count` and `pe.recovered_section_count` are gone:
+    every binary's tables are binform's.
   - `pe.rizin_importless_analysis` → `pe.importless_analysis`,
     `pe.rizin_importless_function_count` → `pe.importless_function_count`;
     `binary.rizin_incomplete`, which nothing set, is gone.

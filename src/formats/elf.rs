@@ -169,6 +169,9 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
     //
     // Owns the header-patched copy when the section header table was cut
     // off; declared here so the parse borrowing it outlives the match.
+    // The section, import and export views are binform's, which also reads
+    // the ELF files goblin rejects.
+    let layout = super::common::layout(bytes, crate::Stage::ElfParse, errors_out);
     let detached;
     let mut section_headers_truncated = false;
     let mut original_section_table = None;
@@ -196,6 +199,7 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
             } else {
                 extract_binary_strings(bytes, strings, XorScan::Yes);
                 metrics.insert(metric!("elf.parse_failed"), 1.0);
+                layout_only(layout.as_ref(), bytes, sections_out, symbols_out);
                 return;
             }
         }
@@ -203,6 +207,7 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
             extract_binary_strings(bytes, strings, XorScan::Yes);
             errors_out.record_panic(crate::Stage::ElfParse, msg);
             metrics.insert(metric!("elf.parse_panicked"), 1.0);
+            layout_only(layout.as_ref(), bytes, sections_out, symbols_out);
             return;
         }
     };
@@ -225,9 +230,16 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
         put_u64(values, value_key!("elf.shstrndx"), shstrndx);
     }
     dynamic::names(&elf, bytes.len(), values);
-    sections(&elf, bytes, sections_out);
+    sections(layout.as_ref(), bytes, sections_out);
     *image_end = Some(image_end_of(&elf));
-    symbols::emit(&elf, bytes.len(), values, metrics, symbols_out);
+    symbols::emit(
+        &elf,
+        layout.as_ref(),
+        bytes.len(),
+        values,
+        metrics,
+        symbols_out,
+    );
     notes::build_id(&elf, bytes, &segment_notes, values, metrics, errors_out);
     if let Some(interp) = elf.interpreter {
         put_str(values, value_key!("elf.interpreter"), interp);
@@ -300,7 +312,7 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
             .iter()
             .any(|symbol| symbol.kind() == crate::SymbolKind::Function);
         if !has_function {
-            super::common::apply_native(native, symbols_out, None, metrics);
+            super::common::apply_native(&native, symbols_out, metrics);
         }
     }
     // Symbol-table names when nothing above produced a function inventory:
@@ -980,7 +992,13 @@ fn decompose_riscv_eflags(v: u32, out: &mut Vec<&'static str>) {
     }
 }
 
-fn sections(elf: &Elf<'_>, bytes: &[u8], sections_out: &mut Vec<Section>) {
+/// The section table, from binform: every header but the null one at index
+/// 0, a relocatable object's at the addresses binform placed them (where its
+/// functions are), with the header's raw flags.
+fn sections(layout: Option<&binform::Binary<'_>>, bytes: &[u8], sections_out: &mut Vec<Section>) {
+    let Some(layout) = layout else {
+        return;
+    };
     // Entropy is O(section length) and section ranges are attacker-supplied:
     // nothing requires them to be disjoint, so `e_shnum` headers can all cover
     // the same megabytes and cost `e_shnum × filesize` — measured at 11.8 s for
@@ -988,19 +1006,19 @@ fn sections(elf: &Elf<'_>, bytes: &[u8], sections_out: &mut Vec<Section>) {
     // disjoint slices of the file, so its own length is the exact budget they
     // need and this never bites a real binary.
     let mut entropy_budget = bytes.len() as u64;
-    for sh in &elf.section_headers {
-        // `section_name` cuts the name: names are attacker-controlled
-        // string-table runs, and distinct headers naming every suffix of one
-        // run to EOF would otherwise turn a few MB of input into hundreds of
-        // MB of JSON. Real names are a handful of bytes.
-        let name = section_name(elf, sh).to_owned();
+    for section in &layout.sections {
+        // The name is cut as `section_name` cuts it: names are
+        // attacker-controlled string-table runs, and distinct headers naming
+        // every suffix of one run to EOF would otherwise turn a few MB of
+        // input into hundreds of MB of JSON. Real names are a handful of
+        // bytes.
+        let name = match section.name.char_indices().nth(MAX_SECTION_NAME) {
+            Some((end, _)) => section.name.get(..end).unwrap_or_default().to_owned(),
+            None => section.name.clone(),
+        };
         // SHT_NOBITS sections have no file bytes. Other types
         // occupy `sh_offset..sh_offset + sh_size` in the file.
-        let (file_offset, file_size) = if sh.sh_type == goblin::elf::section_header::SHT_NOBITS {
-            (sh.sh_offset, 0)
-        } else {
-            (sh.sh_offset, sh.sh_size)
-        };
+        let (file_offset, file_size) = (section.offset, section.file_size);
         // Charging `min` rather than skipping outright means at most one
         // section overdraws, so an honest trailing section is never dropped.
         let entropy = (file_size > 0 && entropy_budget > 0).then(|| {
@@ -1009,15 +1027,32 @@ fn sections(elf: &Elf<'_>, bytes: &[u8], sections_out: &mut Vec<Section>) {
         });
         sections_out.push(Section {
             name,
-            vaddr: sh.sh_addr,
-            vsize: sh.sh_size,
+            vaddr: section.addr,
+            vsize: section.size,
             file_offset,
             file_size,
-            flags: section_flags(sh.sh_flags),
-            flags_raw: Some(sh.sh_flags),
+            flags: section_flags(section.flags),
+            flags_raw: Some(section.flags),
             entropy,
         });
     }
+}
+
+/// The section, import and export views of an ELF goblin could not parse:
+/// binform's, with no symbol table to anchor the names.
+fn layout_only(
+    layout: Option<&binform::Binary<'_>>,
+    bytes: &[u8],
+    sections_out: &mut Vec<Section>,
+    symbols_out: &mut crate::Symbols,
+) {
+    sections(layout, bytes, sections_out);
+    symbols::push_tables(
+        layout,
+        &std::collections::HashMap::new(),
+        &mut NameBudget::new(bytes.len()),
+        symbols_out,
+    );
 }
 
 /// File offset one past the last byte the image itself accounts for,

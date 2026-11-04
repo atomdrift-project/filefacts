@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 
 use goblin::pe::PE;
-use goblin::pe::export::Reexport;
 use goblin::pe::optional_header::{MAGIC_32, MAGIC_64};
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Mnemonic, OpKind};
 
@@ -16,36 +15,35 @@ use crate::value_key;
 /// `IMAGE_SCN_MEM_EXECUTE`.
 const SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 
+/// The export table, from binform: one export per function the table
+/// lists, an unnamed one as `Ordinal_n`. A table too large to walk (see
+/// `goblin_safe::prepare_pe`) contributes nothing.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn exports(
-    pe: &PE<'_>,
+    layout: Option<&binform::Binary<'_>>,
+    image_base: u64,
+    table_skipped: bool,
+    pe: Option<&PE<'_>>,
     bytes: &[u8],
     values: &mut Values,
     metrics: &mut Metrics,
     symbols_out: &mut crate::Symbols,
 ) {
     let mut forwarded_count: u32 = 0;
-    for exp in &pe.exports {
-        let Some(name) = exp.name else { continue };
-        // PE forwarded exports come in two shapes (per
-        // `IMAGE_EXPORT_DIRECTORY` §6.3.1): `DLL.symbol` and
-        // `DLL.#ordinal`. Both are serialised back into a single
-        // string so consumers don't have to switch on a
-        // discriminator. When the entry is a normal export
-        // (RVA points at this binary's own code/data), `forward_to`
-        // stays `None`.
-        let forward_to = match exp.reexport {
-            Some(Reexport::DLLName { export, lib }) => Some(format!("{lib}.{export}")),
-            Some(Reexport::DLLOrdinal { ordinal, lib }) => Some(format!("{lib}.#{ordinal}")),
-            None => None,
-        };
-        forwarded_count = forwarded_count.saturating_add(u32::from(forward_to.is_some()));
+    let table = layout.filter(|_| !table_skipped);
+    for exp in table.iter().flat_map(|layout| &layout.exports) {
+        // A forwarder names its target as the table spells it, `DLL.symbol`
+        // or `DLL.#ordinal` (`IMAGE_EXPORT_DIRECTORY` §6.3.1), so consumers
+        // don't have to switch on a discriminator. A normal export (RVA
+        // pointing at this binary's own code/data) has none.
+        forwarded_count = forwarded_count.saturating_add(u32::from(exp.forward.is_some()));
         // The RVA, not the file offset: it is what `dumpbin /exports`, IDA,
         // Ghidra and the PE specification key exports by.
         symbols_out.push(crate::Symbol::Export {
-            name: name.to_string(),
-            offset: Some(exp.rva as u64),
+            name: exp.name.clone(),
+            offset: Some(exp.addr.wrapping_sub(image_base)),
             ordinal: None,
-            forward_to,
+            forward_to: exp.forward.clone(),
         });
     }
     // Export count flows through cross-format `exports.count`.
@@ -60,6 +58,9 @@ pub(super) fn exports(
     // chain tampering sometimes rewrites one without touching the
     // other, so emit it independently. Zero is a sentinel meaning
     // "unset" — linkers can elect to leave it untouched.
+    let Some(pe) = pe else {
+        return;
+    };
     if let Some(export_data) = &pe.export_data {
         let ts = export_data.export_directory_table.time_date_stamp;
         if ts != 0 {

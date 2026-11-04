@@ -1,10 +1,9 @@
 //! Helpers shared across format extractors.
 
-use crate::functions::RecoveryCounts;
 use crate::metric;
 use serde_json::Value as JsonValue;
 
-use crate::output::{Section, Strings, Text, ValueKey, Values};
+use crate::output::{Strings, Text, ValueKey, Values};
 use crate::scan::entropy;
 
 /// Whether stng's XOR seed search runs for a member.
@@ -264,24 +263,15 @@ pub(super) fn put_i64(values: &mut Values, key: ValueKey, n: i64) {
 // numeric/string value) instead — never a bare boolean that mirrors
 // presence/absence.
 
-/// Recover with binform what the format parser did not supply: the
-/// functions and calls of a binary whose function view is empty, and the
-/// import, export and section views goblin left empty (`sections` is given
-/// only by PE, the one format where goblin can fail to read the table and
-/// still extract). Returns what it added; `None` when the binary already
-/// has functions or binform cannot read it.
+/// Recover with binform the functions and calls of a binary whose function
+/// view is empty. Returns how many functions it added; `None` when the
+/// binary already has functions or binform cannot read it.
 pub(super) fn recover_natively(
     bytes: &[u8],
     symbols: &mut crate::Symbols,
-    sections: Option<&mut Vec<Section>>,
     metrics: &mut crate::output::Metrics,
-) -> Option<RecoveryCounts> {
-    Some(apply_native(
-        native(bytes, symbols)?,
-        symbols,
-        sections,
-        metrics,
-    ))
+) -> Option<u32> {
+    Some(apply_native(&native(bytes, symbols)?, symbols, metrics))
 }
 
 /// binform's answer for `bytes`, or `None` when `symbols` already holds a
@@ -297,92 +287,38 @@ pub(super) fn native(bytes: &[u8], symbols: &crate::Symbols) -> Option<crate::fu
     crate::functions::recover(bytes)
 }
 
-/// Fill the typed views the format parser left empty from binform's
-/// answer: imports when it found none, exports likewise, the functions and
-/// their calls, and the section table when `sections_out` is given and
-/// empty (a PE whose section table the native parser could not read).
+/// Add binform's functions and their calls to the typed views; returns how
+/// many functions it added. The section, import and export views are
+/// binform's already: each format extractor reads them from its layout.
 pub(super) fn apply_native(
-    native: crate::functions::Native,
+    native: &crate::functions::Native,
     symbols: &mut crate::Symbols,
-    sections_out: Option<&mut Vec<Section>>,
     metrics: &mut crate::output::Metrics,
-) -> RecoveryCounts {
-    use crate::output::{SectionFlag, Symbol, SymbolKind};
-    let mut counts = RecoveryCounts::default();
-    let had_imports = symbols.iter().any(|s| s.kind() == SymbolKind::Import);
-    let had_exports = symbols.iter().any(|s| s.kind() == SymbolKind::Export);
-    if !had_imports {
-        for import in native.imports.into_iter().filter(|i| !i.name.is_empty()) {
-            // An import by ordinal from a DLL whose ordinals are stable goes
-            // by the name the DLL exports there.
-            let name = import
-                .ordinal
-                .zip(import.library.as_deref())
-                .and_then(|(ordinal, dll)| {
-                    super::pe::imports::known_ordinal(&dll.to_ascii_lowercase(), ordinal)
-                })
-                .map_or(import.name, str::to_owned);
-            symbols.push(Symbol::Import {
-                name,
-                alias: None,
-                library: import.library,
-                offset: import.slot,
-                ordinal: import.ordinal.map(u32::from),
-            });
-            counts.imports = counts.imports.saturating_add(1);
-        }
-    }
-    if !had_exports {
-        for export in native.exports.into_iter().filter(|e| !e.name.is_empty()) {
-            symbols.push(Symbol::Export {
-                name: export.name,
-                offset: Some(export.addr),
-                ordinal: None,
-                forward_to: export.forward,
-            });
-            counts.exports = counts.exports.saturating_add(1);
-        }
-    }
-    counts.functions = native.functions.apply(symbols, metrics);
-    if let Some(sections_out) = sections_out
-        && sections_out.is_empty()
-    {
-        for section in native.sections {
-            let flags = [
-                (section.readable, SectionFlag::Readable),
-                (section.writable, SectionFlag::Writable),
-                (section.executable, SectionFlag::Executable),
-            ]
-            .into_iter()
-            .filter_map(|(set, flag)| set.then_some(flag))
-            .collect();
-            sections_out.push(Section {
-                name: section.name,
-                vaddr: section.addr,
-                vsize: section.size,
-                file_offset: section.offset,
-                file_size: section.file_size,
-                flags,
-                flags_raw: None,
-                entropy: None,
-            });
-            counts.sections = counts.sections.saturating_add(1);
-        }
-    }
-    counts
+) -> u32 {
+    native.functions.apply(symbols, metrics)
 }
 
-/// Emit the `pe.recovered_*_count` metrics: how many entries of each view
-/// came from binform rather than goblin.
-pub(super) fn recovered_counts(counts: RecoveryCounts, metrics: &mut crate::output::Metrics) {
-    for (key, count) in [
-        (metric!("pe.recovered_import_count"), counts.imports),
-        (metric!("pe.recovered_export_count"), counts.exports),
-        (metric!("pe.recovered_function_count"), counts.functions),
-        (metric!("pe.recovered_section_count"), counts.sections),
-    ] {
-        if count > 0 {
-            metrics.insert(key, f64::from(count));
+/// Emit `pe.recovered_function_count`: how many functions binform recovered
+/// for a PE whose format parser named none.
+pub(super) fn recovered_function_count(functions: u32, metrics: &mut crate::output::Metrics) {
+    if functions > 0 {
+        metrics.insert(metric!("pe.recovered_function_count"), f64::from(functions));
+    }
+}
+
+/// The layout binform reads from `bytes`: the section, import and export
+/// tables every binary extractor takes. `None`, with the reason recorded,
+/// when binform cannot read it.
+pub(super) fn layout<'a>(
+    bytes: &'a [u8],
+    stage: crate::Stage,
+    errors: &mut crate::output::Errors,
+) -> Option<binform::Binary<'a>> {
+    match binform::parse(bytes) {
+        Ok(layout) => Some(layout),
+        Err(error) => {
+            errors.record_malformed(stage, format!("layout: {error}"));
+            None
         }
     }
 }

@@ -47,9 +47,9 @@ Views include `fileid`, `identity`, `values`, `text`, `literals`, `metrics`,
 | `FILEFACTS_CACHE=0` | Disable the disk cache (`~/.cache/atomdrift/filefacts` or the platform equivalent) |
 | `FILEFACTS_DEBUG=1` | Print extractor diagnostics to stderr |
 
-For PE, ELF, and Mach-O, filefacts recovers the functions of a binary with
-no symbol table, and the sections, imports and exports goblin cannot read,
-in-process with [binform](../funktion). It starts no subprocess.
+For PE, ELF, and Mach-O, filefacts reads the sections, imports and exports,
+and recovers the functions of a binary with no symbol table, in-process with
+[binform](../funktion). It starts no subprocess.
 
 ## Library
 

@@ -1,9 +1,9 @@
 //! Functions recovered from machine code, and the symbols and metrics they
 //! yield on a binary whose format parser found no function inventory.
 //!
-//! [`binform`] recovers them in-process, along with the layout tables
-//! (sections, imports, exports) a format parser that read none can take
-//! instead. Everything downstream — the `binary.*` metrics, the typed
+//! [`binform`] recovers them in-process (its layout tables, the section,
+//! import and export views, each format extractor reads itself; see
+//! `formats::common::layout`). Everything downstream — the `binary.*` metrics, the typed
 //! function and call views, the PE API-hash correlation — reads one
 //! [`Functions`] value.
 
@@ -16,7 +16,7 @@ use crate::output::Metrics;
 /// The disk-cache key's part for function recovery. Bump it whenever the
 /// binform commit in Cargo.lock, or what filefacts takes from it, changes:
 /// either changes what a cached extraction holds.
-pub(crate) const POLICY: &str = "binform=v6";
+pub(crate) const POLICY: &str = "binform=v7";
 
 /// Recovered functions, and names for the call targets that are no
 /// recovered function (an import's slot or stub).
@@ -26,14 +26,11 @@ pub(crate) struct Functions {
     pub(crate) targets: HashMap<u64, String>,
 }
 
-/// binform's answer for one file: its functions, the layout tables a format
-/// parser that read none can take instead, and the syscall sites it found.
+/// binform's answer for one file: its functions and the syscall sites it
+/// found.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Native {
     pub(crate) functions: Functions,
-    pub(crate) imports: Vec<binform::Import>,
-    pub(crate) exports: Vec<binform::Export>,
-    pub(crate) sections: Vec<binform::Section>,
     /// Syscall sites, resolved while the `binform::Binary` was in scope.
     pub(crate) syscalls: Vec<SyscallFact>,
     /// The instruction set, for labelling the syscall table a number was
@@ -54,19 +51,8 @@ pub(crate) struct SyscallFact {
     pub(crate) args: Vec<binform::Value>,
 }
 
-/// Counts of entries binform contributed to each typed view, so format
-/// extractors can emit the `*.recovered_*_count` metrics that say a view
-/// was filled in by binform rather than by the format-native parser.
-#[derive(Default, Debug, Clone, Copy)]
-pub(crate) struct RecoveryCounts {
-    pub imports: u32,
-    pub exports: u32,
-    pub functions: u32,
-    pub sections: u32,
-}
-
-/// binform's answer for `bytes`: always the layout it read, and the
-/// functions of an instruction set it decodes (none otherwise). `None` when
+/// binform's answer for `bytes`: the functions of an instruction set it
+/// decodes (none otherwise). `None` when
 /// it cannot read the file at all. A recovery its work budget cut short
 /// still holds every function found within it, which is kept.
 pub(crate) fn recover(bytes: &[u8]) -> Option<Native> {
@@ -100,9 +86,6 @@ pub(crate) fn recover(bytes: &[u8]) -> Option<Native> {
     let syscalls = syscall_facts(&image, &recovery);
     Some(Native {
         functions: Functions { recovery, targets },
-        imports: image.imports,
-        exports: image.exports,
-        sections: image.sections,
         syscalls,
         arch: image.arch,
     })

@@ -169,20 +169,25 @@ pub(super) fn optional_header(opt: &OptionalHeader, values: &mut Values, metrics
     metrics.insert(metric!("binary.is_pie"), f64::from(u8::from(is_pie)));
 }
 
-pub(super) fn sections(pe: &PE<'_>, bytes: &[u8], sections_out: &mut Vec<Section>) {
-    for section in &pe.sections {
-        let name = section.name().unwrap_or("").to_owned();
-        let file_offset = u64::from(section.pointer_to_raw_data);
-        let file_size = u64::from(section.size_of_raw_data);
-        let entropy = (file_size > 0).then(|| section_entropy(bytes, file_offset, file_size));
+/// The section table, from binform: each header's raw values, a long name
+/// (`/4`) resolved through the COFF string table, the address as an RVA.
+pub(super) fn sections(
+    layout: &binform::Binary<'_>,
+    image_base: u64,
+    bytes: &[u8],
+    sections_out: &mut Vec<Section>,
+) {
+    for section in &layout.sections {
+        let entropy = (section.file_size > 0)
+            .then(|| section_entropy(bytes, section.offset, section.file_size));
         sections_out.push(Section {
-            name,
-            vaddr: u64::from(section.virtual_address),
-            vsize: u64::from(section.virtual_size),
-            file_offset,
-            file_size,
-            flags: section_characteristics(section.characteristics),
-            flags_raw: Some(u64::from(section.characteristics)),
+            name: section.name.clone(),
+            vaddr: section.addr.wrapping_sub(image_base),
+            vsize: section.size,
+            file_offset: section.offset,
+            file_size: section.file_size,
+            flags: section_characteristics(u32::try_from(section.flags).unwrap_or(0)),
+            flags_raw: Some(section.flags),
             entropy,
         });
     }

@@ -99,20 +99,6 @@ pub(crate) enum Rejection {
     /// Export and forwarder names, summed over every name pointer, past
     /// budget.
     OversizedExportNames,
-    /// An export-trie edge back to a node already visited.
-    ExportTrieLoop {
-        node: usize,
-        start: usize,
-        end: usize,
-    },
-    /// An export-trie node claiming more branches than the trie can hold.
-    ExportTrieBranches {
-        node: usize,
-        branches: u64,
-        available: usize,
-    },
-    /// An export-trie path deeper than [`MAX_EXPORT_TRIE_DEPTH`] nodes.
-    ExportTrieTooDeep { node: usize, depth: usize },
     /// Mach-O bind opcodes that would make goblin synthesize more imports
     /// than [`MAX_MACHO_BIND_IMPORTS`].
     OversizedBindStream { stream: &'static str, imports: u64 },
@@ -148,22 +134,6 @@ impl fmt::Display for Rejection {
             Self::OversizedExportNames => {
                 write!(f, "export names exceed {MAX_SYMBOL_NAME_BYTES} bytes")
             }
-            Self::ExportTrieLoop { node, start, end } => write!(
-                f,
-                "export trie loops back to node {node:#x} (trie {start:#x}..{end:#x})"
-            ),
-            Self::ExportTrieBranches {
-                node,
-                branches,
-                available,
-            } => write!(
-                f,
-                "export trie node {node:#x} claims {branches} branches in {available} bytes"
-            ),
-            Self::ExportTrieTooDeep { node, depth } => write!(
-                f,
-                "export trie reaches node {node:#x} at depth {depth}, past {MAX_EXPORT_TRIE_DEPTH}"
-            ),
             Self::OversizedBindStream { stream, imports } => write!(
                 f,
                 "{stream} bind opcodes declare at least {imports} imports, past {MAX_MACHO_BIND_IMPORTS}"
@@ -789,133 +759,6 @@ pub(crate) fn parse_mach(data: &[u8]) -> GoblinOutcome<Mach<'_>> {
 /// reads only the fat header; every slice is a full parse of its own.
 pub(crate) fn parse_macho_slice(data: &[u8]) -> GoblinOutcome<MachO<'_>> {
     catch(|| MachO::parse(data, 0))
-}
-
-/// Pre-validate the dyld export trie before `macho.exports()` walks it.
-///
-/// goblin's `ExportTrie::walk_trie` (mach/exports.rs, 0.10.7 and master)
-/// recurses into every child edge with no visited set, no depth bound and no
-/// requirement that a child lie past its parent. A trie whose edge points back
-/// at an ancestor therefore never terminates: each level clones the growing
-/// symbol prefix and pushes another `Export`, and the process is out of memory
-/// long before the stack is — measured at 16 GiB in 6 s on a 232 KiB arm64
-/// binary whose root edge pointed at offset 0 (llvm-objdump rejects the same
-/// file with "loop in children in export trie data"). Neither `catch` nor a
-/// panic hook can stop a walk that never faults.
-///
-/// The walk is also recursive, so an acyclic but deep trie — a straight chain
-/// of five-byte nodes with empty edge labels — exhausts the stack instead: a
-/// 25 KiB trie is enough on a 2 MiB worker thread, and a stack overflow aborts
-/// the process just as surely as the out-of-memory case.
-///
-/// This walks the same nodes goblin will, iteratively, and refuses the trie on
-/// the first revisited node, branch count the trie cannot hold, or path
-/// deeper than [`MAX_EXPORT_TRIE_DEPTH`]. Anything
-/// goblin would itself reject (a truncated ULEB, an edge past the file) is
-/// waved through: goblin's own `Err` is the more precise report for those.
-///
-/// Mirrors goblin's selection of the trie: the last `LC_DYLD_INFO`,
-/// `LC_DYLD_INFO_ONLY` or `LC_DYLD_EXPORTS_TRIE` command wins.
-pub(crate) fn validate_export_trie(macho: &MachO<'_>, bytes: &[u8]) -> Result<(), Rejection> {
-    use goblin::mach::load_command::CommandVariant;
-    let mut location = None;
-    for lc in &macho.load_commands {
-        match &lc.command {
-            CommandVariant::DyldInfo(c) | CommandVariant::DyldInfoOnly(c) => {
-                location = Some((c.export_off as usize, c.export_size as usize));
-            }
-            CommandVariant::DyldExportsTrie(c) => {
-                location = Some((c.dataoff as usize, c.datasize as usize));
-            }
-            _ => {}
-        }
-    }
-    match location {
-        Some((start, size)) => validate_export_trie_bytes(bytes, start, size),
-        None => Ok(()),
-    }
-}
-
-/// Deepest export-trie path [`validate_export_trie`] lets goblin recurse
-/// into. dyld's own trie lookup gives up at 128 nodes, so no binary the loader
-/// accepts needs more, and goblin's three frames per level stay far inside a
-/// 2 MiB worker stack at this depth.
-pub(crate) const MAX_EXPORT_TRIE_DEPTH: usize = 128;
-
-/// [`validate_export_trie`] on an explicit trie range; the walk itself.
-fn validate_export_trie_bytes(bytes: &[u8], start: usize, size: usize) -> Result<(), Rejection> {
-    // goblin's `new_impl` collapses an out-of-file range to an empty trie.
-    let Some(end) = start.checked_add(size).filter(|end| *end <= bytes.len()) else {
-        return Ok(());
-    };
-    // One flag per byte of the trie: a node is at least one byte, so the
-    // visited set is bounded by the trie's own size.
-    let mut visited = vec![false; size];
-    let mut pending = vec![(start, 1usize)];
-    while let Some((node, depth)) = pending.pop() {
-        // goblin's `walk_trie` returns Ok for a node at or past the end.
-        if node >= end {
-            continue;
-        }
-        if depth > MAX_EXPORT_TRIE_DEPTH {
-            return Err(Rejection::ExportTrieTooDeep { node, depth });
-        }
-        // `node >= start`: it is `start` or a child offset added to it.
-        let Some(seen) = visited.get_mut(node - start) else {
-            continue;
-        };
-        if std::mem::replace(seen, true) {
-            return Err(Rejection::ExportTrieLoop { node, start, end });
-        }
-        let mut offset = node;
-        let Some(terminal_size) = read_uleb128(bytes, &mut offset) else {
-            return Ok(());
-        };
-        let children_start = if terminal_size == 0 {
-            offset
-        } else {
-            let Some(next) = offset.checked_add(crate::bytes::sat_usize(terminal_size)) else {
-                return Ok(());
-            };
-            next
-        };
-        offset = children_start;
-        let Some(nbranches) = read_uleb128(bytes, &mut offset) else {
-            return Ok(());
-        };
-        // Every edge takes at least one byte, so a count the remaining trie
-        // cannot hold is forged; goblin would only stop walking it once a read
-        // fell off the end of the file. This also bounds the loop below.
-        let available = end - offset.min(end);
-        if nbranches > available as u64 {
-            return Err(Rejection::ExportTrieBranches {
-                node,
-                branches: nbranches,
-                available,
-            });
-        }
-        for _ in 0..nbranches {
-            let Some(label_len) = bytes
-                .get(offset..)
-                .and_then(|rest| rest.iter().position(|&b| b == 0))
-            else {
-                return Ok(());
-            };
-            offset += label_len + 1;
-            let Some(child) = read_uleb128(bytes, &mut offset) else {
-                return Ok(());
-            };
-            // goblin: `next_node = uleb + self.location.start`.
-            let Some(child) = usize::try_from(child)
-                .ok()
-                .and_then(|c| c.checked_add(start))
-            else {
-                return Ok(());
-            };
-            pending.push((child, depth + 1));
-        }
-    }
-    Ok(())
 }
 
 /// Imports goblin's bind interpreter may synthesize across a Mach-O's bind

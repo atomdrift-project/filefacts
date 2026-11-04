@@ -2,6 +2,8 @@
 //! symbol-kind histograms, hardening markers (FORTIFY, stack canary), and the
 //! `.symtab` function fallback for binaries binform could not recover.
 
+use std::collections::HashMap;
+
 use goblin::elf::Elf;
 use serde_json::Value as JsonValue;
 
@@ -65,6 +67,7 @@ pub(super) fn static_function_fallback(elf: &Elf<'_>, file_len: usize, out: &mut
 
 pub(super) fn emit(
     elf: &Elf<'_>,
+    layout: Option<&binform::Binary<'_>>,
     file_len: usize,
     values: &mut Values,
     metrics: &mut Metrics,
@@ -72,10 +75,11 @@ pub(super) fn emit(
 ) {
     // Names copied into the typed symbol view and `elf.ifuncs`.
     let mut names = NameBudget::new(file_len);
-    // Dynamic-symbol table: imports are undefined (`SHN_UNDEF`, section
-    // index 0); exports are defined globals/weaks. STT_GNU_IFUNC entries
-    // stay in `values` as a derived ELF-specific list; ordinary imports and
-    // exports live only in the typed symbol views.
+    // The typed imports and exports are binform's (see `push_tables`); the
+    // dynamic-symbol table walk here locates their names and derives the
+    // ELF-specific facts. STT_GNU_IFUNC entries stay in `values` as a
+    // derived list.
+    let mut name_offsets: HashMap<&str, u64> = HashMap::new();
     let mut ifuncs = Vec::new();
     let mut fortify_count: u64 = 0;
     let mut hidden_count: u64 = 0;
@@ -148,50 +152,43 @@ pub(super) fn emit(
         if name.starts_with("__") && name.ends_with("_chk") {
             fortify_count += 1;
         }
-        if !names.take(name.len()) {
-            continue;
-        }
         let stt = sym.st_info & 0xf;
-        if stt == goblin::elf::sym::STT_GNU_IFUNC {
+        if stt == goblin::elf::sym::STT_GNU_IFUNC && names.take(name.len()) {
             ifuncs.push(JsonValue::String(name.to_string()));
         }
-        // The symbol name's byte offset in the file (via `.dynstr`): a real,
-        // file-backed location every consumer can render. Imports and exports
-        // both anchor here. `st_value` is a virtual address, not a file offset,
-        // and may point into `.bss` with no file backing — so anchoring exports
-        // on the name string keeps them consistent with imports and always
-        // pointing at bytes that exist in the file.
-        let name_off = dynstr_offset.and_then(|base| {
+        // The symbol name's byte offset in the file (via `.dynstr`), where
+        // its import or export is anchored (see `push_tables`).
+        if let Some(offset) = dynstr_offset.and_then(|base| {
             u64::try_from(sym.st_name)
                 .ok()
                 .map(|n| base.saturating_add(n))
-        });
-        if sym.st_shndx == 0 {
-            // ELF doesn't bind a dynsym entry to a specific
-            // DT_NEEDED library at link time — the dynamic linker
-            // resolves at load. Leave `library` unset; consumers
-            // that need it walk `elf.needed[]` separately.
-            symbols_out.push(crate::Symbol::Import {
-                name: name.to_string(),
-                alias: None,
-                library: None,
-                offset: name_off,
-                ordinal: None,
-            });
-        } else if sym.is_function() || sym.st_type() == goblin::elf::sym::STT_OBJECT {
-            // Defined functions and data objects are the exported surface.
-            symbols_out.push(crate::Symbol::Export {
-                name: name.to_string(),
-                offset: name_off,
-                ordinal: None,
-                // ELF doesn't have a forwarded-export concept like
-                // PE's reexports — symbol versioning solves the same
-                // problem differently and is surfaced through the
-                // version-info extractor.
-                forward_to: None,
-            });
+        }) {
+            name_offsets.entry(name).or_insert(offset);
         }
     }
+    // An object's (or a static executable's) undefined and global symbols,
+    // which binform lists when there is no dynamic table, anchor in `.strtab`.
+    let strtab = if elf.dynsyms.is_empty() {
+        elf.section_headers
+            .iter()
+            .find(|sh| sh.sh_type == goblin::elf::section_header::SHT_SYMTAB)
+            .and_then(|symtab| elf.section_headers.get(symtab.sh_link as usize))
+            .map(|sh| sh.sh_offset)
+    } else {
+        None
+    };
+    if let Some(strtab) = strtab {
+        for sym in elf.syms.iter() {
+            if let Some(name) = elf.strtab.get_at(sym.st_name).filter(|n| !n.is_empty())
+                && let Ok(n) = u64::try_from(sym.st_name)
+            {
+                name_offsets
+                    .entry(name)
+                    .or_insert_with(|| strtab.saturating_add(n));
+            }
+        }
+    }
+    push_tables(layout, &name_offsets, &mut names, symbols_out);
     // Import/export totals flow through cross-format `imports.count`
     // / `exports.count` emitted by `lib.rs::extract_all` after every
     // format extractor runs. No per-format aliases.
@@ -208,6 +205,49 @@ pub(super) fn emit(
         values.insert_key(value_key!("elf.ifuncs"), JsonValue::Array(ifuncs));
     }
     emit_symbol_kind_histograms(&sym_type_counts, &sym_bind_counts, &sym_vis_counts, values);
+}
+
+/// binform's imports (the undefined symbols the loader binds, or in an
+/// object the linker) and exports (the defined globals and weaks other
+/// images can bind to), each anchored at its name's bytes in the file: ELF
+/// binds no useful offset to an import-table entry, and `st_value` is a
+/// virtual address that may point into `.bss`, with no file backing. ELF
+/// binds no symbol to a `DT_NEEDED` library, so `library` is unset;
+/// consumers that need it walk `elf.needed[]`. Nor has it forwarders: symbol
+/// versioning solves that problem, surfaced through the version-info
+/// extractor.
+pub(super) fn push_tables(
+    layout: Option<&binform::Binary<'_>>,
+    name_offsets: &HashMap<&str, u64>,
+    names: &mut NameBudget,
+    symbols_out: &mut crate::Symbols,
+) {
+    let Some(layout) = layout else {
+        return;
+    };
+    for import in &layout.imports {
+        if !names.take(import.name.len()) {
+            return;
+        }
+        symbols_out.push(crate::Symbol::Import {
+            name: import.name.clone(),
+            alias: None,
+            library: None,
+            offset: name_offsets.get(import.name.as_str()).copied(),
+            ordinal: None,
+        });
+    }
+    for export in &layout.exports {
+        if !names.take(export.name.len()) {
+            return;
+        }
+        symbols_out.push(crate::Symbol::Export {
+            name: export.name.clone(),
+            offset: name_offsets.get(export.name.as_str()).copied(),
+            ordinal: None,
+            forward_to: None,
+        });
+    }
 }
 
 /// Bump the type / binding / visibility tallies for one ELF symbol.

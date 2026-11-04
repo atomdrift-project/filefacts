@@ -1,6 +1,6 @@
 use super::{
-    MAX_PLIST_DEPTH, XorScan, apply_native, basename, cfb_entry_path, extract_text_strings,
-    format_guid, has_xor_intent, hex_encode, plist_to_json, read_uleb128, section_entropy, stem,
+    MAX_PLIST_DEPTH, XorScan, basename, cfb_entry_path, extract_text_strings, format_guid,
+    has_xor_intent, hex_encode, plist_to_json, read_uleb128, section_entropy, stem,
 };
 use crate::output::Strings;
 use serde_json::Value as JsonValue;
@@ -230,53 +230,4 @@ fn affix_checks_ignore_ascii_case() {
     assert!(super::ends_with_ci("é.SF", ".sf"));
     assert!(super::starts_with_ci("meta-inf/CERT.SF", "META-INF/"));
     assert!(!super::starts_with_ci("META", "META-INF/"));
-}
-
-/// binform's layout fills only the views the format parser left empty, and
-/// an import by ordinal from a DLL with stable ordinals goes by its name.
-#[test]
-fn binform_layout_fills_only_empty_views() {
-    use crate::output::{Section, SectionFlag, Symbol, SymbolKind};
-    let native = || crate::functions::Native {
-        imports: vec![binform::Import {
-            name: "Ordinal_3".into(),
-            library: Some("WS2_32.dll".into()),
-            ordinal: Some(3),
-            slot: Some(0x1000),
-        }],
-        exports: vec![binform::Export {
-            name: "Run".into(),
-            addr: 0x2000,
-            forward: None,
-        }],
-        sections: vec![binform::Section {
-            name: ".text".into(),
-            addr: 0x1000,
-            size: 0x1000,
-            offset: 0x400,
-            file_size: 0x200,
-            readable: true,
-            writable: false,
-            executable: true,
-        }],
-        ..crate::functions::Native::default()
-    };
-    let mut symbols = crate::Symbols::new();
-    let mut sections = Vec::new();
-    let mut metrics = crate::output::Metrics::default();
-    let counts = apply_native(native(), &mut symbols, Some(&mut sections), &mut metrics);
-    assert_eq!((counts.imports, counts.exports, counts.sections), (1, 1, 1));
-    let import = symbols.iter().find(|s| s.kind() == SymbolKind::Import);
-    assert!(matches!(
-        import,
-        Some(Symbol::Import { name, ordinal: Some(3), offset: Some(0x1000), .. }) if name == "closesocket"
-    ));
-    assert!(matches!(
-        sections.as_slice(),
-        [Section { name, vaddr: 0x1000, file_offset: 0x400, flags, .. }]
-            if name == ".text" && flags == &[SectionFlag::Readable, SectionFlag::Executable]
-    ));
-    // A second answer adds nothing: every view is filled.
-    let counts = apply_native(native(), &mut symbols, Some(&mut sections), &mut metrics);
-    assert_eq!((counts.imports, counts.exports, counts.sections), (0, 0, 0));
 }

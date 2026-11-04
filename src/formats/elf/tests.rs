@@ -1226,9 +1226,11 @@ fn static_function_fallback_leaves_dynamic_exports_as_exports() {
     // The `.dynsym` view is unchanged: an export, and `syscall` an import.
     let bytes = read_fixture("elf-syscall-wrapper-plt.elf");
     let elf = Elf::parse(&bytes).unwrap();
+    let layout = binform::parse(&bytes).ok();
     let mut out = crate::Symbols::default();
     symbols::emit(
         &elf,
+        layout.as_ref(),
         bytes.len(),
         &mut Values::default(),
         &mut Metrics::default(),

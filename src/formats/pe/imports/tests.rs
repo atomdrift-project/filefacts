@@ -45,6 +45,8 @@ fn pe_with_shared_delay_imports(descriptors: usize, entries: usize) -> Vec<u8> {
         let at = pointer + i * 32;
         put(&mut bytes, at, 1); // RvaBased
         put(&mut bytes, at + 4, va + dll_at as u32);
+        // The address table the loader binds, here the name table itself.
+        put(&mut bytes, at + 12, va + int_at as u32);
         put(&mut bytes, at + 16, va + int_at as u32);
     }
     // Data directory 13 is the delay-import table; PE32+ puts the array at +112.
@@ -55,39 +57,47 @@ fn pe_with_shared_delay_imports(descriptors: usize, entries: usize) -> Vec<u8> {
 }
 
 /// Descriptors sharing one name table multiply into symbols; the total is
-/// capped, not just each table.
+/// capped, not just each table, in the descriptor facts and in the symbols.
 #[test]
 fn delay_imports_are_capped_across_descriptors() {
-    let small = pe_with_shared_delay_imports(3, 5);
-    let prepared = goblin_safe::prepare_pe(&small);
-    let pe = goblin_safe::parse_pe(&prepared).ok().expect("parses");
-    let (mut values, mut metrics, mut symbols) =
-        (Values::new(), Metrics::new(), crate::Symbols::new());
-    delay_imports(&pe, &small, &mut values, &mut metrics, &mut symbols);
-    assert_eq!(symbols.len(), 15);
-    assert_eq!(metrics.get("pe.delay_import_count"), Some(15.0));
-
+    let views = |bytes: &[u8]| {
+        let prepared = goblin_safe::prepare_pe(bytes);
+        let pe = goblin_safe::parse_pe(&prepared).ok().expect("parses");
+        let layout = binform::parse(bytes).expect("binform reads it");
+        let (mut values, mut metrics, mut symbols) =
+            (Values::new(), Metrics::new(), crate::Symbols::new());
+        delay_imports(&pe, bytes, &mut values, &mut metrics);
+        imports(
+            &layout,
+            pe.image_base,
+            pe.header.coff_header.machine,
+            false,
+            &mut values,
+            &mut metrics,
+            &mut symbols,
+        );
+        let delayed = symbols
+            .iter()
+            .filter(|s| matches!(s, crate::Symbol::Import { library: Some(l), .. } if l == "a"))
+            .count();
+        (delayed, metrics.get("pe.delay_import_count"))
+    };
+    assert_eq!(views(&pe_with_shared_delay_imports(3, 5)), (15, Some(15.0)));
     // 128 descriptors x 4096 entries would be half a million symbols.
-    let big = pe_with_shared_delay_imports(128, 4096);
-    let prepared = goblin_safe::prepare_pe(&big);
-    let pe = goblin_safe::parse_pe(&prepared).ok().expect("parses");
-    let (mut values, mut metrics, mut symbols) =
-        (Values::new(), Metrics::new(), crate::Symbols::new());
-    delay_imports(&pe, &big, &mut values, &mut metrics, &mut symbols);
-    assert_eq!(symbols.len(), 16 * 1024);
-    assert_eq!(metrics.get("pe.delay_import_count"), Some(16.0 * 1024.0));
+    assert_eq!(
+        views(&pe_with_shared_delay_imports(128, 4096)),
+        (16 * 1024, Some(16.0 * 1024.0))
+    );
 }
 
-/// An import as goblin synthesizes it: by name, or by ordinal as
-/// `ORDINAL n`.
-fn import<'a>(dll: &'a str, name: Option<&'a str>, ordinal: u16) -> Import<'a> {
-    Import {
-        name: name.map_or_else(|| format!("ORDINAL {ordinal}").into(), Into::into),
-        dll,
-        ordinal,
-        offset: 0,
-        rva: 0,
-        size: 0,
+/// An import as binform reads it: by name, or by ordinal.
+fn import(dll: &str, name: Option<&str>, ordinal: u16) -> binform::Import {
+    binform::Import {
+        name: name.map_or_else(|| format!("Ordinal_{ordinal}"), Into::into),
+        library: Some(dll.into()),
+        ordinal: name.is_none().then_some(ordinal),
+        slot: None,
+        delayed: false,
     }
 }
 
@@ -117,19 +127,25 @@ fn imphash_matches_pefile() {
     // ws2_32.ord400,wsock32.recv,oleaut32.sysallocstring,oleaut32.ord1,
     // msvcrt.ord7,foo.ocx.ord2,user32.messageboxa
     assert_eq!(
-        imphash(&imports).as_deref(),
+        imphash(&imports.iter().collect::<Vec<_>>()).as_deref(),
         Some("5003190901ffd22d77db9eea33178aa1")
     );
     assert_eq!(imphash(&[]), None);
 }
 
-/// A function genuinely named like goblin's ordinal placeholder, but with a
-/// different ordinal, is hashed by its name.
+/// A function genuinely named like an ordinal placeholder is hashed by its
+/// name: only an import the table marks by ordinal reads as one.
 #[test]
-fn only_goblins_own_ordinal_names_read_as_ordinals() {
-    assert!(by_ordinal(&import("a.dll", None, 9)));
-    assert!(!by_ordinal(&import("a.dll", Some("ORDINAL 9"), 10)));
-    assert!(!by_ordinal(&import("a.dll", Some("ORDINAL"), 0)));
+fn only_imports_by_ordinal_hash_as_ordinals() {
+    let named = binform::Import {
+        ordinal: None,
+        ..import("a.dll", Some("ORDINAL 9"), 0)
+    };
+    assert_eq!(
+        imphash(&[&named]),
+        imphash(&[&import("a.dll", Some("ordinal 9"), 0)])
+    );
+    assert_ne!(imphash(&[&named]), imphash(&[&import("a.dll", None, 9)]));
 }
 
 /// The tables are sorted for the binary search, ordinals unique.
@@ -144,4 +160,72 @@ fn ordinal_tables_are_sorted() {
         "UnRegisterTypeLibForUser"
     );
     assert_eq!(ordinal_name("kernel32.dll", 1), "ord1");
+}
+
+/// The naming-only tables are sorted too, and name what the DLLs export
+/// there (msi's as Wine's `msi.spec` numbers them); the imphash still takes
+/// pefile's tables alone, so it keeps matching pefile and VirusTotal.
+#[test]
+fn naming_tables_name_imports_but_not_the_imphash() {
+    for table in [
+        ordinal_names::MSI,
+        ordinal_names::COMCTL32,
+        ordinal_names::CABINET,
+        ordinal_names::MFC42,
+        ordinal_names::MFC42U,
+        ordinal_names::COREDLL,
+        ordinal_names::COREDLL_X86,
+        ordinal_names::COREDLL_ARM,
+        ordinal_names::COREDLL_MIPS,
+        ordinal_names::COREDLL_SH,
+        ordinal_names::COMMCTRL,
+    ] {
+        assert!(table.windows(2).all(|w| w[0].0 < w[1].0));
+    }
+    assert_eq!(
+        known_ordinal("msi.dll", 141, None),
+        Some("MsiSetInternalUI")
+    );
+    assert_eq!(
+        known_ordinal("msi.dll", 281, None),
+        Some("MsiSetExternalUIRecord")
+    );
+    assert_eq!(
+        known_ordinal("comctl32.dll", 17, None),
+        Some("InitCommonControls")
+    );
+    assert_eq!(
+        known_ordinal("mfc42.dll", 6375, None),
+        Some("?WinHelpA@CWinApp@@UAEXKI@Z")
+    );
+    // comctl32 6.0 renumbered what 5.82 exported at 18 to 20.
+    assert_eq!(known_ordinal("comctl32.dll", 21, None), None);
+    assert_eq!(known_ordinal("ws2_32.dll", 500, None), Some("WEP"));
+    assert_eq!(ordinal_name("msi.dll", 141), "ord141");
+}
+
+/// Windows CE's coredll numbers most exports alike on every CPU, but not
+/// all: those it does not are named only when the PE's CPU is known.
+#[test]
+fn windows_ce_ordinals_follow_the_cpu() {
+    assert_eq!(
+        known_ordinal("coredll.dll", 2, None),
+        Some("InitializeCriticalSection")
+    );
+    assert_eq!(
+        known_ordinal("commctrl.dll", 2, None),
+        Some("InitCommonControlsEx")
+    );
+    assert_eq!(known_ordinal("coredll.dll", 10, None), None);
+    let arm = Cpu::of_machine(0x01c2);
+    assert_eq!(arm, Some(Cpu::Arm));
+    assert_eq!(
+        known_ordinal("coredll.dll", 10, arm),
+        Some("InterlockedIncrement")
+    );
+    assert_eq!(
+        known_ordinal("coredll.dll", 10, Cpu::of_machine(0x014c)),
+        Some("Int_HeapAlloc")
+    );
+    assert_eq!(Cpu::of_machine(0x8664), None);
 }

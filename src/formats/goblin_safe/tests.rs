@@ -300,29 +300,6 @@ fn rejection_messages_are_unchanged() {
             "export names exceed 33554432 bytes",
         ),
         (
-            Rejection::ExportTrieLoop {
-                node: 0x20,
-                start: 0x10,
-                end: 0x40,
-            },
-            "export trie loops back to node 0x20 (trie 0x10..0x40)",
-        ),
-        (
-            Rejection::ExportTrieBranches {
-                node: 0,
-                branches: 100,
-                available: 4,
-            },
-            "export trie node 0x0 claims 100 branches in 4 bytes",
-        ),
-        (
-            Rejection::ExportTrieTooDeep {
-                node: 0x380,
-                depth: 129,
-            },
-            "export trie reaches node 0x380 at depth 129, past 128",
-        ),
-        (
             Rejection::OversizedBindStream {
                 stream: "lazy",
                 imports: 262_145,
@@ -599,68 +576,8 @@ fn parse_mach_handles_garbage() {
     ));
 }
 
-/// A two-node trie as a linker emits it: a non-terminal root with one
-/// edge `_a` to a terminal leaf (flags 0, address 0x10, no children).
-const WELL_FORMED_TRIE: &[u8] = &[
-    0x00, 0x01, b'_', b'a', 0x00, 0x06, // root @0: 1 branch, child @6
-    0x02, 0x00, 0x10, 0x00, // leaf @6: terminal, no children
-];
-
-#[test]
-fn export_trie_accepts_well_formed() {
-    assert!(validate_export_trie_bytes(WELL_FORMED_TRIE, 0, WELL_FORMED_TRIE.len()).is_ok());
-    // Embedded past a header, as in a real file.
-    let mut file = vec![0xAAu8; 64];
-    file.extend_from_slice(WELL_FORMED_TRIE);
-    assert!(validate_export_trie_bytes(&file, 64, WELL_FORMED_TRIE.len()).is_ok());
-}
-
-/// The leptris shape: the root's only edge points back at the root, so
-/// goblin's walk never ends. llvm-objdump: "loop in children in export
-/// trie data at node: 0x0 back to node: 0x0".
-#[test]
-fn export_trie_rejects_root_self_loop() {
-    let trie = [0x00, 0x01, b'_', b'a', 0x00, 0x00];
-    let err = validate_export_trie_bytes(&trie, 0, trie.len()).expect_err("loop must trip");
-    assert!(
-        matches!(err, Rejection::ExportTrieLoop { node: 0, .. }),
-        "unexpected reason: {err}"
-    );
-}
-
-#[test]
-fn export_trie_rejects_deep_cycle() {
-    // root -> leaf, and the leaf (terminal with one child) points at root.
-    let trie = [
-        0x00, 0x01, b'_', b'a', 0x00, 0x06, // root @0 -> @6
-        0x02, 0x00, 0x10, 0x01, b'b', 0x00, 0x00, // leaf @6, 1 child -> @0
-    ];
-    assert!(validate_export_trie_bytes(&trie, 0, trie.len()).is_err());
-}
-
-#[test]
-fn export_trie_rejects_forged_branch_count() {
-    // Root claims 100 branches in a 6-byte trie.
-    let trie = [0x00, 0x64, b'_', b'a', 0x00, 0x06];
-    let err = validate_export_trie_bytes(&trie, 0, trie.len()).expect_err("count must trip");
-    assert!(
-        matches!(err, Rejection::ExportTrieBranches { branches: 100, .. }),
-        "unexpected reason: {err}"
-    );
-}
-
-#[test]
-fn export_trie_waves_through_what_goblin_rejects() {
-    // Range past the file: goblin treats it as an empty trie.
-    assert!(validate_export_trie_bytes(WELL_FORMED_TRIE, 4, 100).is_ok());
-    assert!(validate_export_trie_bytes(&[], 0, 0).is_ok());
-    // Truncated ULEB / label: goblin's own Err is the report.
-    assert!(validate_export_trie_bytes(&[0x00, 0x01, b'_'], 0, 3).is_ok());
-    assert!(validate_export_trie_bytes(&[0x80], 0, 1).is_ok());
-}
-
 /// A straight chain of `depth` non-terminal nodes, each with one edge `a`, and
-/// a terminal leaf at the bottom. Acyclic, so only a depth bound catches it.
+/// a terminal leaf at the bottom: its one export's name is `depth` bytes.
 pub(crate) fn chain_trie(depth: usize) -> Vec<u8> {
     let mut trie = Vec::new();
     for _ in 0..depth {
@@ -718,54 +635,6 @@ pub(crate) fn macho_with_dyld_info(bind: &[u8], export: &[u8]) -> Vec<u8> {
     file.extend_from_slice(bind);
     file.extend_from_slice(export);
     file
-}
-
-/// Run `f` on a thread with a 2 MiB stack, the size of a Rayon worker's.
-fn on_small_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
-    std::thread::Builder::new()
-        .stack_size(2 << 20)
-        .spawn(f)
-        .expect("spawn")
-        .join()
-        .expect("join")
-}
-
-#[test]
-fn export_trie_rejects_a_chain_past_the_depth_limit() {
-    let trie = chain_trie(MAX_EXPORT_TRIE_DEPTH);
-    let err = validate_export_trie_bytes(&trie, 0, trie.len()).expect_err("depth must trip");
-    assert!(
-        matches!(err, Rejection::ExportTrieTooDeep { depth, .. } if depth == MAX_EXPORT_TRIE_DEPTH + 1),
-        "unexpected reason: {err}"
-    );
-    // A chain 5000 deep overflows goblin's recursive walk on a 2 MiB stack;
-    // the validator refuses it before goblin ever sees it.
-    let deep = macho_with_dyld_info(&[], &chain_trie(5000));
-    on_small_stack(move || {
-        let GoblinOutcome::Ok(Mach::Binary(macho)) = parse_mach(&deep) else {
-            panic!("fixture must parse");
-        };
-        assert!(matches!(
-            validate_export_trie(&macho, &deep),
-            Err(Rejection::ExportTrieTooDeep { .. })
-        ));
-    });
-}
-
-#[test]
-fn export_trie_at_the_depth_limit_is_walkable_on_a_worker_stack() {
-    let file = macho_with_dyld_info(&[], &chain_trie(MAX_EXPORT_TRIE_DEPTH - 1));
-    let exports = on_small_stack(move || {
-        let GoblinOutcome::Ok(Mach::Binary(macho)) = parse_mach(&file) else {
-            panic!("fixture must parse");
-        };
-        validate_export_trie(&macho, &file).expect("within the limit");
-        match catch(|| macho.exports()) {
-            GoblinOutcome::Ok(exports) => exports.len(),
-            other => panic!("goblin walk failed: {:?}", other.ok().map(|e| e.len())),
-        }
-    });
-    assert_eq!(exports, 1);
 }
 
 #[test]
