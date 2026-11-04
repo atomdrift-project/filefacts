@@ -182,7 +182,7 @@ pub(super) fn analyse(
 /// order. A slice binform decodes yields functions, so the top-level views
 /// describe the image they come from.
 fn preference(layout: Option<&binform::Binary<'_>>) -> u8 {
-    match layout.and_then(|layout| layout.arch) {
+    match layout.and_then(|layout| layout.arch()) {
         Some(binform::Arch::X86_64) => 0,
         Some(binform::Arch::Arm64) => 1,
         Some(_) => 2,

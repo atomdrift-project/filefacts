@@ -16,13 +16,13 @@ use crate::output::Metrics;
 /// The disk-cache key's part for function recovery. Bump it whenever the
 /// binform commit in Cargo.lock, or what filefacts takes from it, changes:
 /// either changes what a cached extraction holds.
-pub(crate) const POLICY: &str = "binform=v7";
+pub(crate) const POLICY: &str = "binform=v8";
 
 /// Recovered functions, and names for the call targets that are no
 /// recovered function (an import's slot or stub).
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Functions {
-    pub(crate) recovery: binform::Functions,
+    pub(crate) recovery: binform::Recovery,
     pub(crate) targets: HashMap<u64, String>,
 }
 
@@ -61,8 +61,8 @@ pub(crate) fn recover(image: Option<&binform::Binary<'_>>) -> Option<Native> {
         count(&STATS.unreadable);
         return None;
     };
-    let recovery = binform::functions(image, &binform::Limits::DEFAULT);
-    if image.arch.is_none() {
+    let recovery = binform::recover(image, &binform::Limits::DEFAULT);
+    if image.arch().is_none() {
         count(&STATS.layout_only);
     } else if recovery.truncated {
         count(&STATS.truncated);
@@ -73,10 +73,10 @@ pub(crate) fn recover(image: Option<&binform::Binary<'_>>) -> Option<Native> {
     for function in &recovery.functions {
         for r in &function.refs {
             if r.kind == binform::RefKind::Call
-                && recovery.function(r.to).is_none()
-                && let Some(name) = image.import(r.to)
+                && let binform::Dest::Slot { addr, .. } = r.to
+                && let Some(name) = recovery.name(image, r.to)
             {
-                targets.entry(r.to).or_insert_with(|| name.to_owned());
+                targets.entry(addr).or_insert_with(|| name.to_owned());
             }
         }
     }
@@ -84,14 +84,14 @@ pub(crate) fn recover(image: Option<&binform::Binary<'_>>) -> Option<Native> {
     Some(Native {
         functions: Functions { recovery, targets },
         syscalls,
-        arch: image.arch,
+        arch: image.arch(),
     })
 }
 
 /// Project binform's call sites into syscall facts, while the `Binary` is in
 /// scope to resolve numbers to names: a raw `syscall`/`svc` instruction, and a
 /// call to the libc `syscall()` wrapper whose number argument is constant.
-fn syscall_facts(image: &binform::Binary<'_>, recovery: &binform::Functions) -> Vec<SyscallFact> {
+fn syscall_facts(image: &binform::Binary<'_>, recovery: &binform::Recovery) -> Vec<SyscallFact> {
     use binform::{Target, Value};
     let calls = binform::calls(image, recovery);
     // Statically linked binaries reach `connect` through a thin libc wrapper
@@ -103,9 +103,9 @@ fn syscall_facts(image: &binform::Binary<'_>, recovery: &binform::Functions) -> 
     let wrappers = connect_wrappers(recovery, &calls, connect);
     let mut facts = Vec::new();
     for call in calls {
-        let import = |index: usize| image.imports.get(index).map(|i| i.name.as_str());
+        let import = |index: usize| image.imports().get(index).map(|i| i.name.as_str());
         let (number, name, via, args) = match call.target {
-            Target::Syscall(number) => (number, image.syscall(number), None, call.args),
+            Target::Syscall(Some(number)) => (number, image.syscall(number), None, call.args),
             // A direct call to the connect wrapper: the socket syscall it
             // issues, with the caller's arguments (the sockaddr among them).
             Target::Addr(to) if wrappers.contains(&to) => (
@@ -149,7 +149,7 @@ fn syscall_facts(image: &binform::Binary<'_>, recovery: &binform::Functions) -> 
 /// call carrying the caller's arguments. The size bound keeps a large function
 /// that merely contains a connect from claiming all its callers.
 fn connect_wrappers(
-    recovery: &binform::Functions,
+    recovery: &binform::Recovery,
     calls: &[binform::Call],
     connect: Option<u64>,
 ) -> HashSet<u64> {
@@ -161,7 +161,7 @@ fn connect_wrappers(
     };
     let mut wrappers = HashSet::new();
     for call in calls {
-        if call.target != binform::Target::Syscall(connect) {
+        if call.target != binform::Target::Syscall(Some(connect)) {
             continue;
         }
         // The connect syscall sits inside its wrapper, so find the small
@@ -210,7 +210,7 @@ impl Functions {
                     .refs
                     .iter()
                     .filter(|r| r.kind == binform::RefKind::Call)
-                    .map(move |r| (function.entry, r.from, r.to))
+                    .map(move |r| (function.entry, r.from, r.addr()))
             })
             .collect()
     }
@@ -245,7 +245,7 @@ impl Functions {
                     .refs
                     .iter()
                     .filter(|r| r.kind == binform::RefKind::Call)
-                    .filter_map(|r| resolve(r.to))
+                    .filter_map(|r| resolve(r.addr()))
                     .filter(|name| !name.is_empty())
                     .collect();
                 symbols.push(Symbol::Function {
@@ -270,7 +270,7 @@ impl Functions {
                 for r in &function.refs {
                     if r.kind == binform::RefKind::Call {
                         symbols.push(Symbol::Call {
-                            target: resolve(r.to),
+                            target: resolve(r.addr()),
                             args: Vec::new(),
                             offset: Some(r.from),
                         });
@@ -346,32 +346,27 @@ mod tests {
     use super::*;
 
     fn function(entry: u64, blocks: u32, refs: Vec<binform::Ref>) -> binform::Function {
-        binform::Function {
-            entry,
-            size: 16,
-            blocks,
-            complexity: 1,
-            refs,
-            name: None,
-        }
+        let mut function = binform::Function::default();
+        function.entry = entry;
+        function.size = 16;
+        function.blocks = blocks;
+        function.complexity = 1;
+        function.refs = refs;
+        function
     }
 
-    fn recovery(functions: Vec<binform::Function>) -> binform::Functions {
-        binform::Functions {
-            functions,
-            code: 100,
-            covered: 100,
-            ..binform::Functions::default()
-        }
+    fn recovery(functions: Vec<binform::Function>) -> binform::Recovery {
+        let mut recovery = binform::Recovery::default();
+        recovery.functions = functions;
+        recovery.code = 100;
+        recovery.covered = 100;
+        recovery
     }
 
     #[test]
     fn calls_are_named_by_import_symbol_or_address() {
-        let call = |from, to| binform::Ref {
-            from,
-            to,
-            kind: binform::RefKind::Call,
-        };
+        let call =
+            |from, to| binform::Ref::new(from, binform::Dest::Code(to), binform::RefKind::Call);
         let mut named = function(0x2000, 1, Vec::new());
         named.name = Some("helper".into());
         let caller = function(

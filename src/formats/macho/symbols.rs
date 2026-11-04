@@ -32,7 +32,7 @@ pub(super) fn extract(
     // imports point into `.dynstr`, and the hex/context view expects to
     // render the name's ASCII — so Mach-O imports do too.
     let name_offsets = import_name_offsets(macho, bytes);
-    for imp in &layout.imports {
+    for imp in layout.imports() {
         symbols_out.push(crate::Symbol::Import {
             // Record the base symbol, not the Darwin `$VARIANT` spelling,
             // so anchored trait matchers and imphash see `popen` rather
@@ -56,17 +56,15 @@ pub(super) fn extract(
         .iter()
         .find(|segment| segment.name().is_ok_and(|name| name == "__TEXT"))
         .map_or(0, |segment| segment.vmaddr);
-    for exp in &layout.exports {
+    for exp in layout.exports() {
         symbols_out.push(crate::Symbol::Export {
             // Normalize the same Darwin `$VARIANT` suffix as imports: these
             // markers are *defined* in libSystem, so a library re-exporting
             // libc carries them here. The allow-list leaves a binary's own
             // `_OBJC_CLASS_$_…` exports intact.
             name: strip_darwin_symbol_variant(&exp.name).to_string(),
-            offset: match exp.forward {
-                Some(_) => None,
-                None => exp.addr.checked_sub(base),
-            },
+            // A re-export has no address of its own.
+            offset: exp.addr.and_then(|addr| addr.checked_sub(base)),
             ordinal: None,
             forward_to: exp
                 .forward

@@ -1005,7 +1005,7 @@ fn sections(layout: Option<&binform::Binary<'_>>, bytes: &[u8], sections_out: &m
     // disjoint slices of the file, so its own length is the exact budget they
     // need and this never bites a real binary.
     let mut entropy_budget = bytes.len() as u64;
-    for section in &layout.sections {
+    for section in layout.sections() {
         // The name is cut as `section_name` cuts it: names are
         // attacker-controlled string-table runs, and distinct headers naming
         // every suffix of one run to EOF would otherwise turn a few MB of

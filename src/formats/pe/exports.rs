@@ -27,7 +27,7 @@ pub(super) fn exports(
     symbols_out: &mut crate::Symbols,
 ) {
     let mut forwarded_count: u32 = 0;
-    for exp in layout.iter().flat_map(|layout| &layout.exports) {
+    for exp in layout.iter().flat_map(|layout| layout.exports()) {
         // A forwarder names its target as the table spells it, `DLL.symbol`
         // or `DLL.#ordinal` (`IMAGE_EXPORT_DIRECTORY` §6.3.1), so consumers
         // don't have to switch on a discriminator. A normal export (RVA
@@ -37,7 +37,7 @@ pub(super) fn exports(
         // Ghidra and the PE specification key exports by.
         symbols_out.push(crate::Symbol::Export {
             name: exp.name.clone(),
-            offset: Some(exp.addr.wrapping_sub(image_base)),
+            offset: exp.addr.map(|addr| addr.wrapping_sub(image_base)),
             ordinal: None,
             forward_to: exp.forward.clone(),
         });

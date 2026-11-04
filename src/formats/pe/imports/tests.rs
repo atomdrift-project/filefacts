@@ -91,13 +91,11 @@ fn delay_imports_are_capped_across_descriptors() {
 
 /// An import as binform reads it: by name, or by ordinal.
 fn import(dll: &str, name: Option<&str>, ordinal: u16) -> binform::Import {
-    binform::Import {
-        name: name.map_or_else(|| format!("Ordinal_{ordinal}"), Into::into),
-        library: Some(dll.into()),
-        ordinal: name.is_none().then_some(ordinal),
-        slot: None,
-        delayed: false,
-    }
+    let mut import = binform::Import::default();
+    import.name = name.map_or_else(|| format!("Ordinal_{ordinal}"), Into::into);
+    import.library = Some(dll.into());
+    import.ordinal = name.is_none().then_some(ordinal);
+    import
 }
 
 /// The imphash pefile and VirusTotal compute. The joined string below is
@@ -136,10 +134,8 @@ fn imphash_matches_pefile() {
 /// name: only an import the table marks by ordinal reads as one.
 #[test]
 fn only_imports_by_ordinal_hash_as_ordinals() {
-    let named = binform::Import {
-        ordinal: None,
-        ..import("a.dll", Some("ORDINAL 9"), 0)
-    };
+    let mut named = import("a.dll", Some("ORDINAL 9"), 0);
+    named.ordinal = None;
     assert_eq!(
         imphash(&[&named]),
         imphash(&[&import("a.dll", Some("ordinal 9"), 0)])

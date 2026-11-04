@@ -151,7 +151,7 @@ fn arg_int(value: &binform::Value) -> Option<u64> {
     match value {
         binform::Value::Int(n) => Some(*n),
         binform::Value::Mem { addr, .. } => *addr,
-        binform::Value::Unknown => None,
+        _ => None,
     }
 }
 

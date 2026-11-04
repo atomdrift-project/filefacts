@@ -29,7 +29,7 @@ pub(super) fn imports(
     let mut libraries = std::collections::BTreeSet::new();
     let mut table = Vec::new();
     let mut delayed = 0_u64;
-    for imp in &layout.imports {
+    for imp in layout.imports() {
         if imp.delayed {
             // Descriptors may share one name table; real binaries delay-load
             // tens to hundreds of functions.

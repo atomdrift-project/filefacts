@@ -549,7 +549,7 @@ fn deep_export_trie_yields_no_overlong_export() {
         &crate::formats::goblin_safe::tests::chain_trie(5000),
     );
     let layout = binform::parse(&file).expect("binform reads the fixture");
-    assert!(layout.exports.iter().all(|e| e.name.len() <= 1 << 12));
+    assert!(layout.exports().iter().all(|e| e.name.len() <= 1 << 12));
     let shallow = crate::formats::goblin_safe::tests::macho_with_dyld_info(
         &[],
         &crate::formats::goblin_safe::tests::chain_trie(200),
@@ -557,7 +557,7 @@ fn deep_export_trie_yields_no_overlong_export() {
     let layout = binform::parse(&shallow).expect("binform reads the fixture");
     assert_eq!(
         layout
-            .exports
+            .exports()
             .iter()
             .map(|e| e.name.len())
             .collect::<Vec<_>>(),

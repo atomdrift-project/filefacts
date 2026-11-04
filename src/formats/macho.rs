@@ -360,7 +360,7 @@ fn extract_sections(
     // headers are 80 bytes apiece and may all claim the whole file, which
     // would cost sections × file size. Sections past the budget go unmeasured.
     let mut unmeasured = bytes.len();
-    for section in &layout.sections {
+    for section in layout.sections() {
         let display = match section.name.split_once('.') {
             Some((segment, "")) => segment.to_owned(),
             Some((segment, name)) => format!("{segment},{name}"),

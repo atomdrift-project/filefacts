@@ -177,7 +177,7 @@ pub(super) fn sections(
     bytes: &[u8],
     sections_out: &mut Vec<Section>,
 ) {
-    for section in &layout.sections {
+    for section in layout.sections() {
         let entropy = (section.file_size > 0)
             .then(|| section_entropy(bytes, section.offset, section.file_size));
         sections_out.push(Section {

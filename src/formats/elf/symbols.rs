@@ -227,7 +227,7 @@ pub(super) fn push_tables(
     let Some(layout) = layout else {
         return;
     };
-    for import in &layout.imports {
+    for import in layout.imports() {
         if !names.take(import.name.len()) {
             return;
         }
@@ -239,7 +239,7 @@ pub(super) fn push_tables(
             ordinal: None,
         });
     }
-    for export in &layout.exports {
+    for export in layout.exports() {
         if !names.take(export.name.len()) {
             return;
         }
