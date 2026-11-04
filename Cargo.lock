@@ -90,7 +90,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 [[package]]
 name = "binform"
 version = "0.9.0"
-source = "git+https://github.com/atomdrift-project/binform.git#d10cb13681054b33c99cab4ea60c4841fcdec76a"
+source = "git+https://github.com/atomdrift-project/binform.git#4211c34c06adbed883caf73542cfa76f12130d8b"
 dependencies = [
  "gimli",
  "iced-x86",
@@ -1717,7 +1717,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stng"
 version = "3.0.0"
-source = "git+https://github.com/atomdrift-project/stng.git#9d505cecb9469a75cb9c11f2b5a5a8f3bfa16dc8"
+source = "git+https://github.com/atomdrift-project/stng.git#72e68eaa3b583fd2e1d75baff6e08ef87c68b0b6"
 dependencies = [
  "aho-corasick",
  "base64 0.22.1",
@@ -1743,7 +1743,7 @@ dependencies = [
 [[package]]
 name = "stng-process"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/stng.git#9d505cecb9469a75cb9c11f2b5a5a8f3bfa16dc8"
+source = "git+https://github.com/atomdrift-project/stng.git#72e68eaa3b583fd2e1d75baff6e08ef87c68b0b6"
 dependencies = [
  "libc",
 ]
