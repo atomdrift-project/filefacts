@@ -19,6 +19,7 @@ impl Collector {
         if visit.depth != 1
             || self.rows.len() >= SOURCE_QUERY_OUTPUT_LIMIT
             || !matches!(statement.kind(), "import_statement" | "export_statement")
+            || statement.has_error()
         {
             return;
         }

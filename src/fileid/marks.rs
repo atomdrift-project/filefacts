@@ -258,11 +258,15 @@ fn looks_like_roff_man_page(head: &[u8]) -> bool {
 /// library-specific include fragments; a target followed by a tab-indented
 /// recipe covers ordinary build files.
 fn looks_like_makefile(head: &[u8]) -> bool {
+    if is_binary(head, Controls::Text) {
+        return false;
+    }
     let mut assignments = 0usize;
     let mut shell_functions = 0usize;
     let mut include_directives = 0usize;
-    let mut has_target = false;
-    let mut has_recipe = false;
+    let mut make_variable_lines = 0usize;
+    let mut pending_target = false;
+    let mut target_with_recipe = false;
     // A column-zero Python import plus a tab-indented try/except/else/finally
     // suite is source code, not a make target and recipe. Imports inside a
     // tab-indented make recipe do not satisfy this independent evidence.
@@ -277,13 +281,29 @@ fn looks_like_makefile(head: &[u8]) -> bool {
             continue;
         }
         if line.starts_with(b"\t") {
-            has_recipe = true;
+            target_with_recipe |= pending_target;
+            continue;
         }
+        pending_target = false;
         if trimmed.starts_with(b"include ") || trimmed.starts_with(b"-include ") {
             include_directives += 1;
         }
         if trimmed.windows(8).any(|window| window == b"$(shell ") {
             shell_functions += 1;
+        }
+        if trimmed.windows(2).enumerate().any(|(at, pair)| {
+            if pair != b"$(" {
+                return false;
+            }
+            let rest = &trimmed[at + 2..];
+            rest.iter().position(|&b| b == b')').is_some_and(|end| {
+                end > 0
+                    && rest[..end]
+                        .iter()
+                        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || *b == b'_')
+            })
+        }) {
+            make_variable_lines += 1;
         }
 
         let operators = [
@@ -321,19 +341,56 @@ fn looks_like_makefile(head: &[u8]) -> bool {
             // evidence of a make target (e.g. exec(code, {'stream': s})).
             let source_expression = target
                 .iter()
-                .any(|b| matches!(b, b'\'' | b'"' | b'[' | b']'));
+                .any(|b| matches!(b, b'\'' | b'"' | b'[' | b']'))
+                || target.starts_with(b"-(")
+                || target.starts_with(b"+(");
+            let mail_header = [
+                b"content-type".as_slice(),
+                b"content-disposition",
+                b"received",
+            ]
+            .iter()
+            .any(|header| target.eq_ignore_ascii_case(header));
             if !target.is_empty()
                 && !target.iter().any(u8::is_ascii_whitespace)
                 && !source_expression
                 && !python_suite
+                && !mail_header
             {
-                has_target = true;
+                pending_target = true;
             }
         }
     }
 
-    (assignments >= 2 && (shell_functions > 0 || include_directives > 0))
-        || (has_target && has_recipe)
+    (assignments >= 2
+        && (shell_functions > 0 || include_directives > 0 || make_variable_lines >= 2))
+        || target_with_recipe
+}
+
+#[cfg(test)]
+mod makefile_regression_tests {
+    use super::looks_like_makefile;
+
+    #[test]
+    fn target_and_recipe_must_be_related_text() {
+        assert!(looks_like_makefile(b"all:\n\tcc main.c\n"));
+        assert!(looks_like_makefile(b"all:\n# comment\n\n\tcc main.c\n"));
+        assert!(looks_like_makefile(
+            b"OUT := out\nSOURCES := $(OUT)/a $(OUT)/b\nDATA := $(OUT)/c\n"
+        ));
+        assert!(!looks_like_makefile(
+            b"<%@ Page Language=\"C#\"%>\nlabel:\n<script>\n\tcode();\n"
+        ));
+        assert!(!looks_like_makefile(
+            b"Content-Type: text/html;\n\tcharset=\"utf-8\"\n"
+        ));
+        assert!(!looks_like_makefile(
+            b"-(void)handle:(id)sender {\n\t[self process];\n}"
+        ));
+        assert!(!looks_like_makefile(
+            b"title:\n\x00\x01\x02\x03\x04\x05\x06\x07\n\tcommand\n"
+        ));
+    }
 }
 
 fn looks_like_asp_directive(head: &[u8]) -> bool {

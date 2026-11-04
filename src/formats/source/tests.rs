@@ -1,6 +1,37 @@
 use super::*;
 
 #[test]
+fn javascript_imports_ignore_recovered_source_map_fragments_but_keep_valid_siblings() {
+    // A Unicode-decoded source-map fragment still has JSON-escaped quotes.
+    // Recovery can attach an entire embedded source body as an import source.
+    let source = br#"import Cell from \"../Cell\";\nmodule body","next"; import ok from 'valid';"#;
+    for filename in ["fragment.js", "fragment.ts"] {
+        let parsed = crate::OpenOptions::new()
+            .path(std::path::Path::new(filename))
+            .open(source);
+        let imports: Vec<_> = parsed
+            .symbols()
+            .iter_kind(crate::SymbolKind::Import)
+            .filter_map(|symbol| match symbol {
+                crate::Symbol::Import { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(imports, ["valid"], "{filename}");
+        let values = parsed.values();
+        let rows = values
+            .get("source.js.runtime_imports")
+            .and_then(|value| value.as_array())
+            .unwrap();
+        let runtime: Vec<_> = rows
+            .iter()
+            .filter_map(|row| row["specifier"].as_str())
+            .collect();
+        assert_eq!(runtime, ["valid"], "{filename}");
+    }
+}
+
+#[test]
 fn javascript_constant_string_arguments_keep_exact_values_without_coercion() {
     let source = br#"
 capture('joined', "a" + (/* grouping */ 'b\n' + 'c'));

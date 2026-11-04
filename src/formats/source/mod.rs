@@ -695,6 +695,16 @@ fn collect_query(query: &Query, kind: QueryKind, source: &str, root: Node<'_>) -
                 if name.starts_with('_') {
                     continue;
                 }
+                // Escaped source-map fragments can recover as import statements
+                // whose source is an entire embedded module. Keep valid sibling
+                // imports, but do not publish sources from malformed statements.
+                if imports
+                    && cap.node.parent().is_some_and(|parent| {
+                        parent.kind() == "import_statement" && parent.has_error()
+                    })
+                {
+                    continue;
+                }
                 let cleaned = strip_quotes(text(cap.node, source));
                 if cleaned.is_empty() {
                     continue;
