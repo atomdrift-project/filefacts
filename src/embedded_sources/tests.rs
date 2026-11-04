@@ -6,7 +6,7 @@ fn sources(yaml: &[u8]) -> Vec<(String, String, Option<FileType>)> {
         .open(yaml);
     parsed
         .embedded_sources()
-        .map(|s| (s.pointer, s.source.to_owned(), s.file_type))
+        .map(|s| (s.pointer, s.source.into_owned(), s.file_type))
         .collect()
 }
 

@@ -14,9 +14,9 @@ use filefacts::{DiagnosticKind, FileId, FileType, OpenOptions, ParsedFile};
 /// The stack a rayon worker thread gets by default.
 const WORKER_STACK: usize = 2 << 20;
 
-/// Options for a hermetic open: no disk cache and no rizin subprocess.
+/// Options for a hermetic open: no disk cache.
 fn options() -> OpenOptions<'static> {
-    OpenOptions::new().cache(false).rizin(false)
+    OpenOptions::new().cache(false)
 }
 
 thread_local! {

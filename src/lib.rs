@@ -381,6 +381,8 @@ impl<'a> ParsedFile<'a> {
     /// Declared script bodies in a supported container format. Bodies borrow
     /// the parsed values; no script is executed and no reference is fetched.
     /// Unknown interpreters remain explicit rather than being guessed from text.
+    /// An HTML or SVG page yields its inline scripts as one
+    /// [`layer`](EmbeddedSource::layer) view, built on first iteration.
     pub fn embedded_sources(&self) -> impl Iterator<Item = EmbeddedSource<'_>> {
         // Each reader sees the value tree only for the format it understands,
         // and only that format pays for the extraction.
@@ -388,9 +390,15 @@ impl<'a> ParsedFile<'a> {
         let actions = (file_type == FileType::GithubActions).then(|| self.values());
         let rpm = (file_type == FileType::Rpm).then(|| self.values());
         let rpyc = (file_type == FileType::Rpyc).then(|| self.values());
+        let page =
+            matches!(file_type, FileType::Html | FileType::Svg).then_some((self.bytes, file_type));
         embedded_sources::github_actions(actions)
             .chain(embedded_sources::rpm(rpm))
             .chain(embedded_sources::rpyc(rpyc))
+            .chain(
+                std::iter::once_with(move || embedded_sources::html::inline_scripts(page))
+                    .flatten(),
+            )
     }
 
     /// Byte-scan extracted strings (printable ASCII / UTF-16LE runs).

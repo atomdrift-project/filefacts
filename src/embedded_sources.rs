@@ -1,6 +1,9 @@
 //! Declared source units, separate from arbitrary strings or encoded payloads.
 use crate::{FileType, Values};
 use serde_json::Value;
+use std::borrow::Cow;
+
+pub(crate) mod html;
 
 /// A script explicitly declared by a container format.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9,11 +12,18 @@ pub struct EmbeddedSource<'a> {
     /// JSON Pointer into the original structured values. Not a byte offset:
     /// YAML folding and escapes can make the decoded body non-contiguous.
     pub pointer: String,
-    /// Decoded script body, borrowed from the existing values tree.
-    pub source: &'a str,
+    /// Decoded script body: borrowed from the existing values tree, or an
+    /// owned view built from the host bytes (see [`layer`](Self::layer)).
+    pub source: Cow<'a, str>,
     /// Known declared interpreter, or None for missing/dynamic/custom shells.
     /// None is an analysis limitation, not evidence that the body is benign.
     pub file_type: Option<FileType>,
+    /// The body is a view of the host file itself, not a separate program:
+    /// it has the host's length and line breaks, so its offsets and lines
+    /// are the host's, and it runs in the host's scope (a page's inline
+    /// scripts). Analyze it as a layer of the host. `false` for an
+    /// independent unit, such as one workflow step among others.
+    pub layer: bool,
 }
 
 /// Interpreter for a declared `shell:` value: a GitHub built-in name, or a
@@ -84,8 +94,9 @@ fn steps<'a>(
             let source = step.get("run")?.as_str()?;
             Some(EmbeddedSource {
                 pointer: format!("{prefix}/{index}/run"),
-                source,
+                source: Cow::Borrowed(source),
                 file_type: step.get("shell").map_or(default_shell, shell_type),
+                layer: false,
             })
         })
 }
@@ -149,8 +160,9 @@ pub(crate) fn rpm(values: Option<&Values>) -> impl Iterator<Item = EmbeddedSourc
         .filter_map(|(name, script)| {
             Some(EmbeddedSource {
                 pointer: format!("/rpm/scriptlets/{name}/body"),
-                source: script.get("body")?.as_str()?,
+                source: Cow::Borrowed(script.get("body")?.as_str()?),
                 file_type: rpm_interpreter(script),
+                layer: false,
             })
         })
 }
@@ -166,8 +178,9 @@ pub(crate) fn rpyc(values: Option<&Values>) -> impl Iterator<Item = EmbeddedSour
         .filter_map(|(index, item)| {
             Some(EmbeddedSource {
                 pointer: format!("/rpyc/python_sources/{index}/source"),
-                source: item.get("source")?.as_str()?,
+                source: Cow::Borrowed(item.get("source")?.as_str()?),
                 file_type: Some(FileType::Python),
+                layer: false,
             })
         })
 }
