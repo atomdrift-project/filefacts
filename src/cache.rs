@@ -343,8 +343,19 @@ fn store_at_path<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), Stor
     fs::create_dir_all(dir)?;
     let mut tmp = temp_in(dir)?;
     tmp.write_all(&compressed)?;
-    tmp.persist(path)?;
-    Ok(())
+    match tmp.persist(path) {
+        Ok(_) => Ok(()),
+        // Windows refuses to replace a file another store is renaming into
+        // place at the same moment. A key names its content, so the entry
+        // that won is as good as this one; the loser's temp file deletes
+        // itself when dropped.
+        Err(error)
+            if error.error.kind() == std::io::ErrorKind::PermissionDenied && path.is_file() =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Remove version directories older than the current one under `root`.

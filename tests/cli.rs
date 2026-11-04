@@ -211,8 +211,15 @@ fn is_bidi_control(c: char) -> bool {
 #[test]
 fn control_sequences_from_the_file_are_escaped() {
     let dir = scratch("control-sequences");
+    // Windows forbids control characters in a file name; a bidi control is
+    // still allowed there.
+    let (name, escaped) = if cfg!(windows) {
+        ("evil\u{202e}.py", "evil\\u{202e}.py")
+    } else {
+        ("evil\x1b[2J\u{202e}.py", "evil\\x1b[2J\\u{202e}.py")
+    };
     fs::write(
-        dir.join("evil\x1b[2J\u{202e}.py"),
+        dir.join(name),
         "# \x1b]0;pwned\x07\nimport os\nos.system(\"\x1b[2J\u{2066}\")\n",
     )
     .unwrap();
@@ -230,7 +237,7 @@ fn control_sequences_from_the_file_are_escaped() {
         "--symbols",
         "--calls",
     ] {
-        let text = terminal_text(&[view], &dir.join("evil\x1b[2J\u{202e}.py"));
+        let text = terminal_text(&[view], &dir.join(name));
         assert!(
             !text
                 .chars()
@@ -245,7 +252,7 @@ fn control_sequences_from_the_file_are_escaped() {
             .any(|c| (c.is_control() && c != '\n') || is_bidi_control(c)),
         "{text:?}"
     );
-    assert!(text.contains("evil\\x1b[2J\\u{202e}.py"), "{text}");
+    assert!(text.contains(escaped), "{text}");
     assert!(text.contains("\\x9b31m"), "{text}");
     assert!(text.contains("\\u{202e}"), "{text}");
 }
