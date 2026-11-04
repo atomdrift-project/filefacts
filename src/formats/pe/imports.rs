@@ -16,7 +16,6 @@ pub(super) fn imports(
     layout: &binform::Binary<'_>,
     image_base: u64,
     machine: u16,
-    table_skipped: bool,
     values: &mut Values,
     metrics: &mut Metrics,
     symbols_out: &mut crate::Symbols,
@@ -25,8 +24,7 @@ pub(super) fn imports(
     // entry per slot, the DLL name as the binary spells it. The library lands
     // in the typed view as its lowercase stem (no `.dll` / `.ocx` / `.sys`),
     // so consumers match `library == "kernel32"` without case or extension
-    // juggling. An import table too large to walk (see
-    // `goblin_safe::prepare_pe`) contributes nothing, as it never did.
+    // juggling.
     let cpu = Cpu::of_machine(machine);
     let mut libraries = std::collections::BTreeSet::new();
     let mut table = Vec::new();
@@ -39,8 +37,6 @@ pub(super) fn imports(
                 continue;
             }
             delayed += 1;
-        } else if table_skipped {
-            continue;
         } else {
             libraries.insert(imp.library.as_deref().unwrap_or(""));
             table.push(imp);

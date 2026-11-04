@@ -16,13 +16,10 @@ use crate::value_key;
 const SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 
 /// The export table, from binform: one export per function the table
-/// lists, an unnamed one as `Ordinal_n`. A table too large to walk (see
-/// `goblin_safe::prepare_pe`) contributes nothing.
-#[allow(clippy::too_many_arguments)]
+/// lists, an unnamed one as `Ordinal_n`, within binform's walk budget.
 pub(super) fn exports(
     layout: Option<&binform::Binary<'_>>,
     image_base: u64,
-    table_skipped: bool,
     pe: Option<&PE<'_>>,
     bytes: &[u8],
     values: &mut Values,
@@ -30,8 +27,7 @@ pub(super) fn exports(
     symbols_out: &mut crate::Symbols,
 ) {
     let mut forwarded_count: u32 = 0;
-    let table = layout.filter(|_| !table_skipped);
-    for exp in table.iter().flat_map(|layout| &layout.exports) {
+    for exp in layout.iter().flat_map(|layout| &layout.exports) {
         // A forwarder names its target as the table spells it, `DLL.symbol`
         // or `DLL.#ordinal` (`IMAGE_EXPORT_DIRECTORY` §6.3.1), so consumers
         // don't have to switch on a discriminator. A normal export (RVA

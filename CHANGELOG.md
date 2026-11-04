@@ -80,7 +80,15 @@ is listed under **Changed** with the new value.
   reads each binary, or each slice of a universal one, once: the views,
   function recovery and stng's string passes share that read. Mach-O
   strings no longer come from a copy with forged bind streams emptied,
-  since stng no longer runs goblin's bind interpreter.
+  since stng no longer runs goblin's bind interpreter. An ELF import
+  names its library from its symbol version (`printf@GLIBC_2.2.5` is
+  `libc`, from `libc.so.6`); unversioned imports name none. binform's
+  "layout:" error is recorded only where goblin read the file, since
+  goblin's own error otherwise reports the same defect, and a universal
+  static library's `ar` slices are not read as images. A PE import or
+  export table past goblin's walk budget is still reported as an error,
+  but its view is binform's, read within binform's own budget of the same
+  size, rather than left empty.
 - PE, ELF and Mach-O function recovery runs in-process through binform
   instead of rizin, on every binary without a function inventory, and binform
   fills the section, import and export views of a PE goblin cannot read in
@@ -174,7 +182,10 @@ is listed under **Changed** with the new value.
   - Go build info is read only from the region Go's `debug/buildinfo`
     reads, at 16-byte alignment.
   - ELF overlap counts include every intersecting range.
-  - A fat Mach-O's primary slice is the first that parses.
+  - A fat Mach-O's primary slice, which the top-level views and the
+    recovered functions describe, is the x86-64 slice, else arm64, else
+    another binform decodes, else the first that parses: an armv7 + arm64
+    iOS binary is described by its arm64 image, which yields functions.
   - Literals and `source.rust.modules` are in source order; identifier
     metrics count leaf identifiers.
   - Platform and Developer ID trust require the codeSigning EKU.

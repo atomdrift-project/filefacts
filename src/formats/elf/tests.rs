@@ -1462,3 +1462,30 @@ fn compressed_debug_info_is_inflated() {
         );
     }
 }
+
+/// A file goblin rejects carries goblin's reason alone: binform's, for the
+/// same defect, says nothing more.
+#[test]
+fn an_unreadable_elf_records_one_parse_error() {
+    let mut bytes = b"\x7fELF".to_vec();
+    bytes.resize(64, 0);
+    let mut out = crate::formats::Sinks::default();
+    extract(&bytes, out.ctx());
+    let messages: Vec<&str> = out.errors.iter().map(|d| d.message.as_str()).collect();
+    assert!(!messages.is_empty());
+    assert!(
+        messages.iter().all(|m| !m.starts_with("layout:")),
+        "{messages:?}"
+    );
+}
+
+#[test]
+fn sonames_reduce_to_the_library_stem() {
+    use super::symbols::soname_stem;
+    assert_eq!(soname_stem("libc.so.6"), "libc");
+    assert_eq!(soname_stem("ld-linux-x86-64.so.2"), "ld-linux-x86-64");
+    assert_eq!(soname_stem("libGL.so"), "libgl");
+    assert_eq!(soname_stem("/lib/libz.so.1.2.13"), "libz");
+    assert_eq!(soname_stem("libsoap.so.1"), "libsoap");
+    assert_eq!(soname_stem("libfoo"), "libfoo");
+}

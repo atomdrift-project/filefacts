@@ -1,5 +1,6 @@
 //! FAT (universal) Mach-O: per-slice analysis into `macho.slices[]`, with the
-//! first slice that parses also reported at the top level.
+//! preferred slice that parses (x86-64, else arm64, else one binform
+//! decodes, else the first) also reported at the top level.
 
 use goblin::mach::{MachO, fat::FatArch};
 use serde_json::Value as JsonValue;
@@ -30,20 +31,24 @@ pub(super) struct Analysed {
     pub(super) image_end: Option<u64>,
     /// Whether the primary slice carries a real Go pclntab.
     pub(super) has_go_pclntab: bool,
+    /// Where the primary slice starts in the file; `None` when no slice
+    /// parsed.
+    pub(super) primary: Option<u64>,
 }
 
 /// Analyse each slice of a fat binary once. Every slice gets the same
 /// extraction as a single-arch binary, recorded as its entry of
 /// `macho.slices[]` with its `file_offset` and `file_size` in the fat file.
-/// The first slice that parses is the primary: its extraction also fills the
-/// top-level values, metrics, sections and symbols, and its `macho.*`
-/// subtree is its slice entry. What any slice's extraction records in
-/// `errors` is kept.
+/// Of the slices that parse, the primary is the one [`preference`] ranks
+/// first: its extraction also fills the top-level values, metrics, sections
+/// and symbols, its `macho.*` subtree is its slice entry, and functions are
+/// recovered from it. What any slice's extraction records in `errors` is
+/// kept.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn analyse(
     bytes: &[u8],
     arches: &[FatArch],
-    layouts: &[(u64, binform::Binary<'_>)],
+    layouts: &[Layout<'_>],
     values: &mut Values,
     metrics: &mut Metrics,
     sections_out: &mut Vec<Section>,
@@ -54,8 +59,9 @@ pub(super) fn analyse(
     let mut out = Analysed {
         image_end: None,
         has_go_pclntab: false,
+        primary: None,
     };
-    let mut primary_seen = false;
+    let mut images = Vec::new();
     // Slices of a real universal binary are disjoint. Each slice gets a full
     // analysis (code-page hashing, plists, symbols), and nothing else stops
     // every arch entry naming the same whole-file slice, multiplying that
@@ -69,7 +75,6 @@ pub(super) fn analyse(
         // the file. Validate the start before slicing; `.min(end)`
         // alone only clamps the upper bound.
         let start = arch.offset as usize;
-        let layout = layout_at(layouts, arch.offset);
         if start >= bytes.len() {
             errors_out.record_malformed(
                 Stage::MachoParse,
@@ -90,7 +95,15 @@ pub(super) fn analyse(
         }
         analysed.push(start..end);
         let macho = match goblin_safe::parse_macho_slice(slice_bytes) {
-            goblin_safe::GoblinOutcome::Ok(macho) => macho,
+            goblin_safe::GoblinOutcome::Ok(macho) => {
+                // goblin read the slice, so binform failing to is news.
+                if let Some((_, Err(error))) =
+                    layouts.iter().find(|(at, _)| *at == u64::from(arch.offset))
+                {
+                    errors_out.record_malformed(Stage::MachoParse, error.clone());
+                }
+                macho
+            }
             goblin_safe::GoblinOutcome::Failed(e) => {
                 errors_out.record_malformed(
                     Stage::MachoParse,
@@ -103,12 +116,21 @@ pub(super) fn analyse(
                 continue;
             }
         };
+        images.push((arch, start, slice_bytes, macho));
+    }
+    let primary = images
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, (arch, ..))| preference(layout_at(layouts, u64::from(arch.offset))))
+        .map_or(0, |(i, _)| i);
+    for (i, (arch, start, slice_bytes, macho)) in images.into_iter().enumerate() {
+        let layout = layout_at(layouts, u64::from(arch.offset));
         let slice_end = u64::from(arch.offset).saturating_add(image_end_of(&macho));
         out.image_end = out.image_end.max(Some(slice_end));
-        let mut entry = if primary_seen {
+        let mut entry = if i != primary {
             analyse_slice(&macho, layout, slice_bytes, errors_out)
         } else {
-            primary_seen = true;
+            out.primary = Some(u64::from(arch.offset));
             let (first_section, imports, exports) = (
                 sections_out.len(),
                 symbols_out.iter_kind(SymbolKind::Import).count(),
@@ -153,6 +175,21 @@ pub(super) fn analyse(
     out
 }
 
+/// How strongly a slice is preferred as the primary, by the instruction set
+/// binform read in it (`layout`), lowest first: the one a 64-bit x86 host
+/// runs, else Apple silicon's, else another binform decodes, else any. The
+/// order binform itself reads a universal binary in; ties go to header
+/// order. A slice binform decodes yields functions, so the top-level views
+/// describe the image they come from.
+fn preference(layout: Option<&binform::Binary<'_>>) -> u8 {
+    match layout.and_then(|layout| layout.arch) {
+        Some(binform::Arch::X86_64) => 0,
+        Some(binform::Arch::Arm64) => 1,
+        Some(_) => 2,
+        None => 3,
+    }
+}
+
 /// Run the single-arch extraction on a non-primary slice into outputs of its
 /// own, and return its `macho.*` subtree as the slice's entry. The slice's
 /// metrics, sections and symbols are counted into the entry and otherwise
@@ -184,11 +221,7 @@ fn analyse_slice(
 /// offset, read once for every pass over it. The slices it skips (one
 /// starting past the end of the file, or overlapping one before it) are
 /// skipped here too, without a record: `analyse` records them.
-pub(super) fn layouts<'a>(
-    bytes: &'a [u8],
-    arches: &[FatArch],
-    errors: &mut Errors,
-) -> Vec<(u64, binform::Binary<'a>)> {
+pub(super) fn layouts<'a>(bytes: &'a [u8], arches: &[FatArch]) -> Vec<Layout<'a>> {
     let mut seen: Vec<std::ops::Range<usize>> = Vec::new();
     let mut layouts = Vec::new();
     for arch in arches {
@@ -210,42 +243,36 @@ pub(super) fn layouts<'a>(
         if !image {
             continue;
         }
-        if let Some(layout) = super::super::common::layout(slice, Stage::MachoParse, errors) {
-            layouts.push((u64::from(arch.offset), layout));
-        }
+        layouts.push((
+            u64::from(arch.offset),
+            super::super::common::read_layout(slice),
+        ));
     }
     layouts
 }
 
-/// The layout read from the slice at file offset `offset`.
-fn layout_at<'l, 'a>(
-    layouts: &'l [(u64, binform::Binary<'a>)],
-    offset: u32,
-) -> Option<&'l binform::Binary<'a>> {
+/// binform's reading of the image at a file offset: its layout, or why it
+/// has none. [`analyse`] records the reason only for a slice goblin reads,
+/// since goblin's own reason says the same.
+pub(super) type Layout<'a> = (u64, Result<binform::Binary<'a>, String>);
+
+/// The layouts read, each with its image's file offset.
+pub(super) fn read<'l, 'a>(
+    layouts: &'l [Layout<'a>],
+) -> impl Iterator<Item = (u64, &'l binform::Binary<'a>)> {
     layouts
         .iter()
-        .find(|(at, _)| *at == u64::from(offset))
-        .map(|(_, layout)| layout)
+        .filter_map(|(at, read)| Some((*at, read.as_ref().ok()?)))
 }
 
-/// The layout functions are recovered from: a thin file's own; of a
-/// universal file's slices, the one a 64-bit x86 host runs, else Apple
-/// silicon's, else the first of an instruction set binform decodes, else the
-/// first. Header order breaks ties.
-pub(super) fn recovery_layout<'l, 'a>(
-    layouts: &'l [(u64, binform::Binary<'a>)],
+/// The layout read from the image at file offset `offset`.
+pub(super) fn layout_at<'l, 'a>(
+    layouts: &'l [Layout<'a>],
+    offset: u64,
 ) -> Option<&'l binform::Binary<'a>> {
-    let rank = |layout: &binform::Binary<'_>| match layout.arch {
-        Some(binform::Arch::X86_64) => 0,
-        Some(binform::Arch::Arm64) => 1,
-        Some(_) => 2,
-        None => 3,
-    };
-    // `min_by_key` keeps the first of equals.
-    layouts
-        .iter()
+    read(layouts)
+        .find(|(at, _)| *at == offset)
         .map(|(_, layout)| layout)
-        .min_by_key(|layout| rank(layout))
 }
 
 /// A slice's `macho.*` subtree with its unified-view counts added, mirroring

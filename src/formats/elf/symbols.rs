@@ -211,9 +211,11 @@ pub(super) fn emit(
 /// object the linker) and exports (the defined globals and weaks other
 /// images can bind to), each anchored at its name's bytes in the file: ELF
 /// binds no useful offset to an import-table entry, and `st_value` is a
-/// virtual address that may point into `.bss`, with no file backing. ELF
-/// binds no symbol to a `DT_NEEDED` library, so `library` is unset;
-/// consumers that need it walk `elf.needed[]`. Nor has it forwarders: symbol
+/// virtual address that may point into `.bss`, with no file backing. An
+/// import's `library` is the file its symbol version is required from
+/// (`printf@GLIBC_2.2.5` from `libc.so.6`, as `libc`); an unversioned import
+/// names none, since ELF binds no symbol to a `DT_NEEDED` library, and
+/// consumers that need one walk `elf.needed[]`. ELF has no forwarders: symbol
 /// versioning solves that problem, surfaced through the version-info
 /// extractor.
 pub(super) fn push_tables(
@@ -232,7 +234,7 @@ pub(super) fn push_tables(
         symbols_out.push(crate::Symbol::Import {
             name: import.name.clone(),
             alias: None,
-            library: None,
+            library: import.library.as_deref().map(soname_stem),
             offset: name_offsets.get(import.name.as_str()).copied(),
             ordinal: None,
         });
@@ -342,4 +344,17 @@ fn emit_symbol_kind_histograms(
             JsonValue::Object(by_vis),
         );
     }
+}
+
+/// A shared object's name as the import view spells libraries in every
+/// format: its file name's stem, lowercased, without the `.so` and version
+/// suffix (`libc.so.6` is `libc`, `ld-linux-x86-64.so.2` is
+/// `ld-linux-x86-64`). A name with no `.so` is kept whole.
+pub(super) fn soname_stem(soname: &str) -> String {
+    let file = soname.rsplit_once('/').map_or(soname, |(_, file)| file);
+    let stem = file
+        .match_indices(".so")
+        .find(|&(at, _)| matches!(file.as_bytes().get(at + 3), None | Some(b'.')))
+        .map_or(file, |(at, _)| &file[..at]);
+    stem.to_ascii_lowercase()
 }

@@ -171,7 +171,8 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
     // off; declared here so the parse borrowing it outlives the match.
     // The section, import and export views are binform's, which also reads
     // the ELF files goblin rejects.
-    let layout = super::common::layout(bytes, crate::Stage::ElfParse, errors_out);
+    let read = super::common::read_layout(bytes);
+    let layout = read.as_ref().ok();
     let detached;
     let mut section_headers_truncated = false;
     let mut original_section_table = None;
@@ -199,7 +200,7 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
             } else {
                 extract_binary_strings(bytes, strings, XorScan::Yes);
                 metrics.insert(metric!("elf.parse_failed"), 1.0);
-                layout_only(layout.as_ref(), bytes, sections_out, symbols_out);
+                layout_only(layout, bytes, sections_out, symbols_out);
                 return;
             }
         }
@@ -207,15 +208,19 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
             extract_binary_strings(bytes, strings, XorScan::Yes);
             errors_out.record_panic(crate::Stage::ElfParse, msg);
             metrics.insert(metric!("elf.parse_panicked"), 1.0);
-            layout_only(layout.as_ref(), bytes, sections_out, symbols_out);
+            layout_only(layout, bytes, sections_out, symbols_out);
             return;
         }
     };
 
+    // goblin read the file, so binform failing to is news.
+    if let Err(error) = &read {
+        errors_out.record_malformed(crate::Stage::ElfParse, error.clone());
+    }
     // Reuse this parse for string extraction (move into an Object for stng,
     // then move back out) so the binary isn't parsed a second time.
     let object = goblin::Object::Elf(elf);
-    let shared: Vec<stng::Layout<'_, '_>> = layout.iter().map(|layout| (0, layout)).collect();
+    let shared: Vec<stng::Layout<'_, '_>> = layout.iter().map(|layout| (0, *layout)).collect();
     extract_binary_strings_from_object(&object, &shared, bytes, strings, XorScan::Yes);
     let goblin::Object::Elf(elf) = object else {
         unreachable!("constructed as Object::Elf")
@@ -231,16 +236,9 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
         put_u64(values, value_key!("elf.shstrndx"), shstrndx);
     }
     dynamic::names(&elf, bytes.len(), values);
-    sections(layout.as_ref(), bytes, sections_out);
+    sections(layout, bytes, sections_out);
     *image_end = Some(image_end_of(&elf));
-    symbols::emit(
-        &elf,
-        layout.as_ref(),
-        bytes.len(),
-        values,
-        metrics,
-        symbols_out,
-    );
+    symbols::emit(&elf, layout, bytes.len(), values, metrics, symbols_out);
     notes::build_id(&elf, bytes, &segment_notes, values, metrics, errors_out);
     if let Some(interp) = elf.interpreter {
         put_str(values, value_key!("elf.interpreter"), interp);
@@ -302,7 +300,7 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
     // unmapped range would invent entries, so recovery runs on present bytes
     // only).
     if has_present_load_or_code_bytes(&elf, bytes.len())
-        && let Some(native) = crate::functions::recover(layout.as_ref())
+        && let Some(native) = crate::functions::recover(layout)
     {
         let indirect = elf
             .dynsyms

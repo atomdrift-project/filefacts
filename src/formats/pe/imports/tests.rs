@@ -71,7 +71,6 @@ fn delay_imports_are_capped_across_descriptors() {
             &layout,
             pe.image_base,
             pe.header.coff_header.machine,
-            false,
             &mut values,
             &mut metrics,
             &mut symbols,

@@ -318,20 +318,13 @@ pub(super) fn recovered_function_count(functions: u32, metrics: &mut crate::outp
 /// The layout binform reads from `bytes`: the section, import and export
 /// tables every binary extractor takes, the functions binform recovers and
 /// the tables stng reads. Read once per binary (per slice of a universal
-/// one) and shared by all of them. `None`, with the reason recorded, when
-/// binform cannot read it.
-pub(super) fn layout<'a>(
-    bytes: &'a [u8],
-    stage: crate::Stage,
-    errors: &mut crate::output::Errors,
-) -> Option<binform::Binary<'a>> {
-    match binform::parse(bytes) {
-        Ok(layout) => Some(layout),
-        Err(error) => {
-            errors.record_malformed(stage, format!("layout: {error}"));
-            None
-        }
-    }
+/// one) and shared by all of them.
+///
+/// When binform cannot read it, the reason is returned rather than recorded:
+/// a caller records it only when goblin read the file, since goblin's own
+/// error otherwise says the same.
+pub(super) fn read_layout(bytes: &[u8]) -> Result<binform::Binary<'_>, String> {
+    binform::parse(bytes).map_err(|error| format!("layout: {error}"))
 }
 
 /// Panic-safe fixed-width integer reads. Each helper bounds-checks

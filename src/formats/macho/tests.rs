@@ -754,3 +754,78 @@ fn lc_main_entry_resolves_to_its_section() {
     );
     assert!(m.get("macho.entry_outside_segments").is_none());
 }
+
+/// A universal file of `slices`, each placed at its own page.
+fn universal(slices: &[&[u8]]) -> Vec<u8> {
+    let mut file = vec![0xca, 0xfe, 0xba, 0xbe];
+    file.extend_from_slice(&(slices.len() as u32).to_be_bytes());
+    let at = |i: usize| 0x1000 * (i + 1);
+    for (i, slice) in slices.iter().enumerate() {
+        for word in [0x0100_0007_u32, 3, at(i) as u32, slice.len() as u32, 12] {
+            file.extend_from_slice(&word.to_be_bytes());
+        }
+    }
+    for (i, slice) in slices.iter().enumerate() {
+        file.resize(at(i), 0);
+        file.extend_from_slice(slice);
+    }
+    file
+}
+
+/// The arch table of a universal `file`.
+fn arches(file: &[u8]) -> Vec<goblin::mach::fat::FatArch> {
+    let goblin::mach::Mach::Fat(fat) = goblin::mach::Mach::parse(file).unwrap() else {
+        panic!("universal")
+    };
+    fat.iter_arches().map(Result::unwrap).collect()
+}
+
+/// A universal static library's slices are `ar` archives: binform is not
+/// asked to read them as images, so the file gains no layout error.
+#[test]
+fn archive_slices_are_not_read_as_images() {
+    let archive = b"!<arch>\n".as_slice();
+    let image = thin_macho(&[], &[]);
+    let file = universal(&[archive, &image]);
+    let layouts = fat::layouts(&file, &arches(&file));
+    assert_eq!(layouts.len(), 1);
+    assert_eq!(layouts[0].0, 0x2000);
+    let mut out = crate::formats::Sinks::default();
+    extract(&file, out.ctx());
+    assert!(
+        out.errors.iter().all(|d| !d.message.starts_with("layout:")),
+        "{:?}",
+        out.errors.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+/// The top-level views describe the preferred slice that parses, and
+/// functions are recovered from that slice too, so their addresses fall in
+/// the sections listed: an x86-64 image over one of an instruction set
+/// binform does not decode, and the first of equals.
+#[test]
+fn the_primary_slice_is_the_preferred_one_that_parses() {
+    let primary = |slices: &[&[u8]]| {
+        let file = universal(slices);
+        let arches = arches(&file);
+        let layouts = fat::layouts(&file, &arches);
+        let mut out = crate::formats::Sinks::default();
+        fat::analyse(
+            &file,
+            &arches,
+            &layouts,
+            &mut out.values,
+            &mut out.metrics,
+            &mut out.sections,
+            &mut out.symbols,
+            &mut out.errors,
+        )
+        .primary
+    };
+    let x86_64 = thin_macho(&[], &[]);
+    let mut unknown = x86_64.clone();
+    unknown[4..8].copy_from_slice(&0x0100_0099_u32.to_le_bytes());
+    assert_eq!(primary(&[b"junk", &x86_64, &x86_64]), Some(0x2000));
+    assert_eq!(primary(&[&unknown, &x86_64]), Some(0x2000));
+    assert_eq!(primary(&[&unknown, &unknown]), Some(0x1000));
+}

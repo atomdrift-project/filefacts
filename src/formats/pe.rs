@@ -35,8 +35,8 @@ use goblin::pe::PE;
 
 use crate::error::Error;
 use crate::formats::common::{
-    XorScan, apply_native, extract_binary_strings, extract_binary_strings_from_object, layout,
-    native, recover_natively, recovered_function_count,
+    XorScan, apply_native, extract_binary_strings, extract_binary_strings_from_object, native,
+    read_layout, recover_natively, recovered_function_count,
 };
 use crate::formats::goblin_safe;
 use crate::metric;
@@ -46,19 +46,15 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) -> Result<(), Er
     // goblin is handed the bytes with the structures it cannot survive
     // cleared (see `goblin_safe::prepare_pe`); every raw reader — section
     // data, overlay, Authenticode, the Rich header — keeps reading the
-    // untouched `bytes`. What had to be given up is a fact about the sample,
-    // so it lands in the errors view: an empty import or export view then
-    // reads as a forged table rather than as a binary that has none.
+    // untouched `bytes`. What goblin had to be denied is a fact about the
+    // sample, so it lands in the errors view: an import or export table past
+    // goblin's walk budget is a forged one.
     let prepared = goblin_safe::prepare_pe(bytes);
     // The section, import and export views are binform's, read from the
-    // untouched bytes; an import or export table too large to walk is left
-    // out of them as it is out of goblin's parse.
-    let layout = layout(bytes, crate::Stage::PeParse, ctx.errors);
-    let tables = Tables {
-        layout: layout.as_ref(),
-        imports_skipped: prepared.imports_skipped.is_some(),
-        exports_skipped: prepared.exports_skipped.is_some(),
-    };
+    // untouched bytes under binform's own walk budgets, which match the ones
+    // goblin is held to.
+    let read = read_layout(bytes);
+    let layout = read.as_ref().ok();
     if let Some(reason) = prepared.exports_skipped {
         ctx.errors
             .record_malformed(crate::Stage::PeParse, reason.to_string());
@@ -75,7 +71,11 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) -> Result<(), Er
     // consumers see which stage tripped even when the fallback succeeds.
     match goblin_safe::parse_pe(&prepared) {
         goblin_safe::GoblinOutcome::Ok(pe) => {
-            parsed(pe, bytes, &tables, ctx);
+            if let Err(error) = &read {
+                ctx.errors
+                    .record_malformed(crate::Stage::PeParse, error.clone());
+            }
+            parsed(pe, bytes, layout, ctx);
             return Ok(());
         }
         goblin_safe::GoblinOutcome::Failed(e) => {
@@ -104,60 +104,38 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) -> Result<(), Er
             ctx.metrics.insert(metric!("pe.parse_panicked"), 1.0);
         }
     }
-    header_only(&prepared.bytes, bytes, &tables, ctx)
+    header_only(&prepared.bytes, bytes, layout, ctx)
 }
 
-/// binform's layout of a PE, for its section, import and export views, and
-/// which of its tables goblin's walk budget refused.
-struct Tables<'l, 'a> {
-    layout: Option<&'l binform::Binary<'a>>,
-    imports_skipped: bool,
-    exports_skipped: bool,
-}
-
-impl Tables<'_, '_> {
-    /// The section, import and export views, for an image based at
-    /// `image_base` on `machine`; `pe` gives the export directory's own
-    /// facts, when goblin parsed it.
-    #[allow(clippy::too_many_arguments)]
-    fn views(
-        &self,
-        pe: Option<&PE<'_>>,
-        image_base: u64,
-        machine: u16,
-        bytes: &[u8],
-        values: &mut crate::output::Values,
-        metrics: &mut crate::output::Metrics,
-        sections_out: &mut Vec<crate::output::Section>,
-        symbols_out: &mut crate::Symbols,
-    ) {
-        if let Some(layout) = self.layout {
-            headers::sections(layout, image_base, bytes, sections_out);
-            imports::imports(
-                layout,
-                image_base,
-                machine,
-                self.imports_skipped,
-                values,
-                metrics,
-                symbols_out,
-            );
-        }
-        exports::exports(
-            self.layout,
-            image_base,
-            self.exports_skipped,
-            pe,
-            bytes,
-            values,
-            metrics,
-            symbols_out,
-        );
+/// The section, import and export views from binform's `layout`, for an
+/// image based at `image_base` on `machine`; `pe` gives the export
+/// directory's own facts, when goblin parsed it.
+#[allow(clippy::too_many_arguments)]
+fn views(
+    layout: Option<&binform::Binary<'_>>,
+    pe: Option<&PE<'_>>,
+    image_base: u64,
+    machine: u16,
+    bytes: &[u8],
+    values: &mut crate::output::Values,
+    metrics: &mut crate::output::Metrics,
+    sections_out: &mut Vec<crate::output::Section>,
+    symbols_out: &mut crate::Symbols,
+) {
+    if let Some(layout) = layout {
+        headers::sections(layout, image_base, bytes, sections_out);
+        imports::imports(layout, image_base, machine, values, metrics, symbols_out);
     }
+    exports::exports(layout, image_base, pe, bytes, values, metrics, symbols_out);
 }
 
 /// Every fact a full goblin parse supports.
-fn parsed(pe: PE<'_>, bytes: &[u8], tables: &Tables<'_, '_>, ctx: super::ExtractCtx<'_>) {
+fn parsed(
+    pe: PE<'_>,
+    bytes: &[u8],
+    layout: Option<&binform::Binary<'_>>,
+    ctx: super::ExtractCtx<'_>,
+) {
     let super::ExtractCtx {
         values,
         strings,
@@ -171,8 +149,7 @@ fn parsed(pe: PE<'_>, bytes: &[u8], tables: &Tables<'_, '_>, ctx: super::Extract
     // version-info runs, at absolute file offsets. It takes the parse as an
     // Object, moved in and back out, so the binary is not parsed twice.
     let object = goblin::Object::PE(pe);
-    let shared: Vec<stng::Layout<'_, '_>> =
-        tables.layout.iter().map(|layout| (0, *layout)).collect();
+    let shared: Vec<stng::Layout<'_, '_>> = layout.iter().map(|layout| (0, *layout)).collect();
     extract_binary_strings_from_object(&object, &shared, bytes, strings, XorScan::Yes);
     // Constructed as `Object::PE` two lines up.
     let goblin::Object::PE(pe) = object else {
@@ -184,7 +161,8 @@ fn parsed(pe: PE<'_>, bytes: &[u8], tables: &Tables<'_, '_>, ctx: super::Extract
     if let Some(ref opt) = pe.header.optional_header {
         headers::optional_header(opt, values, metrics);
     }
-    tables.views(
+    views(
+        layout,
         Some(pe),
         pe.image_base,
         pe.header.coff_header.machine,
@@ -236,7 +214,7 @@ fn parsed(pe: PE<'_>, bytes: &[u8], tables: &Tables<'_, '_>, ctx: super::Extract
         go_functions(pe, &go_sections, has_go_pclntab, symbols_out);
     }
     super::build_toolchain::from_pe_rich(values);
-    let Some(recovered) = native(tables.layout, symbols_out) else {
+    let Some(recovered) = native(layout, symbols_out) else {
         return;
     };
     // A compact PE with no imports is often a resolver stub: correlate its
@@ -315,7 +293,7 @@ fn go_functions(
 fn header_only(
     goblin_bytes: &[u8],
     bytes: &[u8],
-    tables: &Tables<'_, '_>,
+    layout: Option<&binform::Binary<'_>>,
     ctx: super::ExtractCtx<'_>,
 ) -> Result<(), Error> {
     let super::ExtractCtx {
@@ -353,7 +331,8 @@ fn header_only(
     anomalies::partial_section_overflows(bytes, &header, values, metrics);
     // binform reads a malformed or packed PE leniently: its tables stand
     // whether or not goblin could parse the rest.
-    tables.views(
+    views(
+        layout,
         None,
         header
             .optional_header
@@ -365,7 +344,7 @@ fn header_only(
         sections_out,
         symbols_out,
     );
-    if let Some(functions) = recover_natively(tables.layout, symbols_out, metrics) {
+    if let Some(functions) = recover_natively(layout, symbols_out, metrics) {
         recovered_function_count(functions, metrics);
     }
     Ok(())
