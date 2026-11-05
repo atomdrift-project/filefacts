@@ -121,6 +121,67 @@ fn image_hash_is_deterministic() {
     }
 }
 
+/// Inter-section padding is part of the authenticated physical file, and
+/// must not move the overlay start backwards into the final section.
+#[test]
+fn image_hash_covers_inter_section_gap_once() {
+    let mut bytes = fixture("test.exe");
+    let pe = goblin::pe::PE::parse(&bytes).expect("parse");
+    let section_table = pe.header.dos_header.pe_pointer as usize
+        + 24
+        + pe.header.coff_header.size_of_optional_header as usize;
+    let gap_start = pe.sections[1].pointer_to_raw_data as usize;
+    let shifted: Vec<_> = pe
+        .sections
+        .iter()
+        .enumerate()
+        .filter(|(_, section)| section.pointer_to_raw_data as usize >= gap_start)
+        .map(|(index, section)| (index, section.pointer_to_raw_data))
+        .collect();
+    let checksum_offset = layout::checksum_offset(
+        pe.header.dos_header.pe_pointer as usize,
+        pe.header
+            .optional_header
+            .as_ref()
+            .unwrap()
+            .standard_fields
+            .magic,
+    )
+    .unwrap();
+    let cert_dir_offset = layout::data_directory_offset(
+        pe.header.dos_header.pe_pointer as usize,
+        pe.header
+            .optional_header
+            .as_ref()
+            .unwrap()
+            .standard_fields
+            .magic,
+        CERTIFICATE_DIRECTORY,
+    )
+    .unwrap();
+    drop(pe);
+    bytes.splice(gap_start..gap_start, std::iter::repeat_n(0xa5, 512));
+    for (index, raw_offset) in shifted {
+        let field = section_table + index * 40 + 20;
+        bytes[field..field + 4].copy_from_slice(&(raw_offset + 512).to_le_bytes());
+    }
+    let pe = goblin::pe::PE::parse(&bytes).expect("gapped PE parses");
+    let regions = derive_regions(&pe, &bytes).expect("regions");
+    // Independent physical-file calculation with only the two header holes.
+    // This fixture is unsigned, so there are no certificate bytes to skip.
+    let mut expected = Sha256::new();
+    Digest::update(&mut expected, &bytes[..checksum_offset]);
+    Digest::update(&mut expected, &bytes[checksum_offset + 4..cert_dir_offset]);
+    Digest::update(&mut expected, &bytes[cert_dir_offset + 8..]);
+    let expected = hex_encode(&expected.finalize());
+    let before = regions.digests(&bytes, &[HashAlg::Sha256]).unwrap();
+    assert_eq!(before.get("sha256"), Some(expected.as_str()));
+    assert_eq!(regions.hashed_len(), bytes.len() as u64 - 12);
+    bytes[gap_start] ^= 1;
+    let after = regions.digests(&bytes, &[HashAlg::Sha256]).unwrap();
+    assert_ne!(before.get("sha256"), after.get("sha256"));
+}
+
 /// Changing the checksum field in the header must NOT change the
 /// image hash — Authenticode explicitly excludes those four
 /// bytes. This is the load-bearing property of the algorithm

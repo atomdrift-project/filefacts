@@ -615,6 +615,16 @@ pub(super) fn scored_type(sniff: &Sniff<'_>) -> Option<FileType> {
     // content rather than indentation.
     let body = data.trim_ascii_start();
     let head = body.get(..SCAN_LIMIT).unwrap_or(body);
+    // Ring Qt programs can contain SQL `exec(...)` calls and otherwise score
+    // as Python. Preserve them as searchable text until Ring has a language
+    // parser; a Python string merely mentioning Ring is not a load statement.
+    if head.split(|&b| b == b'\n').next().is_some_and(|line| {
+        line.trim_ascii()
+            .eq_ignore_ascii_case(b"load \"guilib.ring\"")
+    }) && contains(head, b"new qApp")
+    {
+        return Some(FileType::Text);
+    }
     // Batch, VBScript, mIRC and ircII are read line by line, verb first. That
     // runs ahead of the binary and prose guards on purpose: batch files carry
     // ANSI escapes and `echo` whole paragraphs, and the line grammar is what

@@ -1,6 +1,47 @@
 use super::*;
 
 #[test]
+fn javascript_escaped_identifier_call_targets_are_canonical() {
+    let source = br#"
+const file = path.j\u006fin(home, '.claude.json');
+\u0066s.\u0077riteFile(file, '{}');
+fs[chosen](file);
+const example = 'fs.writeFile(file)';
+"#;
+    for filename in ["escaped.js", "escaped.ts"] {
+        let parsed = crate::OpenOptions::new()
+            .path(std::path::Path::new(filename))
+            .open(source);
+        let calls: Vec<_> = parsed
+            .symbols()
+            .iter_kind(crate::SymbolKind::Call)
+            .filter_map(|symbol| match symbol {
+                crate::Symbol::Call { target, .. } => target.as_deref(),
+                _ => None,
+            })
+            .collect();
+        assert!(calls.contains(&"path.join"), "{filename}: {calls:?}");
+        assert!(calls.contains(&"fs.writeFile"), "{filename}: {calls:?}");
+        assert_eq!(
+            calls.iter().filter(|call| **call == "fs.writeFile").count(),
+            1
+        );
+        assert!(!calls.iter().any(|call| call.contains("chosen")));
+        let flow = parsed.flow().unwrap();
+        assert!(
+            flow.values
+                .iter()
+                .any(|v| v.target.as_deref() == Some("path.join"))
+        );
+        assert!(
+            flow.values
+                .iter()
+                .any(|v| v.target.as_deref() == Some("fs.writeFile"))
+        );
+    }
+}
+
+#[test]
 fn javascript_imports_ignore_recovered_source_map_fragments_but_keep_valid_siblings() {
     // A Unicode-decoded source-map fragment still has JSON-escaped quotes.
     // Recovery can attach an entire embedded source body as an import source.

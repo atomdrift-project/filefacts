@@ -12,8 +12,8 @@
 //!
 //! The hash is computed by feeding the hasher: header bytes (with the
 //! two holes), then each section in `PointerToRawData` order, then
-//! any trailing overlay bytes that sit between the sections and the
-//! cert table. The same byte layout works for SHA-1, SHA-256,
+//! inter-section gaps and any trailing overlay bytes before the cert
+//! table. The same byte layout works for SHA-1, SHA-256,
 //! SHA-384, and SHA-512 — only the hash function changes, so every
 //! wanted digest is fed from one walk over the regions.
 //!
@@ -24,9 +24,8 @@
 //!   on the image (nested ones included) commits to that algorithm, which
 //!   is what the trust judgement compares against. Nothing else reads them.
 //! - `pe.overlay_padding` (metric) — bytes between sections-end and
-//!   the cert table that the signature also covers. Non-zero implies
-//!   data was appended to the binary post-signing-time but inside the
-//!   region the signature authenticates.
+//!   the cert table that the signature also covers. Its presence alone
+//!   does not establish when those bytes were added.
 //! - `pe.image_hash_skipped` (metric) — the section table makes the image
 //!   hash cover more than [`MAX_HASHED_FILE_MULTIPLE`] times the file, which
 //!   only overlapping raw ranges can do; no digest is emitted.
@@ -105,8 +104,7 @@ impl ImageHashes {
 struct Regions {
     ranges: Vec<Range<usize>>,
     /// Overlay padding — bytes between the last section and the cert
-    /// table that the signature also authenticates. Non-zero means
-    /// data was added inside the signed region post-link.
+    /// table that the signature also authenticates.
     overlay_padding: u64,
 }
 
@@ -273,18 +271,25 @@ fn derive_regions(pe: &PE<'_>, bytes: &[u8]) -> Option<Regions> {
         .collect();
     by_raw_offset.sort_by_key(|s| s.pointer_to_raw_data);
 
-    let mut sum_hashed = size_of_headers as u64;
+    let mut last_raw_end = size_of_headers;
     for s in &by_raw_offset {
         let start = s.pointer_to_raw_data as usize;
         let end = start.checked_add(s.size_of_raw_data as usize)?;
         if end > bytes.len() {
             return None;
         }
+        // Raw sections need not be adjacent (MinGW images can leave a gap).
+        // Those physical bytes are authenticated too. Counting raw sizes
+        // instead of tracking offsets skipped the gap and then hashed an
+        // equal-sized slice of the final section twice as overlay.
+        if start > last_raw_end {
+            ranges.push(last_raw_end..start);
+        }
         ranges.push(start..end);
-        sum_hashed = sum_hashed.saturating_add(u64::from(s.size_of_raw_data));
+        last_raw_end = last_raw_end.max(end);
     }
 
-    // Trailing overlay between `sum_hashed` and the cert table at
+    // Trailing overlay between the last raw section and the cert table at
     // file-end. The signature blob itself sits at `file_size -
     // cert_table_size .. file_size` and is excluded.
     let cert_table_size = opt
@@ -293,8 +298,8 @@ fn derive_regions(pe: &PE<'_>, bytes: &[u8]) -> Option<Regions> {
         .map_or(0, |dd| u64::from(dd.size));
     let file_size = bytes.len() as u64;
     let mut overlay_padding = 0_u64;
-    if file_size > sum_hashed.saturating_add(cert_table_size) {
-        let extra_start = crate::bytes::sat_usize(sum_hashed);
+    if file_size > (last_raw_end as u64).saturating_add(cert_table_size) {
+        let extra_start = last_raw_end;
         let extra_end = crate::bytes::sat_usize(file_size - cert_table_size);
         if extra_start < extra_end && extra_end <= bytes.len() {
             ranges.push(extra_start..extra_end);

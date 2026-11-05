@@ -1423,7 +1423,7 @@ const SPINE_DEPTH: u32 = 2 * MAX_AST_DEPTH;
 /// What one node of a chain adds to the path of the receiver below it.
 enum Part<'s> {
     /// The chain's static root name.
-    Root(&'s str),
+    Root(Cow<'s, str>),
     /// `.name` after the receiver: a member's property, or the key of a
     /// string subscript.
     Field(Cow<'s, str>),
@@ -1453,7 +1453,13 @@ fn part<'t>(
     config: &LangConfig,
 ) -> (Part<'t>, Option<Node<'t>>, u32) {
     const DYNAMIC: (Part<'static>, Option<Node<'static>>, u32) = (Part::Dynamic, None, 0);
-    let root = |name: Option<&'t str>| (name.map_or(Part::Dynamic, Part::Root), None, 0);
+    let root = |name: Option<&'t str>| {
+        (
+            name.map_or(Part::Dynamic, |name| Part::Root(Cow::Borrowed(name))),
+            None,
+            0,
+        )
+    };
     let text = || node.utf8_text(source.as_bytes()).ok();
     let kind = node.kind();
     if matches!(config.lang, Lang::JavaScript | Lang::TypeScript)
@@ -1530,6 +1536,15 @@ fn part<'t>(
         return root(if plain { text() } else { None });
     }
     if config.identifier_kinds.contains(&kind) {
+        if matches!(config.lang, Lang::JavaScript | Lang::TypeScript)
+            && let Some(name) = text().filter(|name| name.contains('\\'))
+        {
+            return (
+                Part::Root(Cow::Owned(super::escapes::decode(name))),
+                None,
+                0,
+            );
+        }
         return root(text());
     }
     if config.member_kinds.contains(&kind) {
@@ -1548,7 +1563,13 @@ fn part<'t>(
             .utf8_text(source.as_bytes())
             .ok()
             .filter(|name| !name.is_empty());
-        let part = name.map_or(Part::Dynamic, |name| Part::Field(Cow::Borrowed(name)));
+        let part = name.map_or(Part::Dynamic, |name| {
+            if matches!(config.lang, Lang::JavaScript | Lang::TypeScript) && name.contains('\\') {
+                Part::Field(Cow::Owned(super::escapes::decode(name)))
+            } else {
+                Part::Field(Cow::Borrowed(name))
+            }
+        });
         return (part, Some(object), 1);
     }
     if is_subscript_kind(kind) {
@@ -1664,7 +1685,7 @@ impl Spine {
             ok = ok
                 && match part {
                     Part::Root(name) => {
-                        path.push_str(name);
+                        path.push_str(&name);
                         true
                     }
                     Part::Field(name) => {

@@ -52,7 +52,8 @@ pub(super) fn looks_like_fat_boot_sector(data: &[u8]) -> bool {
 /// A DOS COM program: no header of its own, so the code has to show it.
 /// A body that is not text and calls a DOS service -- `INT 21h` behind an
 /// `AH` selector, adjacent or established by bounded decoding from the entry
-/// point -- or one with the complete shape of a small overwriter. A bare
+/// point -- a BIOS disk service followed by bootstrap, or one with the
+/// complete shape of a small overwriter. A bare
 /// `CD 21` is not enough: two bytes recur in arbitrary binary data.
 pub(super) fn looks_like_dos_com(data: &[u8]) -> bool {
     let not_text = binary_not_source(data) || std::str::from_utf8(data).is_err();
@@ -111,6 +112,17 @@ fn has_entry_dos_service_call(data: &[u8]) -> bool {
         let next = pc + instruction.len();
         if instruction.mnemonic() == Mnemonic::Int {
             if instruction.immediate8() == 0x21 && ah.is_some_and(|n| (1..=0x6c).contains(&n)) {
+                return true;
+            }
+            // COM utilities can call BIOS services without making a DOS
+            // syscall. Keep this tied to the decoded entry path and a known
+            // read/write selector, then require the BIOS bootstrap instruction.
+            // Recognize reads as well as writes: format identification must
+            // not depend on whether the disk operation is destructive.
+            if instruction.immediate8() == 0x13
+                && matches!(ah, Some(0x02 | 0x03))
+                && prefix.get(next..next.saturating_add(2)) == Some(&[0xCD, 0x19])
+            {
                 return true;
             }
             pending.push_back((next, None, 0));

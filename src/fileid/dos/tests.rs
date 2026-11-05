@@ -1,5 +1,45 @@
 use super::*;
 
+#[test]
+fn headerless_bios_disk_bootstrap_uses_the_existing_entry_decoder() {
+    // Argument setup separates AX from the BIOS call. No DOS syscall or
+    // filename extension is needed to recognize this real-mode program.
+    let program = [
+        0xB8, 0x01, 0x03, 0xB9, 0x01, 0x00, 0xBA, 0x80, 0x00, 0xBB, 0x00, 0x38, 0x8E, 0xC3, 0xBB,
+        0x00, 0x00, 0xCD, 0x13, 0xCD, 0x19,
+    ];
+    for selector in [0x02, 0x03] {
+        let mut code = program;
+        code[2] = selector;
+        assert!(looks_like_dos_com(&code));
+        for name in ["program", "program.32", "program.com"] {
+            assert_eq!(
+                super::super::detect(std::path::Path::new(name), &code)
+                    .unwrap()
+                    .file_type,
+                crate::FileType::DosCom
+            );
+        }
+    }
+
+    let mut unknown_selector = program;
+    unknown_selector[2] = 0xFF;
+    assert!(!looks_like_dos_com(&unknown_selector));
+    let mut no_bootstrap = program;
+    no_bootstrap[20] = 0x18;
+    assert!(!looks_like_dos_com(&no_bootstrap));
+    // An intervening AX write invalidates the known selector.
+    let mut clobbered = program[..17].to_vec();
+    clobbered.extend_from_slice(&[0x31, 0xC0]);
+    clobbered.extend_from_slice(&program[17..]);
+    assert!(!looks_like_dos_com(&clobbered));
+    // Valid-looking bytes behind an unconditional return are not entry code.
+    let mut unreachable = vec![0xC3];
+    unreachable.extend_from_slice(&program);
+    assert!(!looks_like_dos_com(&unreachable));
+    assert!(!looks_like_dos_com(&[0xCD, 0x13, 0xCD, 0x19]));
+}
+
 fn fat12_boot_sector() -> [u8; 512] {
     let mut data = [0u8; 512];
     data[..3].copy_from_slice(&[0xEB, 0x3C, 0x90]);

@@ -114,6 +114,14 @@ fn python_heuristic() {
 }
 
 #[test]
+fn ring_gui_sql_exec_is_not_python() {
+    let ring = b"Load \"guilib.ring\"\nMyApp = new qApp\n{\nexec(\"create table x (id int)\"+\"\")\nexec()\n}\n";
+    assert_eq!(detect_from_content(ring), Some(FileType::Text));
+    let python = b"import os\nexample = 'Load \"guilib.ring\" new qApp'\nexec('print(1)')\n";
+    assert_eq!(detect_from_content(python), Some(FileType::Python));
+}
+
+#[test]
 fn python_name_main() {
     let data = b"if __name__ == '__main__':\n    main()\n";
     assert_eq!(detect_from_content(data), Some(FileType::Python));
