@@ -1,279 +1,472 @@
 # Changelog
 
-All notable changes to filefacts are recorded here. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
-adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The
-output schema is versioned separately by `filefacts::SCHEMA_VERSION`; a bump
-is listed under **Changed** with the new value.
+All notable changes to filefacts. Versions follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
+The output schema is versioned separately by `filefacts::SCHEMA_VERSION`; a bump is noted with its new value.
 
-## [Unreleased]
-
-### Added
-
-- `media.trailing_content_kind` identifies the actual trailing region separately
-  from executable/archive signatures in metadata or interior gaps. This prevents
-  assigning an unrelated embedded header to an ordinary image trailer.
-
-- PNG trailer context: `png.trailing_iend_count`, bounded absolute byte offsets
-  in `png.trailing_iend_offsets`, and `trailer_ends_with_iend` in features. These
-  CRC-correct byte records can support investigating image overwrite residue;
-  they never claim trailer coverage or establish that its contents are safe.
-
-- `Registry::favorites` and the `registry.favorites` metric: stars, likes,
-  or favers, a popularity count with no score behind it (unlike
-  `rating_count`, the votes behind `rating`).
-- `filefacts::values`: typed, borrowing reads of the value facts consumers act
-  on, from any `&Values`, live or retained: `basename`, `npm_install_hooks`,
-  `batch_command_sites` (as `BatchCommandSite`) and
-  `batch_command_sites_truncated`. Their producers write through the same
-  declarations, so the JSON output is unchanged.
-- `impl From<serde_json::Value> for Values`, to read a tree retained as JSON.
-- Bounded PNG pixel-payload probes for channel/bit-plane packing, traversal
-  swaps, prime pixels and transparent RGB; Base64, hex, UTF-16, single-byte
-  XOR, and checksum-validated zlib/gzip transforms. Script, configuration and
-  binary-format recognition emit recovered layouts and bounded previews in
-  `png.pixel_payloads`; probe budgets and limits are observable without
-  treating random pixels alone as a recovered payload.
-- `filefacts::{Bundle, View, ViewData}` with `ParsedFile::bundle()` and
-  `ParsedFile::view()`: the CLI's versioned JSON document, now part of the
-  library. The JSON is byte-identical to what the CLI wrote before.
-- `OpenOptions::cache_dir`, `rizin::set_max_concurrent_runs`, `PartyRole`,
-  `Ecosystem`, `Limitation`, `Resolution`, `UnresolvedReason`, `EntryType`,
-  `Registry::new`, `Signer::new`.
-- CLI: any number of paths; `--no-cache`, `--no-rizin`, `--rizin-timeout`;
-  `usage()` documents environment variables and exit codes.
-- File types `ani`, `nrbf`, `image4_trustcache`, `fat_boot_sector` and
-  `certificate_signature` (each was `data`).
-- `filefacts::Group`: every `FileType` belongs to exactly one of 19 groups
-  (`Group::ALL`, `label`, `from_label`, `file_types`); `FileType::ALL` and
-  `const FileType::group()` are public. `docs/file-groups.json` publishes
-  the table for consumers that route or train per group.
-- Signatures report `signer_count`, `key_bits`, `weak_key`,
-  `weak_algorithms[]` and `extended_key_usage[]`.
-- PDF object streams with no filter, ASCIIHex, ASCII85 or chained filters are
-  decoded; `pdf.limits` stage `object-stream-decode`.
-- `deb` reads `control.tar.xz`; Arch packages publish `.PKGINFO` as `pkg.*`;
-  `.tar.xz` source releases are probed for WordPress and autoconf identity.
-- DWARF is read from big-endian ELF and from compressed `.debug_*` /
-  `.zdebug` sections.
-- `source.batch.cycle_analysis_limited`; `functions.*` metrics for every
-  language with function definitions; Go imports carry their `alias`.
-- `pe.manifest.parse_error`, `pe.debug.pdb.path_non_utf8`,
-  `pe.debug.pdb.path_hex`; `crx.name`, `crx.format_version`,
-  `xpi.author_email`.
-- CI on Linux, macOS and Windows, an MSRV job, `cargo audit`, a fuzz build;
-  `SECURITY.md` and `CONTRIBUTING.md`.
-
-### Changed
-
-- The section, import and export views of PE, ELF and Mach-O come from
-  binform rather than goblin; goblin still reads the rest (headers,
-  resources, Authenticode, load config, CLR, notes, the dynamic section).
-  binform reads the ELF and Mach-O files goblin rejects, binds each
-  chained-fixup Mach-O import to its library, lists each Mach-O import once
-  rather than once per bind, adds ELF exports goblin's type filter dropped
-  (`_end`, `_edata`, TLS) and ordinal-only PE exports (`Ordinal_n`), and
-  resolves long PE section names (`/4`) through the COFF string table. PE
-  imports by ordinal from msi, comctl32, cabinet, mfc42(u), and Windows CE's
-  coredll (per CPU) and commctrl are named from those DLLs' own export
-  tables; the imphash still names ordinals only as pefile does. binform
-  reads each binary, or each slice of a universal one, once: the views,
-  function recovery and stng's string passes share that read. Mach-O
-  strings no longer come from a copy with forged bind streams emptied,
-  since stng no longer runs goblin's bind interpreter. An ELF import
-  names its library from its symbol version (`printf@GLIBC_2.2.5` is
-  `libc`, from `libc.so.6`); unversioned imports name none. binform's
-  "layout:" error is recorded only where goblin read the file, since
-  goblin's own error otherwise reports the same defect, and a universal
-  static library's `ar` slices are not read as images. A PE import or
-  export table past goblin's walk budget is still reported as an error,
-  but its view is binform's, read within binform's own budget of the same
-  size, rather than left empty.
-- PE, ELF and Mach-O function recovery runs in-process through binform
-  instead of rizin, on every binary without a function inventory, and binform
-  fills the section, import and export views of a PE goblin cannot read in
-  full. filefacts no longer starts rizin, and its surface is gone: the
-  `rizin` module, the `OpenOptions::rizin*` settings, `rizin::available`,
-  `rizin_recovery_incomplete`, `FILEFACTS_RIZIN_CONCURRENCY`, and the CLI's
-  `--no-rizin` and `--rizin-timeout` (now unknown flags). Binaries of an instruction set binform does not decode
-  (eBPF, M*Core, Nios II, IA-64 and the like) keep their layout facts and get
-  no functions.
-- ELF `elf.syscalls_direct` is projected from `binform::calls`, which tracks
-  register and stack values through each recovered function, rather than a
-  fixed-window scan. This extends direct-syscall extraction from x86-64 and
-  AArch64 to 32-bit Arm and x86, resolves numbers and arguments built across
-  blocks (a `connect` whose number is `mov r7,0x100; add r7,0x1b`, which rizin
-  and the old scan both miss), and no longer reports `0f05` bytes that fall
-  inside other instructions. The syscall number-to-name tables move to
-  binform (`binform::Binary::syscall`, generated from the `libc` crate). New:
-  a `connect`/`bind` argument that points at a `sockaddr_in`/`sockaddr_in6`
-  gets a `decoded` field with the IP and port, and a call through the libc
-  `syscall()` wrapper carries `via: "syscall"`. A call to the libc `connect()`
-  import is projected the same way, carrying `via: "connect"` with the socket
-  syscall number for the architecture (from the new
-  `binform::Binary::syscall_number`). In a statically linked binary, where
-  `connect` reaches the kernel through an in-image wrapper (`mov eax, 42;
-  syscall`), a direct call to that wrapper is projected from the caller with
-  its arguments and carries `via: "wrapper"`. The decoded destinations are also
-  surfaced as a first-class network IOC in `elf.network_endpoints` — one
-  `{ip, port, kind, offset, syscall, via?}` per `sockaddr` a syscall points
-  at — with the count in the `elf.network_endpoint_count` metric.
-
-- **`SCHEMA_VERSION` is now `11`.** Renamed or reshaped keys:
-  - A PE delay-load import's `offset` is its address-table slot's RVA, as
-    every other PE import's is, rather than its lookup entry's file offset.
-    The ELF section view no longer lists the null section at index 0; a
-    relocatable object's sections are at the addresses its functions are
-    recovered at. An executable's `.symtab`-only globals (`main`, `_start`)
-    are functions, not exports: ELF exports are what other images can bind
-    to. A Mach-O re-export has no `offset`. `pe.recovered_import_count`,
-    `pe.recovered_export_count` and `pe.recovered_section_count` are gone:
-    every binary's tables are binform's.
-  - `pe.rizin_importless_analysis` → `pe.importless_analysis`,
-    `pe.rizin_importless_function_count` → `pe.importless_function_count`;
-    `binary.rizin_incomplete`, which nothing set, is gone.
-  - PNG `image.*` statistics normalize palette and 16-bit samples rather than
-    counting palette indices or alternating bytes as color samples.
-  - `cert_chain_depth` → `cert_bag_size` in every signature object;
-    timestamp times are RFC 3339.
-  - `elf.hashes.imphash` → `elf.hashes.import_hash`,
-    `elf.hashes.symhash` → `elf.hashes.symtab_import_hash`,
-    `macho.hashes.imphash` → `macho.hashes.import_hash`.
-  - `python.summary`, `whl.summary`, `deb.summary`, `gem.summary`,
-    `rpm.summary` → `*.description`; `gem.runtime_dependencies` →
-    `gem.dependencies`; `gem.licenses[]` → `gem.license`.
-  - `crx.version` is the extension's version; the CRX header version is
-    `crx.format_version`.
-  - People share one shape in every ecosystem: `<fmt>.authors`,
-    `<fmt>.maintainers`, `<fmt>.owners` and `<fmt>.packagers`, each a list
-    of `{name, email, url}`. Renamed: `npm.author`, `python.author`,
-    `python.maintainer`, `whl.author`(`_email`), `whl.maintainer`(`_email`),
-    `crx.author`(`_email`), `xpi.author`(`_email`), `deb.maintainer`,
-    `apk.maintainer`, `apk.packager`, `rpm.packager`, `registry.author`;
-    reshaped from strings:
-    `crate.authors`, `gem.authors`, `nupkg.authors`, `nupkg.owners`.
-    `deb.maintainers` includes `Uploaders`; comma-separated PEP 621 author
-    lists are separate people.
-  - `archive.members[]` is the typed `ArchiveMember` serialized flat;
-    `entry_type` is an `EntryType` (cpio: `character` → `char-device`,
-    `block` → `block-device`, `unknown` → `other`).
-  - `Reference` gains `resolution`; `go.mod.unresolved-*` sources become
-    `go.mod` with `resolution: {"unresolved": reason}`.
-  - `GoPackage.variant`/`behaviors` → `platforms`; `CargoTarget.behaviors`
-    removed.
-  - `Party.role` and `Registry.ecosystem` are enums; known ecosystem labels
-    are lowercase (`PyPI` → `pypi`).
-  - CFML `Flow.limitations` `syntax-*` values are kebab-case.
-  - `source.shell.fifo_network_loops` and the Python temporary-file facts
-    (`source.python.temporary_files`) are reshaped as general relations.
-  - `consistency.extension_content_mismatch.<content>_as_<ext>` names
-    `Group` labels: `binary` → `native`, `bytecode` or `machine_code`;
-    `script` → `scripts`; `archive` → `archives` or `compressed`;
-    `document` → `documents`; `image` → `images`; `font` → `fonts`. New
-    labels `build`, `signatures`, `serialized` and `unknown` take types
-    that were `config` or `data`; HTML, TeX and Markdown move from `text`
-    to `documents`, `lnk` from `binary` to `config`, and TypeScript from
-    `source` to `scripts`.
-- Semantic changes:
-  - `pe.hashes.imphash` matches pefile and VirusTotal for ordinal imports.
-  - PDF `/Type` counts (`pdf.*_count`, `pdf.shape.*`) count dictionaries in
-    objects and object streams with PDF name rules (whitespace, comments,
-    `#xx` escapes), not byte tokens anywhere in the file.
-  - Go build info is read only from the region Go's `debug/buildinfo`
-    reads, at 16-byte alignment.
-  - ELF overlap counts include every intersecting range.
-  - A fat Mach-O's primary slice, which the top-level views and the
-    recovered functions describe, is the x86-64 slice, else arm64, else
-    another binform decodes, else the first that parses: an armv7 + arm64
-    iOS binary is described by its arm64 image, which yields functions.
-  - Literals and `source.rust.modules` are in source order; identifier
-    metrics count leaf identifiers.
-  - Platform and Developer ID trust require the codeSigning EKU.
-  - Configuration extensions (`.toml`, `.ini`, `.cfg`, …) are text by
-    extension; an npm tarball named `.zip` is an extension mismatch.
-- `OpenOptions::new()` reads no environment: the cache is off unless the host
-  turns it on. The CLI reads `FILEFACTS_CACHE` and
-  `FILEFACTS_RIZIN_CONCURRENCY` itself.
-- CLI colour only when stdout is a terminal and `NO_COLOR` is unset or empty;
-  directory walks are sorted.
-- A structured document's keys merge beside filefacts' own values instead of
-  replacing them.
-- Dependencies: `zip` 9 (deflate only), `zstd` 0.14, `png` 0.18, `toml` 1,
-  `cfb` 0.14; `lzma-rust2` is the one LZMA/xz implementation.
-
-### Removed
-
-- `sevenz-rust` and `xz2` dependencies; `sevenz.rs` parses the 7z header
-  itself.
-- Public `cache` internals (only `cleanup`, `env_override` and
-  `DEFAULT_MAX_ITEMS` remain), `cache_sweep`, `tools`, the full `rpa` index
-  (`rpa::members` returns what a host needs to carve members), `MetricKey`,
-  `ValueKey`, the metric-key family functions, `ParsedFile::symbol_iter`,
-  `FileType::is_supported`.
-- `pe.signature_expired_days` (it depended on the clock, so cached facts went
-  stale; use `not_after_unix`), the `pe.partial_parse` value,
-  `office.compobj.app_version`.
-- CLI `-p/--pretty`; the radare2 fallback (only `rizin` is run).
-- Serde aliases for old `SectionFlag` and `Literal` spellings; the legacy
-  stng cache sweep.
-
-### Fixed
-
-- Content detection reads a file as `go.mod` only when every line after its
-  `module` directive is a `go.mod` directive or block entry. A Ruby (or
-  Fortran) file opening with `module Name` was typed `go.mod`, so no rule for
-  its language ran: strong_password 0.0.7's `eval` of a pastebin fetch went
-  unread.
-- `font.layout_format` retains a structurally coherent WOFF whose signature
-  bytes were reordered, while `font.format` stays `none` and `font.valid`
-  stays false; corrupt decoder fixtures no longer become opaque payloads.
-- Media-carrier CAB candidates require a bounded, versioned fixed header;
-  ASCII `MSCF` in diagram/Base64 metadata is not an embedded cabinet.
-- Media-carrier gzip findings validate reserved header flags and a bounded
-  deflate stream, avoiding three-byte magic coincidences inside compressed
-  PNG metadata while retaining real compressed stowaways.
-- A JSON, YAML, TOML or plist document could erase `file.basename` and forge
-  filefacts-owned keys.
-- A CAB signature reported `verified: true` without being bound to the
-  cabinet; the PE header-only path reported `verified: true` without a digest
-  check.
-- `pdf.signature_object_count` was overwritten with a value that reported 0
-  for a single `/Type/Sig`.
-- A commented-out `requestedExecutionLevel` could hide a manifest's real one.
-- The rizin child could get a looser memory limit than it inherited.
-- Two tree-sitter parses bypassed the parse budget and abort guard; five
-  pipeline stages printed caught panics to stderr.
-- Quadratic walks in Rust attribute handling and ISO namespace merging;
-  uncapped OLE2 stream reads; an unbounded zstd window; a 4 MiB UTF-16 decode
-  per identification.
-- Rust ctor and Go generate facts vanished on files over 2 MiB.
-- Go build constraints followed the wrong rules.
-- Python and Go environment reads never reached `environment-value-http-body`.
-- Overlapping Aho-Corasick matches double-scored language tokens.
-- Encrypted `.class` entries dropped out of `jar` class counts.
-- Identifying a signed phar hashed the whole file; identification now reads
-  the manifest and trailer shape only, and the extractor checks the digest.
-- Mach-O `entry_section` was computed from a file offset, not the entry VA.
-- On macOS a rizin run killed at its deadline was misreported as killed from
-  outside; the rizin memo shared entries across scripts.
+## 3.0.0-beta.1 (unreleased)
 
 ### Security
 
-- Remaining `cargo audit` exceptions, both verification-only, are documented
-  in `.cargo/audit.toml`: RUSTSEC-2023-0071 (`rsa`) and RUSTSEC-2026-0387
-  (`crypto-bigint` via `p256`/`p384`).
-- Real malware specimens in the test data are stored zstd-compressed; see
-  `testdata/README.md`.
+- Escape DEL, C1 and bidi characters in JSON output, blocking terminal-escape injection from analyzed files.
+- Stop JSON, YAML, TOML and plist documents from overwriting `file.basename` and other filefacts-owned keys.
+- Stop reporting CAB signatures as verified without binding them to the cabinet.
+- Stop reporting header-only PE signatures as verified without checking the digest.
+- Require the codeSigning EKU before granting platform or Developer ID trust.
+- Ignore commented-out execution levels that could hide a manifest's real `requestedExecutionLevel`.
 
-## History before this changelog
+### Features
 
-- **Schema 9** — 75 value and metric keys renamed to one naming convention;
-  section flags share one vocabulary; a `Reference` with no locatable
-  position omits `offset`.
+- Recover PE, ELF and Mach-O functions in-process with binform on every binary lacking a function inventory.
+- Extract direct syscalls on 32-bit Arm and x86 too, resolving numbers and arguments built across blocks.
+- Decode sockaddr arguments to connect and bind, reporting each destination in `elf.network_endpoints`.
+- Bind each chained-fixup Mach-O import to its library, and name ELF import libraries from symbol versions.
+- Name PE ordinal imports from msi, comctl32, mfc42 and other DLLs' own export tables.
+- Probe PNG pixel data for hidden scripts and binaries packed into bit planes, XOR, Base64 or zlib.
+- Identify trailing media content and PNG IEND residue separately from headers embedded in metadata.
+- Recover supported PyArmor layouts statically, without executing Python or the native runtime.
+- Recover RC4-encrypted DEX and ZIP containers, accepting only output that passes full integrity checks.
+- Read Ren'Py RPA archives and rpyc scripts without constructing Python objects.
+- Analyze JavaScript embedded in HTML and PHP embedded in other markup.
+- Identify Commodore, ProDOS, DOS, VHD, DEX, MSBuild, Maven POM and Go module files.
+- Identify source package archives by their root manifests.
+- Decode PDF object streams with no filter, ASCIIHex, ASCII85 or chained filters.
+- Read DWARF from big-endian ELF and compressed debug sections.
+- Report signer count, key size, weak keys, weak algorithms and extended key usage for signatures.
+- Detect shell FIFO network loops and measure batch variable cycles.
+- Place every file type in one of 19 groups through `filefacts::Group`.
+- Expose the CLI's versioned JSON document to library users through `ParsedFile::bundle`.
+- Breaking: stop running rizin; its module, options, environment variable and CLI flags are gone.
+- Breaking: bump `SCHEMA_VERSION` to 11, renaming people, hash, summary and archive-member keys.
+- Breaking: report PE delay-load import offsets as RVAs, as every other PE import does.
+- Breaking: make `OpenOptions::new` read no environment, so the cache stays off unless enabled.
+- Breaking: drop `pe.signature_expired_days`, which went stale in cached facts; use not_after_unix instead.
+- Breaking: remove public cache internals, metric and value key types, and the CLI's pretty flag.
+
+### Fixes
+
+- Compute PE imphash for ordinal imports as pefile and VirusTotal do.
+- Type a file as go.mod only when every line is a go.mod directive, so Ruby modules get analyzed.
+- Read ELF and Mach-O files goblin rejects, plus ELF and ordinal-only PE exports it dropped.
+- Resolve long PE section names through the COFF string table.
+- Align .NET managed resource offsets to eight bytes, so later resource streams are no longer hidden.
+- Count PDF `/Type` dictionaries by PDF name rules, not byte tokens anywhere in the file.
+- Report a lone PDF signature object as one, not zero.
+- Read Go build info only where Go's own reader looks for it.
+- Describe fat Mach-O binaries by their x86-64 or arm64 slice, so iOS binaries yield functions.
+- Read plaintext APK entries whose ZIP encryption bit was set by a protector.
+- Validate CAB and gzip carrier headers, cutting false stowaway findings in PNG metadata.
+- Keep Rust ctor and Go generate facts on files over 2 MiB.
+- Route two tree-sitter parses through the parse budget and abort guard.
+- Bound Rust attribute and ISO namespace walks, OLE2 stream reads and the zstd window.
+
+### Optimizations
+
+- Read each binary, or each universal slice, once and share it across views, functions and stng.
+- Check a signed phar's digest during extraction instead of hashing the whole file on identification.
+- Stop decoding 4 MiB of UTF-16 on every identification.
+- Drop the sevenz-rust and xz2 dependencies, parsing 7z headers in-house with one LZMA implementation.
+
+## 2.0.1 (2026-10-10)
+
+### Fixes
+
+- Read Mach-O code-signature blobs only from xnu-honoured slots, ignoring decoy entitlements.
+- Fail Authenticode signatures lacking an image digest, so grafted catalog signatures fail.
+- Take Authenticode timestamps from the signed TSTInfo, not a forgeable byte search.
+- Check nested PE signatures, and mark unrecomputable digests unverifiable, not intact.
+- Correct PE `IMAGE_GUARD_*` masks for delay-load IAT and export-suppression flags.
+- Use the last CRX3 header fields, as Chrome does, so decoys can't spoof extension IDs.
+- Refuse cache roots that are relative, symlinked or writable by other users.
+- Run rizin with an allowlisted environment, and parse its output separators strictly.
+- Catch panics in metrics, identity and reference derivation instead of aborting.
+- Escape control characters in CLI argument errors.
+- Pickle: model the stack and memo, fix `LONG_BINGET` length, cap operand amplification.
+- Budget ZIP open reads and PyTorch version reads, refusing EOCD floods and bombs.
+- Cap ELF name copies, verneed/verdef walks, DWARF attributes and overlapping note walks.
+- Clamp Mach-O `nsyms`, skip overlapping fat slices, and cap load-command record counts.
+- Keep goblin away from PE import/export tables over 32 MiB, and cap TLS and delay-import counts.
+- Limit Authenticode chain walks to 32 candidate issuers.
+- Add overflow checks to CAB, CLR, APK, Authenticode, VBA and code-signature parsing.
+- Cap member listings and path sizes in ISO, UDF, ASAR, RAR, 7z and CHM.
+- Cap APK signature blocks, JAR `pom.properties` reads and AXML/Java string copies.
+- Bound DMG reconstruction, font scanning, NIB archives and JPEG pixel decoding.
+- Cap OOXML `.rels`, PDF action sites, YAML alias replay and VBA decompression.
+- Read each repeated RPM header tag once, and cap Go buildinfo dependency records.
+- Count reference-evidence misses against the budget, fixing slow huge `package-lock.json` scans.
+
+### Features
+
+- Verify CRX2 and CRX3 developer signatures, reported as `crx.signature_verified`.
+- Report Authenticode `unsigned_trailing_bytes` for CVE-2013-3900-style padding.
+- Add a `module_level` flag to value-flow values evaluated at load time.
+- Identify Sphinx `.doctree` files as Pickle.
+- Add public `tools::scrub_env` to restrict spawned tools' environments.
+- Minimum Rust version raised from 1.94 to 1.97.
+
+### Optimizations
+
+- Resolve AST call chains once and layer flow scopes, removing quadratic slowdowns.
+- Reuse PDF `endobj`/`endstream` search positions instead of rescanning to EOF per object.
+- Index ELF section-in-segment checks, and parse each DWARF abbreviation table once.
+- Pre-index PE API-hash call edges, so a million edges now finish.
+- Replace linear dedup scans with hash sets in tar, ISO, OOXML, PKGBUILD and JS.
+- Serialize only the displayed rows in CLI text views, cutting memory on large files.
+
+## 2.0.0 (2026-10-09)
+
+### Breaking Changes
+
+- `open()` is now infallible; `OpenOptions` replaces `open_with_path`, `open_as` and `with_cancellation`.
+- Global cache and rizin settings are replaced by per-file `OpenOptions` settings.
+- Schema v9 renames 75 value and metric keys, such as `pe.imphash` → `pe.hashes.imphash`.
+- `ParseError`/`ErrorKind` become `Diagnostic`/`DiagnosticKind`; `ExtractedString` becomes `Literal` with typed enums.
+- Literal JSON uses `value` instead of `text` and drops `kind`, `section`, `vaddr` and `paddr`.
+- Default features now include `cli` and `jemalloc`; library users should set `default-features = false`.
+
+### Features
+
+- New archive formats: RAR, 7z, CAB, cpio and PHP phar.
+- New formats: AppleScript, nib/xib/bplist, ANI cursors, systemd units, Desktop Entry, deb822, Image4 and TorchScript.
+- New language detection: YARA, JSP, ASP, CFML, TeX, PostScript, DOS COM, mIRC/ircII and Ammonite.
+- Detects shellcode and decodes single-byte and repeating-key XOR PE payloads, including their symbols.
+- Validates Authenticode and Mach-O signatures against embedded Microsoft and Apple root certificates.
+- New `comments` and `references` CLI views; `archive_members` is now a typed member index.
+- RTF objdata is now decoded, exposing OLE class names and new objdata metrics.
+- Reads Mach-O imports from chained fixups and extracts text from compressed Flash (CWS) files.
+- New metrics for Terraform registry lookalikes, PDF upload directories and encrypted 7z entries.
+
+### Fixes
+
+- `office.vba.modules[]` is now populated; it was empty for every document.
+- Overlay metrics no longer count Mach-O `__LINKEDIT`, ELF section headers or fat-binary slices.
+- APKs are identified by their manifest, and Office extensions no longer force OOXML parsing.
+- Binaries are no longer misidentified as scripts because of chance token matches.
+- Fixed Mach-O bind/export panics found by fuzzing and a tree-sitter ambiguous-parse bug.
+- Improved detection of PHP, HTA, Markdown, PowerShell, Lua, shell droppers and appx/msix.
+- ISO appended-payload detection now accounts for partition tables.
+
+### Optimizations
+
+- Upgraded to tree-sitter 0.28 with a tighter source-parse work budget.
+- Go pclntab recovery uses rizin's fastest analysis mode (`aalg`).
+- Identification relies on magic bytes over file extensions, and Mach-O imports/exports load lazily.
+- The disk cache now writes atomically and runs a background sweep with age, count and size limits.
+
+## 1.7.0 (2026-09-14)
+
+### Features
+
+- Shared `media.*` carrier facts: container, validity, stowaway classification, trailing/gap bytes, and entropy.
+- Structure walkers and file types for RIFF (WAV/WebP/AVI), AIFF, ICO/CUR, GIF, BMP, MP3, MP4.
+- Font extractor (`font.*`) for masquerades and table-gap stowaways.
+- New Flow graph with Rust and Go producers, plus bounded payload provenance.
+- `go_dependency_context`, `go_source_context` and `package_context::cargo_source_context` reconcile declarations, replacements, and checksums.
+- ELF anomaly metrics from the Trusting-Trust binary-manipulation paper: entry redirection, uncovered notes and build-id, section overlap/past-EOF, full `elf.sections[]`.
+- x86-64 direct-syscall site extraction with resolved numbers, constant arguments and file offsets.
+- PNG recognizes C2PA caBX credentials as claimed metadata, still scanned for payloads.
+- `has_named_reference_metadata` and hermetic `open_with_path`.
+
+### Fixes
+
+- Go PE binaries that fold `.gopclntab` into `.rdata` are detected via build-info, and rizin runs full `aaa` for Go so pclntab names survive.
+- Rizin's recovery memo keys on the Go script, so Go and generic PE paths can't share an entry.
+- Fonts, audio and video are distinct file-id groups.
+
+### Optimizations
+
+- Cache item ceiling raised to 16,384, matching stng and fletch.
+
+## 1.6.0 (2026-09-10)
+
+### Features
+
+- New Xcode `.pbxproj` format parser, with pbxproj/CMake files recognized by extension and magic and usable as reference sources.
+- Recognition of YAML documents, SquashFS images (hsqs/sqsh), Snap packages, Flatpak bundles, and OpenPGP signatures.
+
+### Fixes
+
+- npm lockfile alias keys (`alias@npm:real@^1`) now resolve to the aliased-to package instead of querying the registry for a name.
+- Timing tests pre-execute staged shims so macOS EndpointSecurity's first-exec scan no longer breaks timing assertions.
+
+## 1.5.0 (2026-09-08)
+
+### Features
+
+- New markdown extractor lifts README identity claims.
+- New `pe_signature_trust` module splits an aged signature from a wrong one via `digest_matches` and `signed_within_validity`.
+- npm manifests now emit cross-field judgements: `consistency.name_repo_mismatch`, `consistency.publisher_repo_owner_mismatch`.
+- BIFF worksheet inventory (`office.sheet_count`, `office.xlm_sheet_count`, `office.hidden_sheet_count`) surfaces Excel 4.0 macro sheets.
+- Source string literals and call arguments are now escape-decoded.
+- `binding.gyp` parsing falls back to a tolerant Python-literal parse (`gyp.parse_lenient=1`).
+- Malformed PE import directories are now detected and reported rather than silently walked.
+- PE version-info consistency checks and `.lnk` location anchors.
+- New `known_metrics()` API enumerates every metric key a build can emit.
+- New `open_with_fileid()` lets a caller that already computed a `FileId` skip the second detection pass.
+
+### Fixes
+
+- Fixed a deadlock where a rizin subprocess wait could park an analysis-pool worker forever without reaping the child or firing its timeout.
+- Fixed an off-by-one in ISO parsing.
+- Fixed null-offset imports in PE, Java class, and WASM.
+- Preserved `posix_spawn` for rizin subprocesses on FreeBSD.
+
+### Optimizations
+
+- PDF parsing no longer scans to end-of-file looking for a stream that isn't there.
+- Rizin runs `aa; aac` instead of `aaa` on x86 PE images.
+- Detection skips a redundant second byte-scan on single-stream containers.
+
+## 1.4.0 (2026-08-25)
+
+### Features
+
+- Added full ISO 9660/UDF parsing and archive-member extraction.
+- Added ELF syscall-site extraction for x86-64 and AArch64.
+- Expanded PE native resolver, API-hash, and anomaly analysis.
+- Added source/package identity extraction and richer npm/GitHub Actions references.
+
+### Bugfixes
+
+- Improved format heuristics for ambiguous and extensionless files.
+- Hardened rizin subprocess cleanup and timeout handling.
+- Corrected Mach-O symbol normalization and extraction-cache partitioning.
+
+### Optimizations
+
+- Added weighted code-entropy analysis and bounded source parsing.
+- Improved cache reuse and tool-path resolution.
+
+## 1.3.0 (2026-07-25)
+
+### Detection & parsing
+
+- PE .NET/CLR metadata (`pe.clr.*`): managed-binary detection independent of Authenticode — strong-name signing, module MVID, runtime/metadata versions, IL-only bits, and metadata stream inventory.
+- Static libraries (`.a`) now identified as a distinct file type, disambiguated from `.deb` (both use the `!<arch>` magic).
+- CRX signed-but-unverified detection fixed: the canonical extension ID is now read from the CRX3 signed header, correctly handling Web Store packages that carry a publisher proof before the developer proof (previously derived the wrong ID).
+- Dependency extraction for `.gem` (runtime deps → `pkg:gem` PURLs) and VSIX (`<Dependency>` → `pkg:vscode` PURLs).
+
+### Reliability
+
+- Fixed panic parsing batch (`.bat`) comments when a line begins with a multibyte char (e.g. CJK) — a `rem` check byte-sliced mid-character. (Crashed the matrixone scan.)
+- Auto-clearing cache: 30-day TTL + 2 GiB ceiling, non-blocking; also sweeps stng's on-disk string cache, which nothing else prunes in a filefacts/cleave process. Fixed an eviction-target overflow on very large `max_items`.
+
+### Project
+
+- Moved to GitHub (atomdrift-project/filefacts); stng dependency re-pinned. Dependency updates.
+
+## 1.2.0 (2026-07-06)
+
+### Features
+
+- New formats: WebAssembly, OCI container images, Python sdist, Android DEX; better npm/gem/oci/xbps/gpkg detection.
+- Recognizes SVG, Cypher/CQL, and Python template files.
+- Windowed entropy metrics surface a concealed high-entropy region (peak + offset) even when overall entropy is low.
+- Facts now carry byte-range spans pinpointing each measurement's evidence.
+- Registry metadata gains a `security_hold` flag and `version_removed` metric.
+
+### Performance
+
+- Skips the XOR seed search on source/script files with no sign of XOR logic.
+- Deduplicates stng strings; cache self-cleans (prunes to 90% of capacity instead of a 30-day TTL).
+
+## 1.1.1 (2026-06-20)
+
+- Hermetic open for cache-less testing.
+- Add missing DMG support file.
+
+## 1.1.0 (2026-06-20)
+
+- Added external reference extraction: PURLs, URLs, evidence, offsets, hashes.
+- Added package/lockfile parsing for npm, PyPI, Cargo, Go, Ruby, Composer, Arch.
+- Added new file types: lockfiles, `go.mod`, `go.sum`, `.SRCINFO`, DMG.
+- Added package metadata and reference output views.
+- Added source call-target metrics, including obfuscated command targets.
+- Improved JS/PHP/protobuf/package/DMG identification.
+- Improved Go buildinfo, Mach-O slicing, and rizin symbol offsets.
+- Added pre-commit hook support.
+
+## 1.0.1 (2026-06-14)
+
+- Program Identity extraction — pulls publisher/package metadata from CRX, npm, nupkg, Rust crate, wheel, and xpi archives.
+- JCL (z/OS Job Control Language) detection; PKGBUILD classified as shell.
+- Panic-safe binary parsing — goblin wrapped to fail soft on malformed PE/Mach-O/ELF instead of aborting.
+- Binary fixes — corrected Mach-O FAT and PE offsets; richer PE version/debug info.
+- Scanning rework — consolidated string scanning, improved wide-char handling.
+- Dependency updates and cleanup.
+
+## 1.0.0 (2026-06-12)
+
+### New Signals
+
+- Added richer package ecosystem identification: Android/Alpine APK, npm, Cargo crate, Ruby gem, Debian package, NuGet, VSIX, IPA, conda, egg, Arch/FreeBSD/macOS pkg.
+- Added `.deb` identity features: package, version, architecture, maintainer, dependencies, installed size.
+- Added `.gem` identity features: name, version, platform, homepage, authors, licenses, runtime/development dependency counts.
+- Added more PE malware-relevant metrics, such as CLR managed resource count, max entropy, max size.
+
+### Better Evidence Anchoring
+
+- ELF dynamic imports now include offsets into `.dynstr`.
+- Mach-O dylib references and code signatures now include offsets.
+- Source member symbols now include byte offsets.
+
+### Detection Quality
+
+- Improved package disambiguation, especially Android vs Alpine `.apk`, npm `.tgz`, Arch/FreeBSD/macOS `.pkg`.
+- Better AppleScript and pacman/AUR install-scriptlet detection.
+- Reduced false positives by classifying unsupported OCaml, Vim, Lisp, SQL, Smali, patches/diffs, CSS-like files, and TS baselines as text instead of weakly guessing JS/Kotlin/Batch.
+
+### Robustness For Large Corpora
+
+- Hardened Tree-sitter extraction against panics, deep ASTs, huge query output, and scanner-risk cases.
+- Added metrics such as `ast.depth_capped`, `source.query_limited.*`, and `source.ast_unavailable` so skipped/truncated AST extraction is explicit.
+- Binary string extraction reuses existing PE/ELF/Mach-O parses, reducing duplicate parsing work.
+
+### Breaking/Schema Notes
+
+- `FileType::Pkg` became specific variants like `PkgMacos`, `PkgFreebsd`, and `PkgArch`.
+- `Symbol::Member` now has optional `offset`.
+- New source error stages: `SourceParse`, `SourceExtract`, `SourceAstWalk`.
+- `pe.cert_table_size` moved from values to metrics.
+
+## 0.9.5 (2026-06-09)
+
+### Features
+
+- Added Debian package metadata: package, version, architecture, maintainer, dependencies, and installed size.
+- Added RubyGems metadata: name, version, platform, authors, licenses, homepage, and runtime deps.
+- Split package ecosystems into distinct types, including Android/Alpine APK, npm, crate, conda, NuGet, IPA, VSIX, FreeBSD pkg, and Arch pkg.
+- Added PE/.NET signals for managed resource entropy/size, suspicious VERSIONINFO identity text, `.reloc` overhang, and certificate table size.
+- Improved AppleScript detection for plaintext macOS stealer scripts with random or unknown extensions.
+
+### Performance
+
+- Reuses parsed PE/ELF/Mach-O objects for string extraction instead of parsing binaries twice.
+- Skips duplicate stng symbol/import extraction because filefacts already walks symbols itself.
+
+### Bugfixes
+
+- Hardened AST analysis against deeply nested source chains that could overflow the worker stack.
+- Emits `ast.depth_capped` when hostile or generated source exceeds analysis depth.
+- Reduced false positives by treating Vim, Lisp, SQL, Smali, diffs, and TS baseline files as text.
+- Fixed archive disambiguation so legitimate `.apk` and `.pkg` ecosystem variants do not look like extension mismatches.
+
+## 0.9.0 (2026-06-07)
+
+### New language & format support
+
+- Clojure and Windows Batch AST analysis (tree-sitter).
+- AppleScript source detection.
+- BEAM bytecode and FreeBSD zstd `.pkg` detection.
+- `binding.gyp` parsed as JSON; Meson, Arch package metadata, and R Markdown/Quarto recognized.
+
+### New facts & metrics
+
+- Comments exposed as a matchable string tier; JS/TS/Go backtick strings no longer misread as comments; Lisp and Batch comment styles added.
+- New obfuscation AST metrics: operator density, numeric arrays, XOR loops, const/string-return functions, identity functions, and more.
+- Extension/content mismatch metrics name the transition (e.g. `binary_as_image`), with carve-outs for benign conventions.
+- VBA identifier metrics: mean length, entropy, distinct trigger count.
+- `binary.overall_entropy` emitted for every file type.
+- Java constructors, C# qualified names, and import aliases (`import x as y`) surfaced.
+
+### Detection accuracy
+
+- Stylesheets treated as text, no longer misparsed as JavaScript.
+- JS/Kotlin scoring fixed: `var`/`let`/`const` count for JS; `===` ignored in separator runs.
+- Python relative imports keep their `.` prefix — no more false PyPI matches.
+- PEs that goblin can't parse now get rizin section/import recovery.
+
+### Performance & memory
+
+- jemalloc tuned to release freed pages immediately: peak RSS −~60%.
+- JSON output streams to stdout instead of building in memory.
+- Tree-sitter queries compiled once and cached.
+
+### API & maintenance
+
+- Symbol objects slimmed: dropped `source`, `decl`, and rare rizin fields.
+- Dependency updates.
+
+## 0.8.0 (2026-05-28)
+
+### Features
+
+- Electron ASAR and Clojure support — new `.asar` archive parser and Clojure source identification.
+- Generic JSON support — `.json` files are parsed into top-level keys (with a 75 KB cap; larger files stay analyzable as raw text).
+- Broader file identification — more extensions in the fileid map, a dedicated PE extension map, and improved GitHub Actions workflow detection.
+
+### Fixes
+
+- Fixed a PDF `/Length` stream-end calculation bug that mis-bounded stream bodies when `endstream` had no preceding EOL.
+
+### Hardening
+
+- Capped AST recursion depth at 1000 to stop pathologically nested (generated/adversarial) source from overflowing the worker stack; `ast.max_depth` now saturates at the cap as a "deeply nested" signal.
+
+### Internal
+
+- Dependency updates and code cleanup.
+
+## 0.7.0 (2026-05-26)
+
+### New facts
+
+- Markdown extractor — `markdown.first_heading` and deduped `markdown.github_repos[]`.
+- `file.basename` / `file.stem` emitted whenever a path is supplied.
+- Wheel outer-filename parsing: `whl.filename.{name_prefix,version,build,python_tag,abi_tag,platform_tag}` from the PEP 427 basename.
+- PDB derived names — `pe.debug.pdb.basename` and `pe.debug.pdb.stem`.
+
+### Hardening
+
+- Tree-sitter scanner audit: per-grammar `ScannerAudit` table re-verified against locked crate sources; Python now models the actual combined delimiter + indent byte.
+- Mach-O fat-binary panic fix — misclassified `CAFEBABE` Java `.class` no longer slices OOB on bogus `arch.offset`.
+- Mach-O code-signature caps — Requirement-expression depth 32, plist depth 64, entitlement XML 1 MiB.
+- CHM bounds arithmetic — directory / namelist / system walks converted to `checked_add` / `checked_mul`.
+- `bytes_at::{u16,u32,u64}_{le,be}` helpers replace unchecked `try_into().unwrap()` reads.
+- CLI — `--help` / `--version` no longer `process::exit`; readdir errors surface per-entry.
+
+### Breaking API
+
+- `unsafe_code = "deny"` (was warn).
+- `FileId` fields private — use `file_type()`, `source()`, `extension_mismatch()`. `#[non_exhaustive]`.
+- `ParseError.kind`/`.stage` are now `ErrorKind` / `Stage` enums (JSON wire form unchanged).
+- `ArchiveMember` regrouped into `ArchiveCompression` / `ArchiveOwnership` / `ArchiveOffsets` sub-structs.
+- VBA sentinel flattened to `filefacts::VBA_NON_LITERAL_SENTINEL`; rizin module no longer a re-export façade.
+- `ParsedFile` is `#[must_use]`; `ParsedFile::strings()` renamed to `text()`.
+- `Sections::from_iter_sections` removed in favour of standard `FromIterator`.
+
+## 0.6.0 (2026-05-25)
+
+### Breaking — schema v4 → v6
+
+- Unified symbol model. The peer `Imports`, `Exports`, `Functions`, and `Ast` collections are collapsed into a single tagged `Symbols` enum with kinds `Import`, `Export`, `Function`, `Call`, `Member`, `Bind`, and `Identifier`. `Function.kind` is renamed to `decl`; `Function.calls` is renamed to `callees`. (v5)
+- Strings split. `Strings` is replaced by two peers: `Text` (byte-scan ASCII + UTF-16LE — the strings(1) tier) and `Literals` (parser-extracted source string literals). The `StringCategory` enum and `ExtractedString.category` field are removed. (v6)
+
+### New languages
+
+- Perl, Groovy, Zig, Elixir, and Makefile join the tree-sitter language set.
+
+### Source-analysis improvements
+
+- Typed call arguments. Calls now emit an `Arg` enum carrying the actual literal value (`String { value }`, `Number { text, value, radix }`, `Identifier { name }`, `Bool { value }`, `Template { value }`, …), so rules can match on the literal directly instead of correlating against literals by offset.
+- New `Identifier` symbol kind. Every bare-identifier leaf (variables, parameters, type names, call targets) is captured with first-seen offset, enabling naming-pattern rules.
+- Subscript-as-member. `obj["constructor"]["constructor"](...)` now folds into a member chain instead of dropping out as a dynamic access, so JS sandbox-escape patterns land as `Member` symbols.
+- Scanner-overflow guard. Files >2 MB, or Python sources whose estimated indent stack exceeds 450 levels, are skipped before parsing to avoid tree-sitter's external-scanner 1024-byte buffer abort in release builds.
+
+### CLI
+
+- New view flags: `--text`, `--literals`, `--symbols`, `--calls`, `--members`, `--binds`, `--identifiers`.
+- Removed: `--strings`, `--ast` (replaced by the above).
+
+## 0.5.0 (2026-05-24)
+
+First release!
+
+## Schema history
+
+Output schema versions before 11:
+
+- **Schema 9** — 75 value and metric keys renamed to one naming convention; section flags share one vocabulary; a `Reference` with no locatable position omits `offset`.
 - **Schema 8** — located metrics serialize as `{"value", "spans"}`.
 - **Schema 7** — the `Identity` view.
 - **Schema 6** — `Strings` split into `Text` and `Literals`.
-- **Schema 5** — `Imports`, `Exports`, `Functions` and `Ast` collapsed into
-  the `Symbol` enum.
-
-[Unreleased]: https://github.com/atomdrift-project/filefacts/compare/v2.0.1...HEAD
+- **Schema 5** — `Imports`, `Exports`, `Functions` and `Ast` collapsed into the `Symbol` enum.
