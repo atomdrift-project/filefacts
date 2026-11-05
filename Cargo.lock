@@ -90,7 +90,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 [[package]]
 name = "binform"
 version = "0.9.0"
-source = "git+https://github.com/atomdrift-project/binform.git#4211c34c06adbed883caf73542cfa76f12130d8b"
+source = "git+https://github.com/atomdrift-project/binform.git#2e9ad27fbc2c39b046b91a56ff093f3f98506b35"
 dependencies = [
  "gimli",
  "iced-x86",
@@ -1301,9 +1301,9 @@ dependencies = [
 
 [[package]]
 name = "psl"
-version = "2.1.246"
+version = "2.1.247"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "27d58bd13c235442118460335daf360f0fefaa9035ec4ad957f851d738e7b7d6"
+checksum = "bcf03dc0cd8c65e109a7848e3b4adf06236a181d937af94bff66966e3876b1aa"
 dependencies = [
  "psl-types",
 ]
@@ -1717,7 +1717,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stng"
 version = "3.0.0"
-source = "git+https://github.com/atomdrift-project/stng.git#72e68eaa3b583fd2e1d75baff6e08ef87c68b0b6"
+source = "git+https://github.com/atomdrift-project/stng.git#0cdf49e6471366209d200f38375eb5502bb7c698"
 dependencies = [
  "aho-corasick",
  "base64 0.22.1",
@@ -1743,7 +1743,7 @@ dependencies = [
 [[package]]
 name = "stng-process"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/stng.git#72e68eaa3b583fd2e1d75baff6e08ef87c68b0b6"
+source = "git+https://github.com/atomdrift-project/stng.git#0cdf49e6471366209d200f38375eb5502bb7c698"
 dependencies = [
  "libc",
 ]
@@ -2405,9 +2405,9 @@ dependencies = [
 
 [[package]]
 name = "winnow"
-version = "1.0.4"
+version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
+checksum = "8c3b93199df0ab874cdf0c6a94f0a0dc3423fe41f1cafb62b8bd7b1deb277aef"
 
 [[package]]
 name = "writeable"
