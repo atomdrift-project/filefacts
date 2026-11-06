@@ -24,63 +24,153 @@ const OCTET_STRING_CONSTRUCTED: u8 = 0x24;
 /// well-formed BER within [`MAX_DEPTH`]. Bytes after the element (the zero
 /// padding a code-signature blob carries) are ignored.
 pub(super) fn to_der(ber: &[u8]) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(ber.len());
-    element(ber, &mut out, 0)?;
-    Some(out)
+    normalize(ber).map(|(der, _)| der)
 }
 
-/// Normalize a complete standalone CMS object. Unlike an embedded signature
-/// blob, a standalone profile must not silently discard trailing bytes.
-pub(super) fn to_der_exact(ber: &[u8]) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(ber.len());
-    let rest = element(ber, &mut out, 0)?;
-    rest.is_empty().then_some(out)
+/// Normalize the first element of `ber` in two passes, so the work is linear
+/// in the input however deep it nests: the first validates the element and
+/// records the DER content length of each constructed element in pre-order,
+/// the second writes the output with those lengths already known. Returns
+/// the DER bytes and the input after the element.
+pub(super) fn normalize(ber: &[u8]) -> Option<(Vec<u8>, &[u8])> {
+    let mut lengths = Vec::new();
+    let (rest, _, len) = measure(ber, 0, &mut lengths)?;
+    let mut out = Vec::with_capacity(encoded_len(len)?);
+    write(ber, &mut out, &mut lengths.into_iter(), true)?;
+    Some((out, rest))
 }
 
-/// Read one element from `input`, append its DER form to `out`, and return
-/// the bytes after it.
-fn element<'a>(input: &'a [u8], out: &mut Vec<u8>, depth: usize) -> Option<&'a [u8]> {
-    if depth > MAX_DEPTH {
-        return None;
-    }
+/// Where a BER element's contents end.
+#[derive(Clone, Copy)]
+enum Extent<'a> {
+    /// A definite length: the contents and the bytes after them.
+    Definite { content: &'a [u8], tail: &'a [u8] },
+    /// An indefinite length: children up to an end-of-contents marker,
+    /// starting at these bytes.
+    Indefinite(&'a [u8]),
+}
+
+/// Read the identifier and length octets of the element at `input`.
+fn header(input: &[u8]) -> Option<(u8, Extent<'_>)> {
     let (&tag, rest) = input.split_first()?;
     // High-tag-number form (low five bits all set) never occurs in CMS.
     if tag & 0x1F == 0x1F {
         return None;
     }
-    let constructed = tag & 0x20 != 0;
-    let (&first, mut rest) = rest.split_first()?;
+    let (&first, rest) = rest.split_first()?;
     if first == 0x80 {
-        // Indefinite length: children up to an end-of-contents marker. Only
-        // constructed encodings may use it.
-        if !constructed {
-            return None;
-        }
-        let mut body = Vec::new();
-        loop {
-            if let [0, 0, tail @ ..] = rest {
-                rest = tail;
-                break;
-            }
-            rest = element(rest, &mut body, depth + 1)?;
-        }
-        emit(tag, &body, out)?;
-        return Some(rest);
+        // Only constructed encodings may use an indefinite length.
+        return is_constructed(tag).then_some((tag, Extent::Indefinite(rest)));
     }
     let (len, rest) = definite_length(first, rest)?;
-    let content = rest.get(..len)?;
-    let tail = rest.get(len..)?;
-    if constructed {
-        let mut body = Vec::new();
-        let mut inner = content;
-        while !inner.is_empty() {
-            inner = element(inner, &mut body, depth + 1)?;
+    let (content, tail) = rest.split_at_checked(len)?;
+    Some((tag, Extent::Definite { content, tail }))
+}
+
+fn is_constructed(tag: u8) -> bool {
+    tag & 0x20 != 0
+}
+
+/// Call `child` on each child of a constructed element, with the input
+/// starting at that child; `child` returns the input after it. Returns the
+/// input after the element.
+fn children<'a>(
+    extent: Extent<'a>,
+    mut child: impl FnMut(&'a [u8]) -> Option<&'a [u8]>,
+) -> Option<&'a [u8]> {
+    match extent {
+        Extent::Definite { mut content, tail } => {
+            while !content.is_empty() {
+                content = child(content)?;
+            }
+            Some(tail)
         }
-        emit(tag, &body, out)?;
-    } else {
-        emit(tag, content, out)?;
+        Extent::Indefinite(mut rest) => loop {
+            if let [0, 0, tail @ ..] = rest {
+                return Some(tail);
+            }
+            rest = child(rest)?;
+        },
     }
-    Some(tail)
+}
+
+/// The DER tag for BER `tag`: a constructed OCTET STRING is folded into a
+/// primitive one.
+fn der_tag(tag: u8) -> u8 {
+    if tag == OCTET_STRING_CONSTRUCTED {
+        OCTET_STRING
+    } else {
+        tag
+    }
+}
+
+/// Validate the element at `input` and push the DER content length of it
+/// and each constructed element inside it to `lengths`, in pre-order.
+/// Returns the input after the element, its DER tag and its DER content
+/// length.
+fn measure<'a>(
+    input: &'a [u8],
+    depth: usize,
+    lengths: &mut Vec<usize>,
+) -> Option<(&'a [u8], u8, usize)> {
+    if depth > MAX_DEPTH {
+        return None;
+    }
+    let (tag, extent) = header(input)?;
+    if !is_constructed(tag) {
+        let Extent::Definite { content, tail } = extent else {
+            return None;
+        };
+        return Some((tail, tag, content.len()));
+    }
+    let slot = lengths.len();
+    lengths.push(0);
+    let fold = tag == OCTET_STRING_CONSTRUCTED;
+    let mut len = 0usize;
+    let rest = children(extent, |child| {
+        let (rest, child_tag, child_len) = measure(child, depth + 1, lengths)?;
+        // A folded OCTET STRING keeps only its chunks' contents.
+        let encoded = if fold {
+            (child_tag == OCTET_STRING).then_some(child_len)?
+        } else {
+            encoded_len(child_len)?
+        };
+        len = len.checked_add(encoded)?;
+        Some(rest)
+    })?;
+    *lengths.get_mut(slot)? = len;
+    Some((rest, der_tag(tag), len))
+}
+
+/// Write the DER form of the element at `input`, already validated by
+/// [`measure`], taking constructed lengths from `lengths` in the same
+/// pre-order. A chunk of a folded OCTET STRING is written without its
+/// header. Returns the input after the element.
+fn write<'a>(
+    input: &'a [u8],
+    out: &mut Vec<u8>,
+    lengths: &mut std::vec::IntoIter<usize>,
+    with_header: bool,
+) -> Option<&'a [u8]> {
+    let (tag, extent) = header(input)?;
+    if !is_constructed(tag) {
+        let Extent::Definite { content, tail } = extent else {
+            return None;
+        };
+        if with_header {
+            out.push(tag);
+            push_length(content.len(), out);
+        }
+        copy(content, out);
+        return Some(tail);
+    }
+    let len = lengths.next()?;
+    if with_header {
+        out.push(der_tag(tag));
+        push_length(len, out);
+    }
+    let fold = tag == OCTET_STRING_CONSTRUCTED;
+    children(extent, |child| write(child, out, lengths, !fold))
 }
 
 /// Decode a definite length whose first octet is `first`. BER allows the
@@ -103,29 +193,27 @@ fn definite_length(first: u8, rest: &[u8]) -> Option<(usize, &[u8])> {
     Some((len, rest))
 }
 
-/// Append `tag`, a minimal definite length, and `content`. A constructed
-/// OCTET STRING, whose `content` is already-normalized primitive chunks, is
-/// folded into one primitive string as DER requires.
-fn emit(tag: u8, content: &[u8], out: &mut Vec<u8>) -> Option<()> {
-    if tag == OCTET_STRING_CONSTRUCTED {
-        let mut joined = Vec::with_capacity(content.len());
-        let mut chunks = content;
-        while !chunks.is_empty() {
-            let (&chunk_tag, rest) = chunks.split_first()?;
-            if chunk_tag != OCTET_STRING {
-                return None;
-            }
-            let (&first, rest) = rest.split_first()?;
-            let (len, rest) = definite_length(first, rest)?;
-            joined.extend_from_slice(rest.get(..len)?);
-            chunks = rest.get(len..)?;
-        }
-        return emit(OCTET_STRING, &joined, out);
-    }
-    out.push(tag);
-    push_length(content.len(), out);
+/// Bytes a DER element with `len` content bytes occupies: tag, length
+/// octets and contents.
+fn encoded_len(len: usize) -> Option<usize> {
+    let octets = if len < 0x80 {
+        1
+    } else {
+        1 + len.bit_width().div_ceil(8) as usize
+    };
+    len.checked_add(1 + octets)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Content bytes appended to DER output on this thread.
+    static COPIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn copy(content: &[u8], out: &mut Vec<u8>) {
+    #[cfg(test)]
+    COPIED.with(|copied| copied.set(copied.get() + content.len()));
     out.extend_from_slice(content);
-    Some(())
 }
 
 /// Append a DER definite length: short form below 128, otherwise `0x80 | n`

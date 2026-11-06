@@ -14,7 +14,7 @@ fn run(hashes: &[(HashAlg, &str)], signatures: JsonValue) -> (JsonValue, Option<
             .collect(),
     );
     let mut sigs: Vec<Signature> = serde_json::from_value(signatures).unwrap();
-    let integrity = judge(&mut sigs, &hashes);
+    let integrity = judge(&mut sigs, &hashes, true);
     (serde_json::to_value(&sigs).unwrap(), integrity)
 }
 
@@ -46,6 +46,7 @@ fn aged_signature_stays_intact_and_reports_its_validity_window() {
             "signature_digest_algorithm": "sha256",
             "signature_digest": HASH,
             "signing_time_unix": 1_500_000_000,
+            "signing_time_source": "rfc3161",
             "not_before_unix": 1_400_000_000,
             "not_after_unix": 1_600_000_000,
         }]),
@@ -66,6 +67,7 @@ fn signing_time_outside_window_is_reported() {
             "signature_digest_algorithm": "sha256",
             "signature_digest": HASH,
             "signing_time_unix": 1_300_000_000,
+            "signing_time_source": "rfc3161",
             "not_before_unix": 1_400_000_000,
             "not_after_unix": 1_600_000_000,
         }]),
@@ -123,6 +125,31 @@ fn unverified_timestamp_does_not_judge_the_validity_window() {
         }]),
     );
     assert!(sigs[0].get("signed_within_validity").is_none());
+}
+
+/// The signer's own `signingTime` is the key holder's word: a leaked,
+/// expired certificate can write any date inside its window. Only a
+/// timestamp that verified attests when the signature was made.
+#[test]
+fn the_signers_own_signing_time_does_not_judge_the_validity_window() {
+    let judged = |source: &str| {
+        let (sigs, _) = run(
+            &[(HashAlg::Sha256, HASH)],
+            json!([{
+                "verified": true,
+                "signature_digest_algorithm": "sha256",
+                "signature_digest": HASH,
+                "signing_time_unix": 1_500_000_000,
+                "signing_time_source": source,
+                "not_before_unix": 1_400_000_000,
+                "not_after_unix": 1_600_000_000,
+            }]),
+        );
+        sigs[0].get("signed_within_validity").cloned()
+    };
+    assert_eq!(judged("signer"), None);
+    assert_eq!(judged("rfc3161"), Some(JsonValue::Bool(true)));
+    assert_eq!(judged("countersignature"), Some(JsonValue::Bool(true)));
 }
 
 /// Dual-signed images are routine; the summary takes the worst state.
@@ -246,6 +273,32 @@ fn grafted_signature_is_not_intact() {
 
     let hashes = ImageHashes(vec![(HashAlg::Sha256, forged_digest)]);
     let mut sigs = vec![forged];
-    assert_eq!(judge(&mut sigs, &hashes), Some(Integrity::Invalid));
+    assert_eq!(judge(&mut sigs, &hashes, true), Some(Integrity::Invalid));
     assert_eq!(sigs[0].digest_matches, Some(true));
+}
+
+/// With the certificate table away from the tail the image hash leaves
+/// out, a match proves nothing and reads as unknown; a mismatch still
+/// shows the image differs from the signed one.
+#[test]
+fn a_table_away_from_the_tail_cannot_match() {
+    let hashes = ImageHashes(vec![(HashAlg::Sha256, HASH.to_string())]);
+    let judged = |digest: String| {
+        let mut sigs: Vec<Signature> = serde_json::from_value(json!([{
+            "verified": true,
+            "signature_digest_algorithm": "sha256",
+            "signature_digest": digest,
+        }]))
+        .unwrap();
+        let integrity = judge(&mut sigs, &hashes, false);
+        (sigs.remove(0).digest_matches, integrity)
+    };
+    assert_eq!(
+        judged(HASH.to_string()),
+        (None, Some(Integrity::Unverifiable))
+    );
+    assert_eq!(
+        judged("0".repeat(64)),
+        (Some(false), Some(Integrity::Tampered))
+    );
 }

@@ -58,6 +58,12 @@ impl Tally {
     fn covered(self) -> u32 {
         self.strong + self.weak
     }
+
+    /// More lines are written in shapes the language cannot have than in
+    /// its own.
+    fn mostly_foreign(self) -> bool {
+        self.foreign * 2 > self.covered()
+    }
 }
 
 /// What the four grammars found in a text.
@@ -94,8 +100,7 @@ impl Evidence {
     /// Whether the lines argue against `ft`: more of them are written in
     /// shapes it cannot have than in its own.
     pub(super) fn rules_out(&self, ft: FileType) -> bool {
-        self.tally(ft)
-            .is_some_and(|t| t.foreign > 0 && t.foreign * 2 > t.covered())
+        self.tally(ft).is_some_and(Tally::mostly_foreign)
     }
 
     /// Whether the text had lines to judge. A file with no line breaks gives
@@ -170,12 +175,11 @@ impl Evidence {
         }
         // The language has to be the file, not a few lines quoted in it. A long
         // run of strong lines may sit beside an encoded payload blob.
-        let covered = best.covered();
-        let share = covered * 100 / self.lines;
+        let share = best.covered() * 100 / self.lines;
         if share < 25 && !(best.strong >= 10 && share >= 10) {
             return None;
         }
-        if best.foreign * 2 > covered {
+        if best.mostly_foreign() {
             return None;
         }
         if ft == FileType::Vbs && self.server_block {
@@ -485,8 +489,7 @@ fn opens_irc_line(head: &[u8]) -> bool {
         match line.first() {
             Some(b'@') => line.get(1).is_some_and(u8::is_ascii_whitespace),
             Some(b'^') => true,
-            Some(b'/') => line.get(1).is_some_and(u8::is_ascii_alphabetic),
-            Some(b'.') => line.get(1).is_some_and(u8::is_ascii_alphabetic),
+            Some(b'/' | b'.') => line.get(1).is_some_and(u8::is_ascii_alphabetic),
             Some(_) => OPENERS.iter().any(|o| starts_ci(line, o)),
             None => false,
         }

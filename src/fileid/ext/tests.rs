@@ -664,7 +664,7 @@ fn odf_extensions_are_shared_with_the_zip_classifier() {
             "{name}"
         );
     }
-    assert!(!is_odf_extension("docx"));
+    assert!(!ODF_EXTENSIONS.contains(&"docx"));
 }
 
 #[test]
@@ -678,4 +678,24 @@ fn lowercase_ext_fits_the_stack_buffer() {
     assert_eq!(ext("x.abcdefghijklmnopq"), None);
     assert_eq!(ext("Makefile"), None);
     assert_eq!(ext(".npmrc"), None);
+}
+
+/// Container build files are named in any case, like every other name here.
+#[test]
+fn container_build_file_names_match_in_any_case() {
+    for name in [
+        "Dockerfile",
+        "dockerfile",
+        "DOCKERFILE",
+        "dockerfile.dev",
+        "Containerfile",
+        "containerfile",
+        "containerfile.prod",
+    ] {
+        assert_eq!(
+            detect_from_path(Path::new(name)),
+            Some(FileType::Dockerfile),
+            "{name}"
+        );
+    }
 }

@@ -35,8 +35,8 @@
 //!    editor-CLI form claims "this is the extension you are installing", so
 //!    only it can contradict the manifest.
 //!
-//! ATX-style fenced code blocks (``` ``` ``` and `~~~`) are skipped so
-//! headings inside code samples don't show up as identity claims.
+//! Fenced code blocks (```` ``` ```` and `~~~`) are skipped so headings
+//! inside code samples don't show up as identity claims.
 //! Setext-style headings (underline form) are intentionally not
 //! supported — every real-world README this signal targets uses ATX.
 //!
@@ -51,48 +51,25 @@ use crate::output::Values;
 use crate::value_key;
 
 pub(super) fn extract(bytes: &[u8], values: &mut Values) {
-    // Markdown is UTF-8 by spec; fall back to lossy decode for safety.
-    let text = match std::str::from_utf8(bytes) {
-        Ok(s) => std::borrow::Cow::Borrowed(s),
-        Err(_) => String::from_utf8_lossy(bytes),
-    };
+    // Markdown is UTF-8 by spec; invalid bytes are replaced.
+    let text = String::from_utf8_lossy(bytes);
 
     if let Some(heading) = first_atx_heading(&text) {
         put_str(values, value_key!("markdown.first_heading"), heading);
     }
 
-    let repos = github_repos(&text);
-    if !repos.is_empty() {
-        let arr = repos.into_iter().map(JsonValue::String).collect::<Vec<_>>();
-        values.insert_key(value_key!("markdown.github_repos"), JsonValue::Array(arr));
-    }
-
-    let pkgs = npm_packages(&text);
-    if !pkgs.is_empty() {
-        let arr = pkgs.into_iter().map(JsonValue::String).collect::<Vec<_>>();
-        values.insert_key(value_key!("markdown.npm_packages"), JsonValue::Array(arr));
-    }
-
     let (installs, extensions) = install_packages(&text);
-    if !installs.is_empty() {
-        let arr = installs
-            .into_iter()
-            .map(JsonValue::String)
-            .collect::<Vec<_>>();
-        values.insert_key(
-            value_key!("markdown.install_packages"),
-            JsonValue::Array(arr),
-        );
-    }
-    if !extensions.is_empty() {
-        let arr = extensions
-            .into_iter()
-            .map(JsonValue::String)
-            .collect::<Vec<_>>();
-        values.insert_key(
-            value_key!("markdown.install_extensions"),
-            JsonValue::Array(arr),
-        );
+    let lists = [
+        (value_key!("markdown.github_repos"), github_repos(&text)),
+        (value_key!("markdown.npm_packages"), npm_packages(&text)),
+        (value_key!("markdown.install_packages"), installs),
+        (value_key!("markdown.install_extensions"), extensions),
+    ];
+    for (key, list) in lists {
+        if !list.is_empty() {
+            let arr = list.into_iter().map(JsonValue::String).collect();
+            values.insert_key(key, JsonValue::Array(arr));
+        }
     }
 }
 
@@ -133,27 +110,11 @@ fn first_atx_heading(text: &str) -> Option<String> {
 /// Parse a single ATX heading line. Returns `Some(text)` if the line
 /// starts with `#`...`######` followed by a space; otherwise `None`.
 fn parse_atx_heading(line: &str) -> Option<String> {
-    let mut chars = line.chars();
-    let mut hashes = 0;
-    for ch in chars.by_ref() {
-        if ch == '#' {
-            hashes += 1;
-            if hashes > 6 {
-                return None;
-            }
-        } else if ch == ' ' || ch == '\t' {
-            if hashes == 0 {
-                return None;
-            }
-            break;
-        } else {
-            return None;
-        }
-    }
-    if hashes == 0 {
+    let rest = line.trim_start_matches('#');
+    if !(1..=6).contains(&(line.len() - rest.len())) {
         return None;
     }
-    let body: String = chars.collect();
+    let body = rest.strip_prefix([' ', '\t'])?;
     let body = body.trim();
     // Trim CommonMark optional trailing `#` markers ("# foo #").
     let body = body.trim_end_matches(|c: char| c == '#' || c.is_whitespace());
@@ -193,15 +154,23 @@ fn strip_inline_emphasis(s: &str) -> String {
 }
 
 /// Find every `github.com/<owner>/<repo>` reference and return them
-/// deduped in first-seen order. Sub-paths past `<repo>` are dropped.
+/// deduped in first-seen order. Sub-paths past `<repo>` are dropped. The host
+/// must be `github.com` or `www.github.com` itself: `api.github.com`,
+/// `gist.github.com` and `notgithub.com` paths name no repository.
 fn github_repos(text: &str) -> Vec<String> {
     const NEEDLE: &str = "github.com/";
+    let is_host_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '.');
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
     let mut cursor = 0;
     while let Some(rel) = text[cursor..].find(NEEDLE) {
-        let start = cursor + rel + NEEDLE.len();
+        let host = cursor + rel;
+        let start = host + NEEDLE.len();
         cursor = start;
+        let before = text[..host].strip_suffix("www.").unwrap_or(&text[..host]);
+        if before.chars().next_back().is_some_and(is_host_char) {
+            continue;
+        }
         let Some(owner) = take_path_segment(&text[start..]) else {
             continue;
         };
@@ -226,21 +195,15 @@ fn github_repos(text: &str) -> Vec<String> {
     out
 }
 
-/// Consume the longest prefix of a path segment from `s`. Stops at
-/// `/`, whitespace, or any character not allowed in GitHub owner/repo
-/// names. Returns `None` if `s` starts with a disallowed character.
+/// Consume the longest prefix of a path segment from `s`. GitHub permits
+/// ASCII alphanumerics plus `-`, `_`, and `.` in owner and repository names;
+/// anything else (`/`, whitespace, parens, brackets, query chars) terminates
+/// the segment. Returns `None` if `s` starts with a disallowed character.
 fn take_path_segment(s: &str) -> Option<&str> {
     let end = s
-        .find(|ch: char| ch == '/' || ch.is_whitespace() || !is_path_segment_char(ch))
+        .find(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')))
         .unwrap_or(s.len());
     s.get(..end).filter(|seg| !seg.is_empty())
-}
-
-/// GitHub permits ASCII alphanumerics plus `-`, `_`, and `.` in owner
-/// and repository names. Anything else (parens, brackets, query
-/// chars) terminates the segment.
-fn is_path_segment_char(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')
 }
 
 /// Deduped, ordered list of npm package names a README points at, lifted from
@@ -268,7 +231,7 @@ fn npm_packages(text: &str) -> Vec<String> {
                 let name = [".svg", ".png", ".json"]
                     .into_iter()
                     .find_map(|ext| name.strip_suffix(ext))
-                    .unwrap_or(&name)
+                    .unwrap_or(name)
                     .to_string();
                 if name.is_empty() {
                     continue;
@@ -353,10 +316,10 @@ fn install_packages(text: &str) -> (Vec<String>, Vec<String>) {
         // caught here rather than in the per-argument check. Abstain on the
         // whole line: the point of this fact is an unambiguous identity claim.
         let args: Vec<&str> = tokens.collect();
-        if args.iter().any(|a| {
-            a.chars()
-                .any(|c| matches!(c, '|' | ';' | '&' | '`' | '$' | '(' | ')' | '<' | '>'))
-        }) {
+        if args
+            .iter()
+            .any(|a| a.contains(['|', ';', '&', '`', '$', '(', ')', '<', '>']))
+        {
             continue;
         }
         // First non-flag argument is the package. Global/dev flags and their
@@ -382,6 +345,10 @@ fn install_packages(text: &str) -> (Vec<String>, Vec<String>) {
     (out, out_ext)
 }
 
+/// Shell punctuation and quotes: an argument holding one is part of a command
+/// line, not a bare name.
+const SHELL_QUOTE_CHARS: [char; 9] = ['|', ';', '&', '`', '$', '(', ')', '"', '\''];
+
 /// Reduce a `--install-extension` argument to the extension's own name.
 ///
 /// Two forms appear in the wild, and both name the same thing:
@@ -393,18 +360,11 @@ fn install_packages(text: &str) -> (Vec<String>, Vec<String>) {
 ///   the version and extension are noise.
 ///
 /// Reducing both to the bare name is what lets the value be compared directly
-/// against the manifest. A republished extension keeps the upstream install
-/// line — "install sugar-extension-pack" in a package shipped as
-/// `krabt-extension-pack` — because the instructions were never part of the
-/// branding the repackager set out to change.
+/// against the manifest. A republished extension tends to keep the upstream
+/// install line, because the instructions were never part of the branding the
+/// repackager set out to change.
 fn extension_argument_name(arg: &str) -> Option<String> {
-    if arg.is_empty() || arg.contains("://") {
-        return None;
-    }
-    if arg
-        .chars()
-        .any(|c| matches!(c, '|' | ';' | '&' | '`' | '$' | '(' | ')' | '"' | '\''))
-    {
+    if arg.is_empty() || arg.contains("://") || arg.contains(SHELL_QUOTE_CHARS) {
         return None;
     }
     // A packaged file may be given by path; only the basename carries identity.
@@ -466,19 +426,17 @@ fn strip_version_suffix(stem: &str) -> &str {
 /// anything carrying shell punctuation. A version suffix is trimmed
 /// (`foo@1.2.3` -> `foo`) while a scope is preserved (`@scope/pkg`).
 fn install_argument_name(arg: &str) -> Option<String> {
-    if arg.is_empty() || arg.contains("://") || arg.contains('\\') {
-        return None;
-    }
-    if arg
-        .chars()
-        .any(|c| matches!(c, '|' | ';' | '&' | '`' | '$' | '(' | ')' | '"' | '\''))
+    if arg.is_empty()
+        || arg.contains("://")
+        || arg.contains('\\')
+        || arg.contains(SHELL_QUOTE_CHARS)
     {
         return None;
     }
     // Trim a version pin, keeping a leading scope marker intact.
-    let body = arg.strip_prefix('@').map_or(arg, |rest| rest);
-    let trimmed = match body.find('@') {
-        Some(at) => &arg[..arg.len() - (body.len() - at)],
+    let scope = usize::from(arg.starts_with('@'));
+    let trimmed = match arg[scope..].find('@') {
+        Some(at) => &arg[..scope + at],
         None => arg,
     };
     if trimmed.starts_with('.') || trimmed.starts_with('/') {
@@ -489,13 +447,13 @@ fn install_argument_name(arg: &str) -> Option<String> {
     if name.len() != trimmed.len() {
         return None;
     }
-    Some(name)
+    Some(name.to_string())
 }
 
 /// Take one npm package name from the start of `s`. Handles a `@scope/name`
 /// pair as a single value; otherwise a bare unscoped segment. Returns `None`
 /// for an empty or malformed name.
-fn take_npm_name(s: &str) -> Option<String> {
+fn take_npm_name(s: &str) -> Option<&str> {
     if let Some(rest) = s.strip_prefix('@') {
         let scope = take_path_segment(rest)?;
         let after_scope = 1 + scope.len();
@@ -503,12 +461,12 @@ fn take_npm_name(s: &str) -> Option<String> {
             return None;
         }
         let name = take_path_segment(&s[after_scope + 1..])?;
-        Some(format!("@{}/{}", scope, name))
+        s.get(..after_scope + 1 + name.len())
     } else {
         // An unscoped name ends where a path segment does; `?` and `#` are
         // not segment characters, so a shields badge such as
         // `/npm/v/foo?style=flat` yields `foo`.
-        take_path_segment(s).map(str::to_owned)
+        take_path_segment(s)
     }
 }
 

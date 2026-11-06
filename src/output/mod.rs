@@ -45,7 +45,7 @@ pub use flow::{
     Flow, FlowFunction, FlowKind, FlowOrigin, FlowOrigins, FlowTransfer, FlowValue, Limitation,
 };
 pub use identity::{Claim, Identity, Party, PartyRole, Signer, Trust, Url, UrlKind};
-pub use metric_keys::{CATALOG, FAMILIES};
+pub(crate) use metric_keys::{CATALOG, FAMILIES};
 pub(crate) use metric_keys::{
     MetricKey, QueryLimit, archive_entry_type_count, archive_method_count, ast_op, ast_op_density,
     declared, dmg_codec_count, extension_content_mismatch, metric, source_query_limited,
@@ -54,7 +54,7 @@ pub use metrics::{Fact, Metrics};
 pub use references::{
     DependencyContext, DependencyScope, HashAlgo, PinnedHash, RefKind, RefLocator, Reference,
 };
-pub use references::{Resolution, UnresolvedReason};
+pub use references::{Replaced, Resolution, UnresolvedReason};
 pub use sections::{Section, SectionFlag, Sections};
 pub use spans::Span;
 pub(crate) use spans::SpanBuilder;
@@ -64,6 +64,6 @@ pub use strings::{Comments, Literal, LiteralEncoding, LiteralMethod, Literals, T
 // Not part of the public schema.
 pub(crate) use strings::{ExtractedString, Strings};
 pub use symbols::{Arg, ArgShape, Symbol, SymbolKind, Symbols};
-pub use value_keys::{VALUE_CATALOG, VALUE_FAMILIES};
+pub(crate) use value_keys::VALUE_CATALOG;
 pub(crate) use value_keys::{ValueKey, declared_value_key, value_key};
 pub use values::Values;

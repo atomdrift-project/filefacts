@@ -48,7 +48,7 @@ pub enum View {
 
 impl View {
     /// Every view, in bundle order.
-    pub const ALL: [Self; 20] = [
+    pub const ALL: &'static [Self] = &[
         Self::Fileid,
         Self::Identity,
         Self::Values,
@@ -101,7 +101,7 @@ impl View {
     /// The view named `name`, if any.
     #[must_use]
     pub fn from_name(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|view| view.name() == name)
+        Self::ALL.iter().copied().find(|view| view.name() == name)
     }
 
     /// One line describing the view.
@@ -150,7 +150,7 @@ impl Serialize for Bundle<'_, '_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(None)?;
         map.serialize_entry("schema_version", crate::SCHEMA_VERSION)?;
-        for view in View::ALL.into_iter().filter(|view| view.bundled()) {
+        for view in View::ALL.iter().copied().filter(|view| view.bundled()) {
             map.serialize_entry(view.name(), &ViewData(self.0, view))?;
         }
         map.end()
@@ -208,87 +208,4 @@ impl<'a> ParsedFile<'a> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::BTreeSet;
-
-    #[test]
-    fn every_view_has_a_unique_name_that_round_trips() {
-        let mut names = BTreeSet::new();
-        for view in View::ALL {
-            assert!(names.insert(view.name()), "{} is listed twice", view.name());
-            assert_eq!(View::from_name(view.name()), Some(view));
-            assert!(!view.description().is_empty());
-        }
-        assert_eq!(View::from_name("strings"), None);
-    }
-
-    #[test]
-    fn bundle_carries_every_bundled_view_and_nothing_else() {
-        let parsed = hermetic(
-            "example.py",
-            b"import os  # fetch\nos.system('curl http://example.invalid/x')\n",
-        );
-        let bundle = serde_json::to_value(parsed.bundle()).unwrap();
-        let keys: BTreeSet<&str> = bundle
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect();
-        let expected: BTreeSet<&str> = std::iter::once("schema_version")
-            .chain(
-                View::ALL
-                    .into_iter()
-                    .filter(|v| v.bundled())
-                    .map(View::name),
-            )
-            .collect();
-        assert_eq!(keys, expected);
-        for view in View::ALL {
-            let alone = serde_json::to_value(parsed.view(view)).unwrap();
-            match view {
-                _ if view.bundled() => assert_eq!(bundle[view.name()], alone, "{view:?}"),
-                // A kind's rows are the matching rows of `symbols`.
-                View::Kind(_) => {
-                    let symbols = bundle["symbols"].as_array().unwrap();
-                    assert!(
-                        alone
-                            .as_array()
-                            .unwrap()
-                            .iter()
-                            .all(|r| symbols.contains(r))
-                    );
-                }
-                View::Flow => assert!(alone.is_object()),
-                _ => panic!("{view:?} is neither bundled nor covered"),
-            }
-        }
-        assert_eq!(parsed.parse_count(), 1);
-    }
-
-    fn hermetic<'a>(path: &str, bytes: &'a [u8]) -> ParsedFile<'a> {
-        crate::OpenOptions::new()
-            .cache(false)
-            .path(std::path::Path::new(path))
-            .open(bytes)
-    }
-
-    #[test]
-    fn flow_is_a_format_neutral_view() {
-        let parsed = hermetic("example.py", b"send(acquire())\n");
-        let value = serde_json::to_value(parsed.view(View::Flow)).unwrap();
-        assert_eq!(value["producer"], "tree-sitter");
-        assert_eq!(value["language"], "python");
-        assert!(value["values"].as_array().is_some());
-        assert_eq!(parsed.parse_count(), 1);
-    }
-
-    #[test]
-    fn unavailable_binary_flow_is_null_not_an_empty_graph() {
-        let parsed = hermetic("example.elf", include_bytes!("../tests/fixtures/test.elf"));
-        assert!(parsed.flow().is_none());
-        let value = serde_json::to_value(parsed.view(View::Flow)).unwrap();
-        assert!(value.is_null());
-    }
-}
+mod tests;

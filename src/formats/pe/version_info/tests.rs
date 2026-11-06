@@ -68,11 +68,41 @@ fn partial_version_pe() -> Vec<u8> {
     pe[0x500..0x500 + root.len()].copy_from_slice(&root);
     pe
 }
-#[test]
-fn partial_resource_recovery_is_bounded_and_structural() {
-    let pe = partial_version_pe();
+/// Run [`extract`] over `pe` as [`partial_version_pe`] lays it out: one
+/// section at RVA 0x1000, file offset 0x400, and the resource directory the
+/// header's slot declares.
+fn read(pe: &[u8]) -> Values {
+    let section = SectionTable {
+        virtual_address: 0x1000,
+        virtual_size: 0xc00,
+        size_of_raw_data: 0xc00,
+        pointer_to_raw_data: 0x400,
+        ..SectionTable::default()
+    };
+    let word = |at: usize| {
+        pe.get(at..at + 4)
+            .map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()))
+    };
+    let resources = DataDirectory {
+        virtual_address: word(0x98 + 112),
+        size: word(0x98 + 116),
+    };
     let mut values = Values::new();
-    recover_partial(&pe, &mut values);
+    extract(
+        &[section],
+        Some(0x200),
+        resources,
+        pe,
+        &mut values,
+        &mut Metrics::new(),
+    );
+    values
+}
+
+#[test]
+fn resource_recovery_is_bounded_and_structural() {
+    let pe = partial_version_pe();
+    let values = read(&pe);
     assert_eq!(
         values
             .get("pe.version.product_name")
@@ -94,17 +124,13 @@ fn partial_resource_recovery_is_bounded_and_structural() {
     ] {
         let mut invalid = pe.clone();
         invalid[off..off + 4].copy_from_slice(&data.to_le_bytes());
-        let mut values = Values::new();
-        recover_partial(&invalid, &mut values);
         assert!(
-            values.get("pe.version.product_name").is_none(),
+            read(&invalid).get("pe.version.product_name").is_none(),
             "offset {off:x}"
         );
     }
     for length in [0, 64, 256, 1024, 1280] {
-        let mut values = Values::new();
-        recover_partial(&pe[..length], &mut values);
-        assert!(values.get("pe.version.product_name").is_none());
+        assert!(read(&pe[..length]).get("pe.version.product_name").is_none());
     }
     let mut invalid = pe.clone();
     let key: Vec<u8> = "ProductName"
@@ -113,9 +139,38 @@ fn partial_resource_recovery_is_bounded_and_structural() {
         .collect();
     let at = memchr::memmem::find(&invalid, &key).unwrap();
     invalid[at - 4..at - 2].copy_from_slice(&65535u16.to_le_bytes());
+    assert!(read(&invalid).get("pe.version.product_name").is_none());
+}
+
+/// Every `StringFileInfo` key reaches `pe.version.*` with its offset, the
+/// same through either parse: one table, one walk.
+#[test]
+fn every_string_key_is_read() {
+    let strings: Vec<u8> = STRING_FIELDS
+        .iter()
+        .flat_map(|(key, ..)| version_block(key, Some(key), &[]))
+        .collect();
+    let table = version_block("040904b0", None, &strings);
+    let root = version_block(
+        "VS_VERSION_INFO",
+        None,
+        &version_block("StringFileInfo", None, &table),
+    );
+    let values = walked(&root);
+    for (key, value_key, offset_key) in STRING_FIELDS {
+        assert_eq!(values.lookup(value_key), Some(&JsonValue::from(key)));
+        assert!(values.lookup(offset_key).is_some(), "{key}");
+    }
+}
+
+/// The values and offsets one walk of `blob`, rooted at offset 0, reads.
+fn walked(blob: &[u8]) -> Values {
+    let mut info = VersionInfo::default();
+    let mut budget = MAX_VERSION_NODES;
+    walk_version_block(blob, 0, blob.len(), 0, &mut budget, &mut info);
     let mut values = Values::new();
-    recover_partial(&invalid, &mut values);
-    assert!(values.get("pe.version.product_name").is_none());
+    info.emit(&mut values, &mut Metrics::new());
+    values
 }
 
 #[test]
@@ -125,8 +180,7 @@ fn version_value_offsets_anchor_at_the_string() {
     let sfi = version_block("StringFileInfo", None, &table);
     let root = version_block("VS_VERSION_INFO", None, &sfi);
 
-    let mut values = Values::new();
-    emit_value_offsets(&root, &mut values);
+    let values = walked(&root);
 
     // The companion offset must point exactly at the UTF-16LE value bytes.
     let want: Vec<u8> = "ACME Corp"
@@ -150,16 +204,15 @@ fn version_value_offsets_anchor_at_the_string() {
 
 #[test]
 fn version_walker_tolerates_garbage() {
-    // No signature, truncated, and zero-length blocks must not panic or loop.
-    let mut v = Values::new();
-    emit_value_offsets(&[], &mut v);
-    emit_value_offsets(&[0u8; 8], &mut v);
+    // Truncated and zero-length blocks must not panic or loop.
+    walked(&[]);
+    walked(&[0u8; 8]);
     let mut sig: Vec<u8> = "VS_VERSION_INFO"
         .encode_utf16()
         .flat_map(u16::to_le_bytes)
         .collect();
     sig.truncate(10); // cut mid-key
-    emit_value_offsets(&sig, &mut v);
+    walked(&sig);
 }
 
 /// Blocks the walker visits for `blob`, rooted at offset 0.
@@ -171,8 +224,7 @@ fn blocks_visited(blob: &[u8]) -> usize {
         blob.len(),
         0,
         &mut budget,
-        &mut Values::new(),
-        false,
+        &mut VersionInfo::default(),
     );
     MAX_VERSION_NODES - budget
 }
@@ -352,4 +404,49 @@ fn fold_module_name_normalises_separators_and_case() {
 fn fold_module_name_rejects_too_short_to_compare() {
     assert!(fold_module_name("a.dll").is_none());
     assert!(fold_module_name("  ").is_none());
+}
+
+/// The root block's `VS_FIXEDFILEINFO` is read by the same walk as the
+/// strings.
+#[test]
+fn fixed_file_info_is_read_from_the_root() {
+    let mut fixed = [0u8; FIXED_FILE_INFO_LEN];
+    for (at, value) in [
+        (0, FIXED_FILE_INFO_SIGNATURE),
+        (24, 0x3f),
+        (28, 0x02),
+        (32, 0x0004_0004),
+        (36, 3),
+        (40, 6),
+    ] {
+        fixed[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    let mut root = version_block("VS_VERSION_INFO", None, &[]);
+    // A binary value (`wType` 0) of the structure's size, after the key.
+    root[2..4].copy_from_slice(&(FIXED_FILE_INFO_LEN as u16).to_le_bytes());
+    root[4..6].copy_from_slice(&0u16.to_le_bytes());
+    root.extend_from_slice(&fixed);
+    let len = root.len() as u16;
+    root[0..2].copy_from_slice(&len.to_le_bytes());
+    let values = walked(&root);
+    assert_eq!(
+        values.get("pe.version.os").and_then(JsonValue::as_str),
+        Some("windows_nt_windows32")
+    );
+    assert_eq!(
+        values.get("pe.version.type").and_then(JsonValue::as_str),
+        Some("drv")
+    );
+    assert_eq!(
+        values.get("pe.version.subtype").and_then(JsonValue::as_str),
+        Some("network")
+    );
+    assert_eq!(
+        values.get("pe.version.flags"),
+        Some(&serde_json::json!(["pre_release"]))
+    );
+    // Without its signature the structure is not read.
+    let signature = root.len() - FIXED_FILE_INFO_LEN;
+    root[signature] ^= 0xff;
+    assert!(walked(&root).get("pe.version.os").is_none());
 }

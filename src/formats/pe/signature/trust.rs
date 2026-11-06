@@ -16,9 +16,9 @@
 //! - `pe.signatures[].digest_matches` — the signature's claimed image digest
 //!   equals the recomputed Authentihash. False means the bytes changed after
 //!   signing.
-//! - `pe.signatures[].signed_within_validity` — the signing timestamp fell
-//!   inside the certificate's validity window. False means backdating or a
-//!   certificate issued after the fact.
+//! - `pe.signatures[].signed_within_validity` — the signing time a verified
+//!   timestamp attests fell inside the certificate's validity window. False
+//!   means backdating or a certificate issued after the fact.
 //! - `pe.signature_integrity` — the worst state across the signatures present,
 //!   nested ones included.
 //!
@@ -64,11 +64,22 @@ impl Integrity {
 /// Nested signatures are judged like the outer one. Each claims to cover the
 /// same image, so a nested signature lifted from another file is tampering
 /// even under an outer signature that matches.
-pub(super) fn judge(signatures: &mut [Signature], hashes: &ImageHashes) -> Option<Integrity> {
-    signatures.iter_mut().map(|sig| annotate(sig, hashes)).max()
+///
+/// `table_is_tail` says the certificate table is the file's tail, the bytes
+/// the image hash leaves out. Otherwise a matching digest is no evidence:
+/// the hash skipped a tail that nothing signs, so a match reads as unknown.
+pub(super) fn judge(
+    signatures: &mut [Signature],
+    hashes: &ImageHashes,
+    table_is_tail: bool,
+) -> Option<Integrity> {
+    signatures
+        .iter_mut()
+        .map(|sig| annotate(sig, hashes, table_is_tail))
+        .max()
 }
 
-fn annotate(sig: &mut Signature, hashes: &ImageHashes) -> Integrity {
+fn annotate(sig: &mut Signature, hashes: &ImageHashes, table_is_tail: bool) -> Integrity {
     sig.signed_within_validity = signed_within_validity(sig);
     // The recomputed Authentihash is keyed by the algorithm the signature
     // committed to, so a signature over SHA-256 is compared against the
@@ -78,13 +89,14 @@ fn annotate(sig: &mut Signature, hashes: &ImageHashes) -> Integrity {
         .signature_digest
         .as_deref()
         .zip(sig.signature_digest_algorithm.as_deref())
-        .and_then(|(claimed, alg)| Some(claimed.eq_ignore_ascii_case(hashes.get(alg)?)));
+        .and_then(|(claimed, alg)| Some(claimed.eq_ignore_ascii_case(hashes.get(alg)?)))
+        .filter(|&matches| !matches || table_is_tail);
 
     let state = match (sig.verified, sig.digest_matches) {
         // A digest mismatch is reported even when the blob itself verifies —
         // that combination *is* the post-signing tamper case.
         (_, Some(false)) => Integrity::Tampered,
-        (Some(Verdict::Failed), _) => Integrity::Invalid,
+        (Some(Verdict::Failed(_)), _) => Integrity::Invalid,
         (Some(Verdict::Unsupported) | None, _) => Integrity::Unverifiable,
         // The signature names an image digest that could not be recomputed
         // (an algorithm not hashed, a layout the image hash refuses, or no
@@ -92,26 +104,25 @@ fn annotate(sig: &mut Signature, hashes: &ImageHashes) -> Integrity {
         // until that comparison is made, and a genuine blob grafted onto a
         // file whose sections run past its end would otherwise read as
         // intact.
-        (_, None) if sig.signature_digest.is_some() => Integrity::Unverifiable,
-        _ => Integrity::Intact,
+        (Some(Verdict::Verified), None) if sig.signature_digest.is_some() => {
+            Integrity::Unverifiable
+        }
+        (Some(Verdict::Verified), Some(true) | None) => Integrity::Intact,
     };
     sig.nested
         .iter_mut()
-        .map(|nested| annotate(nested, hashes))
+        .map(|nested| annotate(nested, hashes, table_is_tail))
         .fold(state, Integrity::max)
 }
 
 /// Was the signing timestamp inside the certificate's validity window?
-/// `None` when the signature carries no signing time — plenty do not, and
-/// their absence is not evidence either way — and when the time came from a
-/// timestamp that did not verify (`signing_time_source` `unverified_*`):
-/// such a time is whatever the file says, so judging the window by it would
-/// let the file choose the answer.
+/// `None` when the signature carries no attested signing time — plenty carry
+/// none, and their absence is not evidence either way. A time no verified
+/// timestamp attests (the signer's own `signingTime`, or `unverified_*`) is
+/// whatever the file says: a leaked key can date its signature inside the
+/// window, so judging the window by it would let the file choose the answer.
 fn signed_within_validity(sig: &Signature) -> Option<bool> {
-    if sig
-        .signing_time_source
-        .is_some_and(TimeSource::is_unverified)
-    {
+    if !sig.signing_time_source.is_some_and(TimeSource::is_attested) {
         return None;
     }
     let signed = sig.signing_time_unix?;

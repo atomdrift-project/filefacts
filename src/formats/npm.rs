@@ -7,9 +7,9 @@
 //! identifier npm carries, so they are surfaced as structured fields the
 //! identity normalizer rolls up.
 //!
-//! Decompression stops as soon as `package/package.json` is reached —
-//! usually near the front, so a multi-megabyte tarball is rarely fully
-//! inflated just to read one manifest.
+//! npm extracts every member, so a later `package.json` replaces an
+//! earlier one: the manifest is the last one in the tarball, and the
+//! whole tarball is inflated to find it.
 //!
 //! Two of the emitted facts are cross-field judgements over the manifest
 //! rather than fields lifted out of it: `consistency.name_repo_mismatch`
@@ -17,51 +17,59 @@
 //! claims the same manifest makes, so they are measurements of one file's
 //! bytes and belong here beside the parse that reads them.
 
+use crate::formats::ExtractCtx;
 use serde_json::Value as JsonValue;
 
-use super::bounded::{Limits, MAX_TARGZ_SEARCH, TarGzSearch, find_targz_member};
+use super::bounded::{
+    Limits, MAX_MANIFEST_BYTES, MAX_TARGZ_SEARCH, TarGzSearch, find_targz_member,
+};
 use super::people::{self, Person};
 use crate::error::Error;
 use crate::fileid::FileType;
 use crate::metric;
-use crate::output::{ArchiveMember, Errors, Metrics, Stage, Values};
+use crate::output::{Errors, Metrics, Stage, Values};
 use crate::value_key;
-
-/// Manifests larger than this are almost certainly hostile padding; we
-/// stop reading rather than buffer them.
-const MAX_MANIFEST: u64 = 1 << 20;
 
 /// Where npm puts the manifest inside the tarball.
 const MANIFEST: &str = "package/package.json";
 
-pub(super) fn extract(
-    bytes: &[u8],
-    file_type: FileType,
-    values: &mut Values,
-    metrics: &mut Metrics,
-    archive_members: &mut Vec<ArchiveMember>,
-    errors: &mut Errors,
-) -> Result<(), Error> {
+pub(super) fn extract(bytes: &[u8], ctx: ExtractCtx<'_>) -> Result<(), Error> {
+    let ExtractCtx {
+        values,
+        metrics,
+        archive_members,
+        errors,
+        ..
+    } = ctx;
     if let Some(manifest) = package_json(bytes, values, errors) {
         emit(&manifest, values, metrics);
     }
-    super::tar::extract(bytes, file_type, values, metrics, archive_members)
+    super::tar::extract(bytes, FileType::Npm, values, metrics, archive_members)
 }
 
 /// Read and parse `package/package.json` from a gzipped npm tarball.
 /// `None` when the tarball has none (silently), when it is over the size
 /// cap or past the inflate budget (an `npm.limits` entry), or when the
-/// tarball or manifest is unreadable or not JSON (an error). Decompression
-/// stops at the manifest.
+/// tarball or manifest is unreadable or not JSON (an error). The last
+/// manifest in the tarball is the one read.
 fn package_json(bytes: &[u8], values: &mut Values, errors: &mut Errors) -> Option<JsonValue> {
-    let prefix = match find_targz_member(bytes, |p| p == MANIFEST, MAX_MANIFEST) {
-        Ok(TarGzSearch::Found { prefix, .. }) => prefix,
+    // npm unpacks a tarball with its first path component stripped, whatever
+    // it is called, so `<any>/package.json` lands as the package's own
+    // manifest; `package/` is only the name `npm pack` writes.
+    let is_manifest = |path: &str| {
+        path.split_once('/')
+            .is_some_and(|(_, rest)| rest == "package.json")
+    };
+    let (path, prefix) = match find_targz_member(bytes, is_manifest, MAX_MANIFEST_BYTES) {
+        Ok(TarGzSearch::Found { path, prefix }) => (path, prefix),
         Ok(TarGzSearch::Absent) => return None,
         Ok(TarGzSearch::InflateCapped) => {
             let mut limits = Limits::default();
             limits.push(
                 "manifest-search",
-                format!("no {MANIFEST} in the first {MAX_TARGZ_SEARCH} inflated bytes"),
+                format!(
+                    "tarball inflates past {MAX_TARGZ_SEARCH} bytes before its end; {MANIFEST} not read"
+                ),
             );
             limits.emit(values, value_key!("npm.limits"));
             return None;
@@ -75,13 +83,13 @@ fn package_json(bytes: &[u8], values: &mut Values, errors: &mut Errors) -> Optio
         let mut limits = Limits::default();
         limits.push(
             "manifest",
-            format!("{MANIFEST} over the {MAX_MANIFEST}-byte cap; not parsed"),
+            format!("{path} over the {MAX_MANIFEST_BYTES}-byte cap; not parsed"),
         );
         limits.emit(values, value_key!("npm.limits"));
         return None;
     }
     serde_json::from_slice(&prefix.bytes)
-        .map_err(|e| errors.record_malformed(Stage::FormatExtract, format!("{MANIFEST}: {e}")))
+        .map_err(|e| errors.record_malformed(Stage::FormatExtract, format!("{path}: {e}")))
         .ok()
 }
 
@@ -92,29 +100,21 @@ pub(super) fn emit(manifest: &JsonValue, values: &mut Values, metrics: &mut Metr
     let Some(obj) = manifest.as_object() else {
         return;
     };
-    if let Some(name) = obj.get("name").and_then(JsonValue::as_str) {
-        values.insert_key(value_key!("npm.name"), JsonValue::String(name.to_string()));
-    }
-    if let Some(version) = obj.get("version").and_then(JsonValue::as_str) {
-        values.insert_key(
-            value_key!("npm.version"),
-            JsonValue::String(version.to_string()),
-        );
-    }
-    if let Some(description) = obj.get("description").and_then(JsonValue::as_str) {
-        values.insert_key(
-            value_key!("npm.description"),
-            JsonValue::String(description.to_string()),
-        );
-    }
-    if let Some(homepage) = obj.get("homepage").and_then(JsonValue::as_str) {
-        values.insert_key(
-            value_key!("npm.homepage"),
-            JsonValue::String(homepage.to_string()),
-        );
+    for (field, key) in [
+        ("name", value_key!("npm.name")),
+        ("version", value_key!("npm.version")),
+        ("description", value_key!("npm.description")),
+        ("homepage", value_key!("npm.homepage")),
+    ] {
+        if let Some(s) = obj.get(field).and_then(JsonValue::as_str) {
+            values.insert_key(key, JsonValue::String(s.to_string()));
+        }
     }
     if let Some(url) = repository_url(obj.get("repository")) {
-        values.insert_key(value_key!("npm.repository.url"), JsonValue::String(url));
+        values.insert_key(
+            value_key!("npm.repository.url"),
+            JsonValue::String(url.to_string()),
+        );
     }
     // npm names one `author` and any number of `maintainers`, each a person
     // object or a `"Name <email> (url)"` string.
@@ -123,7 +123,7 @@ pub(super) fn emit(manifest: &JsonValue, values: &mut Values, metrics: &mut Metr
         value_key!("npm.authors"),
         obj.get("author").map(Person::from_json),
     );
-    people::put(
+    people::put_list(
         values,
         value_key!("npm.maintainers"),
         obj.get("maintainers")
@@ -131,6 +131,7 @@ pub(super) fn emit(manifest: &JsonValue, values: &mut Values, metrics: &mut Metr
             .into_iter()
             .flatten()
             .map(Person::from_json),
+        value_key!("npm.limits"),
     );
     // Install-time lifecycle hooks: the command string is the reference
     // source — a `postinstall` that fetches a remote stage is the classic
@@ -183,12 +184,6 @@ fn repo_slug(url: &str) -> String {
     )
 }
 
-/// A `repository` object may declare the subdirectory a monorepo package
-/// ships from. Only the object form can carry it.
-fn repository_directory(value: Option<&JsonValue>) -> Option<&str> {
-    value?.as_object()?.get("directory")?.as_str()
-}
-
 /// Whether the manifest names one package and claims another project's
 /// repository — the clone-and-rename shape, where there is no hostile code
 /// to find because the payload is a later version.
@@ -209,13 +204,18 @@ fn repository_directory(value: Option<&JsonValue>) -> Option<&str> {
 /// repository shares its name (`@react-pdf/png-js` ships from
 /// `diegomura/react-pdf` with `directory: packages/png-js`).
 fn name_repo_mismatch(obj: &serde_json::Map<String, JsonValue>) -> Option<bool> {
-    if repository_directory(obj.get("repository")).is_some() {
+    // Only the object form of `repository` can name a subdirectory.
+    let directory = obj
+        .get("repository")
+        .and_then(JsonValue::as_object)
+        .and_then(|repository| repository.get("directory"));
+    if directory.and_then(JsonValue::as_str).is_some() {
         return None;
     }
     let raw_name = obj.get("name")?.as_str()?;
     let name = slug(raw_name);
     let unscoped_name = slug(raw_name.rsplit('/').next().unwrap_or(raw_name));
-    let repo = repo_slug(&repository_url(obj.get("repository"))?);
+    let repo = repo_slug(repository_url(obj.get("repository"))?);
     if name.is_empty() || unscoped_name.is_empty() || repo.is_empty() {
         return None;
     }
@@ -227,11 +227,11 @@ fn name_repo_mismatch(obj: &serde_json::Map<String, JsonValue>) -> Option<bool> 
 ///
 /// This is the discriminator a bare name-vs-repository mismatch lacks. An
 /// honest fork renames the package and keeps its own repository, so publisher
-/// and owner still agree (`Bobronium/vscode-pycharm-darcula-theme` published
-/// by `Bobronium`). A republication keeps the *upstream's* repository URL — it
-/// was never part of the branding the repackager set out to change — so the
-/// listing is published by one identity while pointing at another's code
-/// (`krabt-proto`, publisher `krabt`, repository `zxh0/vscode-proto3`).
+/// and owner still agree (`alice/theme` published by `alice`). A
+/// republication keeps the *upstream's* repository URL — it was never part of
+/// the branding the repackager set out to change — so the listing is
+/// published by one identity while pointing at another's code (publisher
+/// `mallory`, repository `alice/theme`).
 ///
 /// `None` whenever either side is missing — a `package.json` with no
 /// `publisher` is not a marketplace extension and has made no claim to
@@ -247,7 +247,7 @@ fn publisher_repo_owner_mismatch(obj: &serde_json::Map<String, JsonValue>) -> Op
         .trim_end_matches(".git")
         .rsplit("://")
         .next()
-        .unwrap_or(&repo);
+        .unwrap_or(repo);
     let segments: Vec<&str> = path
         .split('/')
         .filter(|s| !s.is_empty())
@@ -313,7 +313,7 @@ fn is_git_specifier(spec: &str) -> bool {
 /// `None` when the manifest claims no repository, or declares no git
 /// dependency — there is nothing to agree or disagree about.
 fn self_referential_git_dependency(obj: &serde_json::Map<String, JsonValue>) -> Option<bool> {
-    let own = forge_parts(&repository_url(obj.get("repository"))?)?;
+    let own = forge_parts(repository_url(obj.get("repository"))?)?;
     let mut saw_git_dependency = false;
     for field in [
         "dependencies",
@@ -342,10 +342,10 @@ fn self_referential_git_dependency(obj: &serde_json::Map<String, JsonValue>) -> 
 
 /// A `repository` is either a string (`"github:user/repo"` or a URL) or
 /// an object `{ "url": "…" }`.
-fn repository_url(value: Option<&JsonValue>) -> Option<String> {
+fn repository_url(value: Option<&JsonValue>) -> Option<&str> {
     match value? {
-        JsonValue::String(s) => Some(s.clone()),
-        JsonValue::Object(o) => o.get("url").and_then(JsonValue::as_str).map(str::to_string),
+        JsonValue::String(s) => Some(s),
+        JsonValue::Object(o) => o.get("url").and_then(JsonValue::as_str),
         _ => None,
     }
 }

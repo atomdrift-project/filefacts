@@ -264,3 +264,68 @@ fn protocol_5_recognized() {
     let (_, m) = run(&data);
     assert_eq!(m.get("pickle.protocol"), Some(5.0));
 }
+
+/// Below protocol 3, CPython's `find_class` renames Python 2 modules and
+/// names through `_compat_pickle` before importing, so the global is the
+/// one Python 3 actually imports. From protocol 3 on, names are taken as
+/// written.
+#[test]
+fn python2_names_are_recorded_as_python_imports_them() {
+    let globals = |data: &[u8]| -> Vec<String> {
+        let (v, _) = run(data);
+        v.get("pickle.globals")
+            .and_then(|x| x.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|g| g.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let modules = |data: &[u8]| -> Vec<String> {
+        let (v, _) = run(data);
+        v.get("pickle.modules")
+            .and_then(|x| x.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|g| g.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    // Protocol 0 (no PROTO opcode): IMPORT_MAPPING.
+    let eval = b"c__builtin__\neval\n(S'1'\ntR.";
+    assert_eq!(globals(eval), ["builtins.eval"]);
+    assert_eq!(modules(eval), ["builtins"]);
+    // NAME_MAPPING takes precedence over IMPORT_MAPPING.
+    assert_eq!(
+        globals(b"\x80\x02c__builtin__\nreduce\n."),
+        ["functools.reduce"]
+    );
+    assert_eq!(
+        globals(b"cexceptions\nStandardError\n."),
+        ["builtins.Exception"]
+    );
+    assert_eq!(
+        globals(b"\x80\x02ccopy_reg\n_reconstructor\n."),
+        ["copyreg._reconstructor"]
+    );
+    // INST resolves through find_class too.
+    assert_eq!(
+        globals(b"(icommands\ngetoutput\n."),
+        ["subprocess.getoutput"]
+    );
+    // STACK_GLOBAL, under a protocol-2 header.
+    let mut stack = vec![0x80, 2];
+    for text in [&b"__builtin__"[..], b"exec"] {
+        stack.extend_from_slice(&[0x8C, text.len() as u8]);
+        stack.extend_from_slice(text);
+    }
+    stack.extend_from_slice(&[0x93, b'.']);
+    assert_eq!(globals(&stack), ["builtins.exec"]);
+    // Protocol 3 and later: no renaming.
+    assert_eq!(
+        globals(b"\x80\x03c__builtin__\neval\n."),
+        ["__builtin__.eval"]
+    );
+}

@@ -9,16 +9,15 @@ pub(crate) fn extract(bytes: &[u8], values: &mut Values, errors: &mut Errors) {
     }
     if let Some(root) = parse_systemd_service(bytes) {
         super::structured::merge_document(root, values, errors);
-        let commands = values.get("service.exec_start").cloned();
-        let commands: Vec<&str> = match commands.as_ref() {
-            Some(Value::String(s)) => vec![s],
-            Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).collect(),
+        let flows: Vec<Value> = match values.get("service.exec_start") {
+            Some(Value::String(s)) => literal_shell_flows(s),
+            Some(Value::Array(a)) => a
+                .iter()
+                .filter_map(Value::as_str)
+                .flat_map(literal_shell_flows)
+                .collect(),
             _ => Vec::new(),
         };
-        let flows: Vec<Value> = commands
-            .iter()
-            .flat_map(|s| literal_shell_flows(s))
-            .collect();
         values.insert_key(
             crate::value_key!("shell.literal_command_flows"),
             Value::Array(flows),
@@ -60,12 +59,7 @@ pub(crate) fn literal_shell_body_flows(body: &str) -> Vec<Value> {
     if body.len() > 64 * 1024 {
         return Vec::new();
     }
-    if body.chars().any(|c| {
-        matches!(
-            c,
-            '$' | '`' | '(' | ')' | '|' | ';' | '\'' | '"' | '\\' | '\n' | '\r'
-        )
-    }) {
+    if body.contains(['$', '`', '(', ')', '|', ';', '\'', '"', '\\', '\n', '\r']) {
         return Vec::new();
     }
     let stages: Vec<Vec<&str>> = body
@@ -151,7 +145,22 @@ pub(crate) fn literal_shell_body_flows(body: &str) -> Vec<Value> {
                         || (!s.contains('&') && !s.contains('>') && !s.contains('<'))
                 })
             {
-                flows.push(serde_json::json!({"kind": if (path.starts_with("/tmp/.") || path.starts_with("/var/tmp/.") || path.starts_with("/dev/shm/.")) && last.last() == Some(&"&") { "hidden-temporary-download-chmod-background-exec" } else { "download-chmod-exec" }, "path":path, "url":url, "hidden_temporary": path.starts_with("/tmp/.") || path.starts_with("/var/tmp/.") || path.starts_with("/dev/shm/."), "curl_options": first.iter().filter(|s| s.starts_with('-')).collect::<Vec<_>>(), "download_stderr_target": if first.contains(&"2>/dev/null") { Some("/dev/null") } else { None }}));
+                let hidden_temporary = ["/tmp/.", "/var/tmp/.", "/dev/shm/."]
+                    .iter()
+                    .any(|dir| path.starts_with(dir));
+                let kind = if hidden_temporary && last.last() == Some(&"&") {
+                    "hidden-temporary-download-chmod-background-exec"
+                } else {
+                    "download-chmod-exec"
+                };
+                flows.push(serde_json::json!({
+                    "kind": kind,
+                    "path": path,
+                    "url": url,
+                    "hidden_temporary": hidden_temporary,
+                    "curl_options": first.iter().filter(|s| s.starts_with('-')).collect::<Vec<_>>(),
+                    "download_stderr_target": first.contains(&"2>/dev/null").then_some("/dev/null"),
+                }));
             }
         }
         if first
@@ -182,8 +191,7 @@ pub(crate) fn literal_shell_body_flows(body: &str) -> Vec<Value> {
                     .skip(1)
                     .filter(|s| !s.starts_with('-') && !s.starts_with("2>"))
                     .copied()
-                    .collect::<Vec<_>>()
-                    == vec![path]
+                    .eq([path])
             {
                 flows.push(
                     serde_json::json!({"kind":"copy-exec-delete", "source":source, "path":path}),
@@ -200,9 +208,14 @@ fn parse_systemd_service(content: &[u8]) -> Option<Value> {
     let mut current_section: Option<String> = None;
 
     for line in collect_systemd_logical_lines(text) {
-        let trimmed = line.trim();
-        if let Some(section) = parse_systemd_section_header(trimmed) {
-            current_section = Some(section);
+        if let Some(inner) = line
+            .trim()
+            .strip_prefix('[')
+            .and_then(|l| l.strip_suffix(']'))
+            .map(str::trim)
+            && !inner.is_empty()
+        {
+            current_section = Some(normalize_systemd_key(inner));
             continue;
         }
 
@@ -227,7 +240,10 @@ fn parse_systemd_service(content: &[u8]) -> Option<Value> {
             continue;
         };
 
-        if raw_value.is_empty() && is_systemd_multi_value_key(&key) {
+        // An empty assignment resets a key that accumulates values.
+        let multi_value =
+            key == "environment" || is_systemd_command_key(&key) || is_systemd_token_list_key(&key);
+        if raw_value.is_empty() && multi_value {
             clear_systemd_key(section_obj, &key);
             continue;
         }
@@ -236,9 +252,8 @@ fn parse_systemd_service(content: &[u8]) -> Option<Value> {
             append_systemd_raw(section_obj, &key, raw_value.clone());
             let items = split_systemd_items(&raw_value);
             if !items.is_empty() {
-                append_string_items(section_obj, "environment_list", items.clone());
                 if let Some(env_obj) = ensure_json_object(section_obj, "environment") {
-                    for item in items {
+                    for item in &items {
                         if let Some((name, value)) = item.split_once('=')
                             && !name.is_empty()
                         {
@@ -246,6 +261,7 @@ fn parse_systemd_service(content: &[u8]) -> Option<Value> {
                         }
                     }
                 }
+                append_string_items(section_obj, "environment_list", items);
             }
             continue;
         }
@@ -270,11 +286,7 @@ fn parse_systemd_service(content: &[u8]) -> Option<Value> {
         append_string_occurrence(section_obj, &key, raw_value);
     }
 
-    if root.is_empty() {
-        None
-    } else {
-        Some(Value::Object(root))
-    }
+    (!root.is_empty()).then_some(Value::Object(root))
 }
 
 fn collect_systemd_logical_lines(text: &str) -> Vec<String> {
@@ -286,25 +298,18 @@ fn collect_systemd_logical_lines(text: &str) -> Vec<String> {
         let line = raw_line.trim_end_matches('\r');
         let trimmed_start = line.trim_start();
 
-        if !continuing
-            && (trimmed_start.is_empty()
-                || trimmed_start.starts_with('#')
-                || trimmed_start.starts_with(';'))
-        {
-            continue;
-        }
-
-        if continuing
-            && (trimmed_start.is_empty()
-                || trimmed_start.starts_with('#')
-                || trimmed_start.starts_with(';'))
+        // Blank and comment lines are skipped, inside a continuation too.
+        if trimmed_start.is_empty()
+            || trimmed_start.starts_with('#')
+            || trimmed_start.starts_with(';')
         {
             continue;
         }
 
         let segment = if continuing { trimmed_start } else { line };
         let segment = segment.trim_end();
-        let has_continuation = ends_with_unescaped_backslash(segment);
+        // An odd run of trailing backslashes continues the line.
+        let has_continuation = segment.chars().rev().take_while(|&c| c == '\\').count() % 2 == 1;
         let piece = if has_continuation {
             segment[..segment.len().saturating_sub(1)].trim_end()
         } else {
@@ -334,28 +339,7 @@ fn collect_systemd_logical_lines(text: &str) -> Vec<String> {
     lines
 }
 
-fn ends_with_unescaped_backslash(s: &str) -> bool {
-    let mut count = 0usize;
-    for ch in s.chars().rev() {
-        if ch == '\\' {
-            count += 1;
-        } else {
-            break;
-        }
-    }
-    count % 2 == 1
-}
-
-fn parse_systemd_section_header(line: &str) -> Option<String> {
-    let inner = line.strip_prefix('[')?.strip_suffix(']')?.trim();
-    if inner.is_empty() {
-        None
-    } else {
-        Some(normalize_systemd_key(inner))
-    }
-}
-
-fn normalize_systemd_key(raw: &str) -> String {
+pub(super) fn normalize_systemd_key(raw: &str) -> String {
     let chars: Vec<char> = raw.chars().collect();
     let mut out = String::new();
 
@@ -433,27 +417,30 @@ fn is_systemd_command_key(key: &str) -> bool {
     )
 }
 
-fn is_systemd_multi_value_key(key: &str) -> bool {
-    key == "environment" || is_systemd_command_key(key) || is_systemd_token_list_key(key)
-}
-
-fn ensure_json_object<'a>(
+pub(super) fn ensure_json_object<'a>(
     map: &'a mut serde_json::Map<String, Value>,
     key: &str,
 ) -> Option<&'a mut serde_json::Map<String, Value>> {
-    if !map.contains_key(key) {
-        map.insert(key.to_string(), Value::Object(serde_json::Map::new()));
-    }
-    map.get_mut(key)?.as_object_mut()
+    map.entry(key)
+        .or_insert_with(|| Value::Object(serde_json::Map::new()))
+        .as_object_mut()
 }
 
-fn append_systemd_raw(section_obj: &mut serde_json::Map<String, Value>, key: &str, value: String) {
+pub(super) fn append_systemd_raw(
+    section_obj: &mut serde_json::Map<String, Value>,
+    key: &str,
+    value: String,
+) {
     if let Some(raw_obj) = ensure_json_object(section_obj, "_raw") {
         append_string_occurrence(raw_obj, key, value);
     }
 }
 
-fn append_string_occurrence(map: &mut serde_json::Map<String, Value>, key: &str, value: String) {
+pub(super) fn append_string_occurrence(
+    map: &mut serde_json::Map<String, Value>,
+    key: &str,
+    value: String,
+) {
     let new_value = Value::String(value);
     match map.get_mut(key) {
         None => {
@@ -467,10 +454,11 @@ fn append_string_occurrence(map: &mut serde_json::Map<String, Value>, key: &str,
     }
 }
 
-fn append_string_items<I>(map: &mut serde_json::Map<String, Value>, key: &str, items: I)
-where
-    I: IntoIterator<Item = String>,
-{
+pub(super) fn append_string_items(
+    map: &mut serde_json::Map<String, Value>,
+    key: &str,
+    items: Vec<String>,
+) {
     for item in items {
         append_string_occurrence(map, key, item);
     }

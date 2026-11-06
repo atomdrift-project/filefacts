@@ -511,10 +511,14 @@ fn batch_verb(verb: &[u8], rest: &[u8]) -> Grade {
             return Grade::None;
         }
         let unix_shared = UNIX_SHARED.iter().any(|u| u == cmd);
-        // `del *.*`, `copy %0 *.bat`, `taskkill /im x.exe`: DOS wildcards,
-        // paths and programs.
-        let dos_argument =
-            has_windows_path(arg) || contains(arg, b"*.") || has_windows_program(arg);
+        // `del *.*`, `copy %0 *.bat`, `taskkill /im x.exe`: DOS paths
+        // (`\\server\share`, `C:\`), wildcards and programs.
+        let dos_argument = contains(arg, b"\\\\")
+            || arg
+                .windows(3)
+                .any(|w| matches!(w, [drive, b':', b'\\'] if drive.is_ascii_alphabetic()))
+            || contains(arg, b"*.")
+            || has_windows_program(arg);
         if has_switch(arg, unix_shared) || (!unix_shared && dos_argument) {
             return Grade::Strong;
         }
@@ -814,13 +818,6 @@ fn has_switch(s: &[u8], short_only: bool) -> bool {
                 .get(len)
                 .is_none_or(|b| b.is_ascii_whitespace() || matches!(b, b':' | b'=' | b'"'))
     })
-}
-
-/// `C:\`, `\\server\share`, `%windir%\`.
-fn has_windows_path(s: &[u8]) -> bool {
-    contains(s, b"\\\\")
-        || s.windows(3)
-            .any(|w| matches!(w, [drive, b':', b'\\'] if drive.is_ascii_alphabetic()))
 }
 
 /// A label after its `:`: a name, then the end of the line or a comment.

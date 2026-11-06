@@ -242,11 +242,6 @@ fn collect(root: &Path, now: SystemTime) -> (Vec<Entry>, usize) {
     (entries, orphans)
 }
 
-/// Whether `path` is a directory itself, not a symlink to one.
-fn is_real_dir(path: &Path) -> bool {
-    fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
-}
-
 /// Symlinks followed resolving a root before it is refused, as the kernel's
 /// own `ELOOP` limit does.
 #[cfg(unix)]
@@ -262,16 +257,17 @@ const MAX_LINKS: u32 = 40;
 /// change, such as a cache under a shared directory (`HOME=/tmp`, or
 /// `XDG_CACHE_HOME` pointed there) whose `.cache` someone else created.
 pub(super) fn trusted_dir(dir: &Path) -> Option<PathBuf> {
-    if !dir.is_absolute() || !is_real_dir(dir) {
+    // `symlink_metadata`: a directory itself, not a symlink to one.
+    if !dir.is_absolute() || !fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) {
         return None;
     }
     #[cfg(unix)]
     let dir = {
-        // SAFETY: neither call has preconditions; each only returns an id.
+        // SAFETY: `geteuid` has no preconditions and only returns an id.
         #[allow(unsafe_code)]
-        let ids = unsafe { (libc::geteuid(), libc::getegid()) };
+        let uid = unsafe { libc::geteuid() };
         let mut resolved = PathBuf::new();
-        resolve_trusted(dir, ids, &mut resolved, &mut 0)?;
+        resolve_trusted(dir, uid, &mut resolved, &mut 0)?;
         resolved
     };
     #[cfg(not(unix))]
@@ -280,27 +276,21 @@ pub(super) fn trusted_dir(dir: &Path) -> Option<PathBuf> {
 }
 
 /// Resolve `path` onto `resolved` one component at a time, following
-/// symlinks, and fail on the first step someone other than this user (`ids`
-/// is the effective uid and gid) or the superuser could change. A directory
-/// passes only if no other user can write it: group-writable just for this
-/// user's own group, or world-writable only with the sticky bit (`/tmp`),
-/// where no one may rename what they do not own. `resolved` never holds a
-/// symlink, so `..` is its lexical parent.
+/// symlinks, and fail on the first step someone other than this user (`uid`
+/// is the effective uid) or the superuser could change. A directory passes
+/// only if no other user can write it: neither group- nor world-writable, or
+/// else carrying the sticky bit (`/tmp`), where no one may rename what they
+/// do not own. A group-writable directory fails even when the group is this
+/// user's own: on macOS every account's primary group is `staff`. `resolved`
+/// never holds a symlink, so `..` is its lexical parent.
 #[cfg(unix)]
-fn resolve_trusted(
-    path: &Path,
-    (uid, gid): (u32, u32),
-    resolved: &mut PathBuf,
-    links: &mut u32,
-) -> Option<()> {
+fn resolve_trusted(path: &Path, uid: u32, resolved: &mut PathBuf, links: &mut u32) -> Option<()> {
     use std::os::unix::fs::MetadataExt;
     use std::path::Component;
     let trusted = |m: &fs::Metadata| {
         let mode = m.mode();
         (m.uid() == uid || m.uid() == 0)
-            && (m.is_symlink()
-                || mode & 0o1000 != 0
-                || (mode & 0o002 == 0 && (mode & 0o020 == 0 || m.gid() == gid)))
+            && (m.is_symlink() || mode & 0o1000 != 0 || mode & 0o022 == 0)
     };
     for component in path.components() {
         match component {
@@ -325,7 +315,7 @@ fn resolve_trusted(
                     if *links > MAX_LINKS {
                         return None;
                     }
-                    resolve_trusted(&fs::read_link(&next).ok()?, (uid, gid), resolved, links)?;
+                    resolve_trusted(&fs::read_link(&next).ok()?, uid, resolved, links)?;
                 } else {
                     *resolved = next;
                 }

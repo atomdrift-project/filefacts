@@ -1,12 +1,9 @@
 use super::*;
 
 fn run(bytes: &[u8]) -> (Values, Metrics) {
-    let mut v = Values::new();
-    let mut s = Strings::default();
-    let mut m = Metrics::new();
-    let mut image_end = None;
-    extract(bytes, &mut v, &mut s, &mut m, &mut image_end);
-    (v, m)
+    let mut sinks = crate::formats::Sinks::default();
+    extract(bytes, sinks.ctx());
+    (sinks.values, sinks.metrics)
 }
 
 #[test]
@@ -50,15 +47,6 @@ fn encint_decodes_single_and_multi_byte() {
     assert_eq!(read_encint(&[0x81, 0x01]), Some((0x81, 2)));
     // Empty or all-continuation inputs return None.
     assert_eq!(read_encint(&[]), None);
-}
-
-#[test]
-fn control_name_classifier() {
-    assert!(is_control_name("$OBJINST"));
-    assert!(is_control_name("#SYSTEM"));
-    assert!(is_control_name("::DataSpace/NameList"));
-    assert!(!is_control_name("help/topic.html"));
-    assert!(!is_control_name("toc.hhc"));
 }
 
 #[test]

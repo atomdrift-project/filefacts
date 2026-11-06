@@ -12,9 +12,12 @@
 //! test fixtures and hidden files, plus `Cargo.toml` and `Cargo.lock`. The
 //! lock records which commit of the git `stng` dependency a standalone build
 //! uses. When filefacts is a dependency, its parsers' versions come from the
-//! consumer's lock, which this script deliberately does not read; a host that
-//! wants entries retired on its own dependency updates adds a namespace with
-//! `OpenOptions::cache_namespace`.
+//! consumer's lock, which this script does not read: cargo tells a build
+//! script where its own package is, not where the workspace building it
+//! keeps its lock, and guessing from `OUT_DIR`'s ancestors misses under a
+//! relocated `CARGO_TARGET_DIR` or finds an unrelated workspace's lock. A
+//! host that wants entries retired on its own dependency updates adds a
+//! namespace with `OpenOptions::cache_namespace`.
 
 use std::fs;
 use std::path::{Path, PathBuf};

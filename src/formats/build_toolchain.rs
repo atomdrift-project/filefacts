@@ -57,7 +57,7 @@ impl Family {
 pub(super) fn from_elf(values: &mut Values, sections: &[crate::output::Section], bytes: &[u8]) {
     if sections.iter().any(|s| s.name == ".note.go.buildid") {
         let version = values
-            .get_key(value_key!("elf.go"))
+            .lookup(value_key!("elf.go"))
             .and_then(|go| go.get("version"))
             .and_then(serde_json::Value::as_str)
             .map(|v| v.trim_start_matches("go").to_string())
@@ -66,7 +66,7 @@ pub(super) fn from_elf(values: &mut Values, sections: &[crate::output::Section],
         return;
     }
     let banner = values
-        .get_key(value_key!("elf.comment"))
+        .lookup(value_key!("elf.comment"))
         .and_then(serde_json::Value::as_array)
         .into_iter()
         .flatten()
@@ -110,29 +110,28 @@ fn scan_rust_rodata(sections: &[crate::output::Section], bytes: &[u8]) -> Option
         budget = budget.checked_sub(len)?;
         let mut pos = start;
         while pos + NEEDLE.len() < end {
-            if let Some(rel) = bytes
+            let Some(rel) = bytes
                 .get(pos..end)
                 .and_then(|w| w.windows(NEEDLE.len()).position(|w| w == NEEDLE))
-            {
-                let after = pos + rel + NEEDLE.len();
-                // Require a digit immediately after `rustc ` to
-                // reject "rustcracker"-style false positives.
-                if bytes.get(after).is_some_and(|b| b.is_ascii_digit()) {
-                    let token_end = bytes
-                        .get(after..end)
-                        .and_then(|t| {
-                            t.iter()
-                                .position(|b| matches!(*b, b' ' | b'\n' | b'\0' | b'-' | b'('))
-                        })
-                        .map_or(end, |n| after + n);
-                    if let Some(Ok(v)) = bytes.get(after..token_end).map(std::str::from_utf8) {
-                        return Some(v.to_string());
-                    }
-                }
-                pos = after;
-            } else {
+            else {
                 break;
+            };
+            let after = pos + rel + NEEDLE.len();
+            // Require a digit immediately after `rustc ` to
+            // reject "rustcracker"-style false positives.
+            if bytes.get(after).is_some_and(|b| b.is_ascii_digit()) {
+                let token_end = bytes
+                    .get(after..end)
+                    .and_then(|t| {
+                        t.iter()
+                            .position(|b| matches!(*b, b' ' | b'\n' | b'\0' | b'-' | b'('))
+                    })
+                    .map_or(end, |n| after + n);
+                if let Some(Ok(v)) = bytes.get(after..token_end).map(std::str::from_utf8) {
+                    return Some(v.to_string());
+                }
             }
+            pos = after;
         }
     }
     None
@@ -148,10 +147,7 @@ fn recognize_comment(text: &str) -> Option<(Family, String)> {
     // The trailing token after the parenthesized distro tag is the
     // canonical version.
     if let Some(rest) = text.strip_prefix("GCC:") {
-        let after_paren = match rest.find(')') {
-            Some(p) => rest[p + 1..].trim(),
-            None => rest.trim(),
-        };
+        let after_paren = rest.split_once(')').map_or(rest, |(_, after)| after).trim();
         let version = after_paren
             .split([';', ',', ' '])
             .find(|t| t.chars().next().is_some_and(|c| c.is_ascii_digit()))
@@ -159,30 +155,24 @@ fn recognize_comment(text: &str) -> Option<(Family, String)> {
             .to_string();
         return Some((Family::Gcc, version));
     }
+    // The token after the first `marker`, up to a space or parenthesis.
+    let token_after = |marker: &str| {
+        let (_, rest) = text.split_once(marker)?;
+        Some(rest.split([' ', '(', ')']).next().unwrap_or("").to_string())
+    };
     // Apple clang has a distinct prefix and uses a different version
     // numbering (Apple-internal); treat it as its own family so
     // toolchain-attribution traits don't conflate.
     if text.contains("Apple LLVM") || text.contains("Apple clang") {
-        if let Some(pos) = text.find("version ") {
-            let rest = &text[pos + "version ".len()..];
-            let token = rest.split([' ', '(', ')']).next().unwrap_or("");
-            return Some((Family::AppleClang, token.to_string()));
-        }
-        return Some((Family::AppleClang, String::new()));
+        return Some((
+            Family::AppleClang,
+            token_after("version ").unwrap_or_default(),
+        ));
     }
-    if let Some(pos) = text.find("clang version ") {
-        let rest = &text[pos + "clang version ".len()..];
-        let token = rest.split([' ', '(', ')']).next().unwrap_or("");
-        return Some((Family::Clang, token.to_string()));
+    if let Some(version) = token_after("clang version ") {
+        return Some((Family::Clang, version));
     }
-    // Rustc stamps either `rustc version X.Y.Z` (older) or
-    // `Rust X.Y.Z` (newer). Both match here.
-    if let Some(pos) = text.find("rustc version ") {
-        let rest = &text[pos + "rustc version ".len()..];
-        let token = rest.split([' ', '(', ')']).next().unwrap_or("");
-        return Some((Family::Rustc, token.to_string()));
-    }
-    None
+    token_after("rustc version ").map(|version| (Family::Rustc, version))
 }
 
 /// Mark `build.toolchain.compiler = "msvc"` when the PE carries a
@@ -194,7 +184,7 @@ fn recognize_comment(text: &str) -> Option<(Family, String)> {
 /// inspect `pe.rich.entries[*]` directly.
 pub(super) fn from_pe_rich(values: &mut Values) {
     if values
-        .get_key(value_key!("pe.rich.entries"))
+        .lookup(value_key!("pe.rich.entries"))
         .and_then(serde_json::Value::as_array)
         .is_some_and(|a| !a.is_empty())
     {
@@ -211,37 +201,23 @@ pub(super) fn from_pe_rich(values: &mut Values) {
 /// 3. Otherwise `LC_BUILD_VERSION` presence ⇒ `apple_clang` with
 ///    no version.
 pub(super) fn from_macho(values: &mut Values, sections: &[crate::output::Section]) {
-    let has_swift = sections.iter().any(|s| s.name.contains(",__swift5_"));
-    if has_swift {
-        put_str(
-            values,
-            value_key!("build.toolchain.compiler"),
-            Family::Swift.as_str(),
-        );
+    if sections.iter().any(|s| s.name.contains(",__swift5_")) {
+        emit(values, Family::Swift, String::new());
         return;
     }
-    let bv = values.get_key(value_key!("macho.build_version"));
+    let Some(bv) = values.lookup(value_key!("macho.build_version")) else {
+        return;
+    };
     let clang_version = bv
-        .and_then(|v| v.get("tools"))
+        .get("tools")
         .and_then(serde_json::Value::as_array)
-        .and_then(|tools| {
-            tools.iter().find_map(|t| {
-                if t.get("tool").and_then(serde_json::Value::as_str) == Some("clang") {
-                    t.get("version")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_string)
-                } else {
-                    None
-                }
-            })
-        });
-    if bv.is_some() {
-        emit(
-            values,
-            Family::AppleClang,
-            clang_version.unwrap_or_default(),
-        );
-    }
+        .into_iter()
+        .flatten()
+        .filter(|t| t.get("tool").and_then(serde_json::Value::as_str) == Some("clang"))
+        .find_map(|t| t.get("version").and_then(serde_json::Value::as_str))
+        .unwrap_or_default()
+        .to_string();
+    emit(values, Family::AppleClang, clang_version);
 }
 
 fn emit(values: &mut Values, family: Family, version: String) {

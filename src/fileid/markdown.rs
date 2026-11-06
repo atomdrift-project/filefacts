@@ -82,8 +82,8 @@ pub(super) fn document_structure(data: &[u8]) -> bool {
         }
         // Four spaces is an indented code block at the top level, but inside
         // a list item it is the item's content indent, and a fence there is
-        // still a fence. wolfSSL's IDE/WORKBENCH/README.md indents every
-        // example under a numbered step that way and typed as C.
+        // still a fence: READMEs indent every example under a numbered step
+        // that way.
         let max_indent = if in_list { 7 } else { 3 };
         if spaces > max_indent {
             continue;

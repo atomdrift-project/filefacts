@@ -6,8 +6,6 @@
 //! wildcard/dynamic/aliased imports, and their ratios.
 
 use crate::metric;
-use std::collections::HashSet;
-
 use crate::output::Metrics;
 
 use super::langs::Lang;
@@ -24,7 +22,6 @@ pub(super) fn emit(imports: &[&str], language: Lang, metrics: &mut Metrics) {
     // the ratio metrics below.
     let total = crate::bytes::sat_u32(imports.len());
 
-    let mut unique_modules: HashSet<&str> = HashSet::new();
     let mut stdlib_count = 0u32;
     let mut third_party_count = 0u32;
     let mut relative_count = 0u32;
@@ -33,9 +30,7 @@ pub(super) fn emit(imports: &[&str], language: Lang, metrics: &mut Metrics) {
     let mut aliased_count = 0u32;
 
     for module in imports {
-        unique_modules.insert(*module);
-
-        if module.starts_with('.') || module.starts_with("./") || module.starts_with("../") {
+        if module.starts_with('.') {
             relative_count += 1;
         }
         if is_stdlib_module(module, language) {
@@ -49,7 +44,7 @@ pub(super) fn emit(imports: &[&str], language: Lang, metrics: &mut Metrics) {
         {
             dynamic_count += 1;
         }
-        if module.contains('*') || module.ends_with(".*") {
+        if module.contains('*') {
             wildcard_count += 1;
         }
         if module.contains(" as ") {

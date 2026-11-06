@@ -61,20 +61,19 @@ fn statement_has_type_only_clause(statement: Node<'_>) -> bool {
         return false;
     };
     let list = if clause.kind() == "import_clause" {
-        let children: Vec<_> = named_children(clause).collect();
-        if children.iter().any(|n| n.kind() != "named_imports") {
+        if named_children(clause).any(|n| n.kind() != "named_imports") {
             return false;
         }
-        children.into_iter().find(|n| n.kind() == "named_imports")
+        named_children(clause).next()
     } else {
         Some(clause)
     };
     let Some(list) = list else { return false };
-    let specs: Vec<_> = named_children(list)
+    let mut specs = named_children(list)
         .filter(|n| matches!(n.kind(), "import_specifier" | "export_specifier"))
-        .collect();
-    !specs.is_empty()
-        && specs.into_iter().all(|spec| {
+        .peekable();
+    specs.peek().is_some()
+        && specs.all(|spec| {
             let mut cursor = spec.walk();
             spec.children(&mut cursor).any(|n| n.kind() == "type")
         })

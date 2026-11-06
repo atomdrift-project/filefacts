@@ -29,7 +29,7 @@ use crate::{ValueKey, Values, value_key};
 /// The file's name without its directory (`file.basename`), present when the
 /// caller gave filefacts a path ([`crate::OpenOptions::path`]).
 pub fn basename(values: &Values) -> Option<&str> {
-    values.get_key(value_key!("file.basename"))?.as_str()
+    values.lookup(value_key!("file.basename"))?.as_str()
 }
 
 /// The npm lifecycle hooks that run when a package is installed, in the order
@@ -47,7 +47,7 @@ pub(crate) const NPM_INSTALL_HOOKS: [(&str, ValueKey); 3] = [
 pub fn npm_install_hooks(values: &Values) -> impl Iterator<Item = (&'static str, &str)> {
     NPM_INSTALL_HOOKS
         .into_iter()
-        .filter_map(|(hook, key)| Some((hook, values.get_key(key)?.as_str()?)))
+        .filter_map(|(hook, key)| Some((hook, values.lookup(key)?.as_str()?)))
 }
 
 /// One Batch command as it appears in the source (`source.batch.command_sites[]`).
@@ -77,7 +77,7 @@ pub struct BatchCommandSite<'a> {
 /// bounded, so a consumer should cap how many it reads.
 pub fn batch_command_sites(values: &Values) -> impl Iterator<Item = BatchCommandSite<'_>> {
     values
-        .get_key(value_key!("source.batch.command_sites"))
+        .lookup(value_key!("source.batch.command_sites"))
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
@@ -88,7 +88,7 @@ pub fn batch_command_sites(values: &Values) -> impl Iterator<Item = BatchCommand
 /// [`batch_command_sites`] is missing later ones.
 pub fn batch_command_sites_truncated(values: &Values) -> bool {
     values
-        .get_key(value_key!("source.batch.command_sites_truncated"))
+        .lookup(value_key!("source.batch.command_sites_truncated"))
         .and_then(Value::as_bool)
         == Some(true)
 }

@@ -51,7 +51,8 @@ fn section_past_end_of_file_is_recorded() {
     let mut bytes = module(&[(7, b"\x00")]);
     bytes.extend_from_slice(&[2, 100, 1, 2, 3]);
     let (v, errors) = run(&bytes);
-    assert_eq!(v.get("wasm.has_start"), Some(&serde_json::json!(false)));
+    // No start section: no bare `false`, the key is absent.
+    assert_eq!(v.get("wasm.has_start"), None);
     let entry = errors.iter().next().expect("truncation recorded");
     assert_eq!(entry.kind, DiagnosticKind::Truncated);
     assert!(entry.message.contains("section 2"), "{entry:?}");
@@ -81,4 +82,13 @@ fn repeated_import_section_is_recorded_and_not_reread() {
     assert_eq!(entry.kind, DiagnosticKind::Malformed);
     assert!(entry.message.contains("section 2"), "{entry:?}");
     assert!(entry.message.contains("repeats"), "{entry:?}");
+}
+
+/// A start section is a presence marker; without one there is no key.
+#[test]
+fn has_start_marks_presence_only() {
+    let (v, _) = run(&module(&[(8, b"\x00")]));
+    assert_eq!(v.get("wasm.has_start"), Some(&serde_json::json!(true)));
+    let (v, _) = run(&module(&[]));
+    assert_eq!(v.get("wasm.has_start"), None);
 }

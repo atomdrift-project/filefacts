@@ -20,13 +20,64 @@ mod toml;
 mod yaml;
 
 #[cfg(test)]
-use plist::{PLIST_MAX_DEPTH, base64_encode};
+use plist::base64_encode;
 pub(super) use yaml::parse_yaml;
 
 /// Generic JSON payloads are common, sometimes huge, and not always worth
-/// deserializing. Named JSON formats use `extract_json` directly and are not
-/// subject to this limit.
+/// deserializing. Named manifests are capped by [`parse_manifest_json`]
+/// instead; lockfiles use `extract_json` and are not capped.
 pub(crate) const GENERIC_JSON_PARSE_LIMIT_BYTES: usize = 75 * 1024;
+
+/// Record in `values` that a `len`-byte document was not parsed because it
+/// is over `limit`.
+fn record_parse_skipped(len: usize, limit: usize, values: &mut Values) {
+    values.insert_key(value_key!("json.parse.skipped"), JsonValue::Bool(true));
+    values.insert_key(
+        value_key!("json.parse.reason"),
+        JsonValue::String("size_limit".to_string()),
+    );
+    values.insert_key(
+        value_key!("json.parse.limit_bytes"),
+        JsonValue::Number((limit as u64).into()),
+    );
+    values.insert_key(
+        value_key!("json.parse.size"),
+        JsonValue::Number((len as u64).into()),
+    );
+}
+
+/// Parse a named JSON manifest (`package.json`, `composer.json`, a browser
+/// extension manifest) once. A manifest over
+/// [`MAX_MANIFEST_BYTES`](super::bounded::MAX_MANIFEST_BYTES) is not parsed
+/// and gets the same `json.parse.*` skip record as an oversized generic JSON
+/// document: `Ok(None)`. The cap is the one the package-tarball readers use,
+/// so a bare manifest and the same manifest inside its package agree.
+pub(super) fn parse_manifest_json(
+    bytes: &[u8],
+    values: &mut Values,
+) -> Result<Option<JsonValue>, Error> {
+    let limit = usize::try_from(super::bounded::MAX_MANIFEST_BYTES).unwrap_or(usize::MAX);
+    if bytes.len() > limit {
+        tracing::debug!(target: "filefacts::structured", len = bytes.len(), limit, "manifest over the parse cap; not parsed");
+        record_parse_skipped(bytes.len(), limit, values);
+        return Ok(None);
+    }
+    serde_json::from_slice(bytes)
+        .map(Some)
+        .map_err(|e| Error::malformed_caused_by("json", e))
+}
+
+/// [`parse_manifest_json`], then merge the document into `values`.
+pub(super) fn extract_manifest_json(
+    bytes: &[u8],
+    values: &mut Values,
+    errors: &mut Errors,
+) -> Result<(), Error> {
+    if let Some(doc) = parse_manifest_json(bytes, values)? {
+        merge_document(doc, values, errors);
+    }
+    Ok(())
+}
 
 /// Parse the bytes as JSON and merge the document into `values` (see
 /// [`merge_document`]).
@@ -49,10 +100,9 @@ pub(super) fn extract_composer_json(
     values: &mut Values,
     errors: &mut Errors,
 ) -> Result<(), Error> {
-    extract_json(bytes, values, errors)?;
+    extract_manifest_json(bytes, values, errors)?;
     let mut flows = Vec::new();
-    let scripts = values.get("scripts").cloned();
-    if let Some(JsonValue::Object(scripts)) = scripts {
+    if let Some(JsonValue::Object(scripts)) = values.get("scripts") {
         for (event, handlers) in scripts {
             // Lifecycle hooks applicable to install/update/autoload/create-project.
             if !matches!(
@@ -69,8 +119,8 @@ pub(super) fn extract_composer_json(
                 continue;
             }
             let handlers = match handlers {
-                JsonValue::String(s) => vec![JsonValue::String(s)],
-                JsonValue::Array(a) => a,
+                JsonValue::String(_) => std::slice::from_ref(handlers),
+                JsonValue::Array(a) => a.as_slice(),
                 _ => continue,
             };
             for (index, handler) in handlers.iter().enumerate() {
@@ -108,19 +158,7 @@ pub(super) fn extract_generic_json(
         GENERIC_JSON_PARSE_LIMIT_BYTES as f64,
     );
     if bytes.len() > GENERIC_JSON_PARSE_LIMIT_BYTES {
-        values.insert_key(value_key!("json.parse.skipped"), JsonValue::Bool(true));
-        values.insert_key(
-            value_key!("json.parse.reason"),
-            JsonValue::String("size_limit".to_string()),
-        );
-        values.insert_key(
-            value_key!("json.parse.limit_bytes"),
-            JsonValue::Number((GENERIC_JSON_PARSE_LIMIT_BYTES as u64).into()),
-        );
-        values.insert_key(
-            value_key!("json.parse.size"),
-            JsonValue::Number((bytes.len() as u64).into()),
-        );
+        record_parse_skipped(bytes.len(), GENERIC_JSON_PARSE_LIMIT_BYTES, values);
         return Ok(());
     }
 
@@ -133,23 +171,20 @@ pub(super) fn extract_generic_json(
     // `settings.json`, `launch.json`), `tsconfig.json` and most `.eslintrc`
     // variants are JSONC by specification: `//` and `/* */` comments and
     // trailing commas are legal there, and their consumers parse them fine.
-    // A strict-only parse dropped the whole value tree for every such file,
-    // so a folder-open task with a trailing comma had no `tasks[*].command`
-    // for any value path to read -- a gap one campaign relied on to slip a
-    // hidden autorun past scanners that parse strictly. Fall back to the same
-    // tolerant parser gyp uses, with JSONC comment syntax, and record that
-    // the fallback was needed: a document that is not strict JSON is a fact
-    // worth keeping, without losing the tree.
-    match json::parse_jsonc(bytes) {
+    // A strict-only parse would drop the whole value tree for every such
+    // file, so a folder-open task with a trailing comma would have no
+    // `tasks[*].command` for any value path to read: a hidden autorun that
+    // strict parsers miss. Fall back to the same tolerant parser gyp uses,
+    // with JSONC comment syntax, and record that the fallback was needed: a
+    // document that is not strict JSON is a fact worth keeping, without
+    // losing the tree.
+    match json::parse_lenient(bytes, json::CommentStyle::Jsonc) {
         Some(parsed) => {
             metrics.insert(metric!("json.parse_lenient"), 1.0);
             merge_document(parsed, values, errors);
             Ok(())
         }
-        None => Err(Error::malformed(
-            "json",
-            "not valid JSON or JSONC".to_string(),
-        )),
+        None => Err(Error::malformed("json", "not valid JSON or JSONC")),
     }
 }
 
@@ -176,19 +211,7 @@ pub(super) fn extract_gyp(
         GENERIC_JSON_PARSE_LIMIT_BYTES as f64,
     );
     if bytes.len() > GENERIC_JSON_PARSE_LIMIT_BYTES {
-        values.insert_key(value_key!("json.parse.skipped"), JsonValue::Bool(true));
-        values.insert_key(
-            value_key!("json.parse.reason"),
-            JsonValue::String("size_limit".to_string()),
-        );
-        values.insert_key(
-            value_key!("json.parse.limit_bytes"),
-            JsonValue::Number((GENERIC_JSON_PARSE_LIMIT_BYTES as u64).into()),
-        );
-        values.insert_key(
-            value_key!("json.parse.size"),
-            JsonValue::Number((bytes.len() as u64).into()),
-        );
+        record_parse_skipped(bytes.len(), GENERIC_JSON_PARSE_LIMIT_BYTES, values);
         return Ok(());
     }
     metrics.insert(metric!("json.parsed_bytes"), bytes.len() as f64);
@@ -196,7 +219,7 @@ pub(super) fn extract_gyp(
         merge_document(parsed, values, errors);
         return Ok(());
     }
-    match json::parse_gyp(bytes) {
+    match json::parse_lenient(bytes, json::CommentStyle::Python) {
         Some(parsed) => {
             metrics.insert(metric!("gyp.parse_lenient"), 1.0);
             merge_document(parsed, values, errors);
@@ -204,7 +227,7 @@ pub(super) fn extract_gyp(
         }
         None => Err(Error::malformed(
             "gyp",
-            "not valid JSON or gyp Python-literal syntax".to_string(),
+            "not valid JSON or gyp Python-literal syntax",
         )),
     }
 }
@@ -294,7 +317,7 @@ pub(super) fn extract_pkginfo(
     let text = std::str::from_utf8(bytes)
         .map_err(|e| Error::malformed_with_source("pkginfo", "input is not utf-8", e))?;
     let mut root: Map<String, JsonValue> = Map::new();
-    for (key, value) in super::python_sdist::CoreMetadata::parse(text).fields {
+    for (key, value) in super::core_metadata::CoreMetadata::parse(text).fields {
         let value = JsonValue::String(value);
         match root.get_mut(&key) {
             None => {

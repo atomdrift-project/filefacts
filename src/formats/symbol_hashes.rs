@@ -30,26 +30,20 @@ pub(super) fn md5_of_set(mut names: Vec<String>) -> Option<String> {
 /// The import hash: [`md5_of_set`] over the lowercased imported-symbol names
 /// in the unified symbols view.
 pub(super) fn import_hash(symbols: &Symbols) -> Option<String> {
-    md5_of_set(
-        symbols
-            .iter_kind(SymbolKind::Import)
-            .filter_map(|s| match s {
-                Symbol::Import { name, .. } => Some(name.to_ascii_lowercase()),
-                _ => None,
-            })
-            .collect(),
-    )
+    names_hash(symbols, SymbolKind::Import)
 }
 
 /// The export hash: [`md5_of_set`] over the lowercased exported-symbol names.
 pub(super) fn export_hash(symbols: &Symbols) -> Option<String> {
+    names_hash(symbols, SymbolKind::Export)
+}
+
+fn names_hash(symbols: &Symbols, kind: SymbolKind) -> Option<String> {
     md5_of_set(
         symbols
-            .iter_kind(SymbolKind::Export)
-            .filter_map(|s| match s {
-                Symbol::Export { name, .. } => Some(name.to_ascii_lowercase()),
-                _ => None,
-            })
+            .iter_kind(kind)
+            .filter_map(Symbol::name)
+            .map(str::to_ascii_lowercase)
             .collect(),
     )
 }

@@ -13,12 +13,18 @@ use std::{borrow::Cow, path::Path, sync::LazyLock};
 
 use aho_corasick::{AhoCorasick, MatchKind};
 
+use crate::bytes::{Endian, utf16_lossy};
+
 use super::{
     FileType,
     magic::WSH_SCRIPT_WINDOW,
+    php_tag::has_php_tag,
     scripts,
     sniff::Sniff,
-    text::{Controls, contains, is_binary, strip_utf8_bom},
+    text::{self, Controls, contains, is_binary},
+    text_shapes::{
+        PROSE_GUARD_MIN_BYTES, looks_like_ini_config, looks_like_prose, looks_like_structured_data,
+    },
 };
 
 /// Minimum bytes of non-whitespace content required before we trust heuristics.
@@ -52,16 +58,6 @@ const DECODE_TAIL: usize = scripts::WINDOW;
 
 /// Furthest a leading quoted assignment is followed to its closing quote.
 const ASSIGNMENT_SCAN_LIMIT: usize = 4 << 20;
-
-/// Significant lines a document needs before its shape is judged as YAML. Short
-/// fragments carry too little structure to separate a mapping from prose.
-const MIN_YAML_LINES: usize = 5;
-
-#[derive(Clone, Copy)]
-struct PatternEntry {
-    lang: Lang,
-    weight: u8,
-}
 
 /// Declares [`Lang`], [`LANGS`] and [`Lang::to_file_type`] from one list, so
 /// a language's score index, its place in `LANGS` and the [`FileType`] it
@@ -325,10 +321,9 @@ const PATTERNS: &[(&[u8], Lang, u8)] = &[
     (b"package ", Lang::Kotlin, 5),
     (b"import kotlin", Lang::Kotlin, 10),
     (b"fun main(", Lang::Kotlin, 5),
-    // `val ` is Kotlin-characteristic (Kotlin prefers immutable `val`); `var `
-    // was removed here because it is a core JavaScript keyword and dominates
-    // obfuscated JS, mis-scoring var-heavy scripts as Kotlin. Kotlin still has
-    // conclusive markers (`import kotlin`, `suspend fun `) plus `val `.
+    // `val ` is Kotlin-characteristic (Kotlin prefers immutable `val`). `var `
+    // is not scored for Kotlin: it is a core JavaScript keyword and dominates
+    // obfuscated JS, which would otherwise score as Kotlin.
     (b"val ", Lang::Kotlin, 5),
     (b"suspend fun ", Lang::Kotlin, 10),
     // ── Dockerfile ──
@@ -381,8 +376,8 @@ const PATTERNS: &[(&[u8], Lang, u8)] = &[
     // ── Objective-C ──
     // The compiler directives no C, C++ or Swift file spells. Objective-C is
     // a superset of C, so a real `.m` also scores for C on every `#include`;
-    // `detect_from_content` resolves that pairing toward Objective-C. Without
-    // these a genuine `.m` scored only as C and lost its type.
+    // `scored_type` resolves that pairing toward Objective-C, which these
+    // directives are needed for.
     // `@property` alone is a Python decorator, so only the attribute form.
     (b"@interface ", Lang::ObjectiveC, 10),
     (b"@implementation ", Lang::ObjectiveC, 10),
@@ -399,38 +394,22 @@ const PATTERNS: &[(&[u8], Lang, u8)] = &[
     (b"@end\r", Lang::ObjectiveC, 5),
 ];
 
-struct AcScanner {
-    ac: AhoCorasick,
-    entries: Vec<PatternEntry>,
-}
-
-/// The automaton over [`PATTERNS`]. The patterns are fixed at compile time,
-/// so a build failure is a bug in this file, not something an input can cause;
-/// it panics on first use rather than quietly disabling every language.
-static SCANNER: LazyLock<AcScanner> = LazyLock::new(|| AcScanner {
-    ac: AhoCorasick::builder()
+/// The automaton over [`PATTERNS`]; a match's pattern id is its index there.
+/// The patterns are fixed at compile time, so a build failure is a bug in this
+/// file, not something an input can cause; it panics on first use rather than
+/// quietly disabling every language.
+static SCANNER: LazyLock<AhoCorasick> = LazyLock::new(|| {
+    AhoCorasick::builder()
         .match_kind(MatchKind::LeftmostLongest)
         .build(PATTERNS.iter().map(|(pattern, _, _)| pattern))
-        .expect("heuristic patterns are a valid Aho-Corasick set"),
-    entries: PATTERNS
-        .iter()
-        .map(|&(_, lang, weight)| PatternEntry { lang, weight })
-        .collect(),
+        .expect("heuristic patterns are a valid Aho-Corasick set")
 });
-
-/// Check if the first `limit` bytes are mostly whitespace.
-fn is_mostly_whitespace(data: &[u8], limit: usize) -> bool {
-    let head = data.get(..limit).unwrap_or(data);
-    let non_ws = head.iter().filter(|&&b| !b.is_ascii_whitespace()).count();
-    non_ws < MIN_CONTENT_BYTES
-}
 
 /// Single-pass scan using Aho-Corasick. Returns per-language scores.
 fn scan_scores(data: &[u8]) -> Scores {
-    let s = &*SCANNER;
     let mut scores = Scores::default();
 
-    for mat in s.ac.find_iter(data) {
+    for mat in SCANNER.find_iter(data) {
         // The match, the byte before it and everything after it. The
         // automaton only reports spans inside `data`.
         let Some((before, from)) = data.split_at_checked(mat.start()) else {
@@ -501,11 +480,11 @@ fn scan_scores(data: &[u8]) -> Scores {
                 continue;
             }
         }
-        let Some(entry) = s.entries.get(mat.pattern().as_usize()) else {
+        let Some(&(_, lang, weight)) = PATTERNS.get(mat.pattern().as_usize()) else {
             continue;
         };
-        if let Some(score) = scores.0.get_mut(entry.lang.idx()) {
-            *score = score.saturating_add(u16::from(entry.weight));
+        if let Some(score) = scores.0.get_mut(lang.idx()) {
+            *score = score.saturating_add(u16::from(weight));
         }
     }
 
@@ -660,72 +639,70 @@ pub(super) fn scored_type(sniff: &Sniff<'_>) -> Option<FileType> {
         return None;
     }
 
-    // If the head is mostly whitespace, also scan the tail
-    let scores = if is_mostly_whitespace(body, SCAN_LIMIT) && body.len() > SCAN_LIMIT {
-        let tail_start = body.len().saturating_sub(TAIL_SIZE);
-        let tail = body.get(tail_start..).unwrap_or(body);
-        let mut merged = *sniff.head_scores();
+    // Whether the head window is padding, with content only further in. The
+    // scorer and the JavaScript and PHP gates below all read `body`, so they
+    // judge the same windows.
+    let padded_head = body.len() > SCAN_LIMIT
+        && body
+            .iter()
+            .take(SCAN_LIMIT)
+            .filter(|b| !b.is_ascii_whitespace())
+            .count()
+            < MIN_CONTENT_BYTES;
+    let tail = body
+        .get(body.len().saturating_sub(TAIL_SIZE)..)
+        .unwrap_or(body);
+    let head_scores = *sniff.head_scores();
+    let mut scores = if padded_head {
+        // The head is padding: also scan the tail.
+        let mut merged = head_scores;
         for (score, tail_score) in merged.0.iter_mut().zip(scan_scores(tail).0) {
             *score = (*score).max(tail_score);
         }
         merged
-    } else {
-        *sniff.head_scores()
-    };
-    // A preface can push the real language just past the first window: an ASP
-    // one-liner list, then `<?php` shells a few hundred bytes later. Only the
-    // next window may replace a head that never became conclusive.
-    let scores = if !is_mostly_whitespace(body, SCAN_LIMIT) && body.len() > SCAN_LIMIT {
-        let head_best = scores.best();
-        // A preface of `var ` / `eval ` scores too, and hides `<?php` a few
-        // hundred bytes later. A head that already looks like a real unit
-        // stays as it is.
-        if head_best < SETTLED_HEAD_SCORE {
-            let next = body
-                .get(SCAN_LIMIT..body.len().min(SCAN_LIMIT * 2))
-                .unwrap_or_default();
-            let next_scores = scan_scores(next);
-            let next_best = next_scores.best();
-            if next_best >= THRESHOLD
-                && next_best > head_best
-                && (head_best == 0 || !too_close(head_best, next_best))
-            {
-                next_scores
-            } else {
-                scores
-            }
+    } else if body.len() > SCAN_LIMIT && head_scores.best() < SETTLED_HEAD_SCORE {
+        // A preface can push the real language just past the first window: an
+        // ASP one-liner list, or `var ` / `eval ` lines, then `<?php` shells a
+        // few hundred bytes later. Only the next window may replace a head
+        // that never became conclusive; a head that already looks like a real
+        // unit stays as it is.
+        let head_best = head_scores.best();
+        let next = body
+            .get(SCAN_LIMIT..body.len().min(SCAN_LIMIT * 2))
+            .unwrap_or_default();
+        let next_scores = scan_scores(next);
+        let next_best = next_scores.best();
+        if next_best >= THRESHOLD
+            && next_best > head_best
+            && (head_best == 0 || !too_close(head_best, next_best))
+        {
+            next_scores
         } else {
-            scores
+            head_scores
         }
     } else {
-        scores
+        head_scores
     };
 
     // A long leading string assignment can cover both prefix windows. Read
     // the following source after its lexical closing quote, then use the same
     // language scorer; never infer a language from encoded payload contents.
-    let scores = if scores.best() < SETTLED_HEAD_SCORE {
-        match after_leading_string_assignment(body) {
-            Some(tail) if tail.len() >= MIN_CONTENT_BYTES => {
-                let candidate = scan_scores(tail.get(..SCAN_LIMIT).unwrap_or(tail));
-                if candidate.best() >= THRESHOLD {
-                    candidate
-                } else {
-                    scores
-                }
-            }
-            _ => scores,
+    let after_assignment = after_leading_string_assignment(body);
+    if scores.best() < SETTLED_HEAD_SCORE
+        && let Some(rest) = after_assignment.filter(|rest| rest.len() >= MIN_CONTENT_BYTES)
+    {
+        let candidate = scan_scores(rest.get(..SCAN_LIMIT).unwrap_or(rest));
+        if candidate.best() >= THRESHOLD {
+            scores = candidate;
         }
-    } else {
-        scores
-    };
+    }
 
     // Batch's and VBScript's tokens are quoted by everything that drops or
     // launches them: a VBScript writing `@echo off` into a `.bat`, a makefile
     // recipe's `@echo`, JScript's `new ActiveXObject("WScript.Shell")`. Their
     // score only stands when some line is actually written in the language.
-    let mut scores = scores;
-    for (lang, ft) in [(Lang::Batch, FileType::Batch), (Lang::Vbs, FileType::Vbs)] {
+    for lang in [Lang::Batch, Lang::Vbs] {
+        let ft = lang.to_file_type();
         if script.has_lines()
             && (!script.supports(ft) || script.rules_out(ft))
             && let Some(score) = scores.0.get_mut(lang.idx())
@@ -787,13 +764,10 @@ pub(super) fn scored_type(sniff: &Sniff<'_>) -> Option<FileType> {
     // earlier by extension and never reach here.)
     if lang == Lang::JavaScript {
         let has_structure = |b: &[u8]| b.iter().any(|&c| matches!(c, b';' | b'{' | b'}'));
-        let tail = data.get(data.len().saturating_sub(TAIL_SIZE)..);
-        let structured = has_structure(data.get(..SCAN_LIMIT).unwrap_or(data))
-            || (is_mostly_whitespace(data, SCAN_LIMIT)
-                && data.len() > SCAN_LIMIT
-                && tail.is_some_and(has_structure))
-            || after_leading_string_assignment(data)
-                .is_some_and(|tail| has_structure(tail.get(..SCAN_LIMIT).unwrap_or(tail)));
+        let structured = has_structure(head)
+            || (padded_head && has_structure(tail))
+            || after_assignment
+                .is_some_and(|rest| has_structure(rest.get(..SCAN_LIMIT).unwrap_or(rest)));
         if !structured {
             return None;
         }
@@ -802,7 +776,7 @@ pub(super) fn scored_type(sniff: &Sniff<'_>) -> Option<FileType> {
     // A Dockerfile must begin with FROM (ARG may precede it). `\nFROM ` alone is
     // not enough: uppercase SQL puts `FROM` at the start of a line too, and a
     // `SELECT … FROM users` query would otherwise type as a Dockerfile.
-    if lang == Lang::Dockerfile && !starts_with_dockerfile_instruction(data) {
+    if lang == Lang::Dockerfile && !starts_with_dockerfile_instruction(body) {
         return None;
     }
 
@@ -816,11 +790,7 @@ pub(super) fn scored_type(sniff: &Sniff<'_>) -> Option<FileType> {
     // targets: a fragment cut from a larger file loses its opening tag but keeps
     // the closing one.
     if lang == Lang::Php {
-        let tail = data.get(data.len().saturating_sub(TAIL_SIZE)..);
-        let tagged = has_php_tag(data)
-            || (is_mostly_whitespace(data, SCAN_LIMIT)
-                && data.len() > SCAN_LIMIT
-                && tail.is_some_and(has_php_tag));
+        let tagged = has_php_tag(body) || (padded_head && has_php_tag(tail));
         if !tagged {
             return None;
         }
@@ -883,35 +853,6 @@ pub(super) fn has_powershell_char_code_array(data: &[u8]) -> bool {
     }
 }
 
-/// Only inputs at least this large are screened by [`looks_like_prose`]: a
-/// tiny script (`echo hi`) can legitimately have no code punctuation at all,
-/// and a mis-typed tiny file costs nothing to parse.
-const PROSE_GUARD_MIN_BYTES: usize = 1024;
-
-/// Bytes that appear in essentially every programming language and essentially
-/// never in running prose: brackets, statement/assignment/comparison operators,
-/// and the shell/comment sigils.
-const CODE_PUNCT: &[u8] = b"{}[]();=<>$#@\\|&*";
-
-fn is_code_punct(b: u8) -> bool {
-    1u128
-        .checked_shl(u32::from(b))
-        .is_some_and(|bit| CODE_PUNCT_MASK & bit != 0)
-}
-
-/// [`CODE_PUNCT`] as a bitmask over ASCII: prose screening reads every byte of
-/// the head, and a mask test is a shift where a slice search is a call. Every
-/// mark is ASCII, so a byte above 0x7F shifts out and is never punctuation.
-const CODE_PUNCT_MASK: u128 = {
-    let mut mask = 0u128;
-    let mut rest = CODE_PUNCT;
-    while let [b, tail @ ..] = rest {
-        mask |= 1 << *b;
-        rest = tail;
-    }
-    mask
-};
-
 /// Return the source following a long, leading quoted assignment. The prefix
 /// must be an identifier assignment, optionally introduced by a declaration.
 /// Work is bounded and escaped quotes are skipped without decoding the string.
@@ -924,8 +865,7 @@ fn after_leading_string_assignment(body: &[u8]) -> Option<&[u8]> {
     let prefix = prefix.strip_suffix('=')?.trim_end();
     let fields: Vec<&str> = prefix.split_whitespace().collect();
     let name = match fields.as_slice() {
-        [name] => *name,
-        ["local" | "const" | "let" | "var", name] => *name,
+        [name] | ["local" | "const" | "let" | "var", name] => *name,
         _ => return None,
     };
     if !name
@@ -952,49 +892,6 @@ fn after_leading_string_assignment(body: &[u8]) -> Option<&[u8]> {
     None
 }
 
-/// Object code, not text in any encoding. UTF-16 text is mostly NULs and
-/// would otherwise look the same; a BOM or a lane of NULs keeps that as text.
-pub(super) fn binary_not_source(data: &[u8]) -> bool {
-    let body = strip_utf8_bom(data);
-    let head = body.get(..SCAN_LIMIT).unwrap_or(body);
-    is_binary(head, Controls::Text) && !looks_like_utf16_text(head)
-}
-
-/// UTF-16 text, which the byte-oriented scorer cannot read. Content cannot
-/// judge it, so the extension stays the word on it.
-pub(super) fn is_utf16_text(data: &[u8]) -> bool {
-    looks_like_utf16_text(data.get(..SCAN_LIMIT).unwrap_or(data))
-}
-
-fn looks_like_utf16_text(head: &[u8]) -> bool {
-    head.starts_with(&[0xFF, 0xFE])
-        || head.starts_with(&[0xFE, 0xFF])
-        || utf16_lanes(head).is_some()
-}
-
-/// The byte order of UTF-16 text without a byte-order mark: `Some(true)` for
-/// little-endian, whose ASCII leaves the odd bytes NUL.
-fn utf16_lanes(head: &[u8]) -> Option<bool> {
-    if head.len() < 64 {
-        return None;
-    }
-    let pairs = head.len() / 2;
-    let nul_even = head.iter().step_by(2).filter(|&&b| b == 0).count();
-    let nul_odd = head.iter().skip(1).step_by(2).filter(|&&b| b == 0).count();
-    // One lane of NULs beside a lane of characters. A zero-filled header
-    // (an Access database, a boot sector's padding) is NUL in both lanes and
-    // is not text.
-    let mostly = |n: usize| n * 5 > pairs * 4;
-    let sparse = |n: usize| n * 5 < pairs;
-    if mostly(nul_odd) && sparse(nul_even) {
-        Some(true)
-    } else if mostly(nul_even) && sparse(nul_odd) {
-        Some(false)
-    } else {
-        None
-    }
-}
-
 /// The text the scorers should read instead of `data`, when that differs:
 /// UTF-16 narrowed to UTF-8, or a UTF-16 byte-order mark dropped from the
 /// 8-bit text behind it. The mark in front of plain ASCII is a batch trick --
@@ -1012,32 +909,21 @@ pub(super) fn decoded_text(data: &[u8]) -> Option<Cow<'_, [u8]>> {
         return None;
     }
     let (bom, body) = match data {
-        [0xFF, 0xFE, rest @ ..] => (Some(true), rest),
-        [0xFE, 0xFF, rest @ ..] => (Some(false), rest),
+        [0xFF, 0xFE, rest @ ..] => (Some(Endian::Little), rest),
+        [0xFE, 0xFF, rest @ ..] => (Some(Endian::Big), rest),
         _ => (None, data),
     };
     let probe = body.get(..SCAN_LIMIT).unwrap_or(body);
     // UTF-16 spells ASCII with every other byte NUL. 8-bit text behind the
     // mark has next to none -- a stray one at the end is not an encoding.
     let nuls = probe.iter().filter(|&&b| b == 0).count();
-    let little_endian = match (bom, utf16_lanes(probe)) {
-        (_, Some(le)) => le,
+    let endian = match (bom, text::utf16_lanes(probe)) {
+        (_, Some(lanes)) => lanes,
         (Some(_), None) if nuls * 10 < probe.len() => return Some(Cow::Borrowed(body)),
-        (Some(le), None) => le,
+        (Some(bom), None) => bom,
         (None, None) => return None,
     };
-    let narrow = |units: &[u8]| {
-        let units = units.as_chunks::<2>().0.iter().map(|&pair| {
-            if little_endian {
-                u16::from_le_bytes(pair)
-            } else {
-                u16::from_be_bytes(pair)
-            }
-        });
-        char::decode_utf16(units)
-            .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
-            .collect::<String>()
-    };
+    let narrow = |units: &[u8]| utf16_lossy(units, endian);
     let (head_len, tail_len) = (2 * DECODE_HEAD, 2 * DECODE_TAIL);
     let text = match (body.get(..head_len), body.len().checked_sub(tail_len)) {
         (Some(head), Some(tail_start)) if tail_start > head_len => {
@@ -1151,220 +1037,6 @@ pub(super) fn contradicts_extension(ext: FileType, sniff: &Sniff<'_>) -> Option<
     (claimed.score(scores) == 0).then_some(found)
 }
 
-/// True when `head` reads like natural-language text rather than source.
-///
-/// Measured on the first 4 KiB: prose (novels, licenses) has 0.15-0.3% code
-/// punctuation with ~4% of lines carrying any; minified JS 6.5% / 93%, Rust
-/// 3.5% / 58%, a Makefile 4.1% / 91%, and even a Markdown README with embedded
-/// snippets 2.8% / 30%. Both thresholds sit well inside that gap, and both must
-/// hold — a file has to look like prose on the byte *and* the line axis.
-fn looks_like_prose(head: &[u8]) -> bool {
-    if head.is_empty() {
-        return false;
-    }
-    let punct = head.iter().filter(|&&b| is_code_punct(b)).count();
-    let mut lines = 0usize;
-    let mut code_lines = 0usize;
-    for line in head.split(|&b| b == b'\n') {
-        if line.iter().all(u8::is_ascii_whitespace) {
-            continue;
-        }
-        lines += 1;
-        if line.iter().any(|&b| is_code_punct(b)) {
-            code_lines += 1;
-        }
-    }
-    if lines == 0 {
-        return false;
-    }
-    punct * 100 < head.len() && code_lines * 100 < lines * 15
-}
-
-/// A conservative sectioned key/value document, such as an extensionless
-/// desktop configuration. Every significant line must fit the format.
-fn looks_like_ini_config(data: &[u8]) -> bool {
-    let head = data.get(..SCAN_LIMIT).unwrap_or(data);
-    if head.starts_with(b"#!") || is_binary(head, Controls::Text) {
-        return false;
-    }
-    let mut sections = 0usize;
-    let mut fields = 0usize;
-    let mut lines = head.split(|&b| b == b'\n').peekable();
-    while let Some(line) = lines.next() {
-        if lines.peek().is_none() && head.len() == SCAN_LIMIT {
-            break;
-        }
-        let line = line.trim_ascii();
-        if line.is_empty() || line.starts_with(b"#") || line.starts_with(b";") {
-            continue;
-        }
-        if let Some(name) = line.strip_prefix(b"[").and_then(|s| s.strip_suffix(b"]")) {
-            if name.is_empty()
-                || !name
-                    .iter()
-                    .all(|c| c.is_ascii_alphanumeric() || b"_./: -".contains(c))
-            {
-                return false;
-            }
-            sections += 1;
-            continue;
-        }
-        let Some((key, _)) = line
-            .iter()
-            .position(|&b| b == b'=')
-            .map(|i| line.split_at(i))
-        else {
-            return false;
-        };
-        let key = key.trim_ascii();
-        if sections == 0
-            || key.is_empty()
-            || !key
-                .iter()
-                .all(|c| c.is_ascii_alphanumeric() || b"_.-".contains(c))
-        {
-            return false;
-        }
-        fields += 1;
-    }
-    sections >= 2 && fields >= 3
-}
-
-/// JSON containers, YAML mappings, and RFC822 stanzas are data even when
-/// their values quote programming-language tokens.
-fn looks_like_structured_data(data: &[u8]) -> bool {
-    let head = data.get(..SCAN_LIMIT).unwrap_or(data);
-    // A shebang names an interpreter: that is a script, whatever follows.
-    if head.starts_with(b"#!") {
-        return false;
-    }
-    let body = head.trim_ascii_start();
-    // JSON: opens a container and carries at least one quoted key.
-    if (body.starts_with(b"{") || body.starts_with(b"["))
-        && memchr::memmem::find(body, b"\":").is_some()
-    {
-        return true;
-    }
-    // YAML: block mappings and sequence entries dominate the significant lines.
-    // A trailing partial line from the scan cut is dropped rather than judged.
-    let mut lines = head.split(|&b| b == b'\n').peekable();
-    let mut significant = 0usize;
-    let mut structured = 0usize;
-    while let Some(line) = lines.next() {
-        if lines.peek().is_none() && head.len() == SCAN_LIMIT {
-            break;
-        }
-        let line = line.trim_ascii();
-        if line.is_empty() || line.starts_with(b"#") {
-            continue;
-        }
-        significant += 1;
-        if is_yaml_node_line(line) {
-            structured += 1;
-        }
-    }
-    if significant >= MIN_YAML_LINES && structured * 10 >= significant * 7 {
-        return true;
-    }
-
-    looks_like_rfc822_stanzas(head)
-}
-
-/// `true` for an RFC822/deb822 stanza document: `Field-Name: value` lines whose
-/// continuations are folded onto following lines that begin with a space.
-///
-/// Debian's `control`, APT's `Packages`/`Sources` and its `Translation-*`
-/// description catalogues are all this shape, and the folded continuations are
-/// free English prose -- which is why the YAML check above cannot see them: a
-/// wrapped sentence is not a node line, so the ratio collapses even though
-/// every field line is structured. APT's `Translation-en` is 32 MB of package
-/// descriptions, and "This package contains…" occurring six times in the first
-/// 4 KB was enough to type the whole catalogue as Kotlin and run credential
-/// rules over English sentences.
-fn looks_like_rfc822_stanzas(head: &[u8]) -> bool {
-    let mut lines = head.split(|&b| b == b'\n').peekable();
-    let mut fields = 0usize;
-    let mut folded = 0usize;
-    let mut other = 0usize;
-    let mut first_significant_is_field = false;
-    let mut seen_significant = false;
-
-    while let Some(line) = lines.next() {
-        // Drop the trailing partial line left by the scan cut rather than judge it.
-        if lines.peek().is_none() && head.len() == SCAN_LIMIT {
-            break;
-        }
-        if line.trim_ascii().is_empty() {
-            continue;
-        }
-        // A folded continuation belongs to the field above it, so it is not
-        // evidence either way -- but it only counts as one after a field.
-        if matches!(line.first(), Some(b' ' | b'\t')) {
-            if fields > 0 {
-                folded += 1;
-                continue;
-            }
-            other += 1;
-            continue;
-        }
-        let is_field = is_rfc822_field_line(line);
-        if !seen_significant {
-            seen_significant = true;
-            first_significant_is_field = is_field;
-        }
-        if is_field {
-            fields += 1;
-        } else {
-            other += 1;
-        }
-    }
-
-    // Every unfolded line must be a field, the document must open with one, and
-    // there must be enough of them to be a stanza rather than a stray `Note:`.
-    first_significant_is_field && other == 0 && fields >= MIN_YAML_LINES && folded > 0
-}
-
-/// `true` for `Field-Name: value` with an RFC822 field name -- printable ASCII
-/// without spaces or a colon. Rejects a Kotlin `package a.b` (no colon), a C
-/// label (no value) and a prose line containing a mid-sentence colon.
-fn is_rfc822_field_line(line: &[u8]) -> bool {
-    let Some((name, value)) = line
-        .iter()
-        .position(|&b| b == b':')
-        .and_then(|end| line.split_at_checked(end))
-    else {
-        return false;
-    };
-    if name.is_empty()
-        || !name
-            .iter()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-    {
-        return false;
-    }
-    // `value` opens with the colon itself.
-    matches!(value.get(1), None | Some(b' ') | Some(b'\r'))
-}
-
-/// `true` for a line that opens a YAML sequence entry, a block mapping key, or
-/// a document marker. Keys are matched by shape (`name:` followed by end of line
-/// or a space), which is what separates `regex: \$_POST` from PHP's `$_POST`.
-fn is_yaml_node_line(line: &[u8]) -> bool {
-    if line == b"---" || line == b"..." || line.starts_with(b"--- ") {
-        return true;
-    }
-    if line == b"-" || line.starts_with(b"- ") {
-        return true;
-    }
-    // A sequence entry may carry its first mapping key: `- id: value`.
-    let key = line.strip_prefix(b"- ").unwrap_or(line).trim_ascii_start();
-    let end = key
-        .iter()
-        .position(|b| !matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-' | b'.' | b'/' | b'"' | b'\''))
-        .unwrap_or(key.len());
-    end > 0 && key.get(end) == Some(&b':') && matches!(key.get(end + 1), None | Some(b' '))
-}
-
 /// `true` when the first instruction of the document is `FROM` or `ARG`, the
 /// only two a Dockerfile may open with. Comments, blank lines, and a leading
 /// parser directive are skipped, matching what the builder accepts.
@@ -1382,92 +1054,6 @@ fn starts_with_dockerfile_instruction(data: &[u8]) -> bool {
         return word.eq_ignore_ascii_case(b"FROM") || word.eq_ignore_ascii_case(b"ARG");
     }
     false
-}
-
-/// `true` when the bytes carry a PHP tag delimiter — an opening `<?`, `<?php`,
-/// or `<?=`, or the `?>` that closes a fragment whose opening tag was cut off.
-/// `<?xml …?>` is an XML processing instruction and never counts on its own.
-fn has_php_tag(data: &[u8]) -> bool {
-    let mut saw_non_php_open = false;
-    let mut rest = data;
-    let limit = data.len().min(SCAN_LIMIT * 2);
-    let mut examined = 0;
-    // Bound the tag search, but inspect the original suffix. Cutting the
-    // sample through a Java type name must not turn its wildcard into PHP.
-    while examined < limit {
-        let search_len = rest.len().min(limit - examined + 1);
-        let Some(pos) = memchr::memmem::find(rest.get(..search_len).unwrap_or(rest), b"<?") else {
-            break;
-        };
-        let Some(after) = rest.get(pos + 2..) else {
-            break;
-        };
-        let bound = after.get(..512).unwrap_or(after).trim_ascii_start();
-        // Java wildcard bounds in API signature catalogs are not PHP short
-        // tags. Nor is Class<?>: its question mark is generic type syntax.
-        // These cannot begin valid PHP statements. Continue searching so a
-        // genuine tag later in a mixed file still establishes PHP content.
-        let java_wildcard = after.starts_with(b">")
-            || (after.first().is_some_and(u8::is_ascii_whitespace)
-                && [b"extends".as_slice(), b"super".as_slice()]
-                    .iter()
-                    .any(|keyword| {
-                        if !bound.starts_with(keyword)
-                            || !bound
-                                .get(keyword.len())
-                                .is_some_and(u8::is_ascii_whitespace)
-                        {
-                            return false;
-                        }
-                        let Some(name) = bound.get(keyword.len()..) else {
-                            return false;
-                        };
-                        let name = name.trim_ascii_start();
-                        let valid_start = name.first().is_some_and(|b| {
-                            b.is_ascii_alphabetic() || matches!(*b, b'_' | b'$') || *b >= 0x80
-                        });
-                        let length = name
-                            .iter()
-                            .take(512)
-                            .take_while(|b| {
-                                b.is_ascii_alphanumeric()
-                                    || matches!(**b, b'_' | b'$' | b'.')
-                                    || **b >= 0x80
-                            })
-                            .count();
-                        // PHP word operators followed by arrays or variables
-                        // can resemble Java type suffixes. Keep PHP for those
-                        // ambiguous names rather than hiding executable input.
-                        let Some((prefix, suffix)) = name.split_at_checked(length) else {
-                            return false;
-                        };
-                        let first = prefix
-                            .split(|b| matches!(*b, b'.' | b'$'))
-                            .next()
-                            .unwrap_or_default();
-                        let php_operator = [b"and".as_slice(), b"or", b"xor", b"instanceof"]
-                            .iter()
-                            .any(|op| first.eq_ignore_ascii_case(op));
-                        valid_start
-                            && !php_operator
-                            && suffix
-                                .trim_ascii_start()
-                                .first()
-                                .is_some_and(|b| matches!(*b, b'>' | b'<' | b'['))
-                    }));
-        if after
-            .get(..3)
-            .is_some_and(|pi| pi.eq_ignore_ascii_case(b"xml"))
-            || java_wildcard
-        {
-            saw_non_php_open = true;
-        } else {
-            return true;
-        }
-        examined += pos + 2;
-        rest = after;
-    }
-    !saw_non_php_open && memchr::memmem::find(data.get(..limit).unwrap_or(data), b"?>").is_some()
 }
 
 /// Tags that only markup carries. Static like [`SCANNER`]'s patterns, so a

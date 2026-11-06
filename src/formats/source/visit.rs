@@ -37,32 +37,21 @@ pub(super) struct KindSet(Box<[u64]>);
 
 impl KindSet {
     fn new(language: &Language, kinds: &[&str]) -> Self {
+        Self::matching(language, |_, name| kinds.contains(&name))
+    }
+
+    /// Every kind of `language` that `keep` accepts, by id and name.
+    fn matching(language: &Language, keep: impl Fn(u16, &str) -> bool) -> Self {
         let count = language.node_kind_count();
         let mut bits = vec![0u64; count.div_ceil(64)];
         for id in 0..count {
             let Ok(id) = u16::try_from(id) else { break };
             if language
                 .node_kind_for_id(id)
-                .is_some_and(|name| kinds.contains(&name))
+                .is_some_and(|name| keep(id, name))
+                && let Some(word) = bits.get_mut(usize::from(id) / 64)
             {
-                if let Some(word) = bits.get_mut(usize::from(id) / 64) {
-                    *word |= 1 << (id % 64);
-                }
-            }
-        }
-        Self(bits.into_boxed_slice())
-    }
-
-    /// Every named kind whose name `keep` accepts.
-    fn named_where(language: &Language, keep: impl Fn(&str) -> bool) -> Self {
-        let count = language.node_kind_count();
-        let mut bits = vec![0u64; count.div_ceil(64)];
-        for id in 0..count {
-            let Ok(id) = u16::try_from(id) else { break };
-            if language.node_kind_is_named(id) && language.node_kind_for_id(id).is_some_and(&keep) {
-                if let Some(word) = bits.get_mut(usize::from(id) / 64) {
-                    *word |= 1 << (id % 64);
-                }
+                *word |= 1 << (id % 64);
             }
         }
         Self(bits.into_boxed_slice())
@@ -140,7 +129,9 @@ impl NodeIds {
             use_declaration: set(&["use_declaration"]),
             rust_item: set(&["function_item", "mod_item"]),
             batch_command: set(&["cmd"]),
-            comment: KindSet::named_where(&language, |name| name.contains("comment")),
+            comment: KindSet::matching(&language, |id, name| {
+                language.node_kind_is_named(id) && name.contains("comment")
+            }),
             generic_token: set(&["generic_token"]),
             command_elements: set(&["command_elements"]),
             operator_field: field("operator"),
@@ -148,14 +139,6 @@ impl NodeIds {
             right_field: field("right"),
         }
     }
-}
-
-/// The [`NodeIds`] for `config`'s language, built on first use.
-pub(super) fn node_ids(config: &LangConfig) -> &'static NodeIds {
-    static IDS: [OnceLock<NodeIds>; Lang::COUNT] = [const { OnceLock::new() }; Lang::COUNT];
-    IDS.get(config.lang as usize)
-        .expect("`Lang::COUNT` covers every `Lang`")
-        .get_or_init(|| NodeIds::new(config))
 }
 
 /// One node as the walk reaches it.
@@ -177,15 +160,15 @@ pub(super) struct Collectors<'t> {
     pub(super) comments: Option<Comments<'t>>,
     pub(super) literals: Option<Literals>,
     pub(super) identifiers: Option<Identifiers<'t>>,
-    pub(super) functions: Option<function_metrics::Collector>,
+    pub(super) functions: Option<function_metrics::Collector<'t>>,
     pub(super) ast: Option<ast_walk::State>,
     /// Entered before `payload`, which skips the test-only items it finds.
     pub(super) rust: Option<rust_syntax::Items>,
     pub(super) payload: Option<payload_flow::Collector<'t>>,
     pub(super) batch_commands: Option<batch_commands::Collector>,
     pub(super) runtime_imports: Option<runtime_imports::Collector>,
-    pub(super) python: Option<python_module_calls::Collector>,
-    pub(super) shell: Option<shell_fifo::Collector>,
+    pub(super) python: Option<python_module_calls::Collector<'t>>,
+    pub(super) shell: Option<shell_fifo::Collector<'t>>,
 }
 
 /// Visit every node under `root` once, depth first, left to right, and pass
@@ -197,7 +180,12 @@ pub(super) fn walk<'t>(
     config: &'static LangConfig,
     collectors: &mut Collectors<'t>,
 ) {
-    let ids = node_ids(config);
+    // The [`NodeIds`] for each language, built on first use.
+    static IDS: [OnceLock<NodeIds>; Lang::COUNT] = [const { OnceLock::new() }; Lang::COUNT];
+    let ids = IDS
+        .get(config.lang as usize)
+        .expect("`Lang::COUNT` covers every `Lang`")
+        .get_or_init(|| NodeIds::new(config));
     let mut cursor = root.walk();
     // For collectors that look at a node's children: reset onto each node in
     // turn, so the walk allocates no cursor per node.
@@ -277,10 +265,10 @@ impl<'t> Collectors<'t> {
         if let Some(functions) = &mut self.functions {
             functions.enter(visit, source, ids);
         }
-        if visit.depth <= MAX_AST_DEPTH {
-            if let Some(ast) = &mut self.ast {
-                ast.visit(visit, source, config, ids, scratch);
-            }
+        if visit.depth <= MAX_AST_DEPTH
+            && let Some(ast) = &mut self.ast
+        {
+            ast.visit(visit, source, config, ids, scratch);
         }
         if let Some(rust) = &mut self.rust {
             rust.enter(visit, source, ids);
@@ -346,7 +334,6 @@ impl Literals {
                 self.found.push(ExtractedString {
                     value: text,
                     offset: visit.node.start_byte(),
-                    ..ExtractedString::default()
                 });
             }
             return;
@@ -368,7 +355,6 @@ impl Literals {
                 self.found.push(ExtractedString {
                     value: text.to_string(),
                     offset: visit.node.start_byte(),
-                    ..ExtractedString::default()
                 });
             }
         }
@@ -400,11 +386,8 @@ impl<'t> Comments<'t> {
                 if text.starts_with('#') && text.contains('\n') {
                     let mut offset = start;
                     for line in text.split('\n') {
-                        let indent = line
-                            .bytes()
-                            .take_while(|b| matches!(b, b' ' | b'\t'))
-                            .count();
-                        self.found.push((offset + indent, &line[indent..]));
+                        let body = line.trim_start_matches([' ', '\t']);
+                        self.found.push((offset + line.len() - body.len(), body));
                         offset += line.len() + 1;
                     }
                 } else {

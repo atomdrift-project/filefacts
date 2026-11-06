@@ -8,10 +8,10 @@ use goblin::pe::PE;
 use serde_json::Value as JsonValue;
 
 use super::layout::rva_to_file_offset;
-use crate::formats::common::bytes_at::{u16_le, u32_le};
+use crate::bytes::{sat_usize, u16_le, u32_le};
 use crate::formats::common::{format_guid, put_str, put_u64};
 use crate::metric;
-use crate::output::{Metrics, Values};
+use crate::output::{Metrics, Span, Values};
 use crate::scan::entropy;
 use crate::value_key;
 
@@ -114,25 +114,25 @@ fn clr_metadata(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Me
     // ourselves and parse from the `BSJB` root.
     let mdir = hdr.metadata;
     let md = rva_to_file_offset(pe, mdir.virtual_address).and_then(|base| {
-        let end = base.saturating_add(mdir.size as usize).min(bytes.len());
+        let end = base.saturating_add(sat_usize(mdir.size)).min(bytes.len());
         bytes.get(base..end)
     });
-    if let Some((names, guid_stream)) = md.and_then(parse_clr_streams) {
-        if !names.is_empty() {
-            let arr = names.into_iter().map(JsonValue::String).collect();
-            values.insert_key(value_key!("pe.clr.streams"), JsonValue::Array(arr));
-        }
-        // The module MVID is the first GUID in the `#GUID` heap (Module.Mvid == 1).
-        if let (Some((goff, gsize)), Some(md)) = (guid_stream, md) {
-            if gsize >= 16 {
-                if let Some(mvid) = md
-                    .get(goff..goff.saturating_add(16))
-                    .and_then(|g| <&[u8; 16]>::try_from(g).ok())
-                {
-                    put_str(values, value_key!("pe.clr.mvid"), format_guid(mvid));
-                }
-            }
-        }
+    let Some(md) = md else {
+        return;
+    };
+    let Some((names, guid_stream)) = parse_clr_streams(md) else {
+        return;
+    };
+    if !names.is_empty() {
+        let arr = names.into_iter().map(JsonValue::String).collect();
+        values.insert_key(value_key!("pe.clr.streams"), JsonValue::Array(arr));
+    }
+    // The module MVID is the first GUID in the `#GUID` heap (Module.Mvid == 1).
+    if let Some((goff, gsize)) = guid_stream
+        && gsize >= 16
+        && let Some(mvid) = md.get(goff..).and_then(<[u8]>::first_chunk::<16>)
+    {
+        put_str(values, value_key!("pe.clr.mvid"), format_guid(mvid));
     }
 }
 
@@ -152,7 +152,7 @@ fn clr_il_facts(
         return;
     };
     let Some(root) = base
-        .checked_add(dir.size as usize)
+        .checked_add(sat_usize(dir.size))
         .and_then(|end| bytes.get(base..end))
     else {
         return;
@@ -231,7 +231,7 @@ type HeapRange = (usize, usize);
 /// and the `(offset, size)` of the `#GUID` heap (offsets relative to the blob
 /// start). Returns `None` when the signature or layout is malformed.
 fn parse_clr_streams(md: &[u8]) -> Option<(Vec<String>, Option<HeapRange>)> {
-    let rd_u32 = |p: usize| u32_le(md, p).map(|v| v as usize);
+    let rd_u32 = |p: usize| u32_le(md, p).map(sat_usize);
     if md.get(0..4)? != b"BSJB" {
         return None;
     }
@@ -247,16 +247,14 @@ fn parse_clr_streams(md: &[u8]) -> Option<(Vec<String>, Option<HeapRange>)> {
         let s_size = rd_u32(p + 4)?;
         p += 8;
         // Name: null-terminated ASCII, whole field padded to a 4-byte boundary.
-        let start = p;
-        while *md.get(p)? != 0 {
-            p += 1;
-        }
-        let name = std::str::from_utf8(md.get(start..p)?).ok()?.to_string();
+        let field = md.get(p..)?;
+        let len = memchr::memchr(0, field)?;
+        let name = std::str::from_utf8(field.get(..len)?).ok()?.to_string();
         if name == "#GUID" {
             guid_stream = Some((s_off, s_size));
         }
         names.push(name);
-        p = start.checked_add(((p - start) + 1 + 3) & !3)?;
+        p = p.checked_add((len + 1 + 3) & !3)?;
     }
     Some((names, guid_stream))
 }
@@ -282,7 +280,7 @@ fn clr_resources(pe: &PE<'_>, bytes: &[u8], metrics: &mut Metrics) {
     let Some(base) = rva_to_file_offset(pe, dir.virtual_address) else {
         return;
     };
-    let end = base.saturating_add(dir.size as usize).min(bytes.len());
+    let end = base.saturating_add(sat_usize(dir.size)).min(bytes.len());
     let Some(blob) = bytes.get(base..end) else {
         return;
     };
@@ -292,48 +290,33 @@ fn clr_resources(pe: &PE<'_>, bytes: &[u8], metrics: &mut Metrics) {
         return;
     }
     metrics.insert(metric!("pe.clr.managed_resource_count"), count as f64);
-    if let Some(span) = entropy_span {
-        let span = crate::output::Span::new(base as u64 + span.offset, span.len);
-        metrics.insert_located(
-            metric!("pe.clr.managed_resource_max_entropy"),
-            max_entropy,
-            [span],
-        );
-    } else {
-        metrics.insert(metric!("pe.clr.managed_resource_max_entropy"), max_entropy);
-    }
-    if let Some(span) = size_span {
-        let span = crate::output::Span::new(base as u64 + span.offset, span.len);
-        metrics.insert_located(
-            metric!("pe.clr.managed_resource_max_size"),
-            max_size as f64,
-            [span],
-        );
-    } else {
-        metrics.insert(metric!("pe.clr.managed_resource_max_size"), max_size as f64);
-    }
+    // The spans are relative to the blob; the facts locate them in the file.
+    let in_file =
+        |span: Option<Span>| span.map(|span| Span::new(base as u64 + span.offset, span.len));
+    metrics.insert_located(
+        metric!("pe.clr.managed_resource_max_entropy"),
+        max_entropy,
+        in_file(entropy_span),
+    );
+    metrics.insert_located(
+        metric!("pe.clr.managed_resource_max_size"),
+        max_size as f64,
+        in_file(size_span),
+    );
 }
 
 /// Walk a CLR resources blob (`[u32 len][bytes]` chunks) and return
 /// `(count, max_entropy, max_size, entropy_span, size_span)`. A length that
 /// runs past the blob stops the walk — a corrupt or non-consecutive layout
 /// yields a short count, never a panic or over-read.
-fn scan_resource_blob(
-    blob: &[u8],
-) -> (
-    u64,
-    f64,
-    u64,
-    Option<crate::output::Span>,
-    Option<crate::output::Span>,
-) {
+fn scan_resource_blob(blob: &[u8]) -> (u64, f64, u64, Option<Span>, Option<Span>) {
     let (mut count, mut max_entropy, mut max_size, mut entropy_span, mut size_span, mut p) =
         (0u64, 0.0f64, 0u64, None, None, 0usize);
     while p + 4 <= blob.len() {
         let Some(len) = u32_le(blob, p) else {
             break;
         };
-        let len = len as usize;
+        let len = sat_usize(len);
         p += 4;
         if len == 0 {
             break;
@@ -344,11 +327,11 @@ fn scan_resource_blob(
         let chunk_entropy = entropy::shannon(chunk);
         if chunk_entropy > max_entropy {
             max_entropy = chunk_entropy;
-            entropy_span = Some(crate::output::Span::new(p as u64, len as u64));
+            entropy_span = Some(Span::new(p as u64, len as u64));
         }
         if len as u64 > max_size {
             max_size = len as u64;
-            size_span = Some(crate::output::Span::new(p as u64, len as u64));
+            size_span = Some(Span::new(p as u64, len as u64));
         }
         count += 1;
         // Managed resource offsets are aligned to eight bytes. Reading the

@@ -312,3 +312,21 @@ fn managed_package_executables_have_expected_locations() {
         assert!(classify_filename(path).is_misplaced_executable, "{path}");
     }
 }
+
+/// Windows extractors split member names on `\` as well as `/`, so a
+/// backslash `..` climbs out of the destination just the same.
+#[test]
+fn backslash_traversal_is_traversal() {
+    for path in [
+        "..\\..\\Startup\\evil.exe",
+        "docs\\..\\..\\evil.dll",
+        "\\Windows\\System32\\evil.dll",
+        "C:/Windows/evil.dll",
+        "ok/..\\..\\evil",
+    ] {
+        assert!(classify_filename(path).has_path_traversal, "{path}");
+    }
+    for path in ["docs\\readme.txt", "a..b\\c", "dir/file..txt"] {
+        assert!(!classify_filename(path).has_path_traversal, "{path}");
+    }
+}

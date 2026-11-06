@@ -470,3 +470,17 @@ fn empty_pvd() -> Pvd {
         application_use_nonzero: 0,
     }
 }
+
+#[test]
+fn udf_union_keeps_the_member_cap() {
+    let member = |i: usize| ArchiveMember::new(format!("f{i}"), 0, EntryType::Regular);
+    let mut members: Vec<ArchiveMember> = (0..MAX_ARCHIVE_MEMBERS - 1).map(member).collect();
+    let udf = (0..MAX_ARCHIVE_MEMBERS)
+        .map(|i| member(i + MAX_ARCHIVE_MEMBERS))
+        .collect();
+    assert!(!union_members(&mut members, udf));
+    assert_eq!(members.len(), MAX_ARCHIVE_MEMBERS);
+    let mut small = vec![member(0)];
+    assert!(union_members(&mut small, vec![member(0), member(1)]));
+    assert_eq!(small.len(), 2);
+}

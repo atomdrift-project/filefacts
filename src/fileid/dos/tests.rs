@@ -1,5 +1,10 @@
 use super::*;
 
+/// Whether `data`, under no name, reads as a DOS COM program.
+fn is_com(data: &[u8]) -> bool {
+    looks_like_dos_com(&Sniff::new(std::path::Path::new(""), data))
+}
+
 #[test]
 fn headerless_bios_disk_bootstrap_uses_the_existing_entry_decoder() {
     // Argument setup separates AX from the BIOS call. No DOS syscall or
@@ -11,7 +16,7 @@ fn headerless_bios_disk_bootstrap_uses_the_existing_entry_decoder() {
     for selector in [0x02, 0x03] {
         let mut code = program;
         code[2] = selector;
-        assert!(looks_like_dos_com(&code));
+        assert!(is_com(&code));
         for name in ["program", "program.32", "program.com"] {
             assert_eq!(
                 super::super::detect(std::path::Path::new(name), &code)
@@ -24,20 +29,20 @@ fn headerless_bios_disk_bootstrap_uses_the_existing_entry_decoder() {
 
     let mut unknown_selector = program;
     unknown_selector[2] = 0xFF;
-    assert!(!looks_like_dos_com(&unknown_selector));
+    assert!(!is_com(&unknown_selector));
     let mut no_bootstrap = program;
     no_bootstrap[20] = 0x18;
-    assert!(!looks_like_dos_com(&no_bootstrap));
+    assert!(!is_com(&no_bootstrap));
     // An intervening AX write invalidates the known selector.
     let mut clobbered = program[..17].to_vec();
     clobbered.extend_from_slice(&[0x31, 0xC0]);
     clobbered.extend_from_slice(&program[17..]);
-    assert!(!looks_like_dos_com(&clobbered));
+    assert!(!is_com(&clobbered));
     // Valid-looking bytes behind an unconditional return are not entry code.
     let mut unreachable = vec![0xC3];
     unreachable.extend_from_slice(&program);
-    assert!(!looks_like_dos_com(&unreachable));
-    assert!(!looks_like_dos_com(&[0xCD, 0x13, 0xCD, 0x19]));
+    assert!(!is_com(&unreachable));
+    assert!(!is_com(&[0xCD, 0x13, 0xCD, 0x19]));
 }
 
 fn fat12_boot_sector() -> [u8; 512] {
@@ -148,4 +153,67 @@ fn fat_boot_sector_rejects_each_required_bpb_field_when_invalid() {
     signature_only[510..].copy_from_slice(&[0x55, 0xAA]);
     assert!(!looks_like_fat_boot_sector(&signature_only));
     assert!(!looks_like_fat_boot_sector(&sector[..511]));
+}
+
+/// Anything larger than a COM image is ruled out by its size alone, before a
+/// byte of it is classified: every text file of any size passes through here.
+#[test]
+fn dos_com_size_gate_comes_before_reading_the_body() {
+    let large = vec![b'a'; DOS_COM_MAX_SIZE + 1];
+    let sniff = Sniff::new(std::path::Path::new(""), &large);
+    assert!(!looks_like_dos_com(&sniff));
+    assert!(!sniff.classified_binary());
+}
+
+/// A coherent 16-bit DOS MZ header.
+fn mz_example() -> Vec<u8> {
+    let mut b = vec![0u8; 96];
+    b[..2].copy_from_slice(b"MZ");
+    b[2..4].copy_from_slice(&96u16.to_le_bytes());
+    b[4..6].copy_from_slice(&1u16.to_le_bytes());
+    b[8..10].copy_from_slice(&2u16.to_le_bytes());
+    b[24..26].copy_from_slice(&28u16.to_le_bytes());
+    b[32..34].copy_from_slice(&[0xcd, 0x20]);
+    b
+}
+
+#[test]
+fn mz_valid_header_and_nonzero_entry() {
+    let mut b = mz_example();
+    assert!(looks_like_dos_mz(&b));
+    b[20..22].copy_from_slice(&20u16.to_le_bytes());
+    assert!(looks_like_dos_mz(&b));
+}
+
+#[test]
+fn mz_identification_preserves_extended_formats() {
+    let mut b = mz_example();
+    let path = std::path::Path::new("legacy.exe");
+    assert_eq!(
+        crate::fileid::detect(path, &b).unwrap().file_type,
+        crate::FileType::Data
+    );
+    b[0x3c..0x40].copy_from_slice(&64u32.to_le_bytes());
+    b[64..68].copy_from_slice(b"PE\0\0");
+    assert_eq!(
+        crate::fileid::detect(path, &b).unwrap().file_type,
+        crate::FileType::Pe
+    );
+}
+
+#[test]
+fn mz_rejects_incoherent_geometry() {
+    let b = mz_example();
+    assert!(!looks_like_dos_mz(&b[..31]));
+    for (at, value) in [(0, 0), (4, 0), (8, 0), (20, 255), (22, 255)] {
+        let mut changed = b.clone();
+        changed[at] = value;
+        assert!(!looks_like_dos_mz(&changed), "offset {at}");
+    }
+    let mut changed = b.clone();
+    changed[2..4].copy_from_slice(&512u16.to_le_bytes());
+    assert!(!looks_like_dos_mz(&changed));
+    let mut changed = b;
+    changed[6..8].copy_from_slice(&2u16.to_le_bytes());
+    assert!(!looks_like_dos_mz(&changed));
 }

@@ -17,14 +17,6 @@ use crate::scan::classify;
 
 use super::identifier_metrics::string_entropy;
 
-/// A comment's body, without its delimiters, and the byte offset in the
-/// source where the body starts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Comment<'a> {
-    offset: usize,
-    body: &'a str,
-}
-
 /// Annotation markers, matched case-insensitively.
 const ANNOTATIONS: [&str; 4] = ["TODO", "FIXME", "HACK", "XXX"];
 
@@ -143,21 +135,11 @@ pub(super) fn emit(
     metrics: &mut Metrics,
     comments_out: &mut crate::output::Comments,
 ) {
-    let comments: Vec<Comment<'_>> = found
-        .iter()
-        .map(|&(start, text)| {
-            let (skip, body) = comment_body(text);
-            Comment {
-                offset: start + skip,
-                body,
-            }
-        })
-        .collect();
-    if comments.is_empty() {
+    if found.is_empty() {
         return;
     }
 
-    let total = crate::bytes::sat_u32(comments.len());
+    let total = crate::bytes::sat_u32(found.len());
     metrics.insert(metric!("comments.count"), f64::from(total));
 
     let mut total_chars: u64 = 0;
@@ -169,8 +151,10 @@ pub(super) fn emit(
     let mut url_in_comments: u32 = 0;
     let mut base64_in_comments: u32 = 0;
 
-    for comment in &comments {
-        let body = comment.body;
+    for &(start, text) in found {
+        // The body without its delimiters, and where it starts in `content`.
+        let (skip, body) = comment_body(text);
+        let offset = start + skip;
         total_chars += body.len() as u64;
         comment_lines = comment_lines.saturating_add(crate::bytes::sat_u32(body.lines().count()));
 
@@ -185,8 +169,7 @@ pub(super) fn emit(
         // a keyword in code or a string never reaches this tier).
         comments_out.push(crate::output::ExtractedString {
             value: trimmed.to_string(),
-            offset: comment.offset + (body.len() - body.trim_start().len()),
-            ..Default::default()
+            offset: offset + (body.len() - body.trim_start().len()),
         });
 
         let hits = pattern_hits(trimmed);

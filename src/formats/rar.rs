@@ -1,10 +1,5 @@
 //! RAR 4.x / 5.0 archive-header extractor.
 //!
-//! RAR was identified by magic and classified as an archive, but had no arm
-//! in the extractor dispatch, so `archive.members` came back empty for every
-//! volume. Every rule reading `archive.members[*]` was therefore inert
-//! against a format that is a routine encrypted-payload carrier.
-//!
 //! The member table lives in the headers, not the payload. This walk reads
 //! those headers and never decompresses: encrypted files still disclose
 //! names, sizes, times, host OS, method, and the encryption extras; an
@@ -38,7 +33,6 @@ const MAX_SFX: usize = 1024 * 1024;
 const MAX_HEADER: usize = 2 * 1024 * 1024;
 const MAX_NAME: usize = 65_536;
 const MAX_BLOCKS: usize = 200_000;
-const FILETIME_UNIX_DIFF: u64 = 116_444_736_000_000_000;
 
 const SIG4: &[u8] = b"Rar!\x1a\x07\x00";
 const SIG5: &[u8] = b"Rar!\x1a\x07\x01\x00";
@@ -99,34 +93,27 @@ const R4_LHD_SALT: u16 = 0x0400;
 const R4_LHD_VERSION: u16 = 0x0800;
 const R4_LHD_EXTTIME: u16 = 0x1000;
 
-/// RAR5's variable-length integer: seven bits per byte, low group first,
-/// with the high bit set on every byte but the last.
-trait ReadVint {
-    /// Read one vint. One that runs off the end, or past ten bytes, fails
-    /// having consumed the bytes it read.
-    fn vint(&mut self) -> Option<u64>;
-
-    /// Read one vint as a size or count, saturating past `usize::MAX` so
-    /// the bounds check that follows rejects it on 32-bit hosts.
-    fn vsize(&mut self) -> Option<usize> {
-        self.vint().map(sat_usize)
+/// Read one RAR5 variable-length integer: seven bits per byte, low group
+/// first, with the high bit set on every byte but the last. One that runs off
+/// the end, or past ten bytes, fails having consumed the bytes it read.
+fn read_vint(inp: &mut Reader<'_>) -> Option<u64> {
+    let mut n = 0u64;
+    let mut shift = 0u32;
+    for _ in 0..10 {
+        let b = inp.u8()?;
+        n = n.saturating_add(u64::from(b & 0x7f).checked_shl(shift)?);
+        if b & 0x80 == 0 {
+            return Some(n);
+        }
+        shift = shift.saturating_add(7);
     }
+    None
 }
 
-impl ReadVint for Reader<'_> {
-    fn vint(&mut self) -> Option<u64> {
-        let mut n = 0u64;
-        let mut shift = 0u32;
-        for _ in 0..10 {
-            let b = self.u8()?;
-            n = n.saturating_add(u64::from(b & 0x7f).checked_shl(shift)?);
-            if b & 0x80 == 0 {
-                return Some(n);
-            }
-            shift = shift.saturating_add(7);
-        }
-        None
-    }
+/// Read one vint as a size or count, saturating past `usize::MAX` so the
+/// bounds check that follows rejects it on 32-bit hosts.
+fn read_vsize(inp: &mut Reader<'_>) -> Option<usize> {
+    read_vint(inp).map(sat_usize)
 }
 
 #[derive(Default)]
@@ -139,7 +126,7 @@ struct Extra {
     ctime: Option<i64>,
     atime: Option<i64>,
     file_version: Option<u64>,
-    redir_type: Option<&'static str>,
+    redir_type: Option<Redirect>,
     link_is_dir: bool,
     linkname: Option<String>,
     uname: Option<String>,
@@ -173,7 +160,7 @@ struct Member {
     system: bool,
     read_only: bool,
     linkname: Option<String>,
-    redir_type: Option<&'static str>,
+    redir_type: Option<Redirect>,
     file_version: Option<u64>,
     extra_types: Vec<u64>,
     header_off: u64,
@@ -188,6 +175,50 @@ struct Member {
     tweaked_checksums: bool,
     unpack_version: Option<u64>,
     size_unknown: bool,
+}
+
+impl Member {
+    /// A member with only its header's position and the fields every
+    /// member has; the walks fill in the rest.
+    fn new(path: String, size_bytes: u64, entry_type: EntryType, header_off: u64) -> Self {
+        Self {
+            path,
+            size_bytes,
+            packed: None,
+            entry_type,
+            mtime: None,
+            ctime: None,
+            atime: None,
+            encrypted: false,
+            method: None,
+            dict_size: None,
+            host_os: None,
+            crc32: None,
+            blake2: None,
+            split_before: false,
+            split_after: false,
+            solid: false,
+            hidden: false,
+            system: false,
+            read_only: false,
+            linkname: None,
+            redir_type: None,
+            file_version: None,
+            extra_types: Vec::new(),
+            header_off,
+            data_off: None,
+            mode_octal: None,
+            uid: None,
+            gid: None,
+            uname: None,
+            gname: None,
+            windows_attrs: None,
+            kdf_count: None,
+            tweaked_checksums: false,
+            unpack_version: None,
+            size_unknown: false,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -230,8 +261,8 @@ struct Archive {
     child: u64,
     mapped_unix: u64,
     v1_comp: u64,
-    unpack_min: Option<u64>,
-    unpack_max: Option<u64>,
+    /// Lowest and highest unpack version across members.
+    unpack_range: Option<(u64, u64)>,
     quick_open: bool,
     quick_open_size: u64,
     recovery_size: u64,
@@ -249,18 +280,22 @@ struct Archive {
     r4_encrypt_ver: Option<u8>,
 }
 
-fn limit(ar: &mut Archive, stage: &'static str, reason: impl Into<String>) {
-    ar.limits.push(stage, reason);
-}
-
 /// Step over a block's packed data. Data running past the end of the file is
 /// a truncated archive or a lying size: stop at the end and record it, rather
 /// than resume the header walk inside the payload.
+impl Archive {
+    fn note_unpack_version(&mut self, v: u64) {
+        self.unpack_range = Some(
+            self.unpack_range
+                .map_or((v, v), |(lo, hi)| (lo.min(v), hi.max(v))),
+        );
+    }
+}
+
 fn skip_data(inp: &mut Reader<'_>, ar: &mut Archive, size: u64) {
     let remaining = inp.remaining();
     if size > remaining as u64 {
-        limit(
-            ar,
+        ar.limits.push(
             "data",
             format!(
                 "packed data runs {} bytes past end of file",
@@ -324,42 +359,54 @@ fn method5(n: u64) -> String {
     }
 }
 
-fn redir_name(n: u64) -> &'static str {
-    match n {
-        1 => "unix-symlink",
-        2 => "windows-symlink",
-        3 => "windows-junction",
-        4 => "hard-link",
-        5 => "file-copy",
-        _ => "unknown",
-    }
+/// A RAR5 file-system redirection record's type.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Redirect {
+    UnixSymlink,
+    WindowsSymlink,
+    WindowsJunction,
+    HardLink,
+    FileCopy,
+    Unknown,
 }
 
-fn filetime_to_unix(ft: u64) -> Option<i64> {
-    if ft < FILETIME_UNIX_DIFF {
-        return None;
+impl Redirect {
+    fn from_type(n: u64) -> Self {
+        match n {
+            1 => Self::UnixSymlink,
+            2 => Self::WindowsSymlink,
+            3 => Self::WindowsJunction,
+            4 => Self::HardLink,
+            5 => Self::FileCopy,
+            _ => Self::Unknown,
+        }
     }
-    i64::try_from((ft - FILETIME_UNIX_DIFF) / 10_000_000).ok()
-}
 
-fn dos_to_unix(ft: u32) -> Option<i64> {
-    let date = (ft >> 16) as u16;
-    let time = (ft & 0xffff) as u16;
-    let year = i32::from((date >> 9) & 0x7f) + 1980;
-    let month = u32::from((date >> 5) & 0xf);
-    let day = u32::from(date & 0x1f);
-    let hour = i64::from((time >> 11) & 0x1f);
-    let min = i64::from((time >> 5) & 0x3f);
-    let sec = i64::from(time & 0x1f) * 2;
-    let days = crate::scan::days_from_civil(year, month, day)?;
-    Some(days * 86_400 + hour * 3600 + min * 60 + sec)
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::UnixSymlink => "unix-symlink",
+            Self::WindowsSymlink => "windows-symlink",
+            Self::WindowsJunction => "windows-junction",
+            Self::HardLink => "hard-link",
+            Self::FileCopy => "file-copy",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Whether the member is a link rather than a file of its own.
+    fn is_link(self) -> bool {
+        matches!(
+            self,
+            Self::UnixSymlink | Self::WindowsSymlink | Self::HardLink
+        )
+    }
 }
 
 fn unix_time(flags: u64, inp: &mut Reader<'_>) -> Option<i64> {
     if flags & 0x0001 != 0 {
         Some(i64::from(inp.u32_le()?))
     } else {
-        filetime_to_unix(inp.u64_le()?)
+        inp.u64_le().map(crate::time::filetime_to_unix)
     }
 }
 
@@ -367,7 +414,9 @@ fn parse_extra(bytes: &[u8], extra: &mut Extra) {
     extra.bytes = extra.bytes.saturating_add(bytes.len() as u64);
     let mut inp = Reader::new(bytes);
     while inp.remaining() > 0 {
-        let Some(size) = inp.vsize() else { break };
+        let Some(size) = read_vsize(&mut inp) else {
+            break;
+        };
         let start = inp.pos();
         let Some(end) = start.checked_add(size) else {
             break;
@@ -376,7 +425,9 @@ fn parse_extra(bytes: &[u8], extra: &mut Extra) {
             extra.unknown += 1;
             break;
         }
-        let Some(typ) = inp.vint() else { break };
+        let Some(typ) = read_vint(&mut inp) else {
+            break;
+        };
         extra.types.push(typ);
         let Some(data) = bytes.get(inp.pos()..end) else {
             extra.unknown += 1;
@@ -387,22 +438,20 @@ fn parse_extra(bytes: &[u8], extra: &mut Extra) {
         match typ {
             0x01 => {
                 extra.encrypted = true;
-                let _ver = d.vint();
-                let flags = d.vint().unwrap_or(0);
+                let _ver = read_vint(&mut d);
+                let flags = read_vint(&mut d).unwrap_or(0);
                 extra.kdf_count = d.u8();
                 extra.tweaked_checksums = flags & 0x0002 != 0;
-                let _ = d.skip(16);
-                let _ = d.skip(16);
             }
             0x02 => {
-                if d.vint() == Some(0) && d.remaining() >= 32 {
-                    if let Some(h) = d.bytes(32) {
-                        extra.blake2 = Some(hex_encode(h));
-                    }
+                if read_vint(&mut d) == Some(0)
+                    && let Some(h) = d.bytes(32)
+                {
+                    extra.blake2 = Some(hex_encode(h));
                 }
             }
             0x03 => {
-                let flags = d.vint().unwrap_or(0);
+                let flags = read_vint(&mut d).unwrap_or(0);
                 if flags & 0x0002 != 0 {
                     extra.mtime = unix_time(flags, &mut d);
                 }
@@ -412,33 +461,19 @@ fn parse_extra(bytes: &[u8], extra: &mut Extra) {
                 if flags & 0x0008 != 0 {
                     extra.atime = unix_time(flags, &mut d);
                 }
-                // Sub-second refinements trail all three base timestamps,
-                // in the same mtime/ctime/atime order, as plain 4-byte
-                // nanosecond counts — not folded into a wider mtime field.
-                // They don't change our whole-second values; read them
-                // only to keep the cursor aligned for any record after.
-                if flags & (0x0001 | 0x0010) == (0x0001 | 0x0010) {
-                    if flags & 0x0002 != 0 {
-                        let _ = d.u32_le();
-                    }
-                    if flags & 0x0004 != 0 {
-                        let _ = d.u32_le();
-                    }
-                    if flags & 0x0008 != 0 {
-                        let _ = d.u32_le();
-                    }
-                }
+                // Sub-second refinements may trail the three base
+                // timestamps; they don't change the whole-second values.
             }
             0x04 => {
-                let _ = d.vint();
-                extra.file_version = d.vint();
+                let _ = read_vint(&mut d);
+                extra.file_version = read_vint(&mut d);
             }
             0x05 => {
-                let kind = d.vint().unwrap_or(0);
-                extra.redir_type = Some(redir_name(kind));
-                let flags = d.vint().unwrap_or(0);
+                let kind = read_vint(&mut d).unwrap_or(0);
+                extra.redir_type = Some(Redirect::from_type(kind));
+                let flags = read_vint(&mut d).unwrap_or(0);
                 extra.link_is_dir = flags & 0x0001 != 0;
-                if let Some(nlen) = d.vint() {
+                if let Some(nlen) = read_vint(&mut d) {
                     let n = sat_usize(nlen).min(MAX_NAME);
                     if let Some(name) = d.bytes(n) {
                         extra.linkname = Some(utf8_name(name));
@@ -446,7 +481,7 @@ fn parse_extra(bytes: &[u8], extra: &mut Extra) {
                 }
             }
             0x06 => {
-                let flags = d.vint().unwrap_or(0);
+                let flags = read_vint(&mut d).unwrap_or(0);
                 if flags & 0x0001 != 0 {
                     extra.uname = read_counted_str(&mut d);
                 }
@@ -454,10 +489,10 @@ fn parse_extra(bytes: &[u8], extra: &mut Extra) {
                     extra.gname = read_counted_str(&mut d);
                 }
                 if flags & 0x0004 != 0 {
-                    extra.uid = d.vint();
+                    extra.uid = read_vint(&mut d);
                 }
                 if flags & 0x0008 != 0 {
-                    extra.gid = d.vint();
+                    extra.gid = read_vint(&mut d);
                 }
             }
             0x07 => extra.service_data = Some(data.to_vec()),
@@ -467,7 +502,7 @@ fn parse_extra(bytes: &[u8], extra: &mut Extra) {
 }
 
 fn read_counted_str(inp: &mut Reader<'_>) -> Option<String> {
-    let n = inp.vsize()?;
+    let n = read_vsize(inp)?;
     if n > MAX_NAME {
         return None;
     }
@@ -477,7 +512,9 @@ fn read_counted_str(inp: &mut Reader<'_>) -> Option<String> {
 fn parse_main_extra(bytes: &[u8], ar: &mut Archive) {
     let mut inp = Reader::new(bytes);
     while inp.remaining() > 0 {
-        let Some(size) = inp.vsize() else { break };
+        let Some(size) = read_vsize(&mut inp) else {
+            break;
+        };
         let start = inp.pos();
         let Some(end) = start.checked_add(size) else {
             break;
@@ -485,7 +522,9 @@ fn parse_main_extra(bytes: &[u8], ar: &mut Archive) {
         if end > bytes.len() {
             break;
         }
-        let Some(typ) = inp.vint() else { break };
+        let Some(typ) = read_vint(&mut inp) else {
+            break;
+        };
         let data = bytes.get(inp.pos().min(end)..end).unwrap_or_default();
         inp = Reader::at(bytes, end);
         ar.extra_field_size = ar.extra_field_size.saturating_add(size as u64);
@@ -493,25 +532,22 @@ fn parse_main_extra(bytes: &[u8], ar: &mut Archive) {
         let mut d = Reader::new(data);
         match typ {
             0x01 => {
-                let flags = d.vint().unwrap_or(0);
+                let flags = read_vint(&mut d).unwrap_or(0);
                 if flags & 0x0001 != 0 {
-                    ar.locator_qo = d.vint();
+                    ar.locator_qo = read_vint(&mut d);
                 }
                 if flags & 0x0002 != 0 {
-                    ar.locator_rr = d.vint();
+                    ar.locator_rr = read_vint(&mut d);
                 }
             }
             0x02 => {
-                let flags = d.vint().unwrap_or(0);
-                if flags & 0x0001 != 0 {
-                    if let Some(nlen) = d.vint() {
-                        let n = sat_usize(nlen).min(MAX_NAME);
-                        if let Some(name) = d.bytes(n) {
-                            if name.first() != Some(&0) {
-                                ar.original_name = Some(utf8_name(name));
-                            }
-                        }
-                    }
+                let flags = read_vint(&mut d).unwrap_or(0);
+                if flags & 0x0001 != 0
+                    && let Some(nlen) = read_vint(&mut d)
+                    && let Some(name) = d.bytes(sat_usize(nlen).min(MAX_NAME))
+                    && name.first() != Some(&0)
+                {
+                    ar.original_name = Some(utf8_name(name));
                 }
                 if flags & 0x0002 != 0 {
                     // Unlike the File-time extra record (type 0x03), the
@@ -522,7 +558,7 @@ fn parse_main_extra(bytes: &[u8], ar: &mut Archive) {
                     ar.created_unix = if flags & 0x0004 != 0 {
                         d.u32_le().map(i64::from)
                     } else {
-                        d.u64_le().and_then(filetime_to_unix)
+                        d.u64_le().map(crate::time::filetime_to_unix)
                     };
                 }
             }
@@ -556,12 +592,10 @@ fn apply_attrs(member: &mut Member, attrs: u32, unix: bool) {
     }
 }
 
-fn finish_file(ar: &mut Archive, mut member: Member, extra: Extra, service: bool, name: &str) {
+fn finish_file(ar: &mut Archive, mut member: Member, extra: Extra, service: bool) {
     ar.unknown_extra = ar.unknown_extra.saturating_add(extra.unknown);
     ar.extra_field_size = ar.extra_field_size.saturating_add(extra.bytes);
-    for t in &extra.types {
-        ar.extra_types.insert(*t);
-    }
+    ar.extra_types.extend(&extra.types);
     if extra.encrypted {
         member.encrypted = true;
         member.kdf_count = extra.kdf_count;
@@ -583,10 +617,7 @@ fn finish_file(ar: &mut Archive, mut member: Member, extra: Extra, service: bool
     if extra.linkname.is_some() {
         member.linkname.clone_from(&extra.linkname);
         member.redir_type = extra.redir_type;
-        if extra
-            .redir_type
-            .is_some_and(|t| t.contains("symlink") || t == "hard-link")
-        {
+        if extra.redir_type.is_some_and(Redirect::is_link) {
             member.entry_type = if extra.link_is_dir {
                 EntryType::Directory
             } else {
@@ -601,8 +632,8 @@ fn finish_file(ar: &mut Archive, mut member: Member, extra: Extra, service: bool
     member.extra_types = extra.types;
 
     if service {
-        ar.services.push(name.to_string());
-        match name {
+        ar.services.push(member.path.clone());
+        match member.path.as_str() {
             "CMT" => {
                 ar.comment_packed = member.method.as_deref() != Some("stored");
             }
@@ -630,8 +661,7 @@ fn finish_file(ar: &mut Archive, mut member: Member, extra: Extra, service: bool
                 if ar.streams_capped || cost > MAX_PATH_BYTES - ar.stream_path_bytes {
                     if !ar.streams_capped {
                         ar.streams_capped = true;
-                        limit(
-                            ar,
+                        ar.limits.push(
                             "stream-path-budget",
                             format!("NTFS stream paths exceeded {MAX_PATH_BYTES} bytes"),
                         );
@@ -671,8 +701,7 @@ fn push_member(ar: &mut Archive, member: Member) {
     if ar.members.len() >= MAX_ARCHIVE_MEMBERS {
         if !ar.members_capped {
             ar.members_capped = true;
-            limit(
-                ar,
+            ar.limits.push(
                 "member-cap",
                 format!("stopped at {MAX_ARCHIVE_MEMBERS} members"),
             );
@@ -693,39 +722,43 @@ fn walk_rar5(bytes: &[u8], start: usize, ar: &mut Archive) {
         }
         let header_off = inp.pos() as u64;
         let Some(stored_crc) = inp.u32_le() else {
-            limit(ar, "header", "truncated CRC");
+            ar.limits.push("header", "truncated CRC");
             break;
         };
         let size_at = inp.pos();
-        let Some(header_size) = inp.vsize() else {
-            limit(ar, "header", "truncated header size");
+        let Some(header_size) = read_vsize(&mut inp) else {
+            ar.limits.push("header", "truncated header size");
             break;
         };
         if header_size == 0 || header_size > MAX_HEADER {
-            limit(ar, "header", "header size out of range");
+            ar.limits.push("header", "header size out of range");
             break;
         }
         let type_at = inp.pos();
         let Some(rest_end) = type_at.checked_add(header_size) else {
-            limit(ar, "header", "header size overflow");
+            ar.limits.push("header", "header size overflow");
             break;
         };
         let Some(crc_slice) = bytes.get(size_at..rest_end) else {
-            limit(ar, "header", "header overruns file");
+            ar.limits.push("header", "header overruns file");
             break;
         };
         if crc32fast::hash(crc_slice) != stored_crc {
             ar.header_crc_mismatch += 1;
         }
-        let Some(htype) = inp.vint() else { break };
-        let Some(hflags) = inp.vint() else { break };
+        let Some(htype) = read_vint(&mut inp) else {
+            break;
+        };
+        let Some(hflags) = read_vint(&mut inp) else {
+            break;
+        };
         let extra_size = if hflags & HFL_EXTRA != 0 {
-            inp.vsize().unwrap_or(0)
+            read_vsize(&mut inp).unwrap_or(0)
         } else {
             0
         };
         let data_size = if hflags & HFL_DATA != 0 {
-            inp.vint()
+            read_vint(&mut inp)
         } else {
             None
         };
@@ -736,21 +769,22 @@ fn walk_rar5(bytes: &[u8], start: usize, ar: &mut Archive) {
         match htype {
             HEAD5_CRYPT => {
                 ar.headers_encrypted = true;
-                ar.crypt_version = inp.vint();
-                let _flags = inp.vint();
+                ar.crypt_version = read_vint(&mut inp);
+                let _flags = read_vint(&mut inp);
                 ar.kdf_count = inp.u8();
-                limit(ar, "headers-encrypted", "remaining headers are AES-256");
+                ar.limits
+                    .push("headers-encrypted", "remaining headers are AES-256");
                 ar.end_offset = rest_end as u64;
                 return;
             }
             HEAD5_MAIN => {
-                let aflags = inp.vint().unwrap_or(0);
+                let aflags = read_vint(&mut inp).unwrap_or(0);
                 ar.volume = aflags & MHD_VOLUME != 0;
                 ar.solid = aflags & MHD_SOLID != 0;
                 ar.recovery = aflags & MHD_RECOVERY != 0;
                 ar.locked = aflags & MHD_LOCKED != 0;
                 if aflags & MHD_VOLNUM != 0 {
-                    ar.volume_number = inp.vint();
+                    ar.volume_number = read_vint(&mut inp);
                 }
                 if extra_size > 0 {
                     let extra_at = rest_end.saturating_sub(extra_size);
@@ -763,31 +797,31 @@ fn walk_rar5(bytes: &[u8], start: usize, ar: &mut Archive) {
             }
             HEAD5_FILE | HEAD5_SERVICE => {
                 let service = htype == HEAD5_SERVICE;
-                let file_flags = inp.vint().unwrap_or(0);
-                let unpacked = inp.vint().unwrap_or(0);
-                let attrs = (inp.vint().unwrap_or(0) & 0xffff_ffff) as u32;
-                let mut mtime = None;
-                if file_flags & LHFL_UTIME != 0 {
-                    mtime = inp.u32_le().map(i64::from);
-                }
+                let file_flags = read_vint(&mut inp).unwrap_or(0);
+                let unpacked = read_vint(&mut inp).unwrap_or(0);
+                let attrs = (read_vint(&mut inp).unwrap_or(0) & 0xffff_ffff) as u32;
+                let mtime = if file_flags & LHFL_UTIME != 0 {
+                    inp.u32_le().map(i64::from)
+                } else {
+                    None
+                };
                 let crc = if file_flags & LHFL_CRC32 != 0 {
                     inp.u32_le()
                 } else {
                     None
                 };
-                let comp = inp.vint().unwrap_or(0);
-                let host = inp.vint().unwrap_or(0);
-                let nlen = inp.vsize().unwrap_or(0);
+                let comp = read_vint(&mut inp).unwrap_or(0);
+                let host = read_vint(&mut inp).unwrap_or(0);
+                let nlen = read_vsize(&mut inp).unwrap_or(0);
                 if nlen > MAX_NAME {
-                    limit(ar, "name", "name longer than cap");
+                    ar.limits.push("name", "name longer than cap");
                     inp = Reader::at(bytes, rest_end);
                     if let Some(ds) = data_size {
                         skip_data(&mut inp, ar, ds);
                     }
                     continue;
                 }
-                let name_bytes = inp.bytes(nlen).unwrap_or(&[]);
-                let name = utf8_name(name_bytes);
+                let name = utf8_name(inp.bytes(nlen).unwrap_or(&[]));
                 let mut extra = Extra::default();
                 if extra_size > 0 {
                     let extra_at = rest_end.saturating_sub(extra_size);
@@ -801,59 +835,37 @@ fn walk_rar5(bytes: &[u8], start: usize, ar: &mut Archive) {
                 if unpack_ver >= 1 {
                     ar.v1_comp += 1;
                 }
-                ar.unpack_min = Some(ar.unpack_min.map_or(unpack_ver, |m| m.min(unpack_ver)));
-                ar.unpack_max = Some(ar.unpack_max.map_or(unpack_ver, |m| m.max(unpack_ver)));
-                let method = method5((comp >> 7) & 7);
-                let solid = comp & 0x40 != 0;
+                ar.note_unpack_version(unpack_ver);
+                let size_unknown = file_flags & LHFL_UNPUNKNOWN != 0;
+                let entry_type = if file_flags & LHFL_DIRECTORY != 0 {
+                    EntryType::Directory
+                } else {
+                    EntryType::Regular
+                };
                 let mut member = Member {
-                    path: name.clone(),
-                    size_bytes: if file_flags & LHFL_UNPUNKNOWN != 0 {
-                        0
-                    } else {
-                        unpacked
-                    },
                     packed: data_size,
-                    entry_type: if file_flags & LHFL_DIRECTORY != 0 {
-                        EntryType::Directory
-                    } else {
-                        EntryType::Regular
-                    },
                     mtime,
-                    ctime: None,
-                    atime: None,
-                    encrypted: false,
-                    method: Some(method),
+                    method: Some(method5((comp >> 7) & 7)),
                     dict_size: Some(dict_size(comp)),
                     host_os: Some(host5(host)),
                     crc32: crc,
-                    blake2: None,
                     split_before: hflags & HFL_SPLIT_BEFORE != 0,
                     split_after: hflags & HFL_SPLIT_AFTER != 0,
-                    solid,
-                    hidden: false,
-                    system: false,
-                    read_only: false,
-                    linkname: None,
-                    redir_type: None,
-                    file_version: None,
-                    extra_types: Vec::new(),
-                    header_off,
+                    solid: comp & 0x40 != 0,
                     data_off: data_size.map(|_| rest_end as u64),
-                    mode_octal: None,
-                    uid: None,
-                    gid: None,
-                    uname: None,
-                    gname: None,
-                    windows_attrs: None,
-                    kdf_count: None,
-                    tweaked_checksums: false,
                     unpack_version: Some(unpack_ver),
-                    size_unknown: file_flags & LHFL_UNPUNKNOWN != 0,
+                    size_unknown,
+                    ..Member::new(
+                        name,
+                        if size_unknown { 0 } else { unpacked },
+                        entry_type,
+                        header_off,
+                    )
                 };
                 apply_attrs(&mut member, attrs, host == 1);
                 inp = Reader::at(bytes, rest_end);
                 if let Some(ds) = data_size {
-                    if name == "CMT"
+                    if member.path == "CMT"
                         && member.method.as_deref() == Some("stored")
                         && let Some(body) = inp.bytes(sat_usize(ds))
                     {
@@ -862,12 +874,12 @@ fn walk_rar5(bytes: &[u8], start: usize, ar: &mut Archive) {
                         skip_data(&mut inp, ar, ds);
                     }
                 }
-                finish_file(ar, member, extra, service, &name);
+                finish_file(ar, member, extra, service);
                 continue;
             }
             HEAD5_END => {
                 ar.end_present = true;
-                let eflags = inp.vint().unwrap_or(0);
+                let eflags = read_vint(&mut inp).unwrap_or(0);
                 ar.not_last_volume = eflags & 0x0001 != 0;
                 ar.end_offset = rest_end as u64;
                 inp = Reader::at(bytes, rest_end);
@@ -880,7 +892,7 @@ fn walk_rar5(bytes: &[u8], start: usize, ar: &mut Archive) {
             _ => {
                 ar.unknown_header += 1;
                 if hflags & HFL_SKIP_UNKNOWN == 0 && extra_size == 0 && data_size.is_none() {
-                    limit(ar, "unknown-header", format!("type {htype}"));
+                    ar.limits.push("unknown-header", format!("type {htype}"));
                     ar.end_offset = rest_end as u64;
                     return;
                 }
@@ -894,52 +906,40 @@ fn walk_rar5(bytes: &[u8], start: usize, ar: &mut Archive) {
     }
 }
 
-fn decode_rar4_unicode(ascii: &[u8], enc: &[u8]) -> Option<String> {
-    if enc.is_empty() {
-        return None;
-    }
-    let mut enc_pos = 0usize;
-    let high = u16::from(*enc.get(enc_pos)?);
-    enc_pos += 1;
-    let mut flags = 0u8;
-    let mut flag_bits = 0i32;
+/// Decode the Unicode form of a RAR4 name exactly as unrar does. `raw` is
+/// the whole stored name field and `enc` its encoded part, after the ASCII
+/// name's NUL. Each literal spends at least one byte of `enc`, and a run
+/// copies from `raw` and stops at its end, so the name is never longer than
+/// the field. An operation cut short by the end of `enc` is skipped, as
+/// unrar skips it.
+fn decode_rar4_unicode(raw: &[u8], enc: &[u8]) -> Option<String> {
+    let mut inp = Reader::new(enc);
+    let high = u16::from(inp.u8().unwrap_or(0)) << 8;
+    let (mut flags, mut flag_bits) = (0u8, 0u8);
     let mut out: Vec<u16> = Vec::new();
-    while enc_pos < enc.len() && out.len() < MAX_NAME {
+    while inp.remaining() > 0 {
         if flag_bits == 0 {
-            flags = *enc.get(enc_pos)?;
-            enc_pos += 1;
+            flags = inp.u8()?;
             flag_bits = 8;
         }
         match flags >> 6 {
-            0 => {
-                out.push(u16::from(*enc.get(enc_pos)?));
-                enc_pos += 1;
-            }
-            1 => {
-                out.push(u16::from(*enc.get(enc_pos)?) + (high << 8));
-                enc_pos += 1;
-            }
-            2 => {
-                let lo = u16::from(*enc.get(enc_pos)?);
-                let hi = u16::from(*enc.get(enc_pos + 1)?);
-                out.push(lo + (hi << 8));
-                enc_pos += 2;
-            }
+            0 => out.extend(inp.u8().map(u16::from)),
+            1 => out.extend(inp.u8().map(|b| u16::from(b) | high)),
+            2 if inp.remaining() >= 2 => out.extend(inp.u16_le()),
+            2 => {}
             _ => {
-                let b = *enc.get(enc_pos)?;
-                enc_pos += 1;
-                let length = usize::from(b & 0x7f) + 2;
-                if b & 0x80 != 0 {
-                    for _ in 0..length {
-                        let add = u16::from(*enc.get(enc_pos)?);
-                        enc_pos += 1;
-                        let src = u16::from(ascii.get(out.len()).copied().unwrap_or(0));
-                        out.push(((src + high) << 8) + add);
-                    }
-                } else {
-                    for _ in 0..length {
-                        let src = ascii.get(out.len()).copied().unwrap_or(0);
-                        out.push(u16::from(src));
+                if let Some(run) = inp.u8() {
+                    let length = usize::from(run & 0x7f) + 2;
+                    let source = raw.get(out.len()..).unwrap_or_default();
+                    let source = source.get(..length).unwrap_or(source);
+                    if run & 0x80 == 0 {
+                        out.extend(source.iter().map(|&b| u16::from(b)));
+                    } else if let Some(correction) = inp.u8() {
+                        out.extend(
+                            source
+                                .iter()
+                                .map(|&b| u16::from(b.wrapping_add(correction)) | high),
+                        );
                     }
                 }
             }
@@ -958,12 +958,9 @@ fn rar4_name(raw: &[u8], unicode: bool) -> String {
         // An ASCII name, a NUL, then the encoded Unicode form.
         let mut parts = raw.splitn(2, |&b| b == 0);
         if let (Some(ascii), Some(enc)) = (parts.next(), parts.next()) {
-            if let Some(decoded) = decode_rar4_unicode(ascii, enc) {
-                if !decoded.is_empty() {
-                    return decoded;
-                }
-            }
-            return utf8_name(ascii);
+            return decode_rar4_unicode(raw, enc)
+                .filter(|decoded| !decoded.is_empty())
+                .unwrap_or_else(|| utf8_name(ascii));
         }
     }
     utf8_name(raw)
@@ -984,7 +981,7 @@ fn walk_rar4(bytes: &[u8], start: usize, ar: &mut Archive) {
         let Some(hflags) = inp.u16_le() else { break };
         let Some(head_size) = inp.u16_le() else { break };
         if head_size < 7 {
-            limit(ar, "header", "RAR4 header smaller than 7");
+            ar.limits.push("header", "RAR4 header smaller than 7");
             break;
         }
         let Some(header_end) = block_start.checked_add(usize::from(head_size)) else {
@@ -992,7 +989,7 @@ fn walk_rar4(bytes: &[u8], start: usize, ar: &mut Archive) {
         };
         // The CRC covers the header after its own two bytes.
         let Some(crc_of) = bytes.get(block_start + 2..header_end) else {
-            limit(ar, "header", "RAR4 header overruns file");
+            ar.limits.push("header", "RAR4 header overruns file");
             break;
         };
         if (crc32fast::hash(crc_of) & 0xffff) as u16 != stored_crc {
@@ -1018,7 +1015,7 @@ fn walk_rar4(bytes: &[u8], start: usize, ar: &mut Archive) {
                     ar.comment_packed = true;
                 }
                 if ar.headers_encrypted {
-                    limit(ar, "headers-encrypted", "RAR4 header password");
+                    ar.limits.push("headers-encrypted", "RAR4 header password");
                     ar.end_offset = header_end as u64;
                     return;
                 }
@@ -1032,7 +1029,7 @@ fn walk_rar4(bytes: &[u8], start: usize, ar: &mut Archive) {
                 let ftime = inp.u32_le();
                 let unp_ver = inp.u8().unwrap_or(0);
                 let method = inp.u8().unwrap_or(0x30);
-                let name_size = inp.u16_le().unwrap_or(0) as usize;
+                let name_size = usize::from(inp.u16_le().unwrap_or(0));
                 let attrs = inp.u32_le().unwrap_or(0);
                 let mut pack = u64::from(pack_lo);
                 let mut unp = u64::from(unp_lo);
@@ -1041,7 +1038,7 @@ fn walk_rar4(bytes: &[u8], start: usize, ar: &mut Archive) {
                     unp |= u64::from(inp.u32_le().unwrap_or(0)) << 32;
                 }
                 if name_size > MAX_NAME {
-                    limit(ar, "name", "RAR4 name longer than cap");
+                    ar.limits.push("name", "RAR4 name longer than cap");
                     inp = Reader::at(bytes, header_end);
                     skip_data(&mut inp, ar, pack);
                     continue;
@@ -1056,71 +1053,45 @@ fn walk_rar4(bytes: &[u8], start: usize, ar: &mut Archive) {
                 if hflags & R4_LHD_EXTTIME != 0 && inp.pos() + 2 <= header_end {
                     skip_rar4_exttime(&mut inp, header_end);
                 }
-                ar.unpack_min = Some(
-                    ar.unpack_min
-                        .map_or(u64::from(unp_ver), |m| m.min(u64::from(unp_ver))),
-                );
-                ar.unpack_max = Some(
-                    ar.unpack_max
-                        .map_or(u64::from(unp_ver), |m| m.max(u64::from(unp_ver))),
-                );
+                ar.note_unpack_version(u64::from(unp_ver));
+                let entry_type = if hflags & R4_LHD_WINDOWDIR == R4_LHD_WINDOWDIR {
+                    EntryType::Directory
+                } else {
+                    EntryType::Regular
+                };
                 let mut member = Member {
-                    path: name.clone(),
-                    size_bytes: unp,
                     packed: Some(pack),
-                    entry_type: if hflags & R4_LHD_WINDOWDIR == R4_LHD_WINDOWDIR {
-                        EntryType::Directory
-                    } else {
-                        EntryType::Regular
-                    },
-                    mtime: ftime.and_then(dos_to_unix),
-                    ctime: None,
-                    atime: None,
+                    // The DOS time sits in the low half, the date in the high.
+                    mtime: ftime.and_then(|ft| {
+                        let [t0, t1, d0, d1] = ft.to_le_bytes();
+                        let (date, time) =
+                            (u16::from_le_bytes([d0, d1]), u16::from_le_bytes([t0, t1]));
+                        crate::time::dos_datetime_to_unix(date, time)
+                    }),
                     encrypted: hflags & R4_LHD_PASSWORD != 0,
                     // RAR4 stores the method as 0x30 ("0") + the RAR5-style
                     // method number, so shift it back before the shared lookup.
                     method: Some(method5(u64::from(method.saturating_sub(0x30)))),
-                    dict_size: None,
                     host_os: Some(host4(host)),
                     crc32: crc,
-                    blake2: None,
                     split_before: hflags & R4_LHD_SPLIT_BEFORE != 0,
                     split_after: hflags & R4_LHD_SPLIT_AFTER != 0,
                     solid: hflags & R4_LHD_SOLID != 0,
-                    hidden: false,
-                    system: false,
-                    read_only: false,
-                    linkname: None,
-                    redir_type: None,
-                    file_version: if hflags & R4_LHD_VERSION != 0 {
-                        Some(0)
-                    } else {
-                        None
-                    },
-                    extra_types: Vec::new(),
-                    header_off,
+                    file_version: (hflags & R4_LHD_VERSION != 0).then_some(0),
                     data_off: Some(header_end as u64),
-                    mode_octal: None,
-                    uid: None,
-                    gid: None,
-                    uname: None,
-                    gname: None,
-                    windows_attrs: None,
-                    kdf_count: None,
-                    tweaked_checksums: false,
                     unpack_version: Some(u64::from(unp_ver)),
-                    size_unknown: false,
+                    ..Member::new(name, unp, entry_type, header_off)
                 };
                 apply_attrs(&mut member, attrs, host == 3);
                 inp = Reader::at(bytes, header_end);
-                if service && name == "CMT" && method == 0x30 {
+                if service && member.path == "CMT" && method == 0x30 {
                     if let Some(body) = inp.bytes(sat_usize(pack).min(inp.remaining())) {
                         ar.comment = Some(utf8_name(body));
                     }
                 } else {
                     skip_data(&mut inp, ar, pack);
                 }
-                finish_file(ar, member, Extra::default(), service, &name);
+                finish_file(ar, member, Extra::default(), service);
                 continue;
             }
             R4_END => {
@@ -1132,17 +1103,16 @@ fn walk_rar4(bytes: &[u8], start: usize, ar: &mut Archive) {
             _ => {
                 ar.unknown_header += 1;
                 if hflags & R4_SKIP_UNKNOWN == 0 && hflags & R4_LONG_BLOCK == 0 {
-                    limit(ar, "unknown-header", format!("RAR4 type 0x{htype:02x}"));
+                    ar.limits
+                        .push("unknown-header", format!("RAR4 type 0x{htype:02x}"));
                     ar.end_offset = header_end as u64;
                     return;
                 }
             }
         }
+        // A long block's ADD_SIZE data is part of HEAD_SIZE for MAIN; file
+        // headers skip their packed data in their own arm.
         inp = Reader::at(bytes, header_end);
-        if hflags & R4_LONG_BLOCK != 0 {
-            // ADD_SIZE was already consumed as part of HEAD_SIZE for MAIN;
-            // file headers skip packed data in their own arm.
-        }
         ar.end_offset = inp.pos() as u64;
     }
 }
@@ -1200,7 +1170,7 @@ fn split_member(m: Member) -> (ArchiveMember, JsonMap<String, JsonValue>) {
         }
     }
     if let Some(t) = m.redir_type {
-        rar_keys.insert("redir_type".into(), JsonValue::String(t.into()));
+        rar_keys.insert("redir_type".into(), JsonValue::String(t.as_str().into()));
     }
     if let Some(v) = m.file_version {
         insert_num(&mut rar_keys, "file_version", v);
@@ -1315,19 +1285,16 @@ fn emit(
     if let Some(n) = ar.volume_number {
         values.insert_key(value_key!("rar.volume_number"), JsonValue::Number(n.into()));
     }
-    if let Some(ref name) = ar.original_name {
-        values.insert_key(
-            value_key!("rar.original_name"),
-            JsonValue::String(name.clone()),
-        );
+    if let Some(name) = ar.original_name.take() {
+        values.insert_key(value_key!("rar.original_name"), JsonValue::String(name));
     }
     if let Some(t) = ar.created_unix {
         values.insert_key(value_key!("rar.created_unix"), JsonValue::Number(t.into()));
     }
-    if let Some(ref c) = ar.comment {
-        values.insert_key(value_key!("rar.comment"), JsonValue::String(c.clone()));
+    if let Some(c) = ar.comment.take() {
         metrics.insert(metric!("archive.has_comment"), 1.0);
         metrics.insert(metric!("archive.comment_size"), c.len() as f64);
+        values.insert_key(value_key!("rar.comment"), JsonValue::String(c));
     } else if ar.comment_packed {
         values.insert_key(value_key!("rar.comment_packed"), JsonValue::Bool(true));
         metrics.insert(metric!("archive.has_comment"), 1.0);
@@ -1361,21 +1328,19 @@ fn emit(
         }
         values.insert_key(value_key!("rar.locator"), JsonValue::Object(loc));
     }
-    if !ar.services.is_empty() {
+    let service_count = ar.services.len();
+    if service_count > 0 {
+        let services = std::mem::take(&mut ar.services);
         values.insert_key(
             value_key!("rar.services"),
-            JsonValue::Array(
-                ar.services
-                    .iter()
-                    .map(|s| JsonValue::String(s.clone()))
-                    .collect(),
-            ),
+            JsonValue::Array(services.into_iter().map(JsonValue::String).collect()),
         );
     }
-    if !ar.streams.is_empty() {
+    let stream_count = ar.streams.len();
+    if stream_count > 0 {
         values.insert_key(
             value_key!("rar.ntfs_streams"),
-            JsonValue::Array(ar.streams.clone()),
+            JsonValue::Array(std::mem::take(&mut ar.streams)),
         );
     }
     if !ar.extra_types.is_empty() {
@@ -1390,7 +1355,7 @@ fn emit(
         );
     }
     std::mem::take(&mut ar.limits).emit(values, value_key!("rar.limits"));
-    if let (Some(min), Some(max)) = (ar.unpack_min, ar.unpack_max) {
+    if let Some((min, max)) = ar.unpack_range {
         values.insert_key(
             value_key!("rar.unpack_version.min"),
             JsonValue::Number(min.into()),
@@ -1461,16 +1426,13 @@ fn emit(
     metrics.insert(metric!("rar.unknown_extra_count"), ar.unknown_extra as f64);
     metrics.insert(metric!("rar.blake2_count"), ar.blake2 as f64);
     metrics.insert(metric!("rar.acl_count"), ar.acl as f64);
-    metrics.insert(metric!("rar.ntfs_stream_count"), ar.streams.len() as f64);
+    metrics.insert(metric!("rar.ntfs_stream_count"), stream_count as f64);
     metrics.insert(metric!("rar.file_version_count"), ar.file_version as f64);
     metrics.insert(metric!("rar.split_count"), ar.split as f64);
     metrics.insert(metric!("rar.child_header_count"), ar.child as f64);
     metrics.insert(metric!("rar.mapped_unix_name_count"), ar.mapped_unix as f64);
     metrics.insert(metric!("rar.v1_compression_count"), ar.v1_comp as f64);
-    metrics.insert(
-        metric!("rar.service_header_count"),
-        ar.services.len() as f64,
-    );
+    metrics.insert(metric!("rar.service_header_count"), service_count as f64);
     if ar.quick_open_size > 0 {
         metrics.insert(metric!("rar.quick_open_size"), ar.quick_open_size as f64);
     }
@@ -1494,7 +1456,7 @@ pub(super) fn extract(
         end_offset: sig_at as u64,
         ..Archive::default()
     };
-    let after_sig = sig_at + if version == 5 { 8 } else { 7 };
+    let after_sig = sig_at + if version == 5 { SIG5.len() } else { SIG4.len() };
     if version == 5 {
         walk_rar5(bytes, after_sig, &mut ar);
     } else {

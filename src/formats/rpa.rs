@@ -6,14 +6,16 @@
 //! imports Python globals or constructs Python objects.
 
 use std::collections::HashMap;
-use std::io::{Cursor, Read};
+use std::io::Cursor;
 
 use flate2::bufread::ZlibDecoder;
 use serde_json::{Value as JsonValue, json};
 use sha2::Digest;
 
 use super::archive_stats::{Agg, ArchiveStats, Reading, Scope, member_value};
+use super::bounded::{MAX_ARCHIVE_MEMBERS, OnError, inflate_capped};
 use super::common::hex_encode;
+use super::pickle::ops::{self, Arg};
 use crate::error::Error;
 use crate::output::{ArchiveCompression, ArchiveMember, EntryType, Metrics, Values};
 use crate::scan::entropy::shannon;
@@ -24,10 +26,10 @@ fn sha256(bytes: &[u8]) -> String {
 }
 
 const MAX_INDEX_BYTES: usize = 32 * 1024 * 1024;
-const MAX_MEMBERS: usize = 65_536;
 const MAX_NODES: usize = 1_000_000;
 const MAX_STACK: usize = 1_000_000;
-const MAX_PATH_BYTES: usize = 4 * 1024;
+/// Bytes of one member path; a longer one marks the index as forged.
+const MAX_MEMBER_PATH_BYTES: usize = 4 * 1024;
 
 /// Fixed RPA header fields, before interpreting the compressed index.
 #[derive(Debug, Clone, Copy)]
@@ -82,7 +84,6 @@ pub fn members(bytes: &[u8]) -> Result<Vec<Member>, Error> {
 }
 
 /// Decoded index and forensic properties of its compressed pickle stream.
-#[derive(Debug, Clone)]
 struct Index {
     /// Members in index order, after Python dictionary overwrite semantics.
     members: Vec<Member>,
@@ -166,7 +167,6 @@ fn parse_header(bytes: &[u8]) -> Result<Header, Error> {
     })
 }
 
-#[derive(Clone)]
 enum Node {
     Mark,
     Null,
@@ -206,54 +206,6 @@ impl<'a> Pickle<'a> {
         }
     }
 
-    fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
-        let end = self
-            .pos
-            .checked_add(n)
-            .ok_or_else(|| bad("pickle offset overflow"))?;
-        let part = self
-            .bytes
-            .get(self.pos..end)
-            .ok_or_else(|| bad("truncated pickle"))?;
-        self.pos = end;
-        Ok(part)
-    }
-
-    fn byte(&mut self) -> Result<u8, Error> {
-        self.take(1)?
-            .first()
-            .copied()
-            .ok_or_else(|| bad("truncated pickle"))
-    }
-    fn le32(&mut self) -> Result<u32, Error> {
-        Ok(u32::from_le_bytes(
-            self.take(4)?
-                .try_into()
-                .map_err(|_| bad("truncated integer"))?,
-        ))
-    }
-    fn le64(&mut self) -> Result<u64, Error> {
-        Ok(u64::from_le_bytes(
-            self.take(8)?
-                .try_into()
-                .map_err(|_| bad("truncated integer"))?,
-        ))
-    }
-
-    fn line(&mut self) -> Result<&'a [u8], Error> {
-        let rest = self
-            .bytes
-            .get(self.pos..)
-            .ok_or_else(|| bad("truncated pickle"))?;
-        let len = rest
-            .iter()
-            .position(|b| *b == b'\n')
-            .ok_or_else(|| bad("unterminated pickle line"))?;
-        let line = self.take(len)?;
-        self.take(1)?;
-        Ok(line)
-    }
-
     fn node(&mut self, node: Node) -> Result<usize, Error> {
         if self.nodes.len() >= MAX_NODES {
             return Err(bad("pickle node limit exceeded"));
@@ -276,21 +228,31 @@ impl<'a> Pickle<'a> {
         self.push(id)
     }
 
+    fn node_mut(&mut self, id: usize) -> Result<&mut Node, Error> {
+        self.nodes
+            .get_mut(id)
+            .ok_or_else(|| bad("invalid pickle node"))
+    }
+
+    fn is_mark(&self, id: usize) -> Result<bool, Error> {
+        let node = self
+            .nodes
+            .get(id)
+            .ok_or_else(|| bad("invalid pickle node"))?;
+        Ok(matches!(node, Node::Mark))
+    }
+
     fn pop(&mut self) -> Result<usize, Error> {
         let id = self
             .stack
             .pop()
             .ok_or_else(|| bad("pickle stack underflow"))?;
-        if matches!(
-            self.nodes
-                .get(id)
-                .ok_or_else(|| bad("invalid pickle node"))?,
-            Node::Mark
-        ) {
+        if self.is_mark(id)? {
             self.marks.pop();
         }
         Ok(id)
     }
+
     fn top(&self) -> Result<usize, Error> {
         self.stack
             .last()
@@ -303,6 +265,9 @@ impl<'a> Pickle<'a> {
             .marks
             .last()
             .ok_or_else(|| bad("missing pickle MARK"))?;
+        if mark >= self.stack.len() {
+            return Err(bad("pickle MARK outside the stack"));
+        }
         let items = self.stack.split_off(mark + 1);
         self.pop()?;
         Ok(items)
@@ -313,12 +278,7 @@ impl<'a> Pickle<'a> {
             return Err(bad("pickle memo index exceeds limit"));
         }
         let id = self.top()?;
-        if matches!(
-            self.nodes
-                .get(id)
-                .ok_or_else(|| bad("invalid pickle node"))?,
-            Node::Mark
-        ) {
+        if self.is_mark(id)? {
             return Err(bad("cannot memoize MARK"));
         }
         self.memo.insert(n, id);
@@ -331,49 +291,43 @@ impl<'a> Pickle<'a> {
             .memo
             .get(&n)
             .ok_or_else(|| bad("missing pickle memo entry"))?;
-        if matches!(
-            self.nodes
-                .get(id)
-                .ok_or_else(|| bad("invalid pickle node"))?,
-            Node::Mark
-        ) {
+        if self.is_mark(id)? {
             return Err(bad("memo refers to MARK"));
         }
         self.push(id)
     }
 
-    fn bytes_node(&mut self, n: usize, unicode: bool) -> Result<(), Error> {
-        if n > MAX_INDEX_BYTES {
-            return Err(bad("pickle string exceeds limit"));
-        }
-        let bytes = self.take(n)?.to_vec();
-        self.add(if unicode {
-            Node::Text(bytes)
-        } else {
-            Node::Bytes(bytes)
-        })
-    }
-
     fn parse(mut self) -> Result<(Self, usize), Error> {
         loop {
-            let op = self.byte()?;
+            let (op, next) = ops::decode(self.bytes, self.pos).map_err(|e| match e {
+                ops::DecodeError::Truncated => bad("truncated pickle"),
+                ops::DecodeError::Unknown(code) => Error::malformed(
+                    "rpa",
+                    format!("unsupported or executable pickle opcode 0x{code:02x}"),
+                ),
+            })?;
+            self.pos = next;
             self.opcodes += 1;
             if self.opcodes > MAX_NODES {
                 return Err(bad("pickle opcode limit exceeded"));
             }
-            match op {
-                0x80 => {
-                    let version = self.byte()?;
+            // Each operand's width is the decoder's; only the integer ones
+            // need narrowing back to the opcode's own type.
+            let int = || match op.arg {
+                Arg::Int(n) => usize::try_from(n).map_err(|_| bad("pickle operand overflow")),
+                _ => Err(bad("missing pickle operand")),
+            };
+            match (op.code, op.arg) {
+                (0x80, Arg::Int(version)) => {
+                    let version =
+                        u8::try_from(version).map_err(|_| bad("unsupported pickle protocol"))?;
                     if version > 5 {
                         return Err(bad("unsupported pickle protocol"));
                     }
                     self.protocol = Some(version);
                 }
-                0x95 => {
-                    self.le64()?;
-                    self.frames += 1;
-                }
-                b'.' => {
+                (0x95, _) => self.frames += 1,
+                (b'.', _) => {
                     let root = self.pop()?;
                     if !self.stack.is_empty() {
                         return Err(bad("pickle stack has trailing values"));
@@ -383,199 +337,127 @@ impl<'a> Pickle<'a> {
                     }
                     return Ok((self, root));
                 }
-                b'(' => {
+                (b'(', _) => {
                     self.add(Node::Mark)?;
                     self.marks.push(self.stack.len() - 1);
                 }
-                b'N' => self.add(Node::Null)?,
-                b'}' => self.add(Node::Dict(Vec::new()))?,
-                b']' | b')' => self.add(Node::Seq(Vec::new()))?,
-                b'K' => {
-                    let n = self.byte()?;
-                    self.add(Node::Int(i128::from(n)))?;
+                (b'N', _) => self.add(Node::Null)?,
+                (b'}', _) => self.add(Node::Dict(Vec::new()))?,
+                (b']' | b')', _) => self.add(Node::Seq(Vec::new()))?,
+                (b'K' | b'M', Arg::Int(n)) => self.add(Node::Int(i128::from(n)))?,
+                (b'J', Arg::Int(n)) => {
+                    let n = u32::try_from(n).map_err(|_| bad("pickle operand overflow"))?;
+                    self.add(Node::Int(i128::from(n.cast_signed())))?;
                 }
-                b'M' => {
-                    let n = u16::from_le_bytes(
-                        self.take(2)?
-                            .try_into()
-                            .map_err(|_| bad("truncated integer"))?,
-                    );
-                    self.add(Node::Int(i128::from(n)))?;
-                }
-                b'J' => {
-                    let n = i32::from_le_bytes(
-                        self.take(4)?
-                            .try_into()
-                            .map_err(|_| bad("truncated integer"))?,
-                    );
-                    self.add(Node::Int(i128::from(n)))?;
-                }
-                b'I' | b'L' => {
-                    let line = self.line()?;
+                (b'I' | b'L', Arg::Line(line)) => {
                     let text = std::str::from_utf8(line)
                         .map_err(|_| bad("invalid pickle integer"))?
                         .trim_end_matches('L');
                     let n = text.parse().map_err(|_| bad("invalid pickle integer"))?;
                     self.add(Node::Int(n))?;
                 }
-                0x8a | 0x8b => {
-                    let len = if op == 0x8a {
-                        usize::from(self.byte()?)
-                    } else {
-                        self.le32()? as usize
-                    };
-                    if len > 16 {
+                (0x8a | 0x8b, Arg::Bytes(raw)) => {
+                    if raw.len() > 16 {
                         return Err(bad("pickle integer exceeds 128 bits"));
                     }
-                    let raw = self.take(len)?;
                     let mut bytes = [0u8; 16];
                     if raw.last().is_some_and(|b| b & 0x80 != 0) {
                         bytes.fill(0xff);
                     }
                     bytes
-                        .get_mut(..len)
+                        .get_mut(..raw.len())
                         .ok_or_else(|| bad("pickle integer exceeds 128 bits"))?
                         .copy_from_slice(raw);
                     self.add(Node::Int(i128::from_le_bytes(bytes)))?;
                 }
-                0x8c | b'U' | b'C' => {
-                    let len = usize::from(self.byte()?);
-                    self.bytes_node(len, op == 0x8c)?;
+                (0x8c | b'X' | 0x8d, Arg::Bytes(text)) => self.add(Node::Text(text.to_vec()))?,
+                (b'U' | b'C' | b'T' | b'B' | 0x8e, Arg::Bytes(bytes)) => {
+                    self.add(Node::Bytes(bytes.to_vec()))?;
                 }
-                b'X' | b'T' | b'B' => {
-                    let len = self.le32()? as usize;
-                    self.bytes_node(len, op == b'X')?;
-                }
-                0x8d | 0x8e => {
-                    let len = usize::try_from(self.le64()?)
-                        .map_err(|_| bad("pickle string length overflow"))?;
-                    self.bytes_node(len, op == 0x8d)?;
-                }
-                b'V' => {
-                    let bytes = self.line()?.to_vec();
-                    self.add(Node::Text(bytes))?;
-                }
-                b'S' => {
-                    let bytes = parse_quoted(self.line()?)?;
+                (b'V', Arg::Line(text)) => self.add(Node::Text(text.to_vec()))?,
+                (b'S', Arg::Line(line)) => {
+                    let bytes = parse_quoted(line)?;
                     self.add(Node::Bytes(bytes))?;
                 }
-                b'q' => {
-                    let n = usize::from(self.byte()?);
-                    self.put(n)?;
-                }
-                b'r' => {
-                    let n = self.le32()? as usize;
-                    self.put(n)?;
-                }
-                b'p' => {
-                    let n = parse_decimal(self.line()?)?;
-                    self.put(n)?;
-                }
-                b'h' => {
-                    let n = usize::from(self.byte()?);
-                    self.get(n)?;
-                }
-                b'j' => {
-                    let n = self.le32()? as usize;
-                    self.get(n)?;
-                }
-                b'g' => {
-                    let n = parse_decimal(self.line()?)?;
-                    self.get(n)?;
-                }
-                0x94 => {
+                (b'q' | b'r', _) => self.put(int()?)?,
+                (b'p', Arg::Line(line)) => self.put(parse_decimal(line)?)?,
+                (b'h' | b'j', _) => self.get(int()?)?,
+                (b'g', Arg::Line(line)) => self.get(parse_decimal(line)?)?,
+                (0x94, _) => {
                     let n = self.next_memo;
                     self.put(n)?;
                 }
-                b't' | b'l' | b'd' => {
+                (b't' | b'l' | b'd', _) => {
                     let items = self.after_mark()?;
-                    if op == b'd' {
+                    if op.code == b'd' {
                         self.add(Node::Dict(pairs(&items)?))?;
                     } else {
                         self.add(Node::Seq(items))?;
                     }
                 }
-                0x85..=0x87 => {
-                    let count = usize::from(op - 0x84);
-                    if self.stack.len() < count {
+                (0x85..=0x87, _) => {
+                    // A MARK starts a new stack in Python, so TUPLEn may not
+                    // reach below the innermost one.
+                    let count = usize::from(op.code - 0x84);
+                    let floor = self.marks.last().map_or(0, |&mark| mark + 1);
+                    if self.stack.len() < floor + count {
                         return Err(bad("pickle stack underflow"));
                     }
                     let items = self.stack.split_off(self.stack.len() - count);
                     self.add(Node::Seq(items))?;
                 }
-                b'a' => {
+                (b'a', _) => {
                     let item = self.pop()?;
                     let list = self.top()?;
-                    match self
-                        .nodes
-                        .get_mut(list)
-                        .ok_or_else(|| bad("invalid pickle node"))?
-                    {
+                    match self.node_mut(list)? {
                         Node::Seq(items) => items.push(item),
                         _ => return Err(bad("APPEND target is not a list")),
                     }
                 }
-                b'e' => {
+                (b'e', _) => {
                     let items = self.after_mark()?;
                     let list = self.top()?;
-                    match self
-                        .nodes
-                        .get_mut(list)
-                        .ok_or_else(|| bad("invalid pickle node"))?
-                    {
+                    match self.node_mut(list)? {
                         Node::Seq(seq) => seq.extend(items),
                         _ => return Err(bad("APPENDS target is not a list")),
                     }
                 }
-                b's' => {
+                (b's', _) => {
                     let value = self.pop()?;
                     let key = self.pop()?;
                     let dict = self.top()?;
-                    match self
-                        .nodes
-                        .get_mut(dict)
-                        .ok_or_else(|| bad("invalid pickle node"))?
-                    {
+                    match self.node_mut(dict)? {
                         Node::Dict(items) => items.push((key, value)),
                         _ => return Err(bad("SETITEM target is not a dict")),
                     }
                 }
-                b'u' => {
+                (b'u', _) => {
                     let items = pairs(&self.after_mark()?)?;
                     let dict = self.top()?;
-                    match self
-                        .nodes
-                        .get_mut(dict)
-                        .ok_or_else(|| bad("invalid pickle node"))?
-                    {
+                    match self.node_mut(dict)? {
                         Node::Dict(entries) => entries.extend(items),
                         _ => return Err(bad("SETITEMS target is not a dict")),
                     }
                 }
-                b'2' => {
+                (b'2', _) => {
                     let id = self.top()?;
-                    if matches!(
-                        self.nodes
-                            .get(id)
-                            .ok_or_else(|| bad("invalid pickle node"))?,
-                        Node::Mark
-                    ) {
+                    if self.is_mark(id)? {
                         return Err(bad("cannot duplicate MARK"));
                     }
                     self.push(id)?;
                 }
-                b'0' => {
+                (b'0', _) => {
                     self.pop()?;
                 }
-                b'1' => {
+                (b'1', _) => {
                     self.after_mark()?;
                 }
                 // GLOBAL, REDUCE, BUILD, persistent IDs, extension registries,
-                // object constructors, and all unknown opcodes are rejected.
-                _ => {
+                // object constructors and floats are rejected.
+                (code, _) => {
                     return Err(Error::malformed(
                         "rpa",
-                        format!("unsupported or executable pickle opcode 0x{op:02x}"),
+                        format!("unsupported or executable pickle opcode 0x{code:02x}"),
                     ));
                 }
             }
@@ -645,25 +527,38 @@ fn pairs(items: &[usize]) -> Result<Vec<(usize, usize)>, Error> {
 
 fn path_node(nodes: &[Node], id: usize) -> Result<String, Error> {
     match nodes.get(id).ok_or_else(|| bad("invalid pickle node"))? {
-        Node::Text(bytes) => {
-            String::from_utf8(bytes.clone()).map_err(|_| bad("invalid Unicode path"))
-        }
-        Node::Bytes(bytes) => Ok(match String::from_utf8(bytes.clone()) {
-            Ok(path) => path,
-            Err(_) => bytes.iter().map(|b| char::from(*b)).collect(),
-        }),
+        Node::Text(bytes) => std::str::from_utf8(bytes)
+            .map(str::to_owned)
+            .map_err(|_| bad("invalid Unicode path")),
+        // A byte-string name that is not UTF-8 is read as Latin-1.
+        Node::Bytes(bytes) => Ok(std::str::from_utf8(bytes).map_or_else(
+            |_| bytes.iter().copied().map(char::from).collect(),
+            str::to_owned,
+        )),
         _ => Err(bad("expected pickle path string")),
     }
 }
 
-fn prefix_node(nodes: &[Node], id: usize) -> Result<Vec<u8>, Error> {
-    match nodes.get(id).ok_or_else(|| bad("invalid pickle node"))? {
+/// The prefix bytes of chunk node `id`, charged to `budget`. Pickle memo
+/// references let every chunk share one prefix for two bytes each, so the
+/// copies are bounded by the index that holds them, not by the reference
+/// count.
+fn prefix_node(nodes: &[Node], id: usize, budget: &mut usize) -> Result<Vec<u8>, Error> {
+    let node = nodes.get(id).ok_or_else(|| bad("invalid pickle node"))?;
+    if let Node::Bytes(bytes) | Node::Text(bytes) = node {
+        *budget = budget
+            .checked_sub(bytes.len())
+            .ok_or_else(|| bad("chunk prefixes exceed the index"))?;
+    }
+    match node {
         Node::Bytes(bytes) => Ok(bytes.clone()),
         Node::Text(bytes) => {
             let text =
                 std::str::from_utf8(bytes).map_err(|_| bad("invalid Unicode chunk prefix"))?;
             text.chars()
-                .map(|ch| u8::try_from(ch as u32).map_err(|_| bad("chunk prefix is not Latin-1")))
+                .map(|ch| {
+                    u8::try_from(u32::from(ch)).map_err(|_| bad("chunk prefix is not Latin-1"))
+                })
                 .collect()
         }
         _ => Err(bad("expected pickle chunk prefix")),
@@ -698,16 +593,13 @@ fn parse_index(bytes: &[u8], header: &Header) -> Result<Index, Error> {
     if index_tail.len() > MAX_INDEX_BYTES {
         return Err(bad("compressed index exceeds limit"));
     }
-    let mut index_bytes = Vec::new();
     let mut decoder = ZlibDecoder::new(Cursor::new(index_tail));
-    decoder
-        .by_ref()
-        .take((MAX_INDEX_BYTES + 1) as u64)
-        .read_to_end(&mut index_bytes)
+    let index = inflate_capped(&mut decoder, MAX_INDEX_BYTES as u64, OnError::Discard)
         .map_err(|e| Error::malformed_with_source("rpa", "invalid zlib index", e))?;
-    if index_bytes.len() > MAX_INDEX_BYTES {
+    if index.truncated {
         return Err(bad("decompressed index exceeds limit"));
     }
+    let index_bytes = index.bytes;
     let consumed = usize::try_from(decoder.into_inner().position())
         .map_err(|_| bad("index position overflow"))?;
     let (compressed, trailing) = index_tail
@@ -721,16 +613,17 @@ fn parse_index(bytes: &[u8], header: &Header) -> Result<Index, Error> {
     else {
         return Err(bad("index root is not a dictionary"));
     };
-    if entries.len() > MAX_MEMBERS {
+    if entries.len() > MAX_ARCHIVE_MEMBERS {
         return Err(bad("member limit exceeded"));
     }
     let mut members: Vec<Member> = Vec::with_capacity(entries.len());
     let mut member_positions = HashMap::new();
     let mut duplicate_key_assignment_count = 0usize;
     let mut total_chunks = 0usize;
+    let mut prefix_budget = index_bytes.len();
     for &(name_id, chunks_id) in entries {
         let path = path_node(&pickle.nodes, name_id)?;
-        if path.is_empty() || path.len() > MAX_PATH_BYTES || path.contains('\0') {
+        if path.is_empty() || path.len() > MAX_MEMBER_PATH_BYTES || path.contains('\0') {
             return Err(bad("invalid member path"));
         }
         let item_ids = sequence(&pickle.nodes, chunks_id)?;
@@ -746,7 +639,11 @@ fn parse_index(bytes: &[u8], header: &Header) -> Result<Index, Error> {
             let fields = sequence(&pickle.nodes, item_id)?;
             let (offset_id, length_id, prefix) = match *fields {
                 [offset, length] => (offset, length, Vec::new()),
-                [offset, length, prefix] => (offset, length, prefix_node(&pickle.nodes, prefix)?),
+                [offset, length, prefix] => (
+                    offset,
+                    length,
+                    prefix_node(&pickle.nodes, prefix, &mut prefix_budget)?,
+                ),
                 _ => return Err(bad("invalid chunk tuple")),
             };
             let offset = number(&pickle.nodes, offset_id)? ^ header.key;
@@ -816,13 +713,9 @@ const AGGS: &[Agg] = &[
     Agg::DuplicateMembers,
 ];
 
+/// Lowercase hex of the first 32 bytes.
 fn hex_preview(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut out = String::with_capacity(bytes.len().min(32) * 2);
-    for &b in bytes.iter().take(32) {
-        let _ = write!(out, "{b:02x}");
-    }
-    out
+    hex_encode(bytes.get(..32).unwrap_or(bytes))
 }
 
 pub(super) fn extract(
@@ -852,9 +745,10 @@ pub(super) fn extract(
     };
     values.insert_key(value_key!("archive.format.kind"), json!("rpa"));
 
+    let member_count = index.members.len();
     let mut stats = ArchiveStats::new(AGGS);
-    let mut listed = Vec::with_capacity(index.members.len());
-    let mut detailed = Vec::with_capacity(index.members.len());
+    let mut listed = Vec::with_capacity(member_count);
+    let mut detailed = Vec::with_capacity(member_count);
     let mut ranges = Vec::new();
     let mut chunk_count = 0u64;
     let mut multi_chunk_count = 0u64;
@@ -864,11 +758,10 @@ pub(super) fn extract(
     let mut logical_bytes = 0u64;
     let mut non_monotonic_count = 0u64;
     let mut last_offset = 0u64;
-    for entry in &index.members {
+    for entry in index.members {
         if entry.chunks.len() > 1 {
             multi_chunk_count += 1;
         }
-        let mut has_prefix = false;
         let mut member_prefix_bytes = 0u64;
         let mut member_physical_bytes = 0u64;
         let mut chunk_values = Vec::with_capacity(entry.chunks.len());
@@ -878,9 +771,6 @@ pub(super) fn extract(
             member_prefix_bytes += chunk.prefix.len() as u64;
             referenced_bytes += chunk.length;
             member_physical_bytes += chunk.length;
-            if !chunk.prefix.is_empty() {
-                has_prefix = true;
-            }
             if chunk.offset < last_offset {
                 non_monotonic_count += 1;
             }
@@ -901,19 +791,13 @@ pub(super) fn extract(
                 "payload_hex_preview": hex_preview(preview),
                 "prefix_length": chunk.prefix.len(),
                 "prefix_hex_preview": hex_preview(&chunk.prefix),
-                "prefix_sha256": if chunk.prefix.is_empty() { None } else { Some(sha256(&chunk.prefix)) },
+                "prefix_sha256": (!chunk.prefix.is_empty()).then(|| sha256(&chunk.prefix)),
             }));
         }
-        if has_prefix {
+        if member_prefix_bytes > 0 {
             prefix_member_count += 1;
         }
         logical_bytes += entry.size;
-        let mut member = ArchiveMember::new(entry.path.clone(), entry.size, EntryType::Regular);
-        member.compression = ArchiveCompression::new(None, Some("stored".into()));
-        member.offsets.data = entry.chunks.first().map(|c| c.offset);
-        stats.observe(&member, &Reading::of(&member));
-        listed.push(JsonValue::Object(member_value(&member)));
-        members.push(member);
         detailed.push(json!({
             "path": entry.path,
             "size_bytes": entry.size,
@@ -922,6 +806,12 @@ pub(super) fn extract(
             "physical_bytes": member_physical_bytes,
             "chunks": chunk_values,
         }));
+        let mut member = ArchiveMember::new(entry.path, entry.size, EntryType::Regular);
+        member.compression = ArchiveCompression::new(None, Some("stored".into()));
+        member.offsets.data = entry.chunks.first().map(|c| c.offset);
+        stats.observe(&member, &Reading::of(&member));
+        listed.push(JsonValue::Object(member_value(&member)));
+        members.push(member);
     }
     ranges.sort_unstable();
     let mut covered_bytes = 0u64;
@@ -964,7 +854,7 @@ pub(super) fn extract(
                 "pickle_memo_count": index.pickle_memo_count,
                 "pickle_frame_count": index.pickle_frame_count,
             },
-            "member_count": index.members.len(),
+            "member_count": member_count,
             "duplicate_key_assignment_count": index.duplicate_key_assignment_count,
             "chunk_count": chunk_count,
             "multi_chunk_member_count": multi_chunk_count,
@@ -1004,7 +894,7 @@ pub(super) fn extract(
         metric!("rpa.index_trailing_bytes"),
         index.trailing_bytes as f64,
     );
-    metrics.insert(metric!("rpa.member_count"), index.members.len() as f64);
+    metrics.insert(metric!("rpa.member_count"), member_count as f64);
     metrics.insert(metric!("rpa.logical_member_bytes"), logical_bytes as f64);
     metrics.insert(
         metric!("rpa.multi_chunk_member_count"),

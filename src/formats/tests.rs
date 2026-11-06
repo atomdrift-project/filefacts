@@ -41,3 +41,30 @@ fn inflated_cws_exposes_the_remote_movie_url() {
     );
     assert!(text.iter().any(|s| s.contains("ff.swf")), "{text:?}");
 }
+
+#[test]
+fn oversized_package_json_is_skipped_like_generic_json() {
+    let mut manifest = br#"{"name":"pad","description":""#.to_vec();
+    manifest.resize(manifest.len() + (2 << 20), b' ');
+    manifest.extend_from_slice(br#""}"#);
+    let parsed = crate::OpenOptions::new()
+        .cache(false)
+        .file_type(crate::FileType::PackageJson)
+        .open(&manifest);
+    let values = parsed.values();
+    assert_eq!(
+        values.get("json.parse.skipped"),
+        Some(&serde_json::json!(true))
+    );
+    assert_eq!(values.get("npm.name"), None);
+
+    let small = crate::OpenOptions::new()
+        .cache(false)
+        .file_type(crate::FileType::PackageJson)
+        .open(br#"{"name":"ok","maintainers":["a <a@x.org>"]}"#);
+    assert_eq!(
+        small.values().get("npm.name"),
+        Some(&serde_json::json!("ok"))
+    );
+    assert_eq!(small.values().get("name"), Some(&serde_json::json!("ok")));
+}

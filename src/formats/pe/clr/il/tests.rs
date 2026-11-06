@@ -76,3 +76,60 @@ fn metadata_empty_and_truncated() {
         assert!(Tables::new(b, 0).is_none());
     }
 }
+
+/// Metadata of one type and `methods` methods, every name the same
+/// `name_len`-byte string, each method's IL a lone `ret` at offset 0.
+fn metadata_with_long_names(methods: usize, name_len: usize) -> Vec<u8> {
+    let strings_len = name_len + 2;
+    let tables_len = 32 + 14 + 14 * methods;
+    let (tables, strings) = (80, 80 + tables_len);
+    let blob = strings + strings_len;
+    let mut root = vec![0u8; blob + 1];
+    root[..4].copy_from_slice(b"BSJB");
+    root[12..16].copy_from_slice(&4u32.to_le_bytes());
+    root[16..20].copy_from_slice(b"v4\0\0");
+    root[22..24].copy_from_slice(&3u16.to_le_bytes());
+    for (p, offset, len, name) in [
+        (24usize, tables, tables_len, b"#~".as_slice()),
+        (36, strings, strings_len, b"#Strings".as_slice()),
+        (56, blob, 1, b"#Blob".as_slice()),
+    ] {
+        root[p..p + 4].copy_from_slice(&(offset as u32).to_le_bytes());
+        root[p + 4..p + 8].copy_from_slice(&(len as u32).to_le_bytes());
+        root[p + 8..p + 8 + name.len()].copy_from_slice(name);
+    }
+    // Tables: TypeDef (2) and MethodDef (6), all indexes two bytes wide.
+    let valid = (1u64 << 2) | (1 << 6);
+    root[tables + 8..tables + 16].copy_from_slice(&valid.to_le_bytes());
+    root[tables + 24..tables + 28].copy_from_slice(&1u32.to_le_bytes());
+    root[tables + 28..tables + 32].copy_from_slice(&(methods as u32).to_le_bytes());
+    let typedef = tables + 32;
+    root[typedef + 4..typedef + 6].copy_from_slice(&1u16.to_le_bytes()); // name
+    root[typedef + 12..typedef + 14].copy_from_slice(&1u16.to_le_bytes()); // method list
+    for i in 0..methods {
+        let row = typedef + 14 + 14 * i;
+        root[row..row + 4].copy_from_slice(&1u32.to_le_bytes()); // RVA
+        root[row + 8..row + 10].copy_from_slice(&1u16.to_le_bytes()); // name
+    }
+    root[strings + 1..strings + 1 + name_len].fill(b'a');
+    root
+}
+
+/// A few hundred kilobytes of rows may name one long string thousands of
+/// times over, and each name is copied into several views. The copies stay
+/// within a budget, and an analysis that reaches it says it was cut short.
+#[test]
+fn name_copies_are_budgeted() {
+    let ret = [(1 << 2) | 2, 0x2a];
+    let small = metadata_with_long_names(4, 16);
+    let analysis = analyze(&small, 0, &ret, |_| Some(0)).expect("parses");
+    assert!(!analysis.truncated);
+    assert_eq!(analysis.methods.len(), 4);
+    assert_eq!(analysis.methods[0].name, format!("{0}.{0}", "a".repeat(16)));
+
+    let forged = metadata_with_long_names(20_000, 4000);
+    let analysis = analyze(&forged, 0, &ret, |_| Some(0)).expect("parses");
+    assert!(analysis.truncated);
+    let copied: usize = analysis.methods.iter().map(|m| m.name.len()).sum();
+    assert!(copied <= MAX_NAME_BYTES);
+}

@@ -16,13 +16,10 @@ use crate::scan;
 /// with this binary.
 fn is_api_export(name: &str) -> bool {
     let bare = name.trim_start_matches('_');
-    if bare == "mh_execute_header" {
-        return false;
-    }
-    !(bare.starts_with("ZTI")
-        || bare.starts_with("ZTS")
-        || bare.starts_with("ZTV")
-        || bare.starts_with("ZTT"))
+    bare != "mh_execute_header"
+        && !["ZTI", "ZTS", "ZTV", "ZTT"]
+            .iter()
+            .any(|rtti| bare.starts_with(rtti))
 }
 
 /// Emit `imports.count`, `exports.count`, `exports.api_count`,
@@ -81,16 +78,7 @@ pub(crate) fn emit_symbol_kind_counts(symbols: &Symbols, metrics: &mut Metrics) 
 /// error messages, or string-table assets — a different population
 /// than a binary whose strings are all `__cxx_…` symbols or paths.
 fn is_sentence_like(text: &str) -> bool {
-    if text.len() < 12 {
-        return false;
-    }
-    let mut spaces = 0_usize;
-    for b in text.bytes() {
-        if b == b' ' {
-            spaces += 1;
-        }
-    }
-    if spaces < 2 {
+    if text.len() < 12 || text.bytes().filter(|&b| b == b' ').count() < 2 {
         return false;
     }
     let mut alpha_tokens = 0_usize;
@@ -111,29 +99,22 @@ pub(crate) fn emit_section_metrics(sections: &Sections, metrics: &mut Metrics) {
     // max / mean across the sections that have file-backed bytes (the
     // `None` entries are SHT_NOBITS / BSS-style purely-virtual regions
     // and shouldn't pull the mean toward zero).
-    let mut entropy_max = 0.0_f64;
-    let mut max_span: Option<Span> = None;
+    let mut peak: Option<(f64, Span)> = None;
     let mut entropy_sum = 0.0_f64;
     let mut entropy_n = 0_u64;
     for s in sections {
         if let Some(e) = s.entropy {
-            if max_span.is_none() || e > entropy_max {
-                entropy_max = e;
-                max_span = Some(Span::new(s.file_offset, s.file_size));
+            if peak.is_none_or(|(max, _)| e > max) {
+                peak = Some((e, Span::new(s.file_offset, s.file_size)));
             }
             entropy_sum += e;
             entropy_n += 1;
         }
     }
-    if entropy_n > 0 {
-        // Locate the peak-entropy section so a packer/encrypted-section finding
-        // can point at it; the mean has no single location.
-        match max_span {
-            Some(span) => {
-                metrics.insert_located(metric!("sections.max_entropy"), entropy_max, [span])
-            }
-            None => metrics.insert(metric!("sections.max_entropy"), entropy_max),
-        }
+    // Locate the peak-entropy section so a packer/encrypted-section finding
+    // can point at it; the mean has no single location.
+    if let Some((max, span)) = peak {
+        metrics.insert_located(metric!("sections.max_entropy"), max, [span]);
         metrics.insert(
             metric!("sections.avg_entropy"),
             entropy_sum / entropy_n as f64,
@@ -151,6 +132,10 @@ pub(crate) fn emit_section_metrics(sections: &Sections, metrics: &mut Metrics) {
         let is_write = s.is_writable();
         if is_exec {
             executable += 1;
+        }
+        // Code as `binary.code_entropy` counts it: executable, and not data
+        // the format placed in an executable segment.
+        if s.is_code() {
             code_size = code_size.saturating_add(s.file_size);
         }
         if is_write {
@@ -235,8 +220,9 @@ const MAX_STRING_SPANS: usize = 64;
 /// Emits:
 /// - `binary.string_count`, `binary.max_string_length`,
 ///   `binary.avg_string_length`, `binary.string_length_stddev`,
-///   `binary.high_entropy_string_count`, `binary.sentence_string_count`,
-///   `binary.sentence_string_ratio`.
+///   `binary.high_entropy_string_count` (strings shaped like keys, digests
+///   and encoded blobs; see [`scan::classify::is_random_token`]),
+///   `binary.sentence_string_count`, `binary.sentence_string_ratio`.
 /// - `binary.entropy_variance` — population variance across the
 ///   per-section entropies. Packers tend to flatten this; a normal
 ///   binary spreads across `.text` (~6), `.rodata` (~5), `.data` (~3).
@@ -253,8 +239,9 @@ pub(crate) fn emit_binary_aggregates(
     // -- Strings ------------------------------------------------------
     let total = strings.len();
     if total > 0 {
-        let mut max_len = 0_usize;
-        let mut max_string_span: Option<Span> = None;
+        // The longest string's length and where it lies; `None` while every
+        // string seen is empty.
+        let mut longest: Option<(usize, Span)> = None;
         // Running sums of the lengths and their squares give the mean and
         // the population variance in one pass, with no per-string buffer.
         // `f64` keeps the squares exact well past any realistic input.
@@ -265,17 +252,13 @@ pub(crate) fn emit_binary_aggregates(
         let mut sentence = 0_u64;
         for (span, s) in strings.text_spans() {
             let len = s.len();
-            if len > max_len {
-                max_len = len;
-                max_string_span = Some(span);
+            if len > longest.map_or(0, |(max, _)| max) {
+                longest = Some((len, span));
             }
             let len = len as f64;
             sum_len += len;
             sum_sq += len * len;
-            // Shannon-entropy floor of 6.0 bits/byte separates random-
-            // looking strings (base64, keys, hex blobs) from English /
-            // identifier-shaped text (~3–4.5).
-            if scan::entropy::shannon(s.as_bytes()) >= 6.0 {
+            if scan::classify::is_random_token(s.as_bytes()) {
                 high_entropy += 1;
                 high_entropy_spans.push(span.offset, span.len);
             }
@@ -288,11 +271,11 @@ pub(crate) fn emit_binary_aggregates(
         // every length is equal.
         let variance = (sum_sq / total as f64 - avg * avg).max(0.0);
         metrics.insert(metric!("binary.string_count"), total as f64);
-        match max_string_span {
-            Some(span) => {
-                metrics.insert_located(metric!("binary.max_string_length"), max_len as f64, [span])
+        match longest {
+            Some((len, span)) => {
+                metrics.insert_located(metric!("binary.max_string_length"), len as f64, [span]);
             }
-            None => metrics.insert(metric!("binary.max_string_length"), max_len as f64),
+            None => metrics.insert(metric!("binary.max_string_length"), 0.0),
         }
         metrics.insert(metric!("binary.avg_string_length"), avg);
         metrics.insert(metric!("binary.string_length_stddev"), variance.sqrt());
@@ -363,9 +346,9 @@ pub(crate) fn emit_binary_aggregates(
             data_spans,
         );
     }
-    // Both sums come from file-declared section sizes; adding them as `u64`
-    // overflowed on forged sizes near `u64::MAX`, and saturating would skew
-    // the ratio, so take it in floating point.
+    // Both sums come from file-declared section sizes, whose `u64` sum can
+    // overflow on forged sizes near `u64::MAX`; saturating would skew the
+    // ratio, so take it in floating point.
     let classified = code_size as f64 + data_size as f64;
     if classified > 0.0 {
         metrics.insert(
@@ -404,7 +387,6 @@ pub(crate) fn emit_binary_overlay(
     // Last on-disk extent across sections and the format's own image end.
     let file_size = bytes.len() as u64;
     let last_extent = sections
-        .as_slice()
         .iter()
         .map(|s| s.file_offset.saturating_add(s.file_size))
         .max()

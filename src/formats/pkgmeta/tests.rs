@@ -144,3 +144,46 @@ fn srcinfo_multiline_arrays() {
         other => panic!("expected array, got {other:?}"),
     }
 }
+
+fn sources(values: &Values) -> Vec<String> {
+    values
+        .get("pkg.source")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(JsonValue::as_str)
+        .map(str::to_string)
+        .collect()
+}
+
+/// A `)` inside quotes or a comment does not end a bash array, so the
+/// sources after it are still what makepkg fetches; ending the array there
+/// hid them from the PKGBUILD-versus-.SRCINFO comparison.
+#[test]
+fn quoted_or_commented_parens_do_not_end_an_array() {
+    let mut v = Values::new();
+    pkgbuild(
+        b"source=('a.tar.gz::https://x/a)b' # mirror (old)\n  'https://evil.example/p.sh')\n",
+        &mut v,
+    );
+    let got = sources(&v);
+    assert!(
+        got.contains(&"https://evil.example/p.sh".to_string()),
+        "{got:?}"
+    );
+    assert!(
+        got.contains(&"a.tar.gz::https://x/a)b".to_string()),
+        "{got:?}"
+    );
+}
+
+/// `source+=(…)` appends to the array, as bash does.
+#[test]
+fn appended_array_elements_are_read() {
+    let mut v = Values::new();
+    pkgbuild(
+        b"source=('https://x/a')\nsource+=('https://evil.example/p.sh')\n",
+        &mut v,
+    );
+    assert_eq!(sources(&v), ["https://x/a", "https://evil.example/p.sh"]);
+}

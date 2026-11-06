@@ -23,12 +23,13 @@
 //! - `objects.*` — the raw parsed tree, still addressable via a wildcard
 //!   (`objects[*].shellScript`).
 
+use crate::formats::ExtractCtx;
 use serde_json::Value as JsonValue;
 
 use crate::error::Error;
 use crate::formats::common::{XorScan, extract_binary_strings};
 use crate::metric;
-use crate::output::{Errors, Metrics, Strings, ValueKey, Values};
+use crate::output::ValueKey;
 use crate::value_key;
 
 /// Build settings whose values are ordinary project configuration — long
@@ -48,13 +49,14 @@ const NOISY_SETTINGS: &[&str] = &[
     "PRODUCT_BUNDLE_IDENTIFIER",
 ];
 
-pub(super) fn extract(
-    bytes: &[u8],
-    values: &mut Values,
-    strings: &mut Strings,
-    metrics: &mut Metrics,
-    errors: &mut Errors,
-) -> Result<(), Error> {
+pub(super) fn extract(bytes: &[u8], ctx: ExtractCtx<'_>) -> Result<(), Error> {
+    let ExtractCtx {
+        values,
+        strings,
+        metrics,
+        errors,
+        ..
+    } = ctx;
     // The byte scan is what feeds the decoder pipeline. A pbxproj payload is
     // routinely a hex or base64 blob inside a build setting, so the decoded
     // command only reaches the rules if the raw text is scanned as well as
@@ -128,7 +130,7 @@ pub(super) fn extract(
 
 /// Convert a parsed plist into JSON.
 ///
-/// Mirrors `structured::plist_to_json`, but a pbxproj is pure OpenStep: it has
+/// Mirrors `common::plist_to_json`, but a pbxproj is pure OpenStep: it has
 /// only strings, arrays, and dictionaries, so the numeric, date, and data arms
 /// that dialect never produces are collapsed into their string forms rather
 /// than duplicated here.

@@ -1,4 +1,8 @@
 use super::*;
+
+fn cycles(source: &str) -> (usize, bool) {
+    super::cycles(&Lines::new(source))
+}
 #[test]
 fn binds_arbitrary_labels_and_excludes_forward_and_wait() {
     assert_eq!(

@@ -130,12 +130,12 @@ fn target(parsed: &Parsed, id: usize) -> Option<String> {
 }
 
 fn unicode(data: &[u8]) -> Known {
-    if data.len() <= MAX_TEXT && data.len().is_multiple_of(2) {
-        if let Some(s) = crate::bytes::utf16_strict(data, crate::bytes::Endian::Big) {
-            if s.len() <= MAX_TEXT {
-                return Known::String(s, false);
-            }
-        }
+    if data.len() <= MAX_TEXT
+        && data.len().is_multiple_of(2)
+        && let Some(s) = crate::bytes::utf16_strict(data, crate::bytes::Endian::Big)
+        && s.len() <= MAX_TEXT
+    {
+        return Known::String(s, false);
     }
     Known::Unknown
 }
@@ -582,10 +582,10 @@ pub(super) fn analyze(parsed: &Parsed) -> Analysis {
     let mut decoders = BTreeMap::new();
     if !graph_limited {
         for h in &handlers {
-            if names.get(h.name.as_str()) == Some(&1) {
-                if let Some(d) = recognize(parsed, h) {
-                    decoders.insert(h.name.as_str(), d);
-                }
+            if names.get(h.name.as_str()) == Some(&1)
+                && let Some(d) = recognize(parsed, h)
+            {
+                decoders.insert(h.name.as_str(), d);
             }
         }
     }
@@ -606,11 +606,11 @@ pub(super) fn analyze(parsed: &Parsed) -> Analysis {
                 "handler graph limit reached; decoder resolution disabled",
             );
         }
-        let Some(_) = h.code_offset.checked_add(h.code.len()) else {
+        if h.code_offset.checked_add(h.code.len()).is_none() {
             limit(&mut out, "bytecode source offset overflow");
             analysis.functions.push(out);
             continue;
-        };
+        }
         let (instructions, joins) = decode(h.code, h.code_offset, &mut remaining, &mut out);
         let mut state = State::default();
         let mut tell_depth = 0usize;
@@ -628,9 +628,9 @@ pub(super) fn analyze(parsed: &Parsed) -> Analysis {
             match i.op {
                 224..=239 | 97 => {
                     let idx = if i.op == 97 {
-                        i.operand as usize
+                        usize::from(i.operand)
                     } else {
-                        (i.op & 15) as usize
+                        usize::from(i.op & 15)
                     };
                     pushed = Some(
                         h.literals
@@ -640,17 +640,17 @@ pub(super) fn analyze(parsed: &Parsed) -> Analysis {
                 }
                 160..=175 | 93 => {
                     let idx = if i.op == 93 {
-                        i.operand as usize
+                        usize::from(i.operand)
                     } else {
-                        (i.op & 15) as usize
+                        usize::from(i.op & 15)
                     };
                     pushed = Some(state.locals.get(&idx).cloned().unwrap_or(Known::Unknown));
                 }
                 176..=191 | 94 => {
                     let idx = if i.op == 94 {
-                        i.operand as usize
+                        usize::from(i.operand)
                     } else {
-                        (i.op & 15) as usize
+                        usize::from(i.op & 15)
                     };
                     let value = state.pop();
                     if idx < MAX_LOCALS {
@@ -671,8 +671,7 @@ pub(super) fn analyze(parsed: &Parsed) -> Analysis {
                 }
                 101 => pushed = Some(Known::Bool(true)),
                 102 => pushed = Some(Known::Bool(false)),
-                103 => pushed = Some(Known::Unknown),
-                104 => pushed = Some(Known::Unknown),
+                103 | 104 => pushed = Some(Known::Unknown),
                 105..=109 => pushed = Some(Known::Number(i64::from(i.op) - 106)),
                 41 => pushed = Some(Known::Receiver),
                 42 => {
@@ -722,18 +721,18 @@ pub(super) fn analyze(parsed: &Parsed) -> Analysis {
                     // This is the exact constant subexpression at Concatenate,
                     // even when a subsequent operation appends an unknown path.
                     // Its source offset must not be confused with a shell call.
-                    if i.op == 37 {
-                        if let Known::String(text, true) = &value {
-                            if text.len() > work {
-                                limit(&mut out, "constant recovery work budget exhausted");
-                                break;
-                            }
-                            work -= text.len();
-                            out.decoded.push(Recovered {
-                                text: text.clone(),
-                                offset,
-                            });
+                    if i.op == 37
+                        && let Known::String(text, true) = &value
+                    {
+                        if text.len() > work {
+                            limit(&mut out, "constant recovery work budget exhausted");
+                            break;
                         }
+                        work -= text.len();
+                        out.decoded.push(Recovered {
+                            text: text.clone(),
+                            offset,
+                        });
                     }
                     pushed = Some(value);
                 }
@@ -750,7 +749,7 @@ pub(super) fn analyze(parsed: &Parsed) -> Analysis {
                 12 | 43 => {
                     let name = h
                         .literals
-                        .get(i.operand as usize)
+                        .get(usize::from(i.operand))
                         .and_then(|id| target(parsed, *id));
                     let mut arguments = None;
                     let mut receiver = Known::Unknown;
@@ -759,27 +758,26 @@ pub(super) fn analyze(parsed: &Parsed) -> Analysis {
                             arguments = state.take(n);
                             receiver = state.pop();
                         }
-                    } else if let Some(n) = state.count(128) {
+                    } else if let Some(n) = state.count(128)
+                        && n % 2 == 0
+                        && let Some(named) = state.take(n)
+                    {
                         // MessageSend: direct parameter, (keyword, value)*, word count.
-                        if n % 2 == 0 {
-                            if let Some(named) = state.take(n) {
-                                let direct = state.pop();
-                                if named
-                                    .as_chunks::<2>()
-                                    .0
-                                    .iter()
-                                    .all(|pair| matches!(pair[0], Known::Constant(_)))
-                                {
-                                    let mut args = vec![direct];
-                                    args.extend(
-                                        named
-                                            .into_iter()
-                                            .enumerate()
-                                            .filter_map(|(j, v)| (j % 2 == 1).then_some(v)),
-                                    );
-                                    arguments = Some(args);
-                                }
-                            }
+                        let direct = state.pop();
+                        if named
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .all(|pair| matches!(pair[0], Known::Constant(_)))
+                        {
+                            let mut args = vec![direct];
+                            args.extend(
+                                named
+                                    .into_iter()
+                                    .enumerate()
+                                    .filter_map(|(j, v)| (j % 2 == 1).then_some(v)),
+                            );
+                            arguments = Some(args);
                         }
                     }
                     if let Some(args) = &arguments {
@@ -869,11 +867,11 @@ pub(super) fn analyze(parsed: &Parsed) -> Analysis {
                     );
                 }
             }
-            if let Some(v) = pushed {
-                if !state.push(v, &mut work) {
-                    limit(&mut out, "stack or constant recovery work budget exhausted");
-                    break;
-                }
+            if let Some(v) = pushed
+                && !state.push(v, &mut work)
+            {
+                limit(&mut out, "stack or constant recovery work budget exhausted");
+                break;
             }
         }
         analysis.functions.push(out);

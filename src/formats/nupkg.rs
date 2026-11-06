@@ -10,18 +10,14 @@ use std::io::{Read, Seek};
 
 use serde_json::Value as JsonValue;
 
-use super::bounded::Limits;
-use super::common::ends_with_ci;
-use crate::output::{Errors, Metrics, Stage, ValueKey, Values};
+use super::bounded::{Limits, MAX_MANIFEST_BYTES};
+use crate::bytes::ends_with_ci;
+use crate::output::{Errors, Stage, ValueKey, Values};
 use crate::value_key;
-
-/// A `.nuspec` above this is not legitimate — stop rather than buffer it.
-const MAX_NUSPEC: u64 = 1 << 20;
 
 pub(super) fn extract_from_archive<R: Read + Seek>(
     zip: &mut ::zip::ZipArchive<R>,
     values: &mut Values,
-    _metrics: &mut Metrics,
     errors: &mut Errors,
 ) {
     // The manifest is a single root-level `{id}.nuspec`; NuGet matches the
@@ -29,14 +25,20 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     let Some(name) = zip
         .file_names()
         .filter_map(Result::ok)
-        .find(|n| ends_with_ci(n, ".nuspec") && !n.contains('/'))
+        .find(|n| ends_with_ci(n.as_bytes(), ".nuspec") && !n.contains('/'))
         .map(std::borrow::Cow::into_owned)
     else {
         return;
     };
     let mut limits = Limits::default();
-    let manifest =
-        super::zip::read_manifest_member(zip, &name, MAX_NUSPEC, &mut limits, "nuspec", errors);
+    let manifest = super::zip::read_manifest_member(
+        zip,
+        &name,
+        MAX_MANIFEST_BYTES,
+        &mut limits,
+        "nuspec",
+        errors,
+    );
     limits.emit(values, value_key!("nupkg.limits"));
     let Some(buf) = manifest else {
         return;
@@ -84,12 +86,13 @@ fn parse_nuspec(text: &str, values: &mut Values) -> Result<(), roxmltree::Error>
             .find(|n| n.has_tag_name(tag))
             .and_then(|n| n.text())
             .unwrap_or_default();
-        people::put(
+        people::put_list(
             values,
             key,
             names
                 .split(',')
                 .map(|name| people::Person::from_fields(Some(name), None)),
+            value_key!("nupkg.limits"),
         );
     }
     Ok(())

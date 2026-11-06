@@ -254,25 +254,25 @@ impl Archive {
 
         let objects = parse_table(data, object_count, object_offset, "object", |c| {
             Some(Object {
-                class: c.varint()?,
-                first_value: c.varint()?,
-                value_count: c.varint()?,
+                class: varint(c)?,
+                first_value: varint(c)?,
+                value_count: varint(c)?,
             })
         })?;
         let keys = parse_table(data, key_count, key_offset, "key", |c| {
-            let len = c.varint()?;
+            let len = varint(c)?;
             Some(String::from_utf8_lossy(c.bytes(len)?).into_owned())
         })?;
         let values = parse_table(data, value_count, value_offset, "value", |c| {
-            let key = c.varint()?;
+            let key = varint(c)?;
             let payload = match c.u8()? {
                 8 => {
-                    let len = c.varint()?;
+                    let len = varint(c)?;
                     let start = c.pos();
                     c.skip(len)?;
                     Payload::Data(start..c.pos())
                 }
-                10 => Payload::Ref(c.u32_le()? as usize),
+                10 => Payload::Ref(crate::bytes::sat_usize(c.u32_le()?)),
                 kind @ (0..=7 | 9) => {
                     c.skip(*SCALAR_LEN.get(usize::from(kind))?)?;
                     Payload::Scalar
@@ -282,8 +282,8 @@ impl Archive {
             Some(Value { key, payload })
         })?;
         let classes = parse_table(data, class_count, class_offset, "class name", |c| {
-            let len = c.varint()?;
-            let extras = c.varint()?;
+            let len = varint(c)?;
+            let extras = varint(c)?;
             c.skip(extras.checked_mul(4)?)?;
             let name = c.bytes(len)?;
             let name = name.strip_suffix(b"\0").unwrap_or(name);
@@ -333,13 +333,11 @@ impl Archive {
         start..end
     }
 
-    fn values_of(&self, object: &Object) -> &[Value] {
-        self.values.get(self.run(object)).unwrap_or_default()
-    }
-
     /// The value stored under `key` on `object`, if any.
     fn field<'a>(&'a self, object: &Object, key: &str) -> Option<&'a Value> {
-        self.values_of(object)
+        self.values
+            .get(self.run(object))
+            .unwrap_or_default()
             .iter()
             .find(|v| self.keys.get(v.key).is_some_and(|k| k == key))
     }
@@ -415,25 +413,18 @@ fn parse_table<T>(
     Ok(out)
 }
 
-/// The NIBArchive varint, read off the shared cursor.
-trait ReadVarint {
-    /// NIBArchive varint: little-endian 7-bit groups, with the high bit set
-    /// on the *last* byte rather than on the continuation bytes.
-    fn varint(&mut self) -> Option<usize>;
-}
-
-impl ReadVarint for Reader<'_> {
-    fn varint(&mut self) -> Option<usize> {
-        let mut value: u64 = 0;
-        for shift in (0..64).step_by(7) {
-            let byte = self.u8()?;
-            value |= u64::from(byte & 0x7f) << shift;
-            if byte & 0x80 != 0 {
-                return usize::try_from(value).ok();
-            }
+/// Read a NIBArchive varint: little-endian 7-bit groups, with the high bit
+/// set on the *last* byte rather than on the continuation bytes.
+fn varint(cursor: &mut Reader<'_>) -> Option<usize> {
+    let mut value: u64 = 0;
+    for shift in (0..64).step_by(7) {
+        let byte = cursor.u8()?;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 != 0 {
+            return usize::try_from(value).ok();
         }
-        None
     }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -562,12 +553,11 @@ fn class_name<'a>(objects: &'a [plist::Value], object: &plist::Dictionary) -> Op
 /// front of `DropperController`. Zero when the string is not stored
 /// verbatim.
 fn locate(bytes: &[u8], text: &str) -> usize {
-    let (marker, body, count): (u8, Vec<u8>, usize) = if text.is_ascii() {
-        (0x50, text.as_bytes().to_vec(), text.len())
+    let ascii = text.is_ascii();
+    let (marker, count) = if ascii {
+        (0x50, text.len())
     } else {
-        let body: Vec<u8> = text.encode_utf16().flat_map(u16::to_be_bytes).collect();
-        let count = body.len() / 2;
-        (0x60, body, count)
+        (0x60, text.encode_utf16().count())
     };
     #[expect(
         clippy::cast_possible_truncation,
@@ -588,7 +578,11 @@ fn locate(bytes: &[u8], text: &str) -> usize {
         }
     };
     let header = needle.len();
-    needle.extend(&body);
+    if ascii {
+        needle.extend_from_slice(text.as_bytes());
+    } else {
+        needle.extend(text.encode_utf16().flat_map(u16::to_be_bytes));
+    }
     memchr::memmem::find(bytes, &needle).map_or(0, |at| at + header)
 }
 

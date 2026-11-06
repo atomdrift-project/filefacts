@@ -45,12 +45,13 @@ pub(super) fn extract(manifest_bytes: &[u8], file_offset: Option<u64>, values: &
     };
     // Offsets stay relative to the resource, so a byte-order mark is
     // stepped over rather than sliced away.
-    let bom = if text.starts_with('\u{FEFF}') { 3 } else { 0 };
+    let body = text.strip_prefix('\u{FEFF}').unwrap_or(text);
+    let bom = text.len() - body.len();
     let options = ParsingOptions {
         nodes_limit: MAX_NODES,
         ..ParsingOptions::default()
     };
-    let doc = match Document::parse_with_options(&text[bom..], options) {
+    let doc = match Document::parse_with_options(body, options) {
         Ok(doc) => doc,
         Err(e) => {
             tracing::debug!(

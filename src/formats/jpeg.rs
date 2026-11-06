@@ -12,7 +12,7 @@
 //!   artist, copyright}` — IFD0/ExifIFD tag values.
 //! - `jpeg.comment` — COM segment text.
 //! - `jpeg.adobe_color_transform` — APP14 Adobe color-transform byte.
-//! - `jpeg.features[]` — Pike-style flag array: `exif`, `gps`, `icc`,
+//! - `jpeg.features[]` — presence flags: `exif`, `gps`, `icc`,
 //!   `iptc`, `photoshop_irb`, `xmp`, `jfif_thumbnail`,
 //!   `concatenated_jpegs`, `short_comment_length`.
 //! - `jpeg.{segment_count, app_segment_count, com_count, dqt_count,
@@ -36,14 +36,16 @@ pub(super) fn extract(
 ) {
     extract_binary_strings(bytes, strings, XorScan::No);
 
-    let mut coverage = Coverage::new("jpeg", 2);
     if !bytes.starts_with(&[0xFF, 0xD8]) {
         carrier::emit(bytes, &Coverage::unrecognized(), values, metrics);
         return;
     }
 
-    let mut state = JpegState::default();
-    state.soi_count = 1;
+    let mut coverage = Coverage::new("jpeg", 2);
+    let mut state = JpegState {
+        soi_count: 1,
+        ..JpegState::default()
+    };
     let mut pos = 2usize;
     let mut eoi_pos: Option<usize> = None;
 
@@ -72,7 +74,8 @@ pub(super) fn extract(
                 eoi_pos = Some(pos);
                 break;
             }
-            0xD0..=0xD7 | 0x01 => continue,
+            // RSTn and TEM stand alone: no length, no body.
+            0xD0..=0xD7 | 0x01 => {}
             0xDA => {
                 state.scan_count = state.scan_count.saturating_add(1);
                 let Some(&len) = pair(pos) else {
@@ -136,9 +139,8 @@ pub(super) fn extract(
                 handle_segment(marker, body, &mut state);
                 // Only the metadata segments are recorded, as windows into
                 // the image span claimed below. Claiming every segment
-                // individually left the entropy-coded data between restart
-                // markers unclaimed, which read as concealed space on 25 of
-                // the 897 real media files this was measured against.
+                // individually would leave the entropy-coded data between
+                // restart markers unclaimed, reading as concealed space.
                 if marker == 0xFE || (0xE0..=0xEF).contains(&marker) {
                     coverage.claim_freeform(seg_start as u64, body_end as u64);
                 }
@@ -155,8 +157,7 @@ pub(super) fn extract(
         // The segment walk never reached an end-of-image marker, so where the
         // image stops is unknown. Claim to EOF rather than reporting the
         // remainder as concealed: a boundary we could not establish is not
-        // evidence of one being hidden, and treating it as such flagged 23 of
-        // the 897 real media files this was measured against.
+        // evidence of one being hidden.
         coverage.claim(2, bytes.len() as u64);
     }
     carrier::emit(bytes, &coverage, values, metrics);
@@ -165,32 +166,23 @@ pub(super) fn extract(
         state.features.push("concatenated_jpegs");
     }
 
-    // Emit kv.
-    if state.exif_present {
-        let mut exif = serde_json::Map::new();
-        if let Some(v) = state.exif_make {
-            exif.insert("make".into(), JsonValue::String(v));
+    if let Some(exif) = state.exif {
+        let mut fields = serde_json::Map::new();
+        for (key, value) in [
+            ("make", exif.make),
+            ("model", exif.model),
+            ("software", exif.software),
+            ("datetime", exif.datetime),
+            ("datetime_original", exif.datetime_original),
+            ("artist", exif.artist),
+            ("copyright", exif.copyright),
+        ] {
+            if let Some(value) = value {
+                fields.insert(key.into(), JsonValue::String(value));
+            }
         }
-        if let Some(v) = state.exif_model {
-            exif.insert("model".into(), JsonValue::String(v));
-        }
-        if let Some(v) = state.exif_software {
-            exif.insert("software".into(), JsonValue::String(v));
-        }
-        if let Some(v) = state.exif_datetime {
-            exif.insert("datetime".into(), JsonValue::String(v));
-        }
-        if let Some(v) = state.exif_datetime_original {
-            exif.insert("datetime_original".into(), JsonValue::String(v));
-        }
-        if let Some(v) = state.exif_artist {
-            exif.insert("artist".into(), JsonValue::String(v));
-        }
-        if let Some(v) = state.exif_copyright {
-            exif.insert("copyright".into(), JsonValue::String(v));
-        }
-        if !exif.is_empty() {
-            values.insert_key(value_key!("jpeg.exif"), JsonValue::Object(exif));
+        if !fields.is_empty() {
+            values.insert_key(value_key!("jpeg.exif"), JsonValue::Object(fields));
         }
         state.features.insert(0, "exif");
     }
@@ -204,16 +196,7 @@ pub(super) fn extract(
         values.insert_key(value_key!("jpeg.adobe.color_transform"), json!(t));
     }
     if !state.features.is_empty() {
-        values.insert_key(
-            value_key!("jpeg.features"),
-            JsonValue::Array(
-                state
-                    .features
-                    .into_iter()
-                    .map(|s| JsonValue::String(s.into()))
-                    .collect(),
-            ),
-        );
+        values.insert_key(value_key!("jpeg.features"), JsonValue::from(state.features));
     }
 
     metrics.insert(
@@ -246,7 +229,7 @@ pub(super) fn extract(
 /// Scans past which the pixel pass is skipped. The decoder walks every
 /// block of the image once per scan, and a progressive scan can cover all of
 /// them with a few bytes of end-of-band runs, so a small file of thousands of
-/// scans over a large image took minutes. Encoders write about a dozen.
+/// scans over a large image could take minutes. Encoders write about a dozen.
 const MAX_DECODE_SCANS: u32 = 100;
 
 /// Decode the JPEG (cap-protected) and emit pixel-statistic metrics:
@@ -269,21 +252,21 @@ fn extract_pixel_stats(bytes: &[u8], scans: u32, metrics: &mut Metrics) {
     let Some(info) = decoder.info() else {
         return skipped("no frame header");
     };
-    let width = u32::from(info.width);
-    let height = u32::from(info.height);
+    let width = usize::from(info.width);
+    let height = usize::from(info.height);
     let format = info.pixel_format;
-    let channels: u32 = match format {
+    let channels: u8 = match format {
         jpeg_decoder::PixelFormat::L8 | jpeg_decoder::PixelFormat::L16 => 1,
         jpeg_decoder::PixelFormat::RGB24 => 3,
         jpeg_decoder::PixelFormat::CMYK32 => 4,
     };
 
-    metrics.insert(metric!("image.width"), f64::from(width));
-    metrics.insert(metric!("image.height"), f64::from(height));
+    metrics.insert(metric!("image.width"), f64::from(info.width));
+    metrics.insert(metric!("image.height"), f64::from(info.height));
     metrics.insert(metric!("image.channels"), f64::from(channels));
 
-    let predicted = (width as usize)
-        .saturating_mul(height as usize)
+    let predicted = width
+        .saturating_mul(height)
         .saturating_mul(format.pixel_bytes());
     if predicted > image_stats::MAX_DECODE_BYTES {
         return skipped("decoded image larger than the decode cap");
@@ -299,18 +282,18 @@ fn extract_pixel_stats(bytes: &[u8], scans: u32, metrics: &mut Metrics) {
     let pixel_entropy = entropy::shannon(&pixels);
     metrics.insert(metric!("image.pixel_entropy"), pixel_entropy);
     metrics.insert(metric!("image.histogram_flatness"), pixel_entropy / 8.0);
-    let density =
-        image_stats::edge_density(&pixels, width as usize, height as usize, channels as usize);
+    let channels = usize::from(channels);
+    let density = image_stats::edge_density(&pixels, width, height, channels);
     metrics.insert(metric!("image.edge_density"), f64::from(density));
 
     let (r, g, b, _a) = if channels >= 3 {
-        image_stats::channel_entropy(&pixels, channels as usize)
+        image_stats::channel_entropy(&pixels, channels)
     } else {
         (0.0, 0.0, 0.0, 0.0)
     };
-    metrics.insert(metric!("image.r_entropy"), f64::from(r));
-    metrics.insert(metric!("image.g_entropy"), f64::from(g));
-    metrics.insert(metric!("image.b_entropy"), f64::from(b));
+    metrics.insert(metric!("image.r_entropy"), r);
+    metrics.insert(metric!("image.g_entropy"), g);
+    metrics.insert(metric!("image.b_entropy"), b);
 }
 
 /// The decoded samples as one byte each, the unit every statistic counts in.
@@ -341,17 +324,33 @@ struct JpegState {
     maker_note_bytes: u32,
     comment_bytes: u64,
     exif_size: u64,
-    exif_present: bool,
-    exif_make: Option<String>,
-    exif_model: Option<String>,
-    exif_software: Option<String>,
-    exif_datetime: Option<String>,
-    exif_datetime_original: Option<String>,
-    exif_artist: Option<String>,
-    exif_copyright: Option<String>,
+    /// Present once an APP1 segment opens with the EXIF header, whether or
+    /// not its TIFF block yields any field.
+    exif: Option<Exif>,
     comment: Option<String>,
     adobe_color_transform: Option<u8>,
     features: Vec<&'static str>,
+}
+
+/// The EXIF fields read from IFD0 and the Exif sub-IFD.
+#[derive(Default)]
+struct Exif {
+    make: Option<String>,
+    model: Option<String>,
+    software: Option<String>,
+    datetime: Option<String>,
+    datetime_original: Option<String>,
+    artist: Option<String>,
+    copyright: Option<String>,
+}
+
+impl JpegState {
+    /// Add `feature` to the feature list, once.
+    fn flag(&mut self, feature: &'static str) {
+        if !self.features.contains(&feature) {
+            self.features.push(feature);
+        }
+    }
 }
 
 fn handle_segment(marker: u8, body: &[u8], st: &mut JpegState) {
@@ -368,34 +367,21 @@ fn handle_segment(marker: u8, body: &[u8], st: &mut JpegState) {
         0xE0 if body.starts_with(b"JFIF\0")
             && matches!(body.get(12..14), Some(&[w, h]) if w != 0 && h != 0) =>
         {
-            if !st.features.contains(&"jfif_thumbnail") {
-                st.features.push("jfif_thumbnail");
-            }
+            st.flag("jfif_thumbnail");
         }
         0xE1 => {
             if let Some(tiff) = body.strip_prefix(b"Exif\0\0") {
-                st.exif_present = true;
+                st.exif.get_or_insert_default();
                 parse_exif_app1(tiff, st);
-            } else if body
-                .windows(b"http://ns.adobe.com/xap/1.0/".len())
-                .any(|w| w == b"http://ns.adobe.com/xap/1.0/")
-            {
-                if !st.features.contains(&"xmp") {
-                    st.features.push("xmp");
-                }
+            } else if memchr::memmem::find(body, b"http://ns.adobe.com/xap/1.0/").is_some() {
+                st.flag("xmp");
             }
         }
-        0xE2 if body.starts_with(b"ICC_PROFILE\0") && body.len() >= 14 + 84 => {
-            if !st.features.contains(&"icc") {
-                st.features.push("icc");
-            }
-        }
+        0xE2 if body.starts_with(b"ICC_PROFILE\0") && body.len() >= 14 + 84 => st.flag("icc"),
         0xED if body.starts_with(b"Photoshop 3.0\0") => {
-            if !st.features.contains(&"photoshop_irb") {
-                st.features.push("photoshop_irb");
-            }
-            if body.get(14..18) == Some(b"8BIM") && !st.features.contains(&"iptc") {
-                st.features.push("iptc");
+            st.flag("photoshop_irb");
+            if body.get(14..18) == Some(b"8BIM") {
+                st.flag("iptc");
             }
         }
         // A short APP14 records nothing, exactly as the catch-all arm would.
@@ -429,11 +415,11 @@ fn parse_exif_app1(tiff: &[u8], st: &mut JpegState) {
     if magic != 0x002A {
         return;
     }
-    let ifd0_off = if little {
+    let ifd0_off = crate::bytes::sat_usize(if little {
         u32::from_le_bytes([i0, i1, i2, i3])
     } else {
         u32::from_be_bytes([i0, i1, i2, i3])
-    } as usize;
+    });
     walk_ifd(tiff, ifd0_off, little, st, true);
 }
 
@@ -454,13 +440,13 @@ fn walk_ifd(tiff: &[u8], off: usize, little: bool, st: &mut JpegState, is_root: 
             u32::from_be_bytes(b)
         })
     };
-    let count = match read_u16(off) {
-        Some(c) => c as usize,
-        None => return,
+    let Some(count) = read_u16(off) else {
+        return;
     };
     let mut exif_ifd_off: Option<usize> = None;
     let mut gps_present = false;
-    for i in 0..count {
+    let exif = st.exif.get_or_insert_default();
+    for i in 0..usize::from(count) {
         // `off` is file-controlled; an entry past the address space is past
         // the end of the block, like any other unreadable entry.
         let Some(entry_off) = off.checked_add(2 + i * 12) else {
@@ -484,10 +470,10 @@ fn walk_ifd(tiff: &[u8], off: usize, little: bool, st: &mut JpegState, is_root: 
             5 | 10 | 12 => 8,
             _ => 0,
         };
-        let total_bytes = (cnt as usize).saturating_mul(component_size);
+        let total_bytes = crate::bytes::sat_usize(cnt).saturating_mul(component_size);
         let data_slice: Option<&[u8]> = if total_bytes <= 4 {
             tiff.get(value_off_field..value_off_field + total_bytes.min(4))
-        } else if let Some(abs) = read_u32(value_off_field).map(|v| v as usize) {
+        } else if let Some(abs) = read_u32(value_off_field).map(crate::bytes::sat_usize) {
             abs.checked_add(total_bytes)
                 .and_then(|end| tiff.get(abs..end))
         } else {
@@ -495,20 +481,22 @@ fn walk_ifd(tiff: &[u8], off: usize, little: bool, st: &mut JpegState, is_root: 
         };
 
         match tag {
-            0x010F => st.exif_make = ascii_value(data_slice),
-            0x0110 => st.exif_model = ascii_value(data_slice),
-            0x0131 => st.exif_software = ascii_value(data_slice),
-            0x0132 => st.exif_datetime = ascii_value(data_slice),
-            0x013B => st.exif_artist = ascii_value(data_slice),
-            0x8298 => st.exif_copyright = ascii_value(data_slice),
-            0x9003 if !is_root => st.exif_datetime_original = ascii_value(data_slice),
+            0x010F => exif.make = ascii_value(data_slice),
+            0x0110 => exif.model = ascii_value(data_slice),
+            0x0131 => exif.software = ascii_value(data_slice),
+            0x0132 => exif.datetime = ascii_value(data_slice),
+            0x013B => exif.artist = ascii_value(data_slice),
+            0x8298 => exif.copyright = ascii_value(data_slice),
+            0x9003 if !is_root => exif.datetime_original = ascii_value(data_slice),
             0x927C if !is_root => {
                 st.maker_note_bytes = st
                     .maker_note_bytes
                     .saturating_add(crate::bytes::sat_u32(total_bytes));
             }
             0x8769 if is_root => {
-                exif_ifd_off = Some(read_u32(value_off_field).unwrap_or(0) as usize)
+                exif_ifd_off = Some(crate::bytes::sat_usize(
+                    read_u32(value_off_field).unwrap_or(0),
+                ));
             }
             0x8825 if is_root => gps_present = true,
             _ => {}
@@ -518,8 +506,8 @@ fn walk_ifd(tiff: &[u8], off: usize, little: bool, st: &mut JpegState, is_root: 
         if let Some(off) = exif_ifd_off {
             walk_ifd(tiff, off, little, st, false);
         }
-        if gps_present && !st.features.contains(&"gps") {
-            st.features.push("gps");
+        if gps_present {
+            st.flag("gps");
         }
     }
 }

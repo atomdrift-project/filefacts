@@ -7,11 +7,13 @@
 //! intent. There is no cross-function, conditional-branch, wildcard-import
 //! or dynamic resolution: any statement that could rebind a name ends what
 //! is known about it.
+use super::parse::NestedParses;
 use super::visit::Visit;
-use super::{TreeCache, named_children, text};
+use super::{named_children, text};
 use crate::{FileType, Values, value_key};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::sync::atomic::AtomicBool;
 use tree_sitter::Node;
 
 const MAX_STATEMENTS: usize = 10_000;
@@ -128,7 +130,7 @@ fn literal(node: Node<'_>, source: &str) -> Option<String> {
     Some(if prefix.contains(['r', 'R']) {
         body.to_owned()
     } else {
-        super::decode_source_escapes(body)
+        super::escapes::decode(body)
     })
 }
 
@@ -140,7 +142,7 @@ fn is_bytes(node: Node<'_>, source: &str) -> bool {
 /// at module scope: `exec(urlopen("https://…").read())`, with `urlopen`
 /// imported from `urllib.request` in that same code. The code is parsed,
 /// never run.
-fn remote_exec_urls(code: &str) -> Vec<String> {
+fn remote_exec_urls(code: &str, nested: &mut NestedParses<'_>) -> Vec<String> {
     let mut urls = Vec::new();
     if code.len() > MAX_WRITTEN_SOURCE_BYTES {
         tracing::debug!(
@@ -152,7 +154,9 @@ fn remote_exec_urls(code: &str) -> Vec<String> {
         );
         return urls;
     }
-    let parsed = TreeCache::parse(code.as_bytes(), FileType::Python, None);
+    let Some(parsed) = nested.parse(code, FileType::Python) else {
+        return urls;
+    };
     let Some(cache) = parsed.cache() else {
         return urls;
     };
@@ -394,7 +398,7 @@ fn imports(statement: Node<'_>, source: &str, bindings: &mut Bindings) {
 
 /// The module statements the shared walk ([`super::visit`]) reaches,
 /// interpreted in order.
-pub(super) struct Collector {
+pub(super) struct Collector<'a> {
     bindings: Bindings,
     temporaries: BTreeMap<String, Temporary>,
     calls: Vec<Value>,
@@ -402,10 +406,11 @@ pub(super) struct Collector {
     budget: usize,
     parse_error: bool,
     skipped: bool,
+    nested: NestedParses<'a>,
 }
 
-impl Collector {
-    pub(super) fn new(source: &str) -> Self {
+impl<'a> Collector<'a> {
+    pub(super) fn new(source: &str, cancel: Option<&'a AtomicBool>) -> Self {
         let skipped = source.len() > MAX_SOURCE_BYTES;
         if skipped {
             tracing::debug!(
@@ -424,6 +429,7 @@ impl Collector {
             budget: MAX_STATEMENTS,
             parse_error: false,
             skipped,
+            nested: NestedParses::new(cancel),
         }
     }
 
@@ -632,37 +638,37 @@ impl Collector {
                 f.child_by_field_name("object")
                     .zip(f.child_by_field_name("attribute"))
             });
-        if let Some((object, method)) = method {
-            if let Some(temporary) = temporaries.get_mut(text(object, source)) {
-                let method = text(method, source);
-                let args = arguments(call);
-                let event = match (method, args.as_slice()) {
-                    ("write", [data]) => {
-                        let bytes = is_bytes(*data, source);
-                        let written = literal(*data, source);
-                        json!({
-                            "event": "write",
-                            "offset": offset,
-                            "literal": written.is_some(),
-                            "bytes": bytes,
-                            "remote_exec_urls": written
-                                .filter(|_| bytes)
-                                .map(|code| remote_exec_urls(&code))
-                                .unwrap_or_default(),
-                        })
-                    }
-                    ("close", []) => json!({"event": "close", "offset": offset}),
-                    _ => json!({"event": "call", "method": method, "offset": offset}),
-                };
-                temporary.event(event);
-                return;
-            }
+        if let Some((object, method)) = method
+            && let Some(temporary) = temporaries.get_mut(text(object, source))
+        {
+            let method = text(method, source);
+            let args = arguments(call);
+            let event = match (method, args.as_slice()) {
+                ("write", [data]) => {
+                    let bytes = is_bytes(*data, source);
+                    let written = literal(*data, source);
+                    json!({
+                        "event": "write",
+                        "offset": offset,
+                        "literal": written.is_some(),
+                        "bytes": bytes,
+                        "remote_exec_urls": written
+                            .filter(|_| bytes)
+                            .map(|code| remote_exec_urls(&code, &mut self.nested))
+                            .unwrap_or_default(),
+                    })
+                }
+                ("close", []) => json!({"event": "close", "offset": offset}),
+                _ => json!({"event": "call", "method": method, "offset": offset}),
+            };
+            temporary.event(event);
+            return;
         }
-        if let Some((file, event)) = launch(call, source, bindings, trigger) {
-            if let Some(temporary) = temporaries.get_mut(&file) {
-                temporary.event(event);
-                return;
-            }
+        if let Some((file, event)) = launch(call, source, bindings, trigger)
+            && let Some(temporary) = temporaries.get_mut(&file)
+        {
+            temporary.event(event);
+            return;
         }
         // Opaque calls may use the handle, including writes nested in an
         // argument.
@@ -694,7 +700,7 @@ impl Collector {
             value_key!("source.python.module_calls_analysis"),
             json!({
                 "parse_error": self.parse_error,
-                "truncated": self.skipped || self.budget == 0,
+                "truncated": self.skipped || self.budget == 0 || self.nested.limited,
             }),
         );
     }

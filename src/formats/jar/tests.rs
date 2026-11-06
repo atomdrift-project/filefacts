@@ -348,3 +348,91 @@ fn entry_count_metric_reflects_zip_entries() {
     assert_eq!(m.get("jar.entry_count"), Some(3.0));
     assert_eq!(m.get("jar.class_count"), Some(2.0));
 }
+
+fn main_class(manifest_name: &str, manifest: &[u8]) -> Option<String> {
+    let jar = stored_zip(&[(manifest_name, manifest)]);
+    let (v, _) = run(&jar);
+    v.get("jar.manifest.main_class")
+        .and_then(|x| x.as_str())
+        .map(str::to_string)
+}
+
+/// The JVM runs the main section's `Main-Class`; an entry section naming
+/// another must not stand in for it.
+#[test]
+fn an_entry_section_does_not_override_the_main_section() {
+    let manifest = b"Manifest-Version: 1.0\n\
+        Main-Class: com.evil.Loader\n\
+        \n\
+        Name: com/example/App.class\n\
+        Main-Class: com.example.App\n";
+    assert_eq!(
+        main_class("META-INF/MANIFEST.MF", manifest).as_deref(),
+        Some("com.evil.Loader")
+    );
+    // A header only an entry section carries is still reported.
+    let jar = stored_zip(&[(
+        "META-INF/MANIFEST.MF",
+        b"Manifest-Version: 1.0\n\nName: com/example/\nImplementation-Title: Example\n",
+    )]);
+    let (v, _) = run(&jar);
+    assert_eq!(
+        v.get("jar.manifest.implementation_title")
+            .and_then(|x| x.as_str()),
+        Some("Example")
+    );
+}
+
+/// `java.util.jar.Manifest` ends a line at a bare CR as well: a `Main-Class`
+/// after one is a header of its own, not part of the line before.
+#[test]
+fn a_bare_carriage_return_ends_a_manifest_line() {
+    assert_eq!(
+        main_class(
+            "META-INF/MANIFEST.MF",
+            b"Manifest-Version: 1.0\rMain-Class: com.evil.Loader\r"
+        )
+        .as_deref(),
+        Some("com.evil.Loader")
+    );
+    assert_eq!(
+        main_class(
+            "META-INF/MANIFEST.MF",
+            b"Manifest-Version: 1.0\r\nMain-Class: com.example.App\r\n"
+        )
+        .as_deref(),
+        Some("com.example.App")
+    );
+}
+
+/// `JarFile` finds the manifest by upper-casing `META-INF/` names when no
+/// member is spelled exactly; the JVM runs what that member names.
+#[test]
+fn a_manifest_spelled_in_another_case_is_read() {
+    let manifest = b"Manifest-Version: 1.0\nMain-Class: com.evil.Loader\n";
+    for name in ["meta-inf/manifest.mf", "META-INF/Manifest.mf"] {
+        assert_eq!(
+            main_class(name, manifest).as_deref(),
+            Some("com.evil.Loader"),
+            "{name}"
+        );
+    }
+    assert!(main_class("META-INF/MANIFEST.MF.bak", manifest).is_none());
+    assert!(main_class("x/META-INF/MANIFEST.MF", manifest).is_none());
+    // The exact name wins over an earlier alias.
+    let jar = stored_zip(&[
+        (
+            "meta-inf/manifest.mf",
+            b"Main-Class: com.decoy.Main\n".as_slice(),
+        ),
+        (
+            "META-INF/MANIFEST.MF",
+            b"Main-Class: com.example.App\n".as_slice(),
+        ),
+    ]);
+    let (v, _) = run(&jar);
+    assert_eq!(
+        v.get("jar.manifest.main_class").and_then(|x| x.as_str()),
+        Some("com.example.App")
+    );
+}

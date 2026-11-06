@@ -17,7 +17,7 @@ mod clr;
 mod debug;
 mod exports;
 mod headers;
-pub(super) mod imports;
+mod imports;
 pub(super) mod layout;
 mod load_config;
 mod manifest;
@@ -27,55 +27,72 @@ mod ordinal_names;
 mod ordinals;
 mod relocations;
 mod resources;
-pub(super) mod rich;
+mod rich;
 mod signature;
 mod version_info;
 
 use goblin::pe::PE;
+use goblin::pe::section_table::SectionTable;
 
 use crate::error::Error;
 use crate::formats::common::{
-    XorScan, apply_native, extract_binary_strings, extract_binary_strings_from_object, native,
-    read_layout, recover_natively, recovered_function_count,
+    XorScan, extract_binary_strings, extract_binary_strings_from_object, native, read_layout,
 };
 use crate::formats::goblin_safe;
 use crate::metric;
+use crate::output::Metrics;
 use crate::value_key;
 
-pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) -> Result<(), Error> {
+pub(super) fn extract(bytes: &[u8], mut ctx: super::ExtractCtx<'_>) -> Result<(), Error> {
     // goblin is handed the bytes with the structures it cannot survive
     // cleared (see `goblin_safe::prepare_pe`); every raw reader — section
     // data, overlay, Authenticode, the Rich header — keeps reading the
     // untouched `bytes`. What goblin had to be denied is a fact about the
-    // sample, so it lands in the errors view: an import or export table past
-    // goblin's walk budget is a forged one.
+    // sample, so it lands in the errors view: an export table past goblin's
+    // walk budget is a forged one, as is a resource tree nested past it.
     let prepared = goblin_safe::prepare_pe(bytes);
     // The section, import and export views are binform's, read from the
-    // untouched bytes under binform's own walk budgets, which match the ones
-    // goblin is held to.
-    let read = read_layout(bytes);
+    // untouched bytes under binform's own walk budgets, but for a section
+    // count past what goblin accepts.
+    let (layout_bytes, patch) = binform_bytes(bytes);
+    let read = read_layout(&layout_bytes);
     let layout = read.as_ref().ok();
-    if let Some(reason) = prepared.exports_skipped {
-        ctx.errors
-            .record_malformed(crate::Stage::PeParse, reason.to_string());
+    if let Some(count) = patch.declared_sections {
+        ctx.errors.record_malformed(
+            crate::Stage::PeParse,
+            format!(
+                "section table cut to {} of {count} sections",
+                layout::MAX_SECTIONS
+            ),
+        );
     }
-    if let Some(reason) = prepared.imports_skipped {
+    if patch.realigned > 0 {
+        ctx.errors.record_malformed(
+            crate::Stage::PeParse,
+            format!(
+                "{} section raw pointer(s) not a multiple of 512; read from the rounded-down offset, as the loader maps them",
+                patch.realigned
+            ),
+        );
+    }
+    for reason in [prepared.exports_skipped, prepared.resources_skipped]
+        .into_iter()
+        .flatten()
+    {
         ctx.errors
             .record_malformed(crate::Stage::PeParse, reason.to_string());
-        ctx.metrics
-            .insert(metric!("pe.import_table_unwalkable"), 1.0);
     }
 
-    // The full parse gives imports, exports, resources and the section table
-    // in one go. Its failure is recorded before the header-only fallback, so
-    // consumers see which stage tripped even when the fallback succeeds.
+    // The full parse gives the headers, resources and directories in one go.
+    // Its failure is recorded before the header-only fallback, so consumers
+    // see which stage tripped even when the fallback succeeds.
     match goblin_safe::parse_pe(&prepared) {
         goblin_safe::GoblinOutcome::Ok(pe) => {
             if let Err(error) = &read {
                 ctx.errors
                     .record_malformed(crate::Stage::PeParse, error.clone());
             }
-            parsed(pe, bytes, layout, ctx);
+            parsed(pe, bytes, layout, &mut ctx);
             return Ok(());
         }
         goblin_safe::GoblinOutcome::Failed(e) => {
@@ -104,29 +121,121 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) -> Result<(), Er
             ctx.metrics.insert(metric!("pe.parse_panicked"), 1.0);
         }
     }
-    header_only(&prepared.bytes, bytes, layout, ctx)
+    header_only(&prepared.bytes, bytes, layout, &mut ctx)
+}
+
+/// What [`binform_bytes`] changed on its copy of the image.
+#[derive(Debug, Default)]
+struct BinformPatch {
+    /// The declared section count, when it was cut to
+    /// [`layout::MAX_SECTIONS`].
+    declared_sections: Option<u16>,
+    /// Section headers whose `PointerToRawData` was rounded down.
+    realigned: usize,
+}
+
+/// `bytes` for binform to read, patched on a copy where binform would
+/// otherwise read the image differently from the Windows loader:
+///
+/// - A COFF `NumberOfSections` past [`layout::MAX_SECTIONS`] is cut to it.
+///   binform reads every section's bytes (a Go pclntab search among them),
+///   and nothing makes the raw extents disjoint: 65535 headers may each
+///   claim the whole file, costing sections × file size. goblin refuses
+///   such a header outright; binform reads its first sections.
+/// - Each section's `PointerToRawData` is rounded down to a multiple of
+///   512. The loader maps an image whose `SectionAlignment` is at least a
+///   page in 512-byte sectors, whatever `FileAlignment` says, so a section
+///   whose pointer reads 0x401 is mapped from 0x400. binform adds the
+///   pointer as written, and would read imports, exports and code from
+///   bytes the loader never maps there. An image aligned below a page is
+///   mapped flat, each pointer equal to its section's RVA, and is left as
+///   it is.
+fn binform_bytes(bytes: &[u8]) -> (std::borrow::Cow<'_, [u8]>, BinformPatch) {
+    use crate::bytes::{u16_le, u32_le};
+    use goblin::pe::section_table::SIZEOF_SECTION_TABLE;
+    /// The loader's sector size, and the page below which an image is
+    /// mapped flat.
+    const SECTOR: u32 = 0x200;
+    const PAGE: u32 = 0x1000;
+    let mut patch = BinformPatch::default();
+    let Some(coff) = u32_le(bytes, 0x3c)
+        .map(crate::bytes::sat_usize)
+        .filter(|&pe| bytes.get(pe..pe.saturating_add(4)) == Some(b"PE\0\0".as_slice()))
+        .and_then(|pe| pe.checked_add(4))
+    else {
+        return (bytes.into(), patch);
+    };
+    // The PE signature check bounds `coff` by the file's length, so these
+    // offsets cannot wrap.
+    let header = |at: usize| u16_le(bytes, coff + at);
+    let (Some(count), Some(optional_size)) = (header(2), header(16)) else {
+        return (bytes.into(), patch);
+    };
+    let Ok(cut) = u16::try_from(layout::MAX_SECTIONS) else {
+        return (bytes.into(), patch);
+    };
+    let mut copy = std::borrow::Cow::Borrowed(bytes);
+    if count > cut {
+        tracing::debug!(
+            target: "filefacts::pe",
+            format = "pe",
+            stage = "section-table",
+            declared = count,
+            read = cut,
+            "section count past budget; binform reads the first sections"
+        );
+        if let Some(field) = copy.to_mut().get_mut(coff + 2..coff + 4) {
+            field.copy_from_slice(&cut.to_le_bytes());
+        }
+        patch.declared_sections = Some(count);
+    }
+    // `SectionAlignment` sits at the same place in PE32 and PE32+.
+    let optional = coff + 20;
+    if u32_le(bytes, optional + 32).is_none_or(|alignment| alignment < PAGE) {
+        return (copy, patch);
+    }
+    let table = optional + usize::from(optional_size);
+    for i in 0..usize::from(count.min(cut)) {
+        // `PointerToRawData`, 20 bytes into the section header.
+        let at = table + SIZEOF_SECTION_TABLE * i + 20;
+        let Some(pointer) = u32_le(bytes, at) else {
+            break;
+        };
+        let rounded = pointer & !(SECTOR - 1);
+        if rounded == pointer {
+            continue;
+        }
+        if let Some(field) = copy.to_mut().get_mut(at..at + 4) {
+            field.copy_from_slice(&rounded.to_le_bytes());
+        }
+        patch.realigned += 1;
+    }
+    if patch.realigned > 0 {
+        tracing::debug!(
+            target: "filefacts::pe",
+            format = "pe",
+            stage = "section-table",
+            sections = patch.realigned,
+            "section raw pointers not sector-aligned; binform reads from the loader's offsets"
+        );
+    }
+    (copy, patch)
 }
 
 /// The section, import and export views from binform's `layout`, for an
 /// image based at `image_base` on `machine`; `pe` gives the export
 /// directory's own facts, when goblin parsed it.
-#[allow(clippy::too_many_arguments)]
 fn views(
-    layout: Option<&binform::Binary<'_>>,
+    layout: &binform::Binary<'_>,
     pe: Option<&PE<'_>>,
     image_base: u64,
     machine: u16,
     bytes: &[u8],
-    values: &mut crate::output::Values,
-    metrics: &mut crate::output::Metrics,
-    sections_out: &mut Vec<crate::output::Section>,
-    symbols_out: &mut crate::Symbols,
+    ctx: &mut super::ExtractCtx<'_>,
 ) {
-    if let Some(layout) = layout {
-        headers::sections(layout, image_base, bytes, sections_out);
-        imports::imports(layout, image_base, machine, values, metrics, symbols_out);
-    }
-    exports::exports(layout, image_base, pe, bytes, values, metrics, symbols_out);
+    headers::sections(layout, image_base, bytes, ctx.sections);
+    imports::imports(layout, image_base, machine, ctx);
+    exports::exports(layout, image_base, pe, bytes, ctx);
 }
 
 /// Every fact a full goblin parse supports.
@@ -134,53 +243,58 @@ fn parsed(
     pe: PE<'_>,
     bytes: &[u8],
     layout: Option<&binform::Binary<'_>>,
-    ctx: super::ExtractCtx<'_>,
+    ctx: &mut super::ExtractCtx<'_>,
 ) {
-    let super::ExtractCtx {
-        values,
-        strings,
-        metrics,
-        sections: sections_out,
-        symbols: symbols_out,
-        errors: errors_out,
-        ..
-    } = ctx;
     // One stng pass covers ASCII, section names and the UTF-16 resource and
     // version-info runs, at absolute file offsets. It takes the parse as an
     // Object, moved in and back out, so the binary is not parsed twice.
     let object = goblin::Object::PE(pe);
     let shared: Vec<stng::Layout<'_, '_>> = layout.iter().map(|layout| (0, *layout)).collect();
-    extract_binary_strings_from_object(&object, &shared, bytes, strings, XorScan::Yes);
-    // Constructed as `Object::PE` two lines up.
+    extract_binary_strings_from_object(&object, &shared, bytes, ctx.strings, XorScan::Yes);
+    // Constructed as `Object::PE` above.
     let goblin::Object::PE(pe) = object else {
         return;
     };
     let pe = &pe;
-    headers::coff_header(&pe.header.coff_header, values, metrics);
-    headers::dos_header(&pe.header, values);
+    headers::coff_header(&pe.header.coff_header, ctx.values, ctx.metrics);
+    headers::dos_header(&pe.header, ctx.values);
     if let Some(ref opt) = pe.header.optional_header {
-        headers::optional_header(opt, values, metrics);
+        headers::optional_header(opt, ctx.values, ctx.metrics);
     }
-    views(
-        layout,
-        Some(pe),
-        pe.image_base,
-        pe.header.coff_header.machine,
+    if let Some(layout) = layout {
+        views(
+            layout,
+            Some(pe),
+            pe.image_base,
+            pe.header.coff_header.machine,
+            bytes,
+            ctx,
+        );
+    }
+    let super::ExtractCtx {
+        values,
+        metrics,
+        symbols: symbols_out,
+        errors: errors_out,
+        ..
+    } = ctx;
+    let signals = api_hash::native_resolver_signals(pe, bytes, values, metrics);
+    resources::extract(pe, bytes, values, metrics, errors_out);
+    version_resources(
+        &pe.sections,
+        layout::file_alignment(pe),
+        pe.header.optional_header.as_ref(),
         bytes,
         values,
         metrics,
-        sections_out,
-        symbols_out,
     );
-    let signals = api_hash::native_resolver_signals(pe, bytes, values, metrics);
-    resources::extract(pe, bytes, values, metrics, errors_out);
     if let Some(ref dbg) = pe.debug_data {
         debug::extract(dbg, values, metrics, errors_out);
     }
     imports::bound_imports(pe, bytes, values, metrics);
-    imports::delay_imports(pe, bytes, values, metrics);
+    imports::delay_imports(pe, layout, bytes, values, metrics);
     relocations::base_relocations(pe, bytes, values, metrics);
-    load_config::tls_callbacks(pe, values, metrics);
+    load_config::tls_callbacks(pe, layout, values, metrics);
     load_config::load_config(pe, bytes, values, metrics);
     anomalies::inflated_sections(pe, values);
     anomalies::entry_and_overlay(pe, bytes, values, metrics);
@@ -196,22 +310,32 @@ fn parsed(
     rich::extract(bytes, values);
     super::upx::detect(bytes, values);
     let go_sections = super::go_buildinfo::GoSections {
-        buildinfo: super::go_buildinfo::pe_region(pe, bytes),
+        buildinfo: go_buildinfo_region(pe, bytes),
         buildid_note: None,
         pclntab: layout::section_bytes(pe, bytes, ".gopclntab"),
         rodata: layout::section_bytes(pe, bytes, ".rdata"),
     };
-    let has_go_pclntab = go_sections
+    let pclntab = go_sections
         .pclntab
-        .is_some_and(super::go_buildinfo::has_pclntab_magic);
-    super::go_buildinfo::detect(bytes, values, value_key!("pe.go"), None, &go_sections);
+        .filter(|table| super::go_pclntab::has_magic(table));
+    // Go 1.13–1.17 store pointers to the build-info strings, which resolve
+    // through the image as the loader maps it.
+    let resolve = |va: u64| layout::va_to_file_offset(pe, va);
+    super::go_buildinfo::detect(
+        bytes,
+        values,
+        value_key!("pe.go"),
+        Some(&resolve),
+        &go_sections,
+    );
     // A Go PE may fold `.gopclntab` into `.rdata` and omit a literal
     // `.gopclntab` section. Build-info is still authoritative Go evidence, and
     // in that layout the native parser supplies the function inventory binform
     // would otherwise recover.
-    let has_go_function_metadata = has_go_pclntab || values.get_key(value_key!("pe.go")).is_some();
+    let has_go_function_metadata =
+        pclntab.is_some() || values.lookup(value_key!("pe.go")).is_some();
     if has_go_function_metadata {
-        go_functions(pe, &go_sections, has_go_pclntab, symbols_out);
+        go_functions(pe, pclntab, go_sections.rodata, symbols_out);
     }
     super::build_toolchain::from_pe_rich(values);
     let Some(recovered) = native(layout, symbols_out) else {
@@ -219,7 +343,12 @@ fn parsed(
     };
     // A compact PE with no imports is often a resolver stub: correlate its
     // calls with the API-hash walkers the native scan found.
-    let importless = api_hash::is_importless(bytes, symbols_out);
+    const MAX_IMPORTLESS_ANALYSIS_BYTES: usize = 5 * 1024 * 1024;
+    let importless = bytes.len() <= MAX_IMPORTLESS_ANALYSIS_BYTES
+        && symbols_out
+            .iter_kind(crate::SymbolKind::Import)
+            .next()
+            .is_none();
     if importless {
         api_hash::recover_api_hash_requests(
             pe,
@@ -230,7 +359,7 @@ fn parsed(
             &recovered.functions,
         );
     }
-    let functions = apply_native(&recovered, symbols_out, metrics);
+    let functions = recovered.functions.apply(symbols_out, metrics);
     if importless {
         metrics.insert(metric!("pe.importless_analysis"), 1.0);
         if functions > 0 {
@@ -243,14 +372,58 @@ fn parsed(
     recovered_function_count(functions, metrics);
 }
 
+/// Emit `pe.recovered_function_count`: how many functions binform recovered
+/// for a PE whose format parser named none.
+fn recovered_function_count(functions: u32, metrics: &mut Metrics) {
+    if functions > 0 {
+        metrics.insert(metric!("pe.recovered_function_count"), f64::from(functions));
+    }
+}
+
+/// The `pe.version.*` facts and `pe.has_version_info`, from the
+/// `RT_VERSION` resources the resource directory in `optional`'s data
+/// directories leads to through `sections`.
+fn version_resources(
+    sections: &[SectionTable],
+    file_alignment: Option<u32>,
+    optional: Option<&goblin::pe::optional_header::OptionalHeader>,
+    bytes: &[u8],
+    values: &mut crate::output::Values,
+    metrics: &mut Metrics,
+) {
+    let Some(resources) = optional.and_then(|opt| opt.data_directories.get_resource_table()) else {
+        return;
+    };
+    if version_info::extract(sections, file_alignment, *resources, bytes, values, metrics) {
+        metrics.insert(metric!("pe.has_version_info"), 1.0);
+    }
+}
+
+/// The PE section Go's `debug/buildinfo` searches: the first one with an
+/// address and a size whose characteristics, alignment aside, are exactly
+/// initialized, readable, writable data.
+fn go_buildinfo_region<'a>(pe: &PE<'_>, bytes: &'a [u8]) -> Option<&'a [u8]> {
+    use goblin::pe::section_table::{
+        IMAGE_SCN_ALIGN_32BYTES, IMAGE_SCN_CNT_INITIALIZED_DATA, IMAGE_SCN_MEM_READ,
+        IMAGE_SCN_MEM_WRITE,
+    };
+    const DATA: u32 = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE;
+    let section = pe.sections.iter().find(|s| {
+        s.virtual_address != 0
+            && s.size_of_raw_data != 0
+            && s.characteristics & !IMAGE_SCN_ALIGN_32BYTES == DATA
+    })?;
+    layout::section_data(section, layout::file_alignment(pe), bytes)
+}
+
 /// Add the functions a Go PE's pclntab names (see [`super::go_pclntab`]),
-/// which then spare it binform's recovery. The table is the `.gopclntab`
-/// section when there is one; Go's linker otherwise folds it into `.rdata`,
-/// where a candidate must pass the same validation to count.
+/// which then spare it binform's recovery. The table is `pclntab`, the
+/// `.gopclntab` section, when there is one; Go's linker otherwise folds it
+/// into `rdata`, where a candidate must pass the same validation to count.
 fn go_functions(
-    pe: &goblin::pe::PE<'_>,
-    go_sections: &super::go_buildinfo::GoSections<'_>,
-    has_go_pclntab: bool,
+    pe: &PE<'_>,
+    pclntab: Option<&[u8]>,
+    rdata: Option<&[u8]>,
     symbols_out: &mut crate::Symbols,
 ) {
     use goblin::pe::section_table::{IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE};
@@ -276,10 +449,10 @@ fn go_functions(
     ) else {
         return;
     };
-    let functions = match (has_go_pclntab, go_sections.pclntab, go_sections.rodata) {
-        (true, Some(table), _) => super::go_pclntab::functions(table, code, text),
-        (_, _, Some(rdata)) => super::go_pclntab::find(rdata, code, text),
-        _ => None,
+    let functions = match (pclntab, rdata) {
+        (Some(table), _) => super::go_pclntab::functions(table, code, text),
+        (None, Some(rdata)) => super::go_pclntab::find(rdata, code, text),
+        (None, None) => None,
     };
     for function in functions.into_iter().flatten() {
         symbols_out.push(function);
@@ -289,65 +462,91 @@ fn go_functions(
 /// The facts the headers alone support, for a PE goblin could not parse in
 /// full. The header parse is far more tolerant: machine, subsystem,
 /// characteristics and Authenticode survive a malformed or stripped import
-/// directory (packed installers, Go binaries, obfuscated builds).
+/// directory (packed installers, Go binaries, obfuscated builds). binform
+/// reads a malformed or packed PE leniently, so its section, import and
+/// export views and its functions stand whether or not goblin reads even
+/// the headers.
 fn header_only(
     goblin_bytes: &[u8],
     bytes: &[u8],
     layout: Option<&binform::Binary<'_>>,
-    ctx: super::ExtractCtx<'_>,
+    ctx: &mut super::ExtractCtx<'_>,
 ) -> Result<(), Error> {
-    let super::ExtractCtx {
-        values,
-        strings,
-        metrics,
-        sections: sections_out,
-        symbols: symbols_out,
-        errors: errors_out,
-        ..
-    } = ctx;
     // stng parses the bytes itself, tolerating the malformed structure.
-    extract_binary_strings(bytes, strings, XorScan::Yes);
+    extract_binary_strings(bytes, ctx.strings, XorScan::Yes);
     let header = match goblin_safe::parse_pe_header(goblin_bytes) {
         goblin_safe::GoblinOutcome::Ok(header) => header,
         goblin_safe::GoblinOutcome::Failed(e) => {
+            layout_only(layout, bytes, ctx);
             return Err(Error::malformed_caused_by("pe", e));
         }
         goblin_safe::GoblinOutcome::Panicked(msg) => {
-            errors_out.record_panic(crate::Stage::PeParse, msg);
+            ctx.errors.record_panic(crate::Stage::PeParse, msg);
+            layout_only(layout, bytes, ctx);
             return Ok(());
         }
     };
-    headers::coff_header(&header.coff_header, values, metrics);
-    headers::dos_header(&header, values);
-    if let Some(ref opt) = header.optional_header {
-        headers::optional_header(opt, values, metrics);
+    ctx.errors
+        .record_fallback(crate::Stage::PeParse, "header-only fallback");
+    ctx.metrics.insert(metric!("pe.partial_parse"), 1.0);
+    headers::coff_header(&header.coff_header, ctx.values, ctx.metrics);
+    headers::dos_header(&header, ctx.values);
+    let opt = header.optional_header.as_ref();
+    let image_base = opt.map_or(0, |opt| opt.windows_fields.image_base);
+    if let Some(opt) = opt {
+        headers::optional_header(opt, ctx.values, ctx.metrics);
         // No section table, so no image hash: the signatures are reported,
         // and judged unverifiable.
-        signature::extract(None, opt, bytes, values, metrics);
+        signature::extract(None, opt, bytes, ctx.values, ctx.metrics);
     }
-    version_info::recover_partial(bytes, values);
-    errors_out.record_fallback(crate::Stage::PeParse, "header-only fallback");
-    metrics.insert(metric!("pe.partial_parse"), 1.0);
-    anomalies::partial_section_overflows(bytes, &header, values, metrics);
-    // binform reads a malformed or packed PE leniently: its tables stand
-    // whether or not goblin could parse the rest.
-    views(
-        layout,
-        None,
-        header
-            .optional_header
-            .map_or(0, |opt| opt.windows_fields.image_base),
-        header.coff_header.machine,
-        bytes,
-        values,
-        metrics,
-        sections_out,
-        symbols_out,
-    );
-    if let Some(functions) = recover_natively(layout, symbols_out, metrics) {
-        recovered_function_count(functions, metrics);
+    // goblin read no section table; the readers that need one take
+    // binform's.
+    if let Some(layout) = layout {
+        let sections = layout::section_table(layout, image_base);
+        let alignment = opt.map(|opt| opt.windows_fields.file_alignment);
+        version_resources(&sections, alignment, opt, bytes, ctx.values, ctx.metrics);
+        anomalies::partial_section_overflows(
+            &sections,
+            header.coff_header.number_of_sections,
+            bytes,
+            ctx.values,
+            ctx.metrics,
+        );
+        views(
+            layout,
+            None,
+            image_base,
+            header.coff_header.machine,
+            bytes,
+            ctx,
+        );
     }
+    recover_functions(layout, ctx);
     Ok(())
+}
+
+/// binform's views and functions, for a PE whose headers goblin could not
+/// read, placed at the image base and machine the raw headers declare.
+fn layout_only(
+    layout: Option<&binform::Binary<'_>>,
+    bytes: &[u8],
+    ctx: &mut super::ExtractCtx<'_>,
+) {
+    let Some(layout) = layout else {
+        return;
+    };
+    let (image_base, machine) = layout::base_and_machine(bytes);
+    views(layout, None, image_base, machine, bytes, ctx);
+    recover_functions(Some(layout), ctx);
+}
+
+/// Recover with binform the functions of a PE no format parser named, and
+/// count them.
+fn recover_functions(layout: Option<&binform::Binary<'_>>, ctx: &mut super::ExtractCtx<'_>) {
+    if let Some(recovered) = native(layout, ctx.symbols) {
+        let functions = recovered.functions.apply(ctx.symbols, ctx.metrics);
+        recovered_function_count(functions, ctx.metrics);
+    }
 }
 
 #[cfg(test)]

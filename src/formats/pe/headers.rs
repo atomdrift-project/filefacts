@@ -4,6 +4,10 @@
 use goblin::pe::PE;
 use goblin::pe::header::{CoffHeader, Header};
 use goblin::pe::optional_header::OptionalHeader;
+use goblin::pe::section_table::{
+    IMAGE_SCN_CNT_CODE, IMAGE_SCN_CNT_INITIALIZED_DATA, IMAGE_SCN_CNT_UNINITIALIZED_DATA,
+    IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE,
+};
 use serde_json::Value as JsonValue;
 
 use super::layout::DIRECTORY_NAMES;
@@ -177,9 +181,24 @@ pub(super) fn sections(
     bytes: &[u8],
     sections_out: &mut Vec<Section>,
 ) {
+    // Entropy is a pass over each section's file bytes, and nothing makes
+    // the raw extents disjoint: up to 65535 headers may all claim the whole
+    // file, costing sections × file size. A real image's sections are
+    // disjoint slices of the file, so its length is the budget they need;
+    // sections past it go unmeasured.
+    let mut unmeasured = bytes.len();
     for section in layout.sections() {
-        let entropy = (section.file_size > 0)
-            .then(|| section_entropy(bytes, section.offset, section.file_size));
+        let in_file = bytes
+            .len()
+            .saturating_sub(crate::bytes::sat_usize(section.offset))
+            .min(crate::bytes::sat_usize(section.file_size));
+        let entropy = match unmeasured.checked_sub(in_file) {
+            Some(left) if section.file_size > 0 => {
+                unmeasured = left;
+                Some(section_entropy(bytes, section.offset, section.file_size))
+            }
+            _ => None,
+        };
         sections_out.push(Section {
             name: section.name.clone(),
             vaddr: section.addr.wrapping_sub(image_base),
@@ -316,12 +335,15 @@ fn subsystem_string(subsystem: u16) -> &'static str {
 
 fn section_characteristics(flags: u32) -> Vec<SectionFlag> {
     [
-        (0x0000_0020, SectionFlag::Code),
-        (0x0000_0040, SectionFlag::InitializedData),
-        (0x0000_0080, SectionFlag::UninitializedData),
-        (0x2000_0000, SectionFlag::Executable),
-        (0x4000_0000, SectionFlag::Readable),
-        (0x8000_0000, SectionFlag::Writable),
+        (IMAGE_SCN_CNT_CODE, SectionFlag::Code),
+        (IMAGE_SCN_CNT_INITIALIZED_DATA, SectionFlag::InitializedData),
+        (
+            IMAGE_SCN_CNT_UNINITIALIZED_DATA,
+            SectionFlag::UninitializedData,
+        ),
+        (IMAGE_SCN_MEM_EXECUTE, SectionFlag::Executable),
+        (IMAGE_SCN_MEM_READ, SectionFlag::Readable),
+        (IMAGE_SCN_MEM_WRITE, SectionFlag::Writable),
     ]
     .into_iter()
     .filter_map(|(bit, flag)| (flags & bit != 0).then_some(flag))

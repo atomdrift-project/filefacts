@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use serde_json::{Value as JsonValue, json};
 
 use super::MAX_INFLATED;
-use super::filters::{decode_stream, find_filters};
+use super::filters::{StageBudget, decode_stream, find_filters};
 use super::lex::{
     find_info_value, has_name, parse_indirect_ref_value, read_hex_string, read_literal_string,
     skip_while, truncate,
@@ -25,9 +25,40 @@ pub(super) const MAX_JS_TOTAL: usize = 16 << 20;
 /// `/JS` sites resolved per document.
 const MAX_JS_SITES: usize = 4096;
 
+/// The action key an invocation site uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ActionKind {
+    JavaScript,
+    Launch,
+    Uri,
+    SubmitForm,
+    GoToR,
+    GoToE,
+    Movie,
+    Sound,
+    ImportData,
+}
+
+impl ActionKind {
+    /// The name `pdf.actions[].kind` reports.
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::JavaScript => "javascript",
+            Self::Launch => "launch",
+            Self::Uri => "uri",
+            Self::SubmitForm => "submitform",
+            Self::GoToR => "gotor",
+            Self::GoToE => "gotoe",
+            Self::Movie => "movie",
+            Self::Sound => "sound",
+            Self::ImportData => "importdata",
+        }
+    }
+}
+
 /// One action invocation site.
 pub(super) struct Action {
-    pub(super) kind: &'static str,
+    pub(super) kind: ActionKind,
     /// `object:<id>`, `objstm:<id>` or `openaction`.
     pub(super) source: String,
     pub(super) snippet: String,
@@ -46,16 +77,16 @@ pub(super) struct Action {
 ///
 /// At most `cap` sites are recorded.
 pub(super) fn scan_actions(bytes: &[u8], dict_regions: &[DictRegion], cap: usize) -> Vec<Action> {
-    const KINDS: &[(&[u8], &str)] = &[
-        (b"/JS", "javascript"),
-        (b"/Launch", "launch"),
-        (b"/URI", "uri"),
-        (b"/SubmitForm", "submitform"),
-        (b"/GoToR", "gotor"),
-        (b"/GoToE", "gotoe"),
-        (b"/Movie", "movie"),
-        (b"/Sound", "sound"),
-        (b"/ImportData", "importdata"),
+    const KINDS: &[(&[u8], ActionKind)] = &[
+        (b"/JS", ActionKind::JavaScript),
+        (b"/Launch", ActionKind::Launch),
+        (b"/URI", ActionKind::Uri),
+        (b"/SubmitForm", ActionKind::SubmitForm),
+        (b"/GoToR", ActionKind::GoToR),
+        (b"/GoToE", ActionKind::GoToE),
+        (b"/Movie", ActionKind::Movie),
+        (b"/Sound", ActionKind::Sound),
+        (b"/ImportData", ActionKind::ImportData),
     ];
     let mut out = Vec::new();
     for region_info in dict_regions {
@@ -161,7 +192,7 @@ fn action_snippet(bytes: &[u8], start: usize) -> Option<String> {
                 .get(cursor..end)?
                 .iter()
                 .take_while(|&&b| !matches!(b, b'\n' | b'\r' | b'>' | b'/'))
-                .map(|&b| b as char)
+                .map(|&b| char::from(b))
                 .collect();
             let trimmed = token.trim();
             trimmed.ends_with('R').then(|| trimmed.to_string())
@@ -210,6 +241,7 @@ pub(super) fn scan_javascript_payloads(
     // did not resolve), so a repeat is answered without decoding again.
     let mut seen: HashMap<u32, Option<u64>> = HashMap::new();
     let mut limit = None;
+    let mut stages = StageBudget::default();
     'regions: for region in dict_regions {
         let dict = region.dict(bytes);
         let mut pos = 0;
@@ -251,7 +283,9 @@ pub(super) fn scan_javascript_payloads(
                 break 'regions;
             }
             let payload = match target {
-                Some(id) => resolve_indirect_js(bytes, id, objects, budget.min(MAX_INFLATED)),
+                Some(id) => {
+                    resolve_indirect_js(bytes, id, objects, budget.min(MAX_INFLATED), &mut stages)
+                }
                 None => resolve_inline_js(dict, cursor),
             };
             if let Some(id) = target {
@@ -273,6 +307,12 @@ pub(super) fn scan_javascript_payloads(
             entry.insert("content".into(), JsonValue::String(payload.content));
             out.push(JsonValue::Object(entry));
         }
+    }
+    if stages.refused() > 0 && limit.is_none() {
+        limit = Some(format!(
+            "{} /JS stream(s) not decoded: the filter-stage decode budget was spent",
+            stages.refused()
+        ));
     }
     JsScan {
         payloads: out,
@@ -305,7 +345,7 @@ fn js_reference(dict: &[u8], cursor: usize) -> Option<u32> {
         .get(cursor..end)?
         .iter()
         .take_while(|&&b| !matches!(b, b'\n' | b'\r' | b'>' | b'/' | b'('))
-        .map(|&b| b as char)
+        .map(|&b| char::from(b))
         .collect();
     let reference = token.trim().strip_suffix('R')?;
     reference.split_whitespace().next()?.parse().ok()
@@ -318,6 +358,7 @@ fn resolve_indirect_js(
     target_id: u32,
     objects: &ObjectIndex<'_>,
     cap: usize,
+    stages: &mut StageBudget,
 ) -> Option<JsPayload> {
     let Some(target) = objects.get(&target_id).copied() else {
         tracing::debug!(
@@ -336,7 +377,7 @@ fn resolve_indirect_js(
         && let Some(raw) = bytes.get(s..e).filter(|raw| !raw.is_empty())
     {
         let filters = find_filters(target.dict(bytes)).unwrap_or_default();
-        match decode_stream(raw, &filters, cap) {
+        match decode_stream(raw, &filters, cap, stages) {
             // Surface as a string. `String::from_utf8_lossy` so any
             // embedded shellcode bytes survive as `U+FFFD` rather than
             // throwing the whole payload away — the downstream JS parser
@@ -441,7 +482,7 @@ fn find_ef_stream_length(
         .iter()
         .skip_while(|b| b.is_ascii_whitespace())
         .take_while(|b| b.is_ascii_digit())
-        .map(|&b| b as char)
+        .map(|&b| char::from(b))
         .collect();
     digits.parse().ok()
 }

@@ -222,12 +222,52 @@ fn malformed_utf16_bom_batch_reaches_the_public_text_view() {
 
 #[test]
 fn affix_checks_ignore_ascii_case() {
-    assert!(super::ends_with_ci("word/document.XML", ".xml"));
-    assert!(super::ends_with_ci(".xml", ".xml"));
-    assert!(!super::ends_with_ci("xml", ".xml"));
-    assert!(!super::ends_with_ci("doc.xmlx", ".xml"));
+    assert!(crate::bytes::ends_with_ci("word/document.XML", ".xml"));
+    assert!(crate::bytes::ends_with_ci(".xml", ".xml"));
+    assert!(!crate::bytes::ends_with_ci("xml", ".xml"));
+    assert!(!crate::bytes::ends_with_ci("doc.xmlx", ".xml"));
     // A multi-byte character just before the suffix is not split.
-    assert!(super::ends_with_ci("é.SF", ".sf"));
+    assert!(crate::bytes::ends_with_ci("é.SF", ".sf"));
     assert!(super::starts_with_ci("meta-inf/CERT.SF", "META-INF/"));
     assert!(!super::starts_with_ci("META", "META-INF/"));
+}
+
+/// A file of nothing but short NUL-separated runs makes a byte-scan row
+/// per few input bytes. The rows kept are capped, earliest first, and the
+/// cut is counted rather than silent. Two million distinct runs take stng
+/// tens of seconds in a debug build.
+#[test]
+#[ignore = "CPU-saturating; run with --release -- --ignored"]
+fn byte_scan_rows_are_capped() {
+    let runs = super::MAX_TEXT_ROWS + 1000;
+    let mut bytes = Vec::with_capacity(runs * 8);
+    for i in 0..runs {
+        // Distinct runs: identical ones are reported once.
+        bytes.extend_from_slice(format!("{i:07}").as_bytes());
+        bytes.push(0);
+    }
+    let mut strings = Strings::new();
+    super::extract_binary_strings(&bytes, &mut strings, XorScan::No);
+    assert_eq!(strings.text.len(), super::MAX_TEXT_ROWS);
+    assert!(strings.text.dropped() > 0);
+    // The rows kept are the earliest: one run per eight bytes, so the last
+    // kept starts no later than the cap's worth of runs in.
+    let last = strings.text.rows().iter().map(|r| r.data_offset).max();
+    assert!(last <= Some(super::MAX_TEXT_ROWS as u64 * 8), "{last:?}");
+}
+
+/// The cap keeps the earliest rows, and rows appended later share it.
+#[test]
+fn byte_scan_cap_keeps_the_earliest_rows() {
+    let row =
+        |i: u64| stng::ExtractedString::new(format!("run{i}"), i, stng::StringMethod::RawScan);
+    let mut text = crate::output::Text::capped((0..5).map(row).collect(), 3);
+    assert_eq!(text.len(), 3);
+    assert_eq!(text.dropped(), 2);
+    assert_eq!(text.rows().last().map(|r| r.data_offset), Some(2));
+    text.append_rows(&[row(9)], 4);
+    text.append_rows(&[row(10), row(11)], 4);
+    assert_eq!(text.len(), 4);
+    assert_eq!(text.dropped(), 4);
+    assert_eq!(text.rows().last().map(|r| r.data_offset), Some(9));
 }

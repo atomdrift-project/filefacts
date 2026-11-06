@@ -26,6 +26,7 @@ use serde_json::{Value as JsonValue, json};
 use std::collections::HashSet;
 use std::io::{Read, sink};
 
+use crate::bytes::sat_usize;
 use crate::formats::carrier::{self, Coverage};
 use crate::formats::common::{XorScan, extract_binary_strings};
 use crate::formats::image_stats;
@@ -79,7 +80,6 @@ pub(super) fn extract(
     let mut coverage = Coverage::new("png", 8);
 
     let mut chunks_total: usize = 0;
-    let mut chunks_idat: usize = 0;
     let mut chunks_after_iend: usize = 0;
     let mut text_chunk_bytes: usize = 0;
     let mut unknown_count: usize = 0;
@@ -109,9 +109,8 @@ pub(super) fn extract(
             coverage.problem("chunk walk stopped at its cap");
             break;
         }
-        let length = u32::from_be_bytes([head[0], head[1], head[2], head[3]]) as usize;
-        let ctype_bytes = &head[4..];
-        let ctype_raw = [head[4], head[5], head[6], head[7]];
+        let [l0, l1, l2, l3, ctype_raw @ ..] = *head;
+        let length = u32::from_be_bytes([l0, l1, l2, l3]) as usize;
         let body_start = i + 8;
         let Some(chunk_end) = body_start
             .checked_add(length)
@@ -129,7 +128,7 @@ pub(super) fn extract(
         };
         last_chunk_end = chunk_end;
 
-        let ctype = std::str::from_utf8(ctype_bytes).unwrap_or("");
+        let ctype = std::str::from_utf8(&ctype_raw).unwrap_or("");
         chunks_total += 1;
         if iend_seen {
             chunks_after_iend += 1;
@@ -160,7 +159,6 @@ pub(super) fn extract(
                 }
             }
             "IDAT" => {
-                chunks_idat += 1;
                 idat_extents.push(IdatExtent {
                     chunk_start: i,
                     body_start,
@@ -172,7 +170,7 @@ pub(super) fn extract(
             "tEXt" | "zTXt" | "iTXt" => {
                 text_chunk_bytes += length;
                 if let Some((key, value)) = parse_text_chunk(ctype, body) {
-                    text_kv.insert(snake_case(&key), JsonValue::String(value));
+                    text_kv.insert(snake_case(key), JsonValue::String(value));
                 }
             }
             // A short tIME records nothing, exactly as the catch-all arm would.
@@ -190,12 +188,10 @@ pub(super) fn extract(
                     .iter()
                     .position(|&b| b == 0)
                     .and_then(|end| body.get(..end))
+                    && let Ok(name) = std::str::from_utf8(name)
+                    && !name.is_empty()
                 {
-                    if let Ok(name) = std::str::from_utf8(name) {
-                        if !name.is_empty() {
-                            icc_name = Some(name.to_string());
-                        }
-                    }
+                    icc_name = Some(name.to_string());
                 }
                 if !features.contains(&"icc") {
                     features.push("icc");
@@ -339,7 +335,7 @@ pub(super) fn extract(
     limits.emit(values, value_key!("png.limits"));
 
     metrics.insert(metric!("png.chunk_count"), chunks_total as f64);
-    metrics.insert(metric!("png.idat_chunk_count"), chunks_idat as f64);
+    metrics.insert(metric!("png.idat_chunk_count"), idat_extents.len() as f64);
     metrics.insert(
         metric!("png.trailing_chunk_count"),
         chunks_after_iend as f64,
@@ -374,52 +370,15 @@ fn claim_idat_stream(
     extents: &[IdatExtent],
     coverage: &mut Coverage,
 ) -> Option<usize> {
-    let total = extents.iter().try_fold(0usize, |sum, extent| {
-        sum.checked_add(extent.body_end - extent.body_start)
-    })?;
-    if total == 0 || total > MAX_IDAT_ANALYSIS_BYTES {
-        claim_all_idat(extents, coverage);
-        return None;
-    }
-
-    let mut input = Vec::with_capacity(total);
-    for extent in extents {
-        // Extents come from chunks that fit the file, so the body is present.
-        let Some(body) = bytes.get(extent.body_start..extent.body_end) else {
-            claim_all_idat(extents, coverage);
-            return None;
-        };
-        input.extend_from_slice(body);
-    }
-
-    let mut decoder = flate2::bufread::ZlibDecoder::new(input.as_slice());
-    let copied = match std::io::copy(
-        &mut decoder.by_ref().take(MAX_IDAT_DECODE_BYTES + 1),
-        &mut sink(),
-    ) {
-        Ok(copied) => copied,
-        Err(_) => {
-            claim_all_idat(extents, coverage);
-            return None;
+    let Some(consumed) = idat_zlib_len(bytes, extents) else {
+        for extent in extents {
+            coverage.claim(extent.chunk_start as u64, extent.chunk_end as u64);
         }
-    };
-    if copied > MAX_IDAT_DECODE_BYTES {
-        claim_all_idat(extents, coverage);
-        return None;
-    }
-    let Ok(consumed) = usize::try_from(decoder.total_in()) else {
-        claim_all_idat(extents, coverage);
         return None;
     };
-    if consumed == 0 || consumed > total {
-        claim_all_idat(extents, coverage);
-        return None;
-    }
-
     let mut logical_start = 0usize;
     for extent in extents {
         let body_len = extent.body_end - extent.body_start;
-        let logical_end = logical_start + body_len;
         let used_here = consumed.saturating_sub(logical_start).min(body_len);
 
         // Chunk length/type and CRC remain valid structure even when some or
@@ -430,15 +389,37 @@ fn claim_idat_stream(
         );
         coverage.claim(extent.body_end as u64, extent.chunk_end as u64);
 
-        logical_start = logical_end;
+        logical_start += body_len;
     }
     Some(consumed)
 }
 
-fn claim_all_idat(extents: &[IdatExtent], coverage: &mut Coverage) {
-    for extent in extents {
-        coverage.claim(extent.chunk_start as u64, extent.chunk_end as u64);
+/// The bytes of the concatenated IDAT bodies the first zlib stream consumes,
+/// when a bounded decode reaches its end. `None` for no IDAT data, data or a
+/// decoded image over the analysis caps, or a stream that does not decode.
+fn idat_zlib_len(bytes: &[u8], extents: &[IdatExtent]) -> Option<usize> {
+    let total = extents.iter().try_fold(0usize, |sum, extent| {
+        sum.checked_add(extent.body_end - extent.body_start)
+    })?;
+    if total == 0 || total > MAX_IDAT_ANALYSIS_BYTES {
+        return None;
     }
+    let mut input = Vec::with_capacity(total);
+    for extent in extents {
+        // Extents come from chunks that fit the file, so the body is present.
+        input.extend_from_slice(bytes.get(extent.body_start..extent.body_end)?);
+    }
+    let mut decoder = flate2::bufread::ZlibDecoder::new(input.as_slice());
+    let copied = std::io::copy(
+        &mut decoder.by_ref().take(MAX_IDAT_DECODE_BYTES + 1),
+        &mut sink(),
+    )
+    .ok()?;
+    if copied > MAX_IDAT_DECODE_BYTES {
+        return None;
+    }
+    let consumed = usize::try_from(decoder.total_in()).ok()?;
+    (consumed != 0 && consumed <= total).then_some(consumed)
 }
 
 /// Decode the PNG (cap-protected) and emit pixel-statistic metrics:
@@ -464,7 +445,7 @@ fn extract_pixel_stats(bytes: &[u8], values: &mut Values, metrics: &mut Metrics)
     let info = reader.info();
     let width = info.width;
     let height = info.height;
-    let bit_depth = info.bit_depth as u32;
+    let bit_depth = info.bit_depth as usize;
     let channels: u32 = match reader.output_color_type().0 {
         png::ColorType::Grayscale | png::ColorType::Indexed => 1,
         png::ColorType::GrayscaleAlpha => 2,
@@ -491,10 +472,11 @@ fn extract_pixel_stats(bytes: &[u8], values: &mut Values, metrics: &mut Metrics)
         return skipped("frame larger than its buffer");
     };
 
-    let raw_size = (width as usize)
-        .saturating_mul(height as usize)
-        .saturating_mul(channels as usize)
-        .saturating_mul((bit_depth as usize / 8).max(1));
+    let (width, height, channels) = (sat_usize(width), sat_usize(height), sat_usize(channels));
+    let raw_size = width
+        .saturating_mul(height)
+        .saturating_mul(channels)
+        .saturating_mul((bit_depth / 8).max(1));
     let compression_ratio = if raw_size > 0 {
         bytes.len() as f64 / raw_size as f64
     } else {
@@ -518,50 +500,33 @@ fn extract_pixel_stats(bytes: &[u8], values: &mut Values, metrics: &mut Metrics)
             .iter()
             .map(|[high, _]| *high)
             .collect::<Vec<_>>();
-        super::png_stego::extract(
-            &low,
-            width as usize,
-            height as usize,
-            channels as usize,
-            "u16-low",
-            values,
-            metrics,
-        );
+        super::png_stego::extract(&low, width, height, channels, "u16-low", values, metrics);
         super::png_stego::extract(
             &normalized,
-            width as usize,
-            height as usize,
-            channels as usize,
+            width,
+            height,
+            channels,
             "u16-high",
             values,
             metrics,
         );
         normalized.as_slice()
     } else {
-        super::png_stego::extract(
-            pixels,
-            width as usize,
-            height as usize,
-            channels as usize,
-            "u8",
-            values,
-            metrics,
-        );
+        super::png_stego::extract(pixels, width, height, channels, "u8", values, metrics);
         pixels
     };
     let pixel_entropy = entropy::shannon(pixels);
     metrics.insert(metric!("image.pixel_entropy"), pixel_entropy);
     metrics.insert(metric!("image.histogram_flatness"), pixel_entropy / 8.0);
-    let density =
-        image_stats::edge_density(pixels, width as usize, height as usize, channels as usize);
+    let density = image_stats::edge_density(pixels, width, height, channels);
     metrics.insert(metric!("image.edge_density"), f64::from(density));
 
     if channels >= 3 {
-        let (r, g, b, a) = image_stats::channel_entropy(pixels, channels as usize);
-        metrics.insert(metric!("image.r_entropy"), f64::from(r));
-        metrics.insert(metric!("image.g_entropy"), f64::from(g));
-        metrics.insert(metric!("image.b_entropy"), f64::from(b));
-        metrics.insert(metric!("png.a_entropy"), f64::from(a));
+        let (r, g, b, a) = image_stats::channel_entropy(pixels, channels);
+        metrics.insert(metric!("image.r_entropy"), r);
+        metrics.insert(metric!("image.g_entropy"), g);
+        metrics.insert(metric!("image.b_entropy"), b);
+        metrics.insert(metric!("png.a_entropy"), a);
     } else {
         // A single-channel image reports its pixel entropy as
         // `r_entropy`, so a rule keyed on the red channel still applies.
@@ -615,8 +580,7 @@ fn is_standard_chunk(t: &str) -> bool {
             | "acTL"
             | "fcTL"
             | "fdAT"
-            // PNG 3rd edition / HDR additions. Missing them made every
-            // GarageBand app icon report a 16-byte unaccounted-for region.
+            // PNG 3rd edition / HDR additions.
             | "cICP"
             | "mDCv"
             | "cLLi"
@@ -666,9 +630,9 @@ fn is_well_formed_aapt_chunk(ctype: &str, body: &[u8], crc: &[u8]) -> bool {
 /// All three (`tEXt`, `zTXt`, `iTXt`) start with a NUL-terminated
 /// keyword; what follows differs. We surface the keyword always,
 /// the text value only when it's uncompressed UTF-8.
-fn parse_text_chunk(ctype: &str, body: &[u8]) -> Option<(String, String)> {
+fn parse_text_chunk<'a>(ctype: &str, body: &'a [u8]) -> Option<(&'a str, String)> {
     let kw_end = body.iter().position(|&b| b == 0)?;
-    let key = std::str::from_utf8(body.get(..kw_end)?).ok()?.to_string();
+    let key = std::str::from_utf8(body.get(..kw_end)?).ok()?;
     let value = match ctype {
         "tEXt" => std::str::from_utf8(body.get(kw_end + 1..)?)
             .ok()?

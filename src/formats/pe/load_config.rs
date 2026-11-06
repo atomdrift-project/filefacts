@@ -6,7 +6,7 @@ use goblin::pe::optional_header::MAGIC_64;
 use serde_json::Value as JsonValue;
 
 use super::layout::rva_to_file_offset;
-use crate::formats::common::bytes_at::{u32_le, u64_le};
+use crate::bytes::{u32_le, u64_le};
 use crate::metric;
 use crate::output::{Metrics, Values};
 use crate::value_key;
@@ -22,8 +22,13 @@ const MAX_TLS_CALLBACK_RECORDS: usize = 1024;
 /// callbacks are the Windows analogue of ELF `.init_array`: they run before
 /// the entry point, which makes them a classic anti-analysis hook (malware
 /// uses them to defeat breakpoint-on-entry debuggers). A callback at an
-/// export carries the export's name.
-pub(super) fn tls_callbacks(pe: &PE<'_>, values: &mut Values, metrics: &mut Metrics) {
+/// export of binform's `layout` carries the export's name.
+pub(super) fn tls_callbacks(
+    pe: &PE<'_>,
+    layout: Option<&binform::Binary<'_>>,
+    values: &mut Values,
+    metrics: &mut Metrics,
+) {
     let Some(tls) = pe.tls_data.as_ref() else {
         return;
     };
@@ -32,20 +37,13 @@ pub(super) fn tls_callbacks(pe: &PE<'_>, values: &mut Values, metrics: &mut Metr
     }
     metrics.insert(metric!("pe.tls_callback_count"), tls.callbacks.len() as f64);
 
-    let export_by_va: std::collections::HashMap<u64, &str> = pe
-        .exports
+    // binform's export addresses are VAs in the preferred image, as the
+    // callback table's are.
+    let export_by_va: std::collections::HashMap<u64, &str> = layout
         .iter()
-        .filter_map(|e| {
-            // `e.rva` is the export RVA; turn it into a VA by adding
-            // the image base for symbol-attribution lookup against the
-            // TLS callback table (which is stored as VAs).
-            let va = pe
-                .header
-                .optional_header
-                .as_ref()
-                .map(|h| h.windows_fields.image_base.saturating_add(e.rva as u64))?;
-            e.name.map(|n| (va, n))
-        })
+        .flat_map(|layout| layout.exports())
+        .filter(|export| export.forward.is_none())
+        .filter_map(|export| Some((export.addr?, export.name.as_str())))
         .collect();
 
     let entries: Vec<JsonValue> = tls
@@ -63,6 +61,29 @@ pub(super) fn tls_callbacks(pe: &PE<'_>, values: &mut Values, metrics: &mut Metr
         .collect();
     values.insert_key(value_key!("pe.tls_callbacks"), JsonValue::Array(entries));
 }
+
+/// `SEHandlerTable` and `SEHandlerCount`, as `(PE32, PE32+)` offsets into
+/// `IMAGE_LOAD_CONFIG_DIRECTORY{32,64}` (winnt.h).
+const SE_HANDLER_TABLE: (usize, usize) = (0x40, 0x60);
+const SE_HANDLER_COUNT: (usize, usize) = (0x44, 0x68);
+
+/// The pointer-sized load-config fields `pe.load_config` reports, with their
+/// `(PE32, PE32+)` offsets. The fields before the cookie (TimeDateStamp,
+/// GlobalFlags, the thresholds) are rarely forensically interesting and are
+/// skipped.
+const POINTER_FIELDS: [(&str, (usize, usize)); 11] = [
+    ("security_cookie", (0x3C, 0x58)),
+    ("se_handler_table", SE_HANDLER_TABLE),
+    ("se_handler_count", SE_HANDLER_COUNT),
+    ("guard_cf_check_function_pointer", (0x48, 0x70)),
+    ("guard_cf_dispatch_function_pointer", (0x4C, 0x78)),
+    ("guard_cf_function_table", (0x50, 0x80)),
+    ("guard_cf_function_count", (0x54, 0x88)),
+    ("guard_address_taken_iat_entry_table", (0x68, 0xA0)),
+    ("guard_address_taken_iat_entry_count", (0x6C, 0xA8)),
+    ("guard_long_jump_target_table", (0x70, 0xB0)),
+    ("guard_long_jump_target_count", (0x74, 0xB8)),
+];
 
 /// Parse the IMAGE_LOAD_CONFIG_DIRECTORY structure using the `Size`
 /// field embedded at offset 0 — Microsoft's spec says this is the
@@ -90,7 +111,7 @@ pub(super) fn load_config(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metric
     let Some(start) = rva_to_file_offset(pe, dd.virtual_address) else {
         return;
     };
-    let Some(embedded_size) = u32_le(bytes, start).map(|v| v as usize) else {
+    let Some(embedded_size) = u32_le(bytes, start).map(crate::bytes::sat_usize) else {
         return;
     };
     if embedded_size < 4 {
@@ -104,86 +125,25 @@ pub(super) fn load_config(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metric
     let mut obj = serde_json::Map::new();
     obj.insert("size".into(), JsonValue::Number(embedded_size.into()));
 
-    let read_ptr = |off: usize| -> Option<u64> {
+    let read_ptr = |(off32, off64): (usize, usize)| -> Option<u64> {
         if is_64 {
-            u64_le(slice, off)
+            u64_le(slice, off64)
         } else {
-            u32_le(slice, off).map(u64::from)
+            u32_le(slice, off32).map(u64::from)
         }
     };
+    for (key, offsets) in POINTER_FIELDS {
+        // A zero cookie is a cleared-cookie tampering tell; any other zero
+        // pointer or count is an unused feature.
+        if let Some(v) = read_ptr(offsets)
+            && (v != 0 || key == "security_cookie")
+        {
+            obj.insert(key.into(), JsonValue::Number(v.into()));
+        }
+    }
 
-    // Field offsets per IMAGE_LOAD_CONFIG_DIRECTORY{32,64} from winnt.h.
-    // Pre-cookie fields (TimeDateStamp, GlobalFlags, *Threshold, etc.)
-    // are rarely forensically interesting and bloat the surface — we
-    // skip straight to the security/mitigation-relevant block.
-    let (
-        sec_cookie,
-        seh_table,
-        seh_count,
-        cf_check,
-        cf_dispatch,
-        cf_table,
-        cf_count,
-        guard_flags_off,
-        taken_iat_table,
-        taken_iat_count,
-        longjmp_table,
-        longjmp_count,
-    ) = if is_64 {
-        (
-            0x58, 0x60, 0x68, 0x70, 0x78, 0x80, 0x88, 0x90, 0xA0, 0xA8, 0xB0, 0xB8,
-        )
-    } else {
-        (
-            0x3C, 0x40, 0x44, 0x48, 0x4C, 0x50, 0x54, 0x58, 0x68, 0x6C, 0x70, 0x74,
-        )
-    };
-
-    let put_ptr =
-        |obj: &mut serde_json::Map<String, JsonValue>, key: &str, off: usize, allow_zero: bool| {
-            if let Some(v) = read_ptr(off) {
-                if v != 0 || allow_zero {
-                    obj.insert(key.into(), JsonValue::Number(v.into()));
-                }
-            }
-        };
-    put_ptr(&mut obj, "security_cookie", sec_cookie, true);
-    put_ptr(&mut obj, "se_handler_table", seh_table, false);
-    put_ptr(&mut obj, "se_handler_count", seh_count, false);
-    put_ptr(&mut obj, "guard_cf_check_function_pointer", cf_check, false);
-    put_ptr(
-        &mut obj,
-        "guard_cf_dispatch_function_pointer",
-        cf_dispatch,
-        false,
-    );
-    put_ptr(&mut obj, "guard_cf_function_table", cf_table, false);
-    put_ptr(&mut obj, "guard_cf_function_count", cf_count, false);
-    put_ptr(
-        &mut obj,
-        "guard_address_taken_iat_entry_table",
-        taken_iat_table,
-        false,
-    );
-    put_ptr(
-        &mut obj,
-        "guard_address_taken_iat_entry_count",
-        taken_iat_count,
-        false,
-    );
-    put_ptr(
-        &mut obj,
-        "guard_long_jump_target_table",
-        longjmp_table,
-        false,
-    );
-    put_ptr(
-        &mut obj,
-        "guard_long_jump_target_count",
-        longjmp_count,
-        false,
-    );
-
+    // `GuardFlags` is a u32 in both layouts.
+    let guard_flags_off = if is_64 { 0x90 } else { 0x58 };
     if let Some(flags) = u32_le(slice, guard_flags_off) {
         // Both forms — raw u32 for round-trip and a string-flag array
         // for human-readable trait matches against `cf_instrumented`
@@ -204,73 +164,47 @@ pub(super) fn load_config(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metric
         }
         // Cross-format mitigation summary metrics — boolean-valued for
         // easy trait composition.
-        let cf_on = flags & 0x0000_0100 != 0;
+        let cf_on = flags & GUARD_CF_INSTRUMENTED != 0;
         metrics.insert(metric!("pe.has_cfg"), f64::from(u8::from(cf_on)));
     }
-    if read_ptr(seh_table).unwrap_or(0) != 0 && read_ptr(seh_count).unwrap_or(0) != 0 {
+    if read_ptr(SE_HANDLER_TABLE).unwrap_or(0) != 0 && read_ptr(SE_HANDLER_COUNT).unwrap_or(0) != 0
+    {
         metrics.insert(metric!("pe.has_safe_seh"), 1.0);
     }
 
     values.insert_key(value_key!("pe.load_config"), JsonValue::Object(obj));
 }
 
+/// `IMAGE_GUARD_CF_INSTRUMENTED`: the image was built with Control Flow
+/// Guard.
+const GUARD_CF_INSTRUMENTED: u32 = 0x0000_0100;
+
 /// `IMAGE_GUARD_*` constants from `winnt.h`. Names follow the
 /// Microsoft-published abbreviations (sans `IMAGE_GUARD_` prefix,
 /// lowercased) so analysts can `exact:` against the flag directly.
 fn guard_flag_names(flags: u32) -> Vec<&'static str> {
-    let mut out = Vec::new();
-    if flags & 0x0000_0100 != 0 {
-        out.push("cf_instrumented");
-    }
-    if flags & 0x0000_0200 != 0 {
-        out.push("cfw_instrumented");
-    }
-    if flags & 0x0000_0400 != 0 {
-        out.push("function_table_present");
-    }
-    if flags & 0x0000_0800 != 0 {
-        out.push("security_cookie_unused");
-    }
-    if flags & 0x0000_1000 != 0 {
-        out.push("protect_delayload_iat");
-    }
-    if flags & 0x0000_2000 != 0 {
-        out.push("delayload_iat_in_its_own_section");
-    }
-    if flags & 0x0000_4000 != 0 {
-        out.push("export_suppression_info_present");
-    }
-    if flags & 0x0000_8000 != 0 {
-        out.push("enable_export_suppression");
-    }
-    if flags & 0x0001_0000 != 0 {
-        out.push("longjump_table_present");
-    }
-    if flags & 0x0002_0000 != 0 {
-        out.push("rf_instrumented");
-    }
-    if flags & 0x0004_0000 != 0 {
-        out.push("rf_enable");
-    }
-    if flags & 0x0008_0000 != 0 {
-        out.push("rf_strict");
-    }
-    if flags & 0x0010_0000 != 0 {
-        out.push("retpoline_present");
-    }
-    if flags & 0x0040_0000 != 0 {
-        out.push("eh_continuation_table_present");
-    }
-    if flags & 0x0080_0000 != 0 {
-        out.push("xfg_enabled");
-    }
-    if flags & 0x0100_0000 != 0 {
-        out.push("castguard_present");
-    }
-    if flags & 0x0200_0000 != 0 {
-        out.push("memcpy_present");
-    }
-    out
+    [
+        (GUARD_CF_INSTRUMENTED, "cf_instrumented"),
+        (0x0000_0200, "cfw_instrumented"),
+        (0x0000_0400, "function_table_present"),
+        (0x0000_0800, "security_cookie_unused"),
+        (0x0000_1000, "protect_delayload_iat"),
+        (0x0000_2000, "delayload_iat_in_its_own_section"),
+        (0x0000_4000, "export_suppression_info_present"),
+        (0x0000_8000, "enable_export_suppression"),
+        (0x0001_0000, "longjump_table_present"),
+        (0x0002_0000, "rf_instrumented"),
+        (0x0004_0000, "rf_enable"),
+        (0x0008_0000, "rf_strict"),
+        (0x0010_0000, "retpoline_present"),
+        (0x0040_0000, "eh_continuation_table_present"),
+        (0x0080_0000, "xfg_enabled"),
+        (0x0100_0000, "castguard_present"),
+        (0x0200_0000, "memcpy_present"),
+    ]
+    .into_iter()
+    .filter_map(|(bit, name)| (flags & bit != 0).then_some(name))
+    .collect()
 }
 
 #[cfg(test)]

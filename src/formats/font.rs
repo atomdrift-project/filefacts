@@ -26,7 +26,7 @@
 //!   structure fits inside the file.
 //! - `font.tables[]` / `font.unknown_tables[]` — four-character table tags in
 //!   directory order, and the subset outside the registered OpenType set.
-//! - `font.features[]` — Pike-style flag array: `trailing_data`,
+//! - `font.features[]` — presence flags: `trailing_data`,
 //!   `interior_gaps`, `overlapping_tables`, `table_out_of_bounds`,
 //!   `truncated`, `size_mismatch`, `unknown_tables`, `signed` (DSIG),
 //!   `variable` (fvar), `bitmap` (colour/bitmap strikes), `text_content`.
@@ -51,8 +51,10 @@ use crate::value_key;
 use serde_json::Value as JsonValue;
 use std::collections::HashSet;
 
-use crate::formats::carrier::{classify_region, leading_whitespace, printable_ratio};
-use crate::formats::common::bytes_at::u32_be;
+use crate::bytes::{Reader, u32_be};
+use crate::formats::carrier::{
+    classify_region, classify_region_within, gzip_probe_budget, leading_whitespace, printable_ratio,
+};
 use crate::formats::common::{XorScan, extract_binary_strings, hex_encode};
 use crate::output::{Metrics, Strings, Values};
 use crate::scan::entropy;
@@ -68,10 +70,15 @@ const EOT_MAGIC_OFFSET: usize = 34;
 /// hundred tags and a font carries each at most once; real fonts hold 10-40.
 const MAX_TABLES: usize = 1024;
 
+/// Most members a collection may list. One with thousands is malformed, not
+/// a font, and the cap keeps a hostile header from turning into a long walk.
+const MAX_COLLECTION_FONTS: usize = 512;
+
 /// Region bytes examined per file byte. The regions of a well-formed font
 /// are disjoint, so together they read the file at most once; table records
 /// may overlap, though, and up to 1024 per directory -- or half a million
-/// across a collection -- each naming the whole file made the scan quadratic.
+/// across a collection -- each naming the whole file would make the scan
+/// quadratic.
 const SCAN_PASSES: u64 = 2;
 
 /// A table directory entry reduced to what structural analysis needs.
@@ -137,8 +144,8 @@ struct Report {
     /// trailing data, and tables under an unregistered tag. The `name`/`post`
     /// string tables are searched for payload signatures too but are *not*
     /// counted here — they are legitimately claimed content, and counting
-    /// them reported 4 KB of "stowaway" on every ordinary font. WOFF metadata
-    /// and private blocks are treated the same way.
+    /// them would report kilobytes of "stowaway" on every ordinary font. WOFF
+    /// metadata and private blocks are treated the same way.
     stowaway_bytes: u64,
     /// Shannon entropy over those same regions. Near 8.0 means compressed or
     /// encrypted content, which no font format leaves lying between tables.
@@ -151,6 +158,10 @@ struct Report {
     structure_ok: bool,
     /// Bytes [`note_region`] may still read; see [`SCAN_PASSES`].
     scan_budget: u64,
+    /// Inflate work the regions' gzip checks may still spend, shared so a
+    /// directory of many small regions costs what one file of their size
+    /// does.
+    gzip_budget: u64,
 }
 
 impl Report {
@@ -164,6 +175,20 @@ impl Report {
         if !self.stowaway.contains(&kind) {
             self.stowaway.push(kind);
         }
+    }
+
+    /// List `tag` among the tables, and among the unknown ones when it is
+    /// not registered; `false` when it was already listed.
+    fn list_table(&mut self, tag: [u8; 4]) -> bool {
+        if !self.seen_tables.insert(tag) {
+            return false;
+        }
+        let label = tag_label(&tag);
+        if !is_registered_tag(tag) {
+            self.unknown_tables.push(label.clone());
+        }
+        self.tables.push(label);
+        true
     }
 
     fn problem(&mut self, what: impl Into<String>) {
@@ -186,14 +211,20 @@ pub(super) fn extract(
     extract_binary_strings(bytes, strings, XorScan::No);
 
     let format = classify(bytes);
-    let mut report = Report {
-        structure_ok: format != Format::None,
+    let fresh_report = |structure_ok| Report {
+        structure_ok,
         scan_budget: (bytes.len() as u64).saturating_mul(SCAN_PASSES),
+        gzip_budget: gzip_probe_budget(bytes.len()),
         ..Report::default()
     };
+    let mut report = fresh_report(format != Format::None);
 
     match format {
-        Format::TrueType | Format::OpenType => walk_sfnt(bytes, &mut report),
+        // A bare `.ttf`/`.otf`: one directory, folded straight into coverage.
+        Format::TrueType | Format::OpenType => {
+            let (entries, dir_end) = read_sfnt_dir(bytes, 0, &mut report);
+            record_tables(bytes, dir_end, &entries, &mut report);
+        }
         Format::Collection => walk_collection(bytes, &mut report),
         Format::Woff => walk_woff(bytes, &mut report),
         Format::Woff2 => walk_woff2(bytes, &mut report),
@@ -203,11 +234,7 @@ pub(super) fn extract(
             // and table directory. Keep the signature failure, but do not
             // call the otherwise fully framed font an opaque encrypted blob.
             let recovered = reordered_woff_header(bytes).then(|| {
-                let mut candidate = Report {
-                    structure_ok: true,
-                    scan_budget: (bytes.len() as u64).saturating_mul(SCAN_PASSES),
-                    ..Report::default()
-                };
+                let mut candidate = fresh_report(true);
                 walk_woff(bytes, &mut candidate);
                 candidate
             });
@@ -249,28 +276,14 @@ pub(super) fn extract(
     if !report.tables.is_empty() {
         values.insert_key(
             value_key!("font.tables"),
-            JsonValue::Array(
-                report
-                    .tables
-                    .iter()
-                    .cloned()
-                    .map(JsonValue::String)
-                    .collect(),
-            ),
+            JsonValue::from(report.tables.as_slice()),
         );
     }
     if !report.unknown_tables.is_empty() {
         report.flag("unknown_tables");
         values.insert_key(
             value_key!("font.unknown_tables"),
-            JsonValue::Array(
-                report
-                    .unknown_tables
-                    .iter()
-                    .cloned()
-                    .map(JsonValue::String)
-                    .collect(),
-            ),
+            JsonValue::from(report.unknown_tables.as_slice()),
         );
     }
     if let Some(kind) = report.content_kind {
@@ -283,38 +296,19 @@ pub(super) fn extract(
         report.flag("stowaway");
         values.insert_key(
             value_key!("font.stowaway"),
-            JsonValue::Array(
-                report
-                    .stowaway
-                    .iter()
-                    .map(|s| JsonValue::String((*s).to_string()))
-                    .collect(),
-            ),
+            JsonValue::from(report.stowaway.as_slice()),
         );
     }
     if !report.problems.is_empty() {
         values.insert_key(
             value_key!("font.problems"),
-            JsonValue::Array(
-                report
-                    .problems
-                    .iter()
-                    .cloned()
-                    .map(JsonValue::String)
-                    .collect(),
-            ),
+            JsonValue::from(report.problems.as_slice()),
         );
     }
     if !report.features.is_empty() {
         values.insert_key(
             value_key!("font.features"),
-            JsonValue::Array(
-                report
-                    .features
-                    .iter()
-                    .map(|s| JsonValue::String((*s).to_string()))
-                    .collect(),
-            ),
+            JsonValue::from(report.features.as_slice()),
         );
     }
 
@@ -401,7 +395,7 @@ fn read_sfnt_dir(bytes: &[u8], base: usize, report: &mut Report) -> (Vec<TableEn
     };
     report.sfnt_version = Some(sfnt_version_label(&header[..4]));
 
-    let num_tables = u16::from_be_bytes([header[4], header[5]]) as usize;
+    let num_tables = usize::from(u16::from_be_bytes([header[4], header[5]]));
     if num_tables > MAX_TABLES {
         report.problem("implausible table count");
         return (Vec::new(), 0);
@@ -433,18 +427,12 @@ fn read_sfnt_dir(bytes: &[u8], base: usize, report: &mut Report) -> (Vec<TableEn
     (entries, dir_end as u64)
 }
 
-/// A bare `.ttf`/`.otf`: one directory, folded straight into coverage.
-fn walk_sfnt(bytes: &[u8], report: &mut Report) {
-    let (entries, dir_end) = read_sfnt_dir(bytes, 0, report);
-    record_tables(bytes, dir_end, &entries, report);
-}
-
 /// A TrueType collection is a header of offsets into sfnt directories whose
 /// members deliberately *share* table data — a `.ttc` exists precisely so two
 /// faces can point at one `glyf`. Coverage must therefore be computed across
 /// the union of every member's directory; folding each member in on its own
-/// reports the bytes claimed by earlier members as unaccounted-for, which
-/// marked every shipped macOS `.ttc` invalid.
+/// would report the bytes claimed by earlier members as unaccounted-for and
+/// mark every ordinary `.ttc` invalid.
 fn walk_collection(bytes: &[u8], report: &mut Report) {
     let Some(header) = bytes.first_chunk::<16>() else {
         report.problem("collection header truncated");
@@ -452,10 +440,10 @@ fn walk_collection(bytes: &[u8], report: &mut Report) {
         return;
     };
     report.sfnt_version = Some("ttcf".to_string());
-    let num_fonts = u32::from_be_bytes([header[8], header[9], header[10], header[11]]) as usize;
-    // A collection with thousands of members is malformed, not a font. The
-    // cap keeps a hostile header from turning into a long walk.
-    if num_fonts == 0 || num_fonts > 512 {
+    let num_fonts = crate::bytes::sat_usize(u32::from_be_bytes([
+        header[8], header[9], header[10], header[11],
+    ]));
+    if num_fonts == 0 || num_fonts > MAX_COLLECTION_FONTS {
         report.problem("implausible collection member count");
         return;
     }
@@ -464,7 +452,7 @@ fn walk_collection(bytes: &[u8], report: &mut Report) {
     let mut all: Vec<TableEntry> = Vec::new();
     // Members that share a directory contribute identical entries, which
     // the dedup below would collapse anyway; walk each directory once so a
-    // header pointing all 512 members at one large directory costs one walk.
+    // header pointing every member at one large directory costs one walk.
     let mut walked = HashSet::new();
     for i in 0..num_fonts {
         let Some(off) = u32_be(bytes, 12 + i * 4) else {
@@ -472,7 +460,7 @@ fn walk_collection(bytes: &[u8], report: &mut Report) {
             report.flag("truncated");
             return;
         };
-        let off = off as usize;
+        let off = crate::bytes::sat_usize(off);
         if !walked.insert(off) {
             continue;
         }
@@ -506,7 +494,7 @@ fn walk_woff(bytes: &[u8], report: &mut Report) {
     ]));
     note_declared_size(declared, bytes.len(), report);
 
-    let num_tables = u16::from_be_bytes([header[12], header[13]]) as usize;
+    let num_tables = usize::from(u16::from_be_bytes([header[12], header[13]]));
     if num_tables > MAX_TABLES {
         report.problem("implausible table count");
         return;
@@ -540,21 +528,19 @@ fn walk_woff(bytes: &[u8], report: &mut Report) {
     // so count them as covered rather than reporting them as stowaways.
     // `record_tables` still searches them for payload signatures, as it does
     // the string tables: their contents are free-form.
-    let mut extra = Vec::new();
     // metaOffset/metaLength sit at 24/28, privOffset/privLength at 36/40. The
     // header is 44 bytes, so every read lands; an unreadable field would mean
     // an undeclared block.
     let field = |at: usize| u32_be(header, at).map_or(0, u64::from);
     for (off, len) in [(field(24), field(28)), (field(36), field(40))] {
         if off > 0 && len > 0 {
-            extra.push(TableEntry {
+            entries.push(TableEntry {
                 tag: None,
                 offset: off,
                 length: len,
             });
         }
     }
-    entries.extend(extra);
     record_tables(bytes, dir_end as u64, &entries, report);
 }
 
@@ -573,7 +559,7 @@ fn walk_woff2(bytes: &[u8], report: &mut Report) {
     ]));
     note_declared_size(declared, bytes.len(), report);
 
-    let num_tables = u16::from_be_bytes([header[12], header[13]]) as usize;
+    let num_tables = usize::from(u16::from_be_bytes([header[12], header[13]]));
     if num_tables == 0 {
         report.problem("no tables declared");
         return;
@@ -587,20 +573,14 @@ fn walk_woff2(bytes: &[u8], report: &mut Report) {
     ]));
     report.largest_table_bytes = compressed;
     let collection = header.get(4..8) == Some(b"ttcf".as_slice());
-    let mut cursor = 48;
+    let mut dir = Reader::at(bytes, 48);
     for _ in 0..num_tables {
-        let Some((tag, _length)) = read_woff2_entry(bytes, &mut cursor) else {
+        let Some((tag, _length)) = read_woff2_entry(&mut dir) else {
             report.problem("invalid or truncated WOFF2 table directory");
             report.flag("truncated");
             return;
         };
-        if report.seen_tables.insert(tag) {
-            let label = tag_label(&tag);
-            if !is_registered_tag(tag) {
-                report.unknown_tables.push(label.clone());
-            }
-            report.tables.push(label);
-        } else if !collection {
+        if !report.list_table(tag) && !collection {
             report.problem("duplicate WOFF2 table tag");
         }
         match &tag {
@@ -610,11 +590,12 @@ fn walk_woff2(bytes: &[u8], report: &mut Report) {
             _ => {}
         }
     }
-    if collection && !skip_woff2_collection(bytes, &mut cursor, num_tables) {
+    if collection && skip_woff2_collection(&mut dir, num_tables).is_none() {
         report.problem("invalid or truncated WOFF2 collection directory");
         report.flag("truncated");
         return;
     }
+    let cursor = dir.pos();
     let stream_end = (cursor as u64).saturating_add(compressed);
     if stream_end > bytes.len() as u64 || compressed == 0 {
         report.problem("WOFF2 compressed stream missing or out of bounds");
@@ -686,17 +667,11 @@ const WOFF2_TAGS: [[u8; 4]; 63] = [
     *b"opbd", *b"prop", *b"trak", *b"Zapf", *b"Silf", *b"Glat", *b"Gloc", *b"Feat", *b"Sill",
 ];
 
-fn font_byte(bytes: &[u8], cursor: &mut usize) -> Option<u8> {
-    let byte = *bytes.get(*cursor)?;
-    *cursor += 1;
-    Some(byte)
-}
-
 /// WOFF2 UIntBase128 rejects leading zero groups, overflow and >5 bytes.
-fn woff2_base128(bytes: &[u8], cursor: &mut usize) -> Option<u32> {
+fn woff2_base128(r: &mut Reader<'_>) -> Option<u32> {
     let mut value = 0u32;
     for i in 0..5 {
-        let byte = font_byte(bytes, cursor)?;
+        let byte = r.u8()?;
         if (i == 0 && byte == 0x80) || value & 0xfe00_0000 != 0 {
             return None;
         }
@@ -708,16 +683,14 @@ fn woff2_base128(bytes: &[u8], cursor: &mut usize) -> Option<u32> {
     None
 }
 
-fn read_woff2_entry(bytes: &[u8], cursor: &mut usize) -> Option<([u8; 4], u32)> {
-    let flags = font_byte(bytes, cursor)?;
+fn read_woff2_entry(r: &mut Reader<'_>) -> Option<([u8; 4], u32)> {
+    let flags = r.u8()?;
     let tag = if flags & 63 == 63 {
-        let tag = bytes.get(*cursor..*cursor + 4)?.try_into().ok()?;
-        *cursor += 4;
-        tag
+        r.array::<4>()?
     } else {
         *WOFF2_TAGS.get(usize::from(flags & 63))?
     };
-    let original = woff2_base128(bytes, cursor)?;
+    let original = woff2_base128(r)?;
     let version = flags >> 6;
     let outlines = matches!(&tag, b"glyf" | b"loca");
     if (outlines && !matches!(version, 0 | 3))
@@ -727,7 +700,7 @@ fn read_woff2_entry(bytes: &[u8], cursor: &mut usize) -> Option<([u8; 4], u32)> 
     }
     let transformed = if outlines { version != 3 } else { version != 0 };
     let length = if transformed {
-        woff2_base128(bytes, cursor)?
+        woff2_base128(r)?
     } else {
         original
     };
@@ -737,46 +710,39 @@ fn read_woff2_entry(bytes: &[u8], cursor: &mut usize) -> Option<([u8; 4], u32)> 
     Some((tag, length))
 }
 
-fn woff2_255u16(bytes: &[u8], cursor: &mut usize) -> Option<u16> {
-    match font_byte(bytes, cursor)? {
-        253 => {
-            Some(u16::from(font_byte(bytes, cursor)?) * 256 + u16::from(font_byte(bytes, cursor)?))
-        }
-        254 => Some(506 + u16::from(font_byte(bytes, cursor)?)),
-        255 => Some(253 + u16::from(font_byte(bytes, cursor)?)),
+fn woff2_255u16(r: &mut Reader<'_>) -> Option<u16> {
+    match r.u8()? {
+        253 => r.u16_be(),
+        254 => Some(506 + u16::from(r.u8()?)),
+        255 => Some(253 + u16::from(r.u8()?)),
         byte => Some(u16::from(byte)),
     }
 }
 
-fn skip_woff2_collection(bytes: &[u8], cursor: &mut usize, tables: usize) -> bool {
-    let Some(version) = u32_be(bytes, *cursor) else {
-        return false;
-    };
-    *cursor += 4;
-    if !matches!(version, 0x0001_0000 | 0x0002_0000) {
-        return false;
+/// Step over a WOFF2 collection directory whose members index `tables`
+/// table entries; `None` when it is malformed or truncated.
+fn skip_woff2_collection(r: &mut Reader<'_>, tables: usize) -> Option<()> {
+    if !matches!(r.u32_be()?, 0x0001_0000 | 0x0002_0000) {
+        return None;
     }
-    let Some(fonts) = woff2_255u16(bytes, cursor) else {
-        return false;
-    };
-    if fonts == 0 || fonts > 512 {
-        return false;
+    let fonts = woff2_255u16(r)?;
+    if fonts == 0 || usize::from(fonts) > MAX_COLLECTION_FONTS {
+        return None;
     }
     for _ in 0..fonts {
-        let Some(count) = woff2_255u16(bytes, cursor) else {
-            return false;
-        };
-        if count == 0 || usize::from(count) > tables || bytes.get(*cursor..*cursor + 4).is_none() {
-            return false;
+        let count = usize::from(woff2_255u16(r)?);
+        if count == 0 || count > tables {
+            return None;
         }
-        *cursor += 4;
+        // The member's sfnt flavor.
+        r.skip(4)?;
         for _ in 0..count {
-            if woff2_255u16(bytes, cursor).is_none_or(|index| usize::from(index) >= tables) {
-                return false;
+            if usize::from(woff2_255u16(r)?) >= tables {
+                return None;
             }
         }
     }
-    true
+    Some(())
 }
 
 /// Embedded OpenType: a little-endian header wrapping an sfnt (optionally
@@ -840,13 +806,7 @@ fn record_tables(bytes: &[u8], dir_end: u64, entries: &[TableEntry], report: &mu
         // and neither registered nor unknown.
         let registered = e.tag.is_some_and(is_registered_tag);
         if let Some(tag) = e.tag {
-            if report.seen_tables.insert(tag) {
-                let label = tag_label(&tag);
-                if !registered {
-                    report.unknown_tables.push(label.clone());
-                }
-                report.tables.push(label);
-            }
+            report.list_table(tag);
             if !registered {
                 report.unknown_table_bytes = report.unknown_table_bytes.saturating_add(e.length);
             }
@@ -979,7 +939,7 @@ fn note_region(bytes: &[u8], start: u64, end: u64, report: &mut Report, kind: Re
     if kind == RegionKind::Unclaimed {
         report.stowaway_entropy = report.stowaway_entropy.max(entropy::shannon(region));
     }
-    if let Some(found) = classify_region(region)
+    if let Some(found) = classify_region_within(region, &mut report.gzip_budget)
         && (kind == RegionKind::Unclaimed || !matches!(found, "text" | "base64" | "high_entropy"))
     {
         report.stow(found);

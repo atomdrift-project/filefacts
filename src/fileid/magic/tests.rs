@@ -26,52 +26,6 @@ fn is_svg(data: &[u8]) -> bool {
 }
 
 #[test]
-fn go_mod_content_signature_is_bounded_and_specific() {
-    assert!(looks_like_go_mod(
-        b"// generated\r\n\r\nmodule example.org/shell_reverse_tcp // module path\r\ngo 1.23.4\r\n"
-    ));
-    assert!(looks_like_go_mod(b"module shell_reverse_tcp\n"));
-    assert!(looks_like_go_mod(b"module\texample.org/tool\n"));
-    assert!(!looks_like_go_mod(
-        b"module shell_reverse_tcp is a phrase\n"
-    ));
-    assert!(!looks_like_go_mod(b"module example.org//tool\n"));
-    assert!(!looks_like_go_mod(b"module ./relative\n"));
-    assert!(!looks_like_go_mod(b"module \"\n"));
-    assert!(!looks_like_go_mod(b"export module shell_reverse_tcp;\n"));
-    assert!(!looks_like_go_mod(
-        b"// module shell_reverse_tcp\npackage main\n"
-    ));
-}
-
-#[test]
-fn go_mod_content_signature_needs_the_whole_manifest_grammar() {
-    // A real manifest: directives, a require block, comments.
-    assert!(looks_like_go_mod(
-        b"module example.org/tool\n\ngo 1.23\ntoolchain go1.23.4\n\nrequire (\n\tgolang.org/x/net v0.30.0 // indirect\n\texample.org/lib v1.2.3\n)\n\nreplace example.org/lib => ../lib\n"
-    ));
-    // strong_password 0.0.7: a Ruby module declaration is followed by Ruby.
-    assert!(!looks_like_go_mod(
-        b"module StrongPassword\n  class StrengthChecker\n    BASE_ENTROPY = 18\n  end\nend\n"
-    ));
-    // Fortran and other `module NAME` languages likewise.
-    assert!(!looks_like_go_mod(
-        b"module constants\n  implicit none\ncontains\nend module\n"
-    ));
-    // An unclosed block holds entries, not directives.
-    assert!(looks_like_go_mod(
-        b"module example.org/tool\nrequire (\n\texample.org/lib v1.2.3\n"
-    ));
-}
-
-#[test]
-fn go_mod_content_signature_only_needs_the_prefix() {
-    let mut data = b"module example.org/tool\ngo 1.23\n".to_vec();
-    data.resize(GO_MOD_HEAD_LIMIT + 256, b' ');
-    assert!(looks_like_go_mod(&data));
-}
-
-#[test]
 fn svg_root_needs_a_doctype_that_names_svg() {
     // The `<!DOCTYPE …>` allowance exists for `<!DOCTYPE svg PUBLIC …>`.
     // Accepting any doctype and then hunting for `<svg` in the first
@@ -245,24 +199,6 @@ fn shebang_variants() {
         assert_eq!(
             got,
             Some((*want, DetectionSource::Shebang)),
-            "{}",
-            String::from_utf8_lossy(data).escape_debug()
-        );
-    }
-}
-
-#[test]
-fn shebang_without_interpreter() {
-    for data in [
-        &b"#!\n"[..],
-        b"#! \r\n",
-        b"#!/usr/bin/env\n",
-        b"#!/usr/bin/env -S\n",
-        b"#!/opt/x/unknown\n",
-    ] {
-        assert_eq!(
-            detect_shebang(data),
-            None,
             "{}",
             String::from_utf8_lossy(data).escape_debug()
         );
@@ -571,13 +507,6 @@ fn tampered_pe() {
     }
     let (ft, _) = detect_from_content(Path::new("suspicious"), &data).unwrap();
     assert_eq!(ft, FileType::Pe);
-}
-
-#[test]
-fn chrome_manifest() {
-    let data = br#"{"manifest_version": 3, "permissions": ["storage"]}"#;
-    let (ft, _) = detect_from_content(Path::new("manifest.json"), data).unwrap();
-    assert_eq!(ft, FileType::ChromeManifest);
 }
 
 #[test]
@@ -1726,4 +1655,89 @@ fn dib_header_versions() {
     assert!(!looks_like_dib_header(&header(40, 0, 8)));
     assert!(!looks_like_dib_header(&header(40, 1, 3)));
     assert!(!looks_like_dib_header(&[40, 0, 0]));
+}
+
+/// LZMA-alone dictionaries are 2^n or 2^n + 2^(n-1), from 4 KiB to 1.5 GiB.
+#[test]
+fn lzma_alone_accepts_both_dictionary_shapes_within_bounds() {
+    let header = |dict: u32| {
+        let mut h = vec![0x5D];
+        h.extend_from_slice(&dict.to_le_bytes());
+        h.extend_from_slice(&u64::MAX.to_le_bytes());
+        h.push(0);
+        h
+    };
+    for dict in [1 << 12, 1 << 23, 1 << 30, 3 << 11, 3 << 22, 3 << 29] {
+        assert_eq!(
+            content_type("blob", &header(dict)),
+            Some(FileType::Lzma),
+            "dictionary {dict:#x}"
+        );
+    }
+    for dict in [1 << 11, 1 << 31, 3 << 10, 3 << 30, 5 << 20, 0] {
+        assert_ne!(
+            content_type("blob", &header(dict)),
+            Some(FileType::Lzma),
+            "dictionary {dict:#x}"
+        );
+    }
+}
+
+/// Every MZ reader follows `e_lfanew` by one rule: it closes the 64-byte DOS
+/// header, so an offset inside that header names no new header.
+#[test]
+fn e_lfanew_inside_the_dos_header_names_no_new_header() {
+    let image = |e_lfanew: u32, at: usize, signature: &[u8]| {
+        let mut b = vec![0u8; 0x80];
+        b[..2].copy_from_slice(b"MZ");
+        b[0x3c..0x40].copy_from_slice(&e_lfanew.to_le_bytes());
+        b[at..at + signature.len()].copy_from_slice(signature);
+        b
+    };
+    assert!(looks_like_ne_executable(&image(0x40, 0x40, b"NE")));
+    assert!(!looks_like_ne_executable(&image(0x20, 0x20, b"NE")));
+    assert!(has_extended_mz_header(&image(0x40, 0x40, b"LE")));
+    assert!(!has_extended_mz_header(&image(0x20, 0x20, b"LE")));
+    let mut shifted = vec![0u8; 4];
+    shifted.extend_from_slice(&image(0x40, 0x40, b"PE\0\0"));
+    assert_eq!(content_type("blob", &shifted), Some(FileType::Pe));
+    let mut inside = vec![0u8; 4];
+    inside.extend_from_slice(&image(0x20, 0x20, b"PE\0\0"));
+    assert_ne!(content_type("blob", &inside), Some(FileType::Pe));
+}
+
+#[test]
+fn script_host_unterminated_script_tags_are_read_once() {
+    // A `<script` whose `>` is far off, or absent, must not have the rest
+    // of the window read for its attributes once per `<script` in it.
+    let mut data = b"<job>".to_vec();
+    while data.len() < WSH_SCRIPT_WINDOW {
+        data.extend_from_slice(b"<script l");
+    }
+    let started = std::time::Instant::now();
+    assert_eq!(windows_script_host(&data), None);
+    data.truncate(WSH_SCRIPT_WINDOW - 1);
+    data.push(b'>');
+    assert_eq!(windows_script_host(&data), None);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "took {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn char_refs_without_digits_are_skipped_in_one_pass() {
+    // No `&#` may search the rest of the value for a `;`.
+    let mut value = b"&#".repeat(WSH_SCRIPT_WINDOW / 2);
+    value.push(b';');
+    let started = std::time::Instant::now();
+    assert_eq!(decode_char_refs(&value).len(), value.len());
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(decode_char_refs(b"&#86;B&#x53;"), "VBS");
+    assert_eq!(decode_char_refs(b"&#0000086;&#8 6;"), "V&#8 6;");
 }

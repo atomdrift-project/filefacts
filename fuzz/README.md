@@ -14,8 +14,10 @@ the root skip it. `cargo check -p filefacts-fuzz` type-checks it on stable.
 | `fileid` | Identification only, with and without a path |
 | `pe`, `elf`, `macho`, `zip`, `pdf`, `iso`, `plist` | That extractor, forced with `OpenOptions::file_type` so inputs keep reaching it after mutation breaks the magic |
 | `source_js`, `source_c`, `source_python` | tree-sitter source extraction, the AST walk and the flow graph |
+| `html` | The HTML extractor, forced as above, and that every byte-aligned HTML or SVG inline script lies within the page |
+| `rpa` | The public `rpa::members` index reader, which runs outside the panic guard; the input is also wrapped as a pickle in a valid archive |
 
-Every target opens with the disk cache and rizin off, and touches every view:
+Every target except `rpa` opens with the disk cache off, and touches every view:
 strings, values, metrics, symbols, sections, archive members, flow, identity,
 references and errors.
 
@@ -58,7 +60,7 @@ runaway memory and runaway time, not panics.
 ### Stack depth
 
 libFuzzer calls each target on the main thread, whose 8 MiB stack hides
-recursion that overflows a 2 MiB rayon worker in a real scan. The shared
+recursion that overflows a 2 MiB host worker thread in a real scan. The shared
 driver (`src/lib.rs`) therefore runs every input on a 2 MiB thread. A stack
 overflow aborts the process, and libFuzzer reports it as a deadly signal with
 the reproducing input saved under `fuzz/artifacts/<target>/`.

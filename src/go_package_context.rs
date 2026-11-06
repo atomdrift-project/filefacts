@@ -1,5 +1,7 @@
 //! Same-package Go context, independent of scanners and archive extractors.
 use crate::Values;
+use crate::fileid::FileType;
+use crate::formats::source::{Budget, GoMember, TreeCache, go_syntax, package_flow};
 use crate::package_context::{ContextLimits, Coverage, Phase, SourceFile, member_directory};
 use constraint::PLATFORMS;
 use serde::{Deserialize, Serialize};
@@ -8,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 mod constraint;
 
-/// What [`crate::go_package_payload_flow`] found for one package variant.
+/// What [`crate::package_context::go_package_payload_flow`] found for one package variant.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct GoPackageFlow {
@@ -20,7 +22,7 @@ pub struct GoPackageFlow {
 }
 
 /// Payload-flow facts for one Go member.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct GoFileFlow {
     /// The member's logical path.
@@ -30,7 +32,7 @@ pub struct GoFileFlow {
 }
 
 /// What [`go_source_context`] found.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct GoSourceContext {
     /// One entry per package directory, build variant and phase.
@@ -47,7 +49,7 @@ pub struct GoSourceContext {
 
 /// One Go package variant: the members compiled together for one set of
 /// platforms, in one phase.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct GoPackage {
     /// The package directory, as a logical member path.
@@ -66,6 +68,9 @@ pub struct GoPackage {
     pub platforms: Vec<String>,
     /// The members compiled together, in input order.
     pub members: Vec<String>,
+    /// The payload flow of these members analysed together, one entry per
+    /// member, as [`crate::package_context::go_package_payload_flow`] reports it.
+    pub files: Vec<GoFileFlow>,
     /// The payload-flow analysis of this variant hit a budget.
     pub truncated: bool,
 }
@@ -73,7 +78,9 @@ pub struct GoPackage {
 /// Analyze supplied Go members without filesystem access or execution.
 /// Package directories, test variants, and build constraints bound helper
 /// resolution. `sources` are one artifact's members; see [the path
-/// contract](crate::package_context#paths). Raising `cancel` stops parsing
+/// contract](crate::package_context#paths). Each member is parsed once, and
+/// every variant's payload flow shares one
+/// [`ContextLimits::max_flow_steps`] budget. Raising `cancel` stops parsing
 /// and analysis early and marks the result truncated. An incomplete input
 /// or analysis budget remains explicit in the result.
 #[must_use]
@@ -98,7 +105,7 @@ pub fn go_source_context(
             truncated: true,
         };
     }
-    let mut groups: BTreeMap<(&str, String), Vec<Member<'_>>> = BTreeMap::new();
+    let mut groups: BTreeMap<(&str, &str), Vec<Member<'_>>> = BTreeMap::new();
     let mut unselected = Vec::new();
     let mut truncated = coverage == Coverage::Incomplete;
     for &SourceFile { path, source } in sources {
@@ -150,17 +157,7 @@ pub fn go_source_context(
             unselected.push(path.to_string());
             continue;
         }
-        let Some(package) = crate::formats::source::go_package_clause(source, cancel) else {
-            tracing::debug!(
-                target: "filefacts::go_package_context",
-                stage = "parse",
-                path,
-                len = source.len(),
-                "Go member did not parse; left out of its package"
-            );
-            truncated = true;
-            continue;
-        };
+        let package = go_syntax::package_clause(source);
         groups
             .entry((directory.strip_suffix('/').unwrap_or(directory), package))
             .or_default()
@@ -172,21 +169,48 @@ pub fn go_source_context(
             });
     }
     let mut packages = Vec::new();
+    let mut budget = Budget::new(limits.max_flow_steps, cancel);
     'packages: for ((directory, package), members) in &groups {
+        // Parse each member once; every variant below analyses these trees.
+        let trees: Vec<_> = members
+            .iter()
+            .map(|m| TreeCache::parse(m.source.as_bytes(), FileType::Go, cancel))
+            .collect();
+        let parsed: Vec<Option<GoMember<'_>>> = members
+            .iter()
+            .zip(&trees)
+            .map(|(member, tree)| {
+                let cache = tree.cache();
+                if cache.is_none() {
+                    tracing::debug!(
+                        target: "filefacts::go_package_context",
+                        stage = "parse",
+                        path = member.path,
+                        len = member.source.len(),
+                        "Go member did not parse; left out of its package"
+                    );
+                    truncated = true;
+                }
+                Some(GoMember::new(member.path, cache?))
+            })
+            .collect();
         for phase in [Phase::Runtime, Phase::Test] {
             let test = phase == Phase::Test;
             if test && !members.iter().any(|m| m.test) {
                 continue;
             }
             // Ports that build the same members share one variant, listed in
-            // [`PLATFORMS`] order.
-            // Each variant holds indices into `members`.
+            // [`PLATFORMS`] order. Each variant holds indices into `members`.
             let mut variants: Vec<(Vec<usize>, Vec<String>)> = Vec::new();
             for (index, platform) in PLATFORMS.iter().enumerate() {
                 let selected: Vec<usize> = members
                     .iter()
                     .enumerate()
-                    .filter(|(_, m)| (!m.test || test) && m.builds.get(index) == Some(&true))
+                    .filter(|&(i, m)| {
+                        (!m.test || test)
+                            && m.builds.get(index) == Some(&true)
+                            && parsed.get(i).is_some_and(Option::is_some)
+                    })
                     .map(|(i, _)| i)
                     .collect();
                 let has_test = selected
@@ -213,22 +237,23 @@ pub fn go_source_context(
                     truncated = true;
                     break 'packages;
                 }
-                let inputs: Vec<_> = selected
+                let inputs: Vec<&GoMember<'_>> = selected
                     .iter()
-                    .filter_map(|&i| members.get(i))
-                    .map(|m| SourceFile {
-                        path: m.path,
-                        source: m.source,
-                    })
+                    .filter_map(|&i| parsed.get(i)?.as_ref())
                     .collect();
-                let flow = crate::go_package_payload_flow(&inputs, limits, cancel);
+                let flow = package_flow(&inputs, limits, &mut budget);
                 truncated |= flow.truncated;
                 packages.push(GoPackage {
                     directory: (*directory).to_string(),
-                    package: package.clone(),
+                    package: (*package).to_string(),
                     phase,
                     platforms: if everywhere { Vec::new() } else { platforms },
-                    members: inputs.iter().map(|f| f.path.to_string()).collect(),
+                    members: selected
+                        .iter()
+                        .filter_map(|&i| members.get(i))
+                        .map(|m| m.path.to_string())
+                        .collect(),
+                    files: flow.files,
                     truncated: flow.truncated,
                 });
             }

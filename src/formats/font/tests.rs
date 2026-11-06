@@ -828,3 +828,34 @@ fn reordered_magic_does_not_whitelist_noise_or_hide_private_payloads() {
     );
     assert_eq!(stowaway(&values), vec!["pe"]);
 }
+
+/// Hundreds of private tables, each a few dozen bytes of gzip that inflate
+/// to the probe's 64 KiB cap: probed one by one, the directory cost
+/// hundreds of times the file. The tables share the file's one budget.
+#[test]
+fn small_gzip_tables_share_one_probe_budget() {
+    use std::io::Write;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+    encoder.write_all(&vec![0; 1 << 20]).unwrap();
+    let bomb = encoder.finish().unwrap();
+    let tags: Vec<[u8; 4]> = (0..512u16)
+        .map(|i| {
+            let [hi, lo] = i.to_be_bytes();
+            [b'Z', b'z', b'a' + hi, lo]
+        })
+        .collect();
+    let tables: Vec<(&[u8; 4], &[u8])> = tags.iter().map(|t| (t, bomb.as_slice())).collect();
+    let bytes = build_sfnt(*b"OTTO", &tables);
+    let mut report = Report {
+        structure_ok: true,
+        scan_budget: u64::MAX,
+        gzip_budget: gzip_probe_budget(bytes.len()),
+        ..Report::default()
+    };
+    let (entries, dir_end) = read_sfnt_dir(&bytes, 0, &mut report);
+    record_tables(&bytes, dir_end, &entries, &mut report);
+    assert_eq!(report.gzip_budget, 0);
+    // Probed alone, every table spends the 64 KiB output cap.
+    assert!(512 * (64 << 10) > 8 * gzip_probe_budget(bytes.len()));
+    assert!(report.stowaway.contains(&"gzip"));
+}

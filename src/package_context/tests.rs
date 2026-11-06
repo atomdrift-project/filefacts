@@ -151,3 +151,188 @@ fn member_paths_split_only_on_slash() {
         assert_eq!(join_relative("a", escaping), None, "{escaping}");
     }
 }
+
+/// Declared `[[bin]]`, `[[example]]`, `[[test]]` and `[[bench]]` targets
+/// resolve, and so do the ones Cargo discovers in `src/bin`, `examples`,
+/// `tests` and `benches` unless the manifest turns discovery off.
+#[test]
+fn cargo_binary_example_test_and_bench_targets_resolve() {
+    let empty = values(json!({}));
+    let manifest = values(json!({
+        "package": {"name": "pkg", "build": false},
+        "bin": [
+            {"name": "tool", "path": "tools/tool.rs"},
+            {"name": "pkg"},
+            {"name": "named"},
+        ],
+        "test": [{"name": "custom", "path": "checks/custom.rs"}],
+    }));
+    let paths = [
+        "pkg/Cargo.toml",
+        "pkg/src/main.rs",
+        "pkg/tools/tool.rs",
+        "pkg/src/bin/named.rs",
+        "pkg/src/bin/auto.rs",
+        "pkg/src/bin/multi/main.rs",
+        "pkg/src/bin/multi/helper.rs",
+        "pkg/examples/demo.rs",
+        "pkg/tests/it.rs",
+        "pkg/checks/custom.rs",
+        "pkg/benches/speed/main.rs",
+        "pkg/src/bin/nested/deeper/x.rs",
+    ];
+    let members: Vec<_> = paths
+        .iter()
+        .map(|&path| SourceMember {
+            path,
+            values: if path.ends_with("Cargo.toml") {
+                &manifest
+            } else {
+                &empty
+            },
+        })
+        .collect();
+    let facts = cargo_source_context(&members, &ContextLimits::default());
+    let targets: BTreeSet<_> = facts
+        .targets
+        .iter()
+        .map(|t| (t.entry.as_str(), t.phase))
+        .collect();
+    assert_eq!(
+        targets,
+        BTreeSet::from([
+            ("pkg/src/main.rs", Phase::Runtime),
+            ("pkg/tools/tool.rs", Phase::Runtime),
+            ("pkg/src/bin/named.rs", Phase::Runtime),
+            ("pkg/src/bin/auto.rs", Phase::Runtime),
+            ("pkg/src/bin/multi/main.rs", Phase::Runtime),
+            ("pkg/examples/demo.rs", Phase::Runtime),
+            ("pkg/tests/it.rs", Phase::Test),
+            ("pkg/checks/custom.rs", Phase::Test),
+            ("pkg/benches/speed/main.rs", Phase::Test),
+        ])
+    );
+
+    let off = values(json!({
+        "package": {"autobins": false, "autoexamples": false, "autotests": false, "autobenches": false},
+    }));
+    let members: Vec<_> = paths
+        .iter()
+        .map(|&path| SourceMember {
+            path,
+            values: if path.ends_with("Cargo.toml") {
+                &off
+            } else {
+                &empty
+            },
+        })
+        .collect();
+    let entries: Vec<_> = cargo_source_context(&members, &ContextLimits::default())
+        .targets
+        .into_iter()
+        .map(|t| t.entry)
+        .collect();
+    assert_eq!(entries, ["pkg/src/main.rs"]);
+}
+
+/// Members for `targets` binaries that all include one shared module file,
+/// which declares `missing` modules no member provides and carries `events`
+/// payload-flow events.
+fn shared_module_crate(targets: usize, missing: usize, events: usize) -> Vec<(String, Values)> {
+    let shared = values(json!({"source": {
+        "rust": {"modules": (0..missing).map(|i| json!({"name": format!("m{i}")})).collect::<Vec<_>>()},
+        "payload_flow": {"events": (0..events)
+            .map(|i| json!({"kind": "file-http-body", "function": format!("f{i}")}))
+            .collect::<Vec<_>>()},
+    }}));
+    let bin = values(
+        json!({"source": {"rust": {"modules": [{"name": "shared", "path": "../shared.rs"}]}}}),
+    );
+    let mut members = vec![
+        ("Cargo.toml".to_string(), values(json!({}))),
+        ("src/shared.rs".to_string(), shared),
+    ];
+    members.extend((0..targets).map(|i| (format!("src/bin/b{i}.rs"), bin.clone())));
+    members
+}
+
+fn cargo_context(members: &[(String, Values)], limits: &ContextLimits) -> CargoSourceContext {
+    let members: Vec<_> = members
+        .iter()
+        .map(|(path, values)| SourceMember { path, values })
+        .collect();
+    cargo_source_context(&members, limits)
+}
+
+/// Every target that reaches a module file reports that file's unresolved
+/// declarations, so they count against the visit budget like the files
+/// themselves: otherwise a few hundred small members could each list every
+/// declaration of one large file.
+#[test]
+fn unresolved_modules_count_against_the_visit_budget() {
+    let mut limits = ContextLimits::default();
+    limits.max_cargo_visits = 1_000;
+    let context = cargo_context(&shared_module_crate(200, 1_000, 0), &limits);
+    assert!(context.truncated);
+    let listed: usize = context
+        .targets
+        .iter()
+        .map(|t| t.unresolved_modules.len())
+        .sum();
+    assert!(
+        listed <= limits.max_cargo_visits,
+        "{listed} unresolved modules listed"
+    );
+
+    // Within the budget every declaration is still listed.
+    let context = cargo_context(&shared_module_crate(2, 10, 0), &limits);
+    assert!(!context.truncated);
+    for target in &context.targets {
+        assert_eq!(target.unresolved_modules.len(), 10, "{}", target.entry);
+    }
+}
+
+/// A module file's payload-flow events are read once per call, not once per
+/// target that reaches it.
+#[test]
+fn shared_module_events_are_read_once() {
+    let members = shared_module_crate(200, 0, 1_000);
+    EVENT_READS.set(0);
+    let context = cargo_context(&members, &ContextLimits::default());
+    assert!(!context.truncated);
+    assert_eq!(context.targets.len(), 200);
+    for target in &context.targets {
+        assert_eq!(
+            target.events,
+            BTreeSet::from(["file-http-body".to_string()])
+        );
+    }
+    assert!(
+        EVENT_READS.get() <= 2_000,
+        "{} events read",
+        EVENT_READS.get()
+    );
+}
+
+/// Each manifest discovers its targets among the members under its own
+/// directory, so an artifact of many small packages costs time linear in
+/// its members, not their square.
+#[test]
+#[ignore = "wall-clock bound; run with --ignored"]
+fn target_discovery_is_linear_in_members() {
+    let empty = values(json!({}));
+    let paths: Vec<String> = (0..30_000)
+        .flat_map(|i| [format!("p{i}/Cargo.toml"), format!("p{i}/src/bin/b.rs")])
+        .collect();
+    let members: Vec<_> = paths
+        .iter()
+        .map(|path| SourceMember {
+            path,
+            values: &empty,
+        })
+        .collect();
+    let started = std::time::Instant::now();
+    let context = cargo_source_context(&members, &ContextLimits::default());
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    assert_eq!(context.targets.len(), 30_000);
+}

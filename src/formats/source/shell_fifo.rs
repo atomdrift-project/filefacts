@@ -6,11 +6,13 @@
 //!
 //! These are source relationships, not observed execution, successful FIFO
 //! creation or a reachable caller.
+use super::parse::NestedParses;
 use super::visit::Visit;
-use super::{TreeCache, named_children, text};
+use super::{named_children, text};
 use crate::{FileType, Values, value_key};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::AtomicBool;
 use tree_sitter::Node;
 
 /// Largest `sh -c` argument parsed for loops.
@@ -211,17 +213,28 @@ fn feedback<'s>(node: Node<'_>, source: &'s str) -> Option<Loop<'s>> {
 }
 
 /// Loops and FIFO creations the shared walk ([`super::visit`]) reaches.
-#[derive(Default)]
-pub(super) struct Collector {
+pub(super) struct Collector<'a> {
     loops: Vec<Value>,
     /// FIFO path → offset of the first `mkfifo` creating it.
     fifos: BTreeMap<String, usize>,
     /// Names the script defines as functions, which shadow programs.
     functions: BTreeSet<String>,
+    /// [`MAX_FACTS`] loops were found and later ones dropped.
     limited: bool,
+    nested: NestedParses<'a>,
 }
 
-impl Collector {
+impl<'a> Collector<'a> {
+    pub(super) fn new(cancel: Option<&'a AtomicBool>) -> Self {
+        Self {
+            loops: Vec::new(),
+            fifos: BTreeMap::new(),
+            functions: BTreeSet::new(),
+            limited: false,
+            nested: NestedParses::new(cancel),
+        }
+    }
+
     pub(super) fn enter(&mut self, visit: &Visit<'_>, source: &str) {
         let node = visit.node;
         match node.kind() {
@@ -269,7 +282,9 @@ impl Collector {
         {
             return;
         }
-        let parsed = TreeCache::parse(body.as_bytes(), FileType::Shell, None);
+        let Some(parsed) = self.nested.parse(body, FileType::Shell) else {
+            return;
+        };
         let Some(cache) = parsed.cache() else {
             tracing::debug!(
                 target: "filefacts::source",
@@ -313,8 +328,12 @@ impl Collector {
         }));
     }
 
-    /// Write `source.shell.fifos` and `source.shell.fifo_network_loops`.
+    /// Write `source.shell.fifos`, `source.shell.fifo_network_loops` and,
+    /// when a budget cut the analysis short, `source.shell.fifo_limited`.
     pub(super) fn emit(mut self, values: &mut Values) {
+        if self.limited || self.nested.limited {
+            values.insert_key(value_key!("source.shell.fifo_limited"), Value::Bool(true));
+        }
         if self.limited {
             tracing::debug!(
                 target: "filefacts::source",

@@ -57,8 +57,9 @@
 //! ## Configuration
 //!
 //! [`open`] uses the library defaults. [`OpenOptions`] supplies a path, a
-//! known type or [`FileId`], a cancellation flag, and the cache settings. Every setting belongs to the [`ParsedFile`] it opens, so one
-//! process can open files under different settings at once.
+//! known type or [`FileId`], a cancellation flag, and the cache settings.
+//! Every setting belongs to the [`ParsedFile`] it opens, so one process can
+//! open files under different settings at once.
 //!
 //! ```no_run
 //! use std::path::Path;
@@ -77,8 +78,23 @@
 //! The disk cache in [`cache`] is off unless the host opts in with
 //! [`OpenOptions::cache`]. When on, the first view access reads a matching
 //! entry from the cache directory, or writes one after computing the views.
-//! The library reads no environment variables: a host that wants
-//! `FILEFACTS_CACHE` to decide passes [`cache::env_override`] itself.
+//! A store that finds the cache over its budget, like the host's own call to
+//! [`cache::cleanup`] or [`cache::cleanup_in`], starts a detached
+//! `filefacts-cache-sweep` thread that deletes expired and least recently
+//! used entries, and superseded version directories, inside the cache's own
+//! tagged directory. The library reads no environment variables: a host that
+//! wants `FILEFACTS_CACHE` to decide passes [`cache::env_override`] itself.
+//!
+//! Identification and every extraction stage run under
+//! [`std::panic::catch_unwind`], so a parser panic on hostile input becomes
+//! an [`Errors`] entry (or [`FileType::Unknown`]) rather than an unwind into
+//! the host. To keep those expected panics off stderr, the first open
+//! installs a process-wide panic hook, once. It chains to the hook
+//! installed before it and stays silent only for a panic raised inside a
+//! filefacts guard on the panicking thread; every other panic reaches the
+//! previous hook unchanged. A host that installs its own hook later replaces
+//! it, losing only that silencing. filefacts requires `panic = "unwind"` and
+//! fails to build under `panic = "abort"`.
 //!
 //! filefacts reports what it decided, skipped and recovered from through
 //! [`tracing`], under `filefacts::<module>` targets. It never writes to stderr
@@ -116,15 +132,12 @@ mod go_dependency_context;
 mod go_package_context;
 mod identity;
 pub mod package_context;
-pub use go_dependency_context::{ReferenceMember, go_dependency_context};
-pub use go_package_context::{
-    GoFileFlow, GoPackage, GoPackageFlow, GoSourceContext, go_source_context,
-};
-pub use output::{Resolution, UnresolvedReason};
+pub use output::{Replaced, Resolution, UnresolvedReason};
 mod output;
 mod panic_guard;
 mod registry;
 mod scan;
+mod time;
 
 // The string-extraction and parsing engines whose types appear in this
 // crate's API (`Text` rows, `SourceAst::tree`, `Error::InvalidQuery`), so a
@@ -136,47 +149,44 @@ pub use tree_sitter;
 // re-exported here so every module imports them as `crate::metric`.
 pub(crate) use output::{metric, value_key};
 
-/// Bounded static recovery of supported PyArmor layouts using a companion runtime.
-/// Recovery never executes Python objects or the native runtime.
-pub mod pyarmor {
-    pub use crate::formats::pyarmor::{
-        RecoveredPyc, Recovery, is_container, python_containers, recover,
-    };
-}
+mod rc4_container;
 
-/// Bounded integrity-checked recovery of RC4-encrypted code containers.
-pub mod rc4_container;
+/// Recovery of code that a format hides from ordinary extraction, for a host
+/// that has the bytes in hand (an archive member, a companion runtime, a key
+/// it found). Every recovery is static and bounded: nothing it decodes is run.
+pub mod recover {
+    /// Bounded static recovery of supported PyArmor layouts using a companion
+    /// runtime. Recovery never executes Python objects or the native runtime.
+    pub mod pyarmor {
+        pub use crate::formats::pyarmor::{
+            RecoveredPyc, Recovery, is_container, python_containers, recover,
+        };
+    }
+
+    /// Bounded, integrity-checked recovery of RC4-encrypted code containers.
+    pub mod rc4 {
+        pub use crate::rc4_container::{Kind, MAX_INPUT, Recovery, recover};
+    }
+
+    /// Ren'Py RPA archive members, for hosts that extract them.
+    pub mod rpa {
+        pub use crate::formats::rpa::{Chunk, Member, members};
+    }
+
+    /// Structurally framed JVM classes embedded in a JPHP compiled module.
+    pub use crate::formats::jphp::class_frames as jphp_class_frames;
+}
 
 pub mod cache;
 pub mod fileid;
 pub mod values;
 
-/// Ren'Py RPA archive members, for hosts that extract them.
-pub mod rpa {
-    pub use crate::formats::rpa::{Chunk, Member, members};
-}
-/// Emit binform's cumulative recovery statistics as a `tracing::info!` line.
-/// Host CLIs call this at shutdown for telemetry.
-pub fn log_stats() {
-    functions::log_stats();
-}
+pub use functions::{RecoveryStats, recovery_stats};
 
 mod bundle;
 pub use bundle::{Bundle, View, ViewData};
 
-pub use formats::source::go_package_payload_flow;
-pub use formats::source::{decode_source_escapes, decode_source_escapes_for_type};
-
-/// Additional reference metadata selected by filename, independently of the
-/// detected file type. Archive walkers must retain these even when detection
-/// calls them non-program data. Type-identified manifests need no exception.
-#[must_use]
-pub fn has_named_reference_metadata(path: &std::path::Path) -> bool {
-    matches!(
-        path.file_name().and_then(|name| name.to_str()),
-        Some("go.work" | "go.work.sum" | "modules.txt")
-    )
-}
+pub use formats::source::decode_source_escapes_for_type;
 
 pub use output::{
     Flow, FlowFunction, FlowKind, FlowOrigin, FlowOrigins, FlowTransfer, FlowValue, Limitation,
@@ -186,17 +196,16 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 
-pub use embedded_sources::EmbeddedSource;
+pub use embedded_sources::{EmbeddedSource, Origin, ScriptScope};
 pub use error::Error;
 pub use fileid::{ArchiveFormat, Compression, Container, FileId, FileType, Group, container_of};
 pub use output::EntryType;
 pub use output::{
-    ArchiveCompression, ArchiveMember, ArchiveOffsets, ArchiveOwnership, Arg, ArgShape, CATALOG,
-    Claim, Comments, DependencyContext, DependencyScope, Diagnostic, DiagnosticKind, Errors,
-    FAMILIES, Fact, HashAlgo, Identity, Literal, LiteralEncoding, LiteralMethod, Literals, Metrics,
-    Party, PartyRole, PinnedHash, RefKind, RefLocator, Reference, Section, SectionFlag, Sections,
-    Signer, Span, Stage, Symbol, SymbolKind, Symbols, Text, Trust, Url, UrlKind, VALUE_CATALOG,
-    VALUE_FAMILIES, Values,
+    ArchiveCompression, ArchiveMember, ArchiveOffsets, ArchiveOwnership, Arg, ArgShape, Claim,
+    Comments, DependencyContext, DependencyScope, Diagnostic, DiagnosticKind, Errors, Fact,
+    HashAlgo, Identity, Literal, LiteralEncoding, LiteralMethod, Literals, Metrics, Party,
+    PartyRole, PinnedHash, RefKind, RefLocator, Reference, Section, SectionFlag, Sections, Signer,
+    Span, Stage, Symbol, SymbolKind, Symbols, Text, Trust, Url, UrlKind, Values,
 };
 // Key types and the templated metric-key constructors: only filefacts emits
 // keys, so none of these is public.
@@ -214,36 +223,35 @@ pub use registry::{Ecosystem, Registry};
 /// rather than silently never firing.
 #[must_use]
 pub fn known_metrics() -> (&'static [&'static str], &'static [&'static str]) {
-    (CATALOG, FAMILIES)
+    (output::CATALOG, output::FAMILIES)
 }
 
-/// Every [`Values`] key this build can write, as fixed keys
-/// ([`VALUE_CATALOG`]) plus templates for keys with a data-derived segment
-/// inside the path ([`VALUE_FAMILIES`]).
+/// Every [`Values`] key this build can write.
 ///
 /// This is the [`known_metrics`] counterpart for `type: values` rule fields.
 /// Unlike a metric, a value can be an object or an array that a rule reaches
-/// into, so a validator should accept a rule path when it:
+/// into, so a validator should accept a rule path when it equals a listed key
+/// or extends one with `.` or `[`, as in `pe.signatures[0].subject`,
+/// `pdf.info.Author` or `npm.author.email`. That also covers data tails
+/// written below a key, such as `pkg.<field>` or `wasm.producers.<field>`. An
+/// index in a rule path, whether `[0]` or the `[*]` wildcard, matches the
+/// same way.
 ///
-/// - equals a fixed key;
-/// - extends a fixed key with `.` or `[`, as in `pe.signatures[0].subject`,
-///   `pdf.info.Author` or `npm.author.email`. This also covers data tails
-///   written below a key, such as `pkg.<field>` or `wasm.producers.<field>`;
-/// - matches a template, where each `<name>` placeholder stands for a
-///   non-empty run of characters other than `.` and `[`, either exactly or
-///   extended with `.` or `[` as above.
-///
-/// An index in a rule path, whether `[0]` or the `[*]` wildcard, matches the
-/// same way. One kind of path is outside this list: the parsed document of a
+/// One kind of path is outside this list: the parsed document of a
 /// structured format (JSON, YAML, TOML, plist, `PKG-INFO` and Xcode project
 /// files), which filefacts places at the values root verbatim. A rule that
 /// reads such a document's own fields, such as `scripts.postinstall` in a
 /// `package.json`, names data rather than a filefacts key, so the validator
 /// should not report it as unknown.
 #[must_use]
-pub fn known_values() -> (&'static [&'static str], &'static [&'static str]) {
-    (VALUE_CATALOG, VALUE_FAMILIES)
+pub fn known_values() -> &'static [&'static str] {
+    output::VALUE_CATALOG
 }
+
+/// The function-recovery part of the disk-cache key: binform's recovery
+/// policy. For a host keying its own cache of results derived from
+/// filefacts, so an upgrade that changes recovery invalidates it.
+pub const RECOVERY_FINGERPRINT: &str = functions::POLICY;
 
 /// Schema version of the public output shape.
 ///
@@ -255,12 +263,13 @@ pub const SCHEMA_VERSION: &str = "11";
 
 /// A file with its bytes and lazily-computed metadata views.
 ///
-/// `ParsedFile` is the central type. Construct one with [`open`] or its
-/// path-aware variants; [`from_path`] reads the bytes from disk first.
+/// `ParsedFile` is the central type. Construct one with [`open`] or
+/// [`OpenOptions::open`]; [`from_path`] reads and identifies the bytes from
+/// disk first.
 ///
 /// Views are computed on first access and cached for the lifetime of
-/// the `ParsedFile`. That first access reads and writes the disk cache when the host enabled it; see the crate-level
-/// "Side effects" section.
+/// the `ParsedFile`. That first access reads and writes the disk cache when
+/// the host enabled it; see the crate-level "Side effects" section.
 ///
 /// Typed fact families such as strings, sections, symbols, AST
 /// projections, and recoverable errors live in their own views;
@@ -282,19 +291,15 @@ pub struct ParsedFile<'a> {
     // that fills `extracted`.
     tree_parse: OnceLock<Option<formats::source::TreeParse<'a>>>,
     flow: OnceLock<Option<Flow>>,
-    /// `Err` holds the panic the CFML parse raised.
-    cfml_parse: OnceLock<Option<Result<formats::cfml::Parsed, PanicMessage>>>,
+    /// The CFML parse, for a CFML file only; `Err` holds the panic it raised.
+    cfml_parse: OnceLock<Result<formats::cfml::Parsed, PanicMessage>>,
     // Caller's cancellation flag, polled by long-running leaf work (currently
     // the tree-sitter parse). Borrowed rather than `Arc`-shared, and never
     // written here: filefacts only ever reads it.
     cancellation: Option<&'a AtomicBool>,
-    // Whether `extracted` reads and writes the disk cache.
-    cache: bool,
-    // The host's cache root (`OpenOptions::cache_dir`); `None` for the
-    // per-user default.
-    cache_dir: Option<Arc<Path>>,
-    // The host's addition to every disk-cache key (`OpenOptions::cache_namespace`).
-    cache_namespace: Option<Arc<str>>,
+    // Where `extracted` reads and writes the disk cache; `None` when it
+    // does not.
+    cache: Option<CacheSettings>,
     extracted: OnceLock<Extracted>,
     // How many times this `ParsedFile` ran its extraction pipeline.
     // A correctly-implemented `ParsedFile` never reports more than 1
@@ -346,8 +351,10 @@ impl std::fmt::Debug for ParsedFile<'_> {
 ///
 /// The byte-scan `text` rows are cached in extraction order (see
 /// [`output::Strings`]), and under filefacts' key like everything else here.
-/// That key covers `Cargo.lock` (see `build.rs`), which pins stng to an exact
-/// commit: bumping stng retires every entry, with no version to maintain.
+/// That key covers filefacts' own `Cargo.lock` (see `build.rs`), which pins
+/// stng to an exact commit, so in a standalone build bumping stng retires
+/// every entry. When filefacts is a dependency the consumer's lock chooses
+/// stng, and the key does not see it (see [`crate::cache`]).
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Extracted {
     values: Values,
@@ -381,8 +388,8 @@ impl<'a> ParsedFile<'a> {
     /// Declared script bodies in a supported container format. Bodies borrow
     /// the parsed values; no script is executed and no reference is fetched.
     /// Unknown interpreters remain explicit rather than being guessed from text.
-    /// An HTML or SVG page yields its inline scripts as one
-    /// [`layer`](EmbeddedSource::layer) view, built on first iteration.
+    /// An HTML or SVG page yields each executable inline script as an
+    /// [`Origin::Script`] unit, found on first iteration.
     pub fn embedded_sources(&self) -> impl Iterator<Item = EmbeddedSource<'_>> {
         // Each reader sees the value tree only for the format it understands,
         // and only that format pays for the extraction.
@@ -396,8 +403,15 @@ impl<'a> ParsedFile<'a> {
             .chain(embedded_sources::rpm(rpm))
             .chain(embedded_sources::rpyc(rpyc))
             .chain(
-                std::iter::once_with(move || embedded_sources::html::inline_scripts(page))
-                    .flatten(),
+                // The page scan runs on the host's thread, outside the
+                // extraction stages, so it gets its own panic guard.
+                std::iter::once_with(move || {
+                    guarded("embedded_sources", || {
+                        embedded_sources::html::inline_scripts(page).collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+                })
+                .flatten(),
             )
     }
 
@@ -479,7 +493,7 @@ impl<'a> ParsedFile<'a> {
     /// Source parsers (tree-sitter and bounded CFML tags) produce flow; binary flow recovery is
     /// not implemented. The graph records its producer and known limitations.
     pub fn flow(&self) -> Option<&Flow> {
-        if let Some(parsed) = self.cfml_parse() {
+        if let Some(Ok(parsed)) = self.cfml_outcome() {
             return Some(&parsed.flow);
         }
         self.flow
@@ -516,9 +530,10 @@ impl<'a> ParsedFile<'a> {
 
     /// Non-fatal extraction errors encountered during the parse.
     ///
-    /// Filefacts always returns as much data as it can: when a goblin
-    /// lazy walker panics or a sub-table is truncated, the failure
-    /// is recorded here and the rest of the extraction continues.
+    /// Filefacts always returns as much data as it can: when a parser
+    /// (filefacts' own, or goblin, binform, tree-sitter, …) panics or a
+    /// sub-table is truncated, the failure is recorded here and the rest of
+    /// the extraction continues.
     /// Empty when nothing went wrong. See [`crate::Diagnostic`] for
     /// the entry shape.
     pub fn errors(&self) -> &Errors {
@@ -587,28 +602,22 @@ impl<'a> ParsedFile<'a> {
         self.parse_count.load(Ordering::Acquire)
     }
 
-    fn cfml_parse(&self) -> Option<&formats::cfml::Parsed> {
-        self.cfml_outcome()?.as_ref().ok()
-    }
-
     fn cfml_outcome(&self) -> Option<&Result<formats::cfml::Parsed, PanicMessage>> {
         if self.fileid.file_type() != FileType::Cfml {
             return None;
         }
-        self.cfml_parse
-            .get_or_init(|| {
-                Some(guarded(Stage::SourceParse.as_str(), || {
-                    formats::cfml::parse(self.bytes)
-                }))
+        Some(self.cfml_parse.get_or_init(|| {
+            guarded(Stage::SourceParse.as_str(), || {
+                formats::cfml::parse(self.bytes)
             })
-            .as_ref()
+        }))
     }
 
     fn extracted(&self) -> &Extracted {
         self.extracted.get_or_init(|| {
-            if !self.cache {
+            let Some(cache) = &self.cache else {
                 return self.run_pipeline();
-            }
+            };
             // The disk cache is keyed by (content, filefacts build, detected
             // type, basename, binform policy). Type belongs in the key because detection
             // may use the logical filename: identical gzip bytes named
@@ -617,27 +626,23 @@ impl<'a> ParsedFile<'a> {
             // Basename also produces facts independent of detected type:
             // `build.rs` and `lib.rs` must not share `file.basename`, nor may
             // Go workspace and module metadata inherit one another's context.
-            // A source parse stopped by the
-            // wall-clock backstop or cancellation, is returned but not
-            // persisted, so a later healthy run still gets to fill the entry.
+            // An extraction that stopped at a load-dependent point is
+            // returned but not persisted (see `cache_outcome`), so a later
+            // healthy run still gets to fill the entry.
             let variant = extraction_cache_variant(
-                self.cache_namespace.as_deref(),
+                cache.namespace.as_deref(),
                 self.fileid.file_type(),
                 self.fileid.extension_mismatch(),
                 self.fileid.extension_mismatch_transition(),
                 self.basename.as_deref(),
             );
-            cache::open_with_cache(self.cache_dir.as_deref(), self.bytes, &variant, || {
+            cache::open_with_cache(cache.dir.as_deref(), self.bytes, &variant, || {
                 let extracted = self.run_pipeline();
-                let transient = self
+                let parse_transient = self
                     .tree_parse()
                     .and_then(formats::source::TreeParse::diagnostic)
                     .is_some_and(formats::source::TreeSitterDiagnostic::is_transient);
-                if transient {
-                    cache::Computed::Transient(extracted)
-                } else {
-                    cache::Computed::Cacheable(extracted)
-                }
+                cache_outcome(extracted, parse_transient)
             })
         })
     }
@@ -675,6 +680,26 @@ impl<'a> ParsedFile<'a> {
     }
 }
 
+/// Whether a fresh extraction may be persisted: a payload must be a function
+/// of its cache key, and two stops depend on load instead. One is the source
+/// parse stopping at its wall-clock backstop or on cancellation
+/// (`parse_transient`). The other is a source query stopping at its time
+/// budget: the query's work budget and its wall-clock backstop both report
+/// as `source.query_limited.<query>.timeout`, so neither is cached, or a run
+/// on a busy machine would decide the facts of every later open of the same
+/// bytes.
+fn cache_outcome(extracted: Extracted, parse_transient: bool) -> cache::Computed<Extracted> {
+    let query_timed_out = extracted.metrics.iter().any(|(key, _)| {
+        key.strip_prefix("source.query_limited.")
+            .is_some_and(|query| query.ends_with(".timeout"))
+    });
+    if parse_transient || query_timed_out {
+        cache::Computed::Transient(extracted)
+    } else {
+        cache::Computed::Cacheable(extracted)
+    }
+}
+
 /// The message of a panic caught by [`guarded`].
 #[derive(Debug)]
 struct PanicMessage(String);
@@ -687,12 +712,10 @@ struct PanicMessage(String);
 /// value-flow graph, which is built after the views and so has no entry in
 /// [`Errors`].
 fn guarded<T>(stage: &'static str, work: impl FnOnce() -> T) -> Result<T, PanicMessage> {
-    let message = match panic_guard::catch_infallible(work) {
-        Ok(value) => return Ok(value),
-        Err(message) => message,
-    };
-    tracing::warn!(stage, %message, "caught panic; stage facts lost");
-    Err(PanicMessage(message))
+    panic_guard::catch_infallible(work).map_err(|message| {
+        tracing::warn!(stage, %message, "caught panic; stage facts lost");
+        PanicMessage(message)
+    })
 }
 
 /// Everything besides the bytes and the build that a cached extraction
@@ -758,7 +781,7 @@ fn run_extraction(
         );
         values.insert_key(
             value_key!("file.stem"),
-            serde_json::Value::String(formats::common::stem(name)),
+            serde_json::Value::String(formats::common::stem(name).to_owned()),
         );
     }
     // Content-based detection disagreed with the file's extension — a
@@ -789,8 +812,8 @@ fn run_extraction(
     }
     // Format extractors return `Result` so they can report a hard
     // "this file is not in the format I expect" failure. Any
-    // recoverable mid-extraction issues (goblin lazy-walker panics,
-    // truncated sub-tables, permissive-mode fallbacks) are recorded
+    // recoverable mid-extraction issues (parser panics, truncated
+    // sub-tables, permissive-mode fallbacks) are recorded
     // through the typed `Errors` view instead: a consumer gets everything
     // that was extracted even when some sub-stage failed.
     let stage = stage_for(file_type);
@@ -833,6 +856,16 @@ fn run_extraction(
             }
             errors.record_panic(stage, panic.0);
         }
+    }
+    let dropped = strings.text.dropped();
+    if dropped > 0 {
+        tracing::debug!(
+            stage = "strings",
+            kept = strings.text.len(),
+            dropped,
+            "byte-scan rows past the per-file cap not kept"
+        );
+        metrics.insert(metric!("strings.text_truncated"), 1.0);
     }
     // Tree-sitter source extraction also pushes Call/Member/Bind/
     // Identifier symbols when a parse is available. Bundling here
@@ -955,21 +988,21 @@ impl<'a> ParsedFile<'a> {
             flow: OnceLock::new(),
             cfml_parse: OnceLock::new(),
             cancellation: None,
-            cache: false,
-            cache_dir: None,
-            cache_namespace: None,
+            cache: None,
             extracted: OnceLock::new(),
             parse_count: AtomicU32::new(0),
         }
     }
 }
 
-/// The basename surfaced as `file.basename`. Lossy rather than dropped: a
-/// name that is not valid UTF-8 is common among samples, and losing it would
-/// hide `file.basename` / `file.stem` from exactly those files.
-fn basename_of(path: &Path) -> Option<String> {
-    path.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
+/// Where the disk cache lives and how its keys are namespaced: the
+/// [`OpenOptions::cache_dir`] and [`OpenOptions::cache_namespace`] settings.
+#[derive(Clone, Debug, Default)]
+struct CacheSettings {
+    /// The host's cache root; `None` for the per-user default.
+    dir: Option<Arc<Path>>,
+    /// The host's addition to every disk-cache key.
+    namespace: Option<Arc<str>>,
 }
 
 /// How [`OpenOptions::open`] settles the file type.
@@ -1014,8 +1047,7 @@ pub struct OpenOptions<'a> {
     identification: Identification,
     cancellation: Option<&'a AtomicBool>,
     cache: bool,
-    cache_dir: Option<Arc<Path>>,
-    cache_namespace: Option<Arc<str>>,
+    cache_settings: CacheSettings,
 }
 
 impl Default for OpenOptions<'_> {
@@ -1038,8 +1070,7 @@ impl<'a> OpenOptions<'a> {
             identification: Identification::Detect,
             cancellation: None,
             cache: false,
-            cache_dir: None,
-            cache_namespace: None,
+            cache_settings: CacheSettings::default(),
         }
     }
 
@@ -1110,7 +1141,7 @@ impl<'a> OpenOptions<'a> {
     /// directory, or writes one after computing the views; a later open of
     /// the same bytes, under the same settings, skips the extraction. The key
     /// covers the bytes, the filefacts build, the detected type, the
-    /// basename and [`recovery_fingerprint`](Self::recovery_fingerprint). Off
+    /// basename and [`RECOVERY_FINGERPRINT`]. Off
     /// by default.
     pub fn cache(mut self, enabled: bool) -> Self {
         self.cache = enabled;
@@ -1122,31 +1153,25 @@ impl<'a> OpenOptions<'a> {
     /// other user can change, or the cache is skipped for these opens (its
     /// entries are served as results and its sweep deletes by path). Does not
     /// turn the cache on; see [`cache`](Self::cache).
+    ///
+    /// The cache keeps to a `filefacts` directory it creates and tags inside
+    /// `dir`, so `dir` may hold other files; [`cache::cleanup_in`] bounds it.
     pub fn cache_dir(mut self, dir: &Path) -> Self {
-        self.cache_dir = Some(Arc::from(dir));
+        self.cache_settings.dir = Some(Arc::from(dir));
         self
     }
 
     /// Add `namespace` to every disk-cache key, so entries written under a
     /// different namespace are never read.
     ///
-    /// The key already covers filefacts' source and, when the build finds
-    /// it, the `Cargo.lock` that chose filefacts' dependency versions. A
-    /// host that builds with a relocated target directory (where that lock
-    /// is not found), or that wants its own invalidation, passes something
-    /// that changes with what it ships — a hash of its own lockfile, its
-    /// version.
+    /// The key already covers filefacts' source and filefacts' own
+    /// `Cargo.lock`, but not the lock of a build that depends on filefacts,
+    /// which is what chooses stng, binform and the grammars there. Such a
+    /// host passes something that changes with what it ships — a hash of
+    /// its own lockfile, its version — so updating them retires its entries.
     pub fn cache_namespace(mut self, namespace: &str) -> Self {
-        self.cache_namespace = Some(Arc::from(namespace));
+        self.cache_settings.namespace = Some(Arc::from(namespace));
         self
-    }
-
-    /// The function-recovery part of the disk-cache key: binform's policy.
-    /// For a host keying its own cache of results derived from filefacts, so
-    /// an upgrade that changes recovery invalidates it.
-    #[must_use]
-    pub fn recovery_fingerprint(&self) -> String {
-        crate::functions::POLICY.to_owned()
     }
 
     /// Identify `bytes` and return a [`ParsedFile`] that borrows them.
@@ -1165,11 +1190,17 @@ impl<'a> OpenOptions<'a> {
             (Identification::Forced(file_type), _) => FileId::forced(file_type),
             (Identification::Precomputed(fileid), _) => fileid,
         };
-        let mut parsed = ParsedFile::new(bytes, fileid, self.path.as_deref().and_then(basename_of));
+        // Lossy rather than dropped: a name that is not valid UTF-8 is common
+        // among samples, and losing it would hide `file.basename` /
+        // `file.stem` from exactly those files.
+        let basename = self
+            .path
+            .as_deref()
+            .and_then(Path::file_name)
+            .map(|name| name.to_string_lossy().into_owned());
+        let mut parsed = ParsedFile::new(bytes, fileid, basename);
         parsed.cancellation = self.cancellation;
-        parsed.cache = self.cache;
-        parsed.cache_dir.clone_from(&self.cache_dir);
-        parsed.cache_namespace.clone_from(&self.cache_namespace);
+        parsed.cache = self.cache.then(|| self.cache_settings.clone());
         parsed
     }
 }
@@ -1235,9 +1266,13 @@ pub fn read_input(path: &Path, max_bytes: u64) -> Result<Vec<u8>, Error> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     // A FIFO's `open` blocks until a writer appears; O_NONBLOCK returns at
-    // once, and changes nothing for a regular file's reads.
+    // once, and changes nothing for a regular file's reads. O_NOCTTY keeps a
+    // terminal device named as input from becoming the controlling terminal.
     #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NONBLOCK);
+    std::os::unix::fs::OpenOptionsExt::custom_flags(
+        &mut options,
+        libc::O_NONBLOCK | libc::O_NOCTTY,
+    );
     let file = options.open(path).map_err(fail)?;
     let meta = file.metadata().map_err(fail)?;
     if !meta.is_file() {
@@ -1322,6 +1357,3 @@ fn canonical_source_language(name: &str) -> &str {
 
 #[cfg(test)]
 mod tests;
-
-/// Structurally framed JVM classes embedded in a JPHP compiled module.
-pub use formats::jphp::class_frames as jphp_class_frames;

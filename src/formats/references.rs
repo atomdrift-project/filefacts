@@ -2,12 +2,14 @@
 //! at, plus the intra-artifact files it names (a manifest entry point), folded
 //! across formats into [`Reference`] rows.
 //!
-//! Mirrors [`super::identity`]: format parsers write `values`, and
+//! Mirrors [`crate::identity`]: format parsers write `values`, and
 //! [`derive()`] reads them back into one typed view. PURL is preferred over
 //! a raw URL wherever the ecosystem is identifiable, for disambiguation; an
 //! intra-artifact target is a [`RefLocator::Path`].
 
+use std::borrow::Cow;
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -30,51 +32,42 @@ pub(crate) fn derive(file_type: FileType, bytes: &[u8], values: &Values) -> Vec<
         cursor: 0,
         budget: MAX_LOCATE_SCAN,
     };
-    match values
-        .get_key(value_key!("go_manifest.kind"))
-        .and_then(JsonValue::as_str)
-    {
-        Some("go.work") => {
-            go::manifest(&mut out, go::source::WORK);
-            return out.refs;
-        }
-        Some("go.work.sum") => {
-            go::sums(&mut out);
-            return out.refs;
-        }
-        Some("modules.txt") => {
-            go::vendor(&mut out);
-            return out.refs;
-        }
-        _ => {}
-    }
+    let go_manifest = values
+        .lookup(value_key!("go_manifest.kind"))
+        .and_then(JsonValue::as_str);
     // Only declared, structured dependencies live here. Imperative or
     // undeclared references (install-hook commands, a Dockerfile's
     // `npm install`, `curl | sh`, URLs in variables) are left to consumers
-    // that hunt for them in the other facts.
-    match file_type {
-        FileType::Npm | FileType::PackageJson => npm(values, &mut out),
-        FileType::PackageLockJson => npm_lock(values, &mut out),
-        FileType::SrcInfo | FileType::PkgArch => alpm(values, &mut out),
-        FileType::GoMod => go::manifest(&mut out, go::source::MOD),
-        FileType::GoSum => go::sums(&mut out),
-        FileType::CargoToml => cargo_toml(values, &mut out),
-        FileType::CargoLock => cargo_lock(values, &mut out),
-        FileType::PyProjectToml => manifests::pyproject(values, &mut out),
-        FileType::PkgInfo => manifests::pkginfo(values, &mut out),
-        FileType::RequirementsTxt => requirements_txt(&mut out),
-        FileType::PoetryLock => poetry_lock(values, &mut out),
-        FileType::PipfileLock => pipfile_lock(values, &mut out),
-        FileType::GemfileLock => gemfile_lock(&mut out),
-        FileType::Gem => gem_runtime_deps(values, &mut out),
-        FileType::Jar => maven_jar(values, &mut out),
-        FileType::Vsix => vsix_deps(values, &mut out),
-        FileType::ComposerLock => composer_lock(values, &mut out),
-        FileType::YarnLock => yarn_lock(&mut out),
-        FileType::PnpmLock => pnpm_lock(values, &mut out),
-        FileType::JavaScript | FileType::TypeScript => js_local_refs(&mut out),
-        FileType::GithubActions => github_actions(values, &mut out),
-        _ => {}
+    // that hunt for them in the other facts. A Go manifest is told apart by
+    // its content, everything else by file type.
+    match go_manifest {
+        Some("go.work") => go::manifest(&mut out, go::source::WORK),
+        Some("go.work.sum") => go::sums(&mut out),
+        Some("modules.txt") => go::vendor(&mut out),
+        _ => match file_type {
+            FileType::Npm | FileType::PackageJson => npm(values, &mut out),
+            FileType::PackageLockJson => npm_lock(values, &mut out),
+            FileType::SrcInfo | FileType::PkgArch => alpm(values, &mut out),
+            FileType::GoMod => go::manifest(&mut out, go::source::MOD),
+            FileType::GoSum => go::sums(&mut out),
+            FileType::CargoToml => cargo_toml(values, &mut out),
+            FileType::CargoLock => cargo_lock(values, &mut out),
+            FileType::PyProjectToml => manifests::pyproject(values, &mut out),
+            FileType::PkgInfo => manifests::pkginfo(values, &mut out),
+            FileType::RequirementsTxt => requirements_txt(&mut out),
+            FileType::PoetryLock => poetry_lock(values, &mut out),
+            FileType::PipfileLock => pipfile_lock(values, &mut out),
+            FileType::GemfileLock => gemfile_lock(&mut out),
+            FileType::Gem => gem_runtime_deps(values, &mut out),
+            FileType::Jar => maven_jar(values, &mut out),
+            FileType::Vsix => vsix_deps(values, &mut out),
+            FileType::ComposerLock => composer_lock(values, &mut out),
+            FileType::YarnLock => yarn_lock(&mut out),
+            FileType::PnpmLock => pnpm_lock(values, &mut out),
+            FileType::JavaScript | FileType::TypeScript => js_local_refs(&mut out),
+            FileType::GithubActions => github_actions(values, &mut out),
+            _ => {}
+        },
     }
     out.refs
 }
@@ -522,7 +515,7 @@ fn gemfile_lock(out: &mut Refs<'_>) {
 /// the `faraday-multipart` gem).
 fn gem_runtime_deps(values: &Values, out: &mut Refs<'_>) {
     let Some(deps) = values
-        .get_key(value_key!("gem.dependencies"))
+        .lookup(value_key!("gem.dependencies"))
         .and_then(JsonValue::as_array)
     else {
         return;
@@ -551,7 +544,7 @@ fn gem_runtime_deps(values: &Values, out: &mut Refs<'_>) {
 /// resolvable extension identity and is skipped rather than turned into a bad ref.
 fn vsix_deps(values: &Values, out: &mut Refs<'_>) {
     let Some(deps) = values
-        .get_key(value_key!("vsix.dependencies"))
+        .lookup(value_key!("vsix.dependencies"))
         .and_then(JsonValue::as_array)
     else {
         return;
@@ -643,7 +636,7 @@ fn cargo_toml(values: &Values, out: &mut Refs<'_>) {
 /// Unsupported declarations remain `jar.pom.dependency_gaps`, not latest pins.
 fn maven_jar(values: &Values, out: &mut Refs<'_>) {
     let Some(rows) = values
-        .get_key(value_key!("jar.pom"))
+        .lookup(value_key!("jar.pom"))
         .and_then(|pom| pom.get("dependencies"))
         .and_then(JsonValue::as_array)
     else {
@@ -774,7 +767,7 @@ impl Refs<'_> {
         self.note_spent(before, text.len());
         let found = text
             .find(evidence)
-            .or_else(|| text.find(&anchor_from_locator(locator)));
+            .or_else(|| text.find(&*anchor_from_locator(locator)));
         if let Some(at) = found {
             self.cursor = at;
         }
@@ -853,6 +846,7 @@ impl Refs<'_> {
             content_sha256,
             context,
             resolution: None,
+            replaces: None,
         });
     }
 }
@@ -860,15 +854,15 @@ impl Refs<'_> {
 /// A findable substring for locating a reference when its full `evidence`
 /// isn't verbatim in the file — the URL, or a PURL's package name with the
 /// `%40` scope decoded back to `@` and the version stripped.
-fn anchor_from_locator(loc: &RefLocator) -> String {
+fn anchor_from_locator(loc: &RefLocator) -> Cow<'_, str> {
     match loc {
-        RefLocator::Url(u) => u.clone(),
-        RefLocator::Path(p) => p.clone(),
+        RefLocator::Url(u) => Cow::Borrowed(u),
+        RefLocator::Path(p) => Cow::Borrowed(p),
         RefLocator::Purl(p) => {
             let body = p.strip_prefix("pkg:").unwrap_or(p);
             let body = body.split_once('/').map_or(body, |(_, rest)| rest); // drop type
             let name = body.split('@').next().unwrap_or(body); // drop @version
-            name.replace("%40", "@")
+            Cow::Owned(name.replace("%40", "@"))
         }
     }
 }
@@ -878,7 +872,7 @@ fn anchor_from_locator(loc: &RefLocator) -> String {
 /// and URLs inside install hooks are not declarations and are not read here.
 fn npm(values: &Values, out: &mut Refs<'_>) {
     if let Some(repo) = values
-        .get_key(value_key!("npm.repository.url"))
+        .lookup(value_key!("npm.repository.url"))
         .and_then(JsonValue::as_str)
     {
         out.push(
@@ -966,15 +960,15 @@ fn vscode_extension_deps(manifest: &JsonValue, out: &mut Refs<'_>) {
 /// (`main`/`module`), the `exports` map's targets, and the executables (`bin`).
 /// Each points at a sibling file in the same package, so a consumer resolves it
 /// against the bundle's other members rather than fetching it.
-fn npm_local_refs(manifest: &JsonValue, out: &mut Refs<'_>) {
+fn npm_local_refs<'m>(manifest: &'m JsonValue, out: &mut Refs<'_>) {
     // Dedup identical targets — `exports` routinely repeats `main` and lists one
     // file under several conditions (`require`/`import`/`default`).
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut emit = |out: &mut Refs<'_>, path: &str, source: &str| {
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut emit = |out: &mut Refs<'_>, path: &'m str, source: &str| {
         if path.is_empty() || path.contains('*') {
             return; // empty, or a subpath pattern (`./*`) that names no one file
         }
-        if !seen.insert(path.to_string()) {
+        if !seen.insert(path) {
             return;
         }
         push_local_ref(out, path, source);
@@ -996,7 +990,7 @@ fn npm_local_refs(manifest: &JsonValue, out: &mut Refs<'_>) {
         let mut paths = Vec::new();
         collect_export_paths(exports, &mut paths);
         for path in paths {
-            emit(out, &path, "package.json:exports");
+            emit(out, path, "package.json:exports");
         }
     }
     // `bin`: either a single path (the package's lone binary) or a name→path map.
@@ -1015,9 +1009,9 @@ fn npm_local_refs(manifest: &JsonValue, out: &mut Refs<'_>) {
 /// which nests arbitrarily: a string, a conditions object, a subpath map, or an
 /// array of fallbacks. Non-relative entries (bare package names in a fallback
 /// array) are not intra-artifact references and are left out.
-fn collect_export_paths(value: &JsonValue, out: &mut Vec<String>) {
+fn collect_export_paths<'v>(value: &'v JsonValue, out: &mut Vec<&'v str>) {
     match value {
-        JsonValue::String(s) if s.starts_with("./") => out.push(s.clone()),
+        JsonValue::String(s) if s.starts_with("./") => out.push(s),
         JsonValue::Object(map) => {
             for v in map.values() {
                 collect_export_paths(v, out);
@@ -1186,7 +1180,7 @@ fn npm_remote_locator(spec: &str) -> Option<RefLocator> {
     let (base, fragment) = spec
         .split_once('#')
         .map_or((spec, None), |(b, f)| (b, Some(f)));
-    let url = npm_forge_shorthand(base).unwrap_or_else(|| base.to_string());
+    let url = npm_forge_shorthand(base).map_or(Cow::Borrowed(base), Cow::Owned);
     let locator = source_locator(&url)?;
     let version = fragment.filter(|f| !f.is_empty() && !f.starts_with("semver:"));
     match (locator, version) {
@@ -1236,7 +1230,8 @@ fn purl_encode(s: &str) -> String {
         if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
             out.push(char::from(byte));
         } else {
-            out.push_str(&format!("%{byte:02X}"));
+            // Writing to a `String` cannot fail.
+            let _ = write!(out, "%{byte:02X}");
         }
     }
     out
@@ -1409,7 +1404,7 @@ fn parse_integrity(s: &str) -> Option<PinnedHash> {
 /// is parsed here.
 fn alpm(values: &Values, out: &mut Refs<'_>) {
     let Some(pkg) = values
-        .get_key(value_key!("pkg"))
+        .lookup(value_key!("pkg"))
         .and_then(JsonValue::as_object)
     else {
         return;
@@ -1426,8 +1421,9 @@ fn alpm(values: &Values, out: &mut Refs<'_>) {
             "makedepends" | "checkdepends" => (crate::DependencyScope::Build, false),
             _ => continue,
         };
+        let source = format!("pkg.{field}");
         for spec in str_array(Some(value)) {
-            push_alpm_dependency(out, &format!("pkg.{field}"), spec, scope, optional);
+            push_alpm_dependency(out, &source, spec, scope, optional);
         }
     }
 
@@ -1527,11 +1523,11 @@ fn source_locator(src: &str) -> Option<RefLocator> {
             frag.split('&')
                 .find_map(|p| p.strip_prefix("tag=").or_else(|| p.strip_prefix("commit=")))
                 .filter(|v| !v.is_empty())
-                .map(str::to_string)
         });
-        return Some(RefLocator::Purl(
-            version.map_or(purl.clone(), |v| format!("{purl}@{v}")),
-        ));
+        return Some(RefLocator::Purl(match version {
+            Some(version) => format!("{purl}@{version}"),
+            None => purl,
+        }));
     }
     Some(RefLocator::Url(scheme_part.to_string()))
 }

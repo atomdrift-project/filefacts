@@ -1,12 +1,6 @@
 use super::*;
 
 #[test]
-fn entropy_from_histogram_zero_total_is_zero() {
-    let h = [0u32; 256];
-    assert_eq!(entropy_from_histogram(&h, 0), 0.0);
-}
-
-#[test]
 fn channel_entropy_uniform_rgb() {
     // 256 unique RGB triples — each channel sees every value once,
     // so per-channel entropy is exactly 8.0 bits.

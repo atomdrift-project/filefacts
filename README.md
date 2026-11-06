@@ -49,7 +49,7 @@ Views include `fileid`, `identity`, `values`, `text`, `literals`, `metrics`,
 
 For PE, ELF, and Mach-O, filefacts reads the sections, imports and exports,
 and recovers the functions of a binary with no symbol table, in-process with
-[binform](../funktion). It starts no subprocess.
+[binform](https://github.com/atomdrift-project/binform). It starts no subprocess.
 
 ## Library
 

@@ -369,3 +369,26 @@ fn members_past_the_cap_are_counted_not_listed() {
     let limits = v.get("tar.limits").and_then(|x| x.as_array()).unwrap();
     assert_eq!(limits[0]["stage"].as_str(), Some("member-cap"));
 }
+
+#[test]
+fn damaged_header_keeps_the_members_walked_before_it() {
+    let mut bytes = build_tar(&[("a.txt", 0o644, 0, 0, 0, b"hello")]);
+    // Replace the end-of-archive block with a header whose checksum is wrong.
+    let end = 1024;
+    bytes[end..end + 512].fill(b'x');
+    let mut values = Values::new();
+    let mut metrics = Metrics::new();
+    let mut members = Vec::new();
+    let result = extract(
+        &bytes,
+        FileType::Tar,
+        &mut values,
+        &mut metrics,
+        &mut members,
+    );
+    assert!(result.is_err());
+    assert_eq!(members.len(), 1);
+    let listed = values.get("archive.members").and_then(|x| x.as_array());
+    assert_eq!(listed.map(Vec::len), Some(1));
+    assert_eq!(metrics.get("archive.member_count"), Some(1.0));
+}

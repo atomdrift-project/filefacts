@@ -5,7 +5,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use super::MAX_INFLATED;
-use super::filters::{decode_stream, find_filters};
+use super::filters::{StageBudget, decode_stream, find_filters};
 use super::lex::{
     byte_before, dict_names, find_info_value, find_token_between, has_name, is_name_char,
     skip_while,
@@ -178,39 +178,41 @@ fn parse_obj_id_before(bytes: &[u8], obj_pos: usize) -> Option<u32> {
 /// there.
 struct NextToken {
     needle: &'static [u8],
-    /// Whether `found` holds a search result yet.
-    started: bool,
-    /// The last search's result; `None` once none is left.
-    found: Option<usize>,
+    last: Search,
     /// Bytes searched so far.
     searched: usize,
+}
+
+/// What a [`NextToken`]'s last search found.
+#[derive(Clone, Copy)]
+enum Search {
+    NotStarted,
+    Found(usize),
+    /// No occurrence is left.
+    Exhausted,
 }
 
 impl NextToken {
     fn new(needle: &'static [u8]) -> Self {
         Self {
             needle,
-            started: false,
-            found: None,
+            last: Search::NotStarted,
             searched: 0,
         }
     }
 
     fn find(&mut self, bytes: &[u8], from: usize) -> Option<usize> {
-        if self.started {
-            match self.found {
-                Some(at) if at >= from => return Some(at),
-                None => return None,
-                Some(_) => {}
-            }
+        match self.last {
+            Search::Found(at) if at >= from => return Some(at),
+            Search::Exhausted => return None,
+            Search::NotStarted | Search::Found(_) => {}
         }
-        self.started = true;
-        self.found = find_token_between(bytes, from, bytes.len(), self.needle);
-        self.searched += self
-            .found
+        let found = find_token_between(bytes, from, bytes.len(), self.needle);
+        self.last = found.map_or(Search::Exhausted, Search::Found);
+        self.searched += found
             .map_or(bytes.len(), |at| at + self.needle.len())
             .saturating_sub(from);
-        self.found
+        found
     }
 }
 
@@ -384,6 +386,7 @@ pub(super) fn decode_object_streams(
         undecodable: 0,
         first_failure: None,
     };
+    let mut stages = StageBudget::default();
     for region in dict_regions {
         let Some((s, e)) = region.stream_range else {
             continue;
@@ -398,7 +401,7 @@ pub(super) fn decode_object_streams(
         }
         let raw = bytes.get(s..e).unwrap_or_default();
         let filters = find_filters(dict).unwrap_or_default();
-        match decode_stream(raw, &filters, budget.min(MAX_INFLATED)) {
+        match decode_stream(raw, &filters, budget.min(MAX_INFLATED), &mut stages) {
             Ok(decoded) => {
                 budget = budget.saturating_sub(decoded.len());
                 out.decoded.push((region.obj_id, decoded));

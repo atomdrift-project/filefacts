@@ -27,29 +27,23 @@ use crate::metric;
 use serde_json::Value as JsonValue;
 use std::collections::{HashSet, VecDeque};
 
-use crate::formats::common::bytes_at::{u16_le, u32_le, u64_le};
+use crate::bytes::{sat_usize, u16_le, u32_le, u64_le};
 use crate::output::{ArchiveMember, ArchiveOwnership, EntryType, Metrics, Values};
 use crate::value_key;
 
-use super::bounded::{MAX_ARCHIVE_MEMBERS, MAX_PATH_BYTES};
+use super::bounded::{MAX_ARCHIVE_MEMBERS, MAX_DIR_BYTES_TOTAL, MAX_DIR_EXTENT, MAX_PATH_BYTES};
 use super::iso::SECTOR;
 
-/// The Anchor Volume Descriptor Pointer sits at a fixed sector; ECMA-167
-/// requires at least two of these three locations to hold one.
-const ANCHOR_SECTORS: [usize; 1] = [256];
+/// The sector of the first Anchor Volume Descriptor Pointer. ECMA-167
+/// requires an anchor in at least two of three places: this one, the last
+/// sector and the one 256 before it.
+const ANCHOR_SECTOR: usize = 256;
 /// Cap on descriptors read from the main volume descriptor sequence.
 const MAX_VDS_DESCRIPTORS: usize = 64;
 /// Cap on directories visited during the file-tree walk.
 const MAX_DIRS: usize = 8192;
 /// Cap on tree depth.
 const MAX_DEPTH: u32 = 32;
-/// Cap on a single directory extent read.
-const MAX_DIR_EXTENT: usize = 32 << 20;
-/// Directory-extent bytes parsed across the whole walk. `visited` keys a
-/// directory on its ICB, so `MAX_DIRS` distinct ICBs can all point at one
-/// `MAX_DIR_EXTENT` run of identifiers: a quarter-terabyte of parsing from a
-/// 32 MiB image. Real trees spend well under 100 bytes per identifier.
-const MAX_DIR_BYTES_TOTAL: usize = 128 << 20;
 
 /// Descriptor tag identifiers used here (ECMA-167 §3/4).
 mod tag {
@@ -87,8 +81,7 @@ pub(super) fn extract(bytes: &[u8], values: &mut Values, metrics: &mut Metrics) 
     };
     facts.present = true;
 
-    let mvds = ExtentAd::parse(anchor.get(16..24));
-    let Some(mvds) = mvds else {
+    let Some(mvds) = ExtentAd::parse(anchor.get(16..24)) else {
         return facts;
     };
 
@@ -99,9 +92,9 @@ pub(super) fn extract(bytes: &[u8], values: &mut Values, metrics: &mut Metrics) 
 
     // The volume descriptor sequence is a run of whole sectors, terminated
     // by a Terminating Descriptor or by the extent's declared length.
-    let count = (mvds.length as usize / SECTOR).min(MAX_VDS_DESCRIPTORS);
+    let count = (sat_usize(mvds.length) / SECTOR).min(MAX_VDS_DESCRIPTORS);
     for i in 0..count {
-        let Some(sector) = sector_at(bytes, mvds.location as usize + i) else {
+        let Some(sector) = sector_at(bytes, sat_usize(mvds.location).saturating_add(i)) else {
             break;
         };
         let Some(id) = u16_le(sector, 0) else { break };
@@ -226,16 +219,14 @@ fn find_anchor(bytes: &[u8]) -> Option<&[u8]> {
     let last = bytes.len() / SECTOR;
     // 256 is mandatory; the tail copies are the fallback for images whose
     // head was overwritten or that were cut from a larger volume.
-    let candidates = ANCHOR_SECTORS
-        .into_iter()
+    let candidates = std::iter::once(ANCHOR_SECTOR)
         .chain(last.checked_sub(1))
         .chain(last.checked_sub(257));
     for sector in candidates {
         let Some(block) = sector_at(bytes, sector) else {
             continue;
         };
-        if u16_le(block, 0) == Some(tag::ANCHOR)
-            && u32_le(block, 12).map(|v| v as usize) == Some(sector)
+        if u16_le(block, 0) == Some(tag::ANCHOR) && u32_le(block, 12).map(sat_usize) == Some(sector)
         {
             return Some(block);
         }
@@ -296,7 +287,7 @@ impl LongAd {
 /// whose first content byte is a charset marker (8 = Latin-1, 16 = UCS-2BE).
 fn dstring(raw: Option<&[u8]>) -> Option<String> {
     let raw = raw?;
-    let used = *raw.last()? as usize;
+    let used = usize::from(*raw.last()?);
     if used < 2 {
         return None;
     }
@@ -342,18 +333,19 @@ struct Volume<'a> {
 }
 
 impl<'a> Volume<'a> {
-    fn byte_offset(&self, block: u32) -> u64 {
-        (u64::from(self.partition_start) + u64::from(block)) * u64::from(self.block_size)
+    /// Where logical block `block` starts in the image; `None` past `u64`.
+    fn byte_offset(&self, block: u32) -> Option<u64> {
+        (u64::from(self.partition_start) + u64::from(block)).checked_mul(u64::from(self.block_size))
     }
 
     fn block(&self, block: u32) -> Option<&'a [u8]> {
-        let start = usize::try_from(self.byte_offset(block)).ok()?;
-        let len = self.block_size as usize;
+        let start = usize::try_from(self.byte_offset(block)?).ok()?;
+        let len = sat_usize(self.block_size);
         self.bytes.get(start..start.checked_add(len)?)
     }
 
     fn range(&self, block: u32, len: usize) -> Option<&'a [u8]> {
-        let start = usize::try_from(self.byte_offset(block)).ok()?;
+        let start = usize::try_from(self.byte_offset(block)?).ok()?;
         let end = start.checked_add(len.min(MAX_DIR_EXTENT))?;
         self.bytes.get(start..end.min(self.bytes.len()))
     }
@@ -390,30 +382,31 @@ fn parse_file_entry(block: &[u8]) -> Option<FileEntry> {
     let (info_off, ea_off) = if extended { (56, 208) } else { (56, 168) };
     let info_length = u64_le(block, info_off)?;
     let mtime_unix = timestamp(block.get(if extended { 96 } else { 84 }..));
-    let l_ea = u32_le(block, ea_off)? as usize;
-    let l_ad = u32_le(block, ea_off + 4)? as usize;
-    let ad_start = ea_off + 8 + l_ea;
+    let l_ea = sat_usize(u32_le(block, ea_off)?);
+    let l_ad = sat_usize(u32_le(block, ea_off + 4)?);
+    let ad_start = (ea_off + 8).checked_add(l_ea)?;
 
-    let mut entry = FileEntry {
+    let embedded = ad_type == 3;
+    let first_extent = if embedded {
+        None
+    } else {
+        let ads = block.get(ad_start..ad_start.checked_add(l_ad)?)?;
+        match ad_type {
+            // short_ad (length u32, position u32) and long_ad (length u32,
+            // block u32, partition u16, impl [6]) both open with the length,
+            // whose high 2 bits are the extent type, then the block.
+            0 | 1 => Some((u32_le(ads, 0)? & 0x3FFF_FFFF, u32_le(ads, 4)?)),
+            _ => None,
+        }
+    };
+    Some(FileEntry {
         file_type,
         info_length,
         permissions,
         mtime_unix,
-        first_extent: None,
-        embedded: ad_type == 3,
-    };
-    if ad_type == 3 {
-        return Some(entry);
-    }
-    let ads = block.get(ad_start..ad_start.checked_add(l_ad)?)?;
-    entry.first_extent = match ad_type {
-        // short_ad: length u32 (high 2 bits are the extent type), position u32
-        0 => Some((u32_le(ads, 0)? & 0x3FFF_FFFF, u32_le(ads, 4)?)),
-        // long_ad: length u32, block u32, partition u16, impl [6]
-        1 => Some((u32_le(ads, 0)? & 0x3FFF_FFFF, u32_le(ads, 4)?)),
-        _ => None,
-    };
-    Some(entry)
+        first_extent,
+        embedded,
+    })
 }
 
 /// ECMA-167 timestamp: type/timezone u16, year i16, then byte fields.
@@ -424,7 +417,7 @@ fn timestamp(raw: Option<&[u8]>) -> Option<i64> {
     if !(1900..=2999).contains(&year) {
         return None;
     }
-    let days = crate::scan::days_from_civil(i32::from(year), u32::from(b[4]), u32::from(b[5]))?;
+    let days = crate::time::days_from_civil(i32::from(year), u32::from(b[4]), u32::from(b[5]))?;
     Some(days * 86_400 + i64::from(b[6]) * 3600 + i64::from(b[7]) * 60 + i64::from(b[8]))
 }
 
@@ -500,12 +493,12 @@ impl<'a, 'v> TreeWalk<'a, 'v> {
             // or in the entry's first extent. Both borrow the image, not
             // the walk, so neither needs copying out.
             let data = if entry.embedded {
-                let l_ea = u32_le(block, 168).unwrap_or(0) as usize;
-                block.get(176 + l_ea..)
+                let l_ea = sat_usize(u32_le(block, 168).unwrap_or(0));
+                176_usize.checked_add(l_ea).and_then(|at| block.get(at..))
             } else {
                 entry
                     .first_extent
-                    .and_then(|(len, blk)| self.vol.range(blk, len as usize))
+                    .and_then(|(len, blk)| self.vol.range(blk, sat_usize(len)))
             };
             let Some(data) = data else { continue };
             let Some(left) = self.dir_budget.checked_sub(data.len()) else {
@@ -553,7 +546,7 @@ impl<'a, 'v> TreeWalk<'a, 'v> {
         let offset = entry
             .first_extent
             .filter(|_| !entry.embedded)
-            .map(|(_, blk)| self.vol.byte_offset(blk));
+            .and_then(|(_, blk)| self.vol.byte_offset(blk));
         let entry_type = match entry.file_type {
             4 => EntryType::Directory,
             12 => EntryType::Symlink,
@@ -591,10 +584,10 @@ fn parse_fids(data: &[u8]) -> Vec<(String, u32, bool)> {
             break;
         }
         let characteristics = rec.get(18).copied().unwrap_or(0);
-        let l_fi = rec.get(19).copied().unwrap_or(0) as usize;
+        let l_fi = usize::from(rec.get(19).copied().unwrap_or(0));
         // The ICB is a long_ad at +20: extent length first, then block number.
         let icb_block = u32_le(rec, 24).unwrap_or(0);
-        let l_iu = u16_le(rec, 36).unwrap_or(0) as usize;
+        let l_iu = usize::from(u16_le(rec, 36).unwrap_or(0));
         let name_off = 38 + l_iu;
         let total = name_off + l_fi;
         // Records are padded to a 4-byte boundary.

@@ -171,10 +171,10 @@ impl Metrics {
         self.0.get(key).map(|f| f.value)
     }
 
-    /// [`Self::get`] for a catalog-checked key: `metrics.get_key(&metric!("…"))`
+    /// [`Self::get`] for a catalog-checked key: `metrics.lookup(&metric!("…"))`
     /// fails to build on a key no extractor emits, where `get` would just
     /// return `None` forever.
-    pub(crate) fn get_key(&self, key: &MetricKey) -> Option<f64> {
+    pub(crate) fn lookup(&self, key: &MetricKey) -> Option<f64> {
         self.get(key.as_str())
     }
 

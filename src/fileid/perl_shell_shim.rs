@@ -5,6 +5,15 @@
 use regex::Regex;
 use std::sync::LazyLock;
 
+/// The `eval 'exec perl …'` line that hands the file to Perl. The pattern is
+/// fixed, so a build failure is a bug here, not something an input can cause.
+static SHIM: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"^eval 'exec (?:perl|/[A-Za-z0-9_./-]+/perl|\$\{PERL:=/[A-Za-z0-9_./-]+/perl\})(?: -[wWSxTt]+)* \$0 \$\{1\+"\$@"\}'$"#,
+    )
+    .expect("fixed Perl self-exec shim grammar")
+});
+
 pub(super) fn recognized(data: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(data.get(..32 * 1024).unwrap_or(data)) else {
         return false;
@@ -26,11 +35,6 @@ pub(super) fn recognized(data: &[u8]) -> bool {
     if guard != "if 0;" {
         return false;
     }
-    static SHIM: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(
-            r#"^eval 'exec (?:perl|/[A-Za-z0-9_./-]+/perl|\$\{PERL:=/[A-Za-z0-9_./-]+/perl\})(?: -[wWSxTt]+)* \$0 \$\{1\+"\$@"\}'$"#,
-        ).expect("fixed Perl self-exec shim grammar")
-    });
     SHIM.is_match(eval)
 }
 

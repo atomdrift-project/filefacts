@@ -1,6 +1,7 @@
 //! Helpers shared across format extractors.
 
-use crate::metric;
+use std::sync::LazyLock;
+
 use serde_json::Value as JsonValue;
 
 use crate::output::{Strings, Text, ValueKey, Values};
@@ -31,11 +32,12 @@ pub(super) enum XorScan {
 /// a single member this large is a bundled runtime or media blob.
 const XOR_MAX_BYTES: usize = 300 << 20;
 
-impl XorScan {
-    fn runs_on(self, bytes: &[u8]) -> bool {
-        self == Self::Yes && bytes.len() < XOR_MAX_BYTES
-    }
-}
+/// Byte-scan rows one file keeps, earliest first. Each row costs a record
+/// and its JSON, and NUL-separated four-byte runs make one row per five
+/// input bytes: twenty million rows, and gigabytes, from a 100 MB file. The
+/// largest real binaries (browser engines, compiler toolchains) carry about
+/// half a million.
+pub(super) const MAX_TEXT_ROWS: usize = 2_000_000;
 
 /// stng extraction options. filefacts is the one string-extraction authority
 /// for its callers, so it asks stng for the full treatment:
@@ -43,12 +45,12 @@ impl XorScan {
 /// - `xor` recovers XOR-deobfuscated strings (key auto-detected),
 /// - `caller_provides_symbols` skips stng's symbol pass — filefacts walks the
 ///   symbol tables itself (`extract_symbols`), the single symbol codepath.
-fn string_opts_for(xor: XorScan, bytes: &[u8]) -> stng::ExtractOptions {
+pub(super) fn string_opts_for(xor: XorScan, bytes: &[u8]) -> stng::ExtractOptions {
     // Four bytes is the minimum run `strings(1)` reports.
     let opts = stng::ExtractOptions::new(4)
         .with_garbage_filter(true)
         .with_caller_provides_symbols(true);
-    if xor.runs_on(bytes) {
+    if xor == XorScan::Yes && bytes.len() < XOR_MAX_BYTES {
         opts.with_xor(stng::XorMode::Auto)
     } else {
         opts
@@ -59,7 +61,7 @@ fn string_opts_for(xor: XorScan, bytes: &[u8]) -> stng::ExtractOptions {
 /// over these rows, derived from each row's `StringMethod`, rather than two
 /// separate buffers.
 fn push_stng_strings(extracted: Vec<stng::ExtractedString>, strings: &mut Strings) {
-    strings.text = Text::from_rows(extracted.into());
+    strings.text = Text::capped(extracted, MAX_TEXT_ROWS);
 }
 
 /// Return the payload of a malformed UTF-16 wrapper.
@@ -81,23 +83,6 @@ fn malformed_utf16_bom_payload(bytes: &[u8]) -> Option<&[u8]> {
     (!text.contains(&0) && std::str::from_utf8(text).is_ok()).then_some(payload)
 }
 
-fn extract_malformed_utf16_bom_text_strings(
-    bytes: &[u8],
-    strings: &mut Strings,
-    xor: XorScan,
-) -> bool {
-    let Some(payload) = malformed_utf16_bom_payload(bytes) else {
-        return false;
-    };
-    let opts = string_opts_for(xor, payload);
-    let mut rows = stng::extract_strings_with_options(payload, &opts);
-    for row in &mut rows {
-        row.data_offset = row.data_offset.saturating_add(2);
-    }
-    push_stng_strings(rows, strings);
-    true
-}
-
 /// Extract strings from a binary stng parses itself. Used as the fallback when
 /// the format handler's own goblin parse failed (malformed input) — see
 /// [`extract_binary_strings_from_object`] for the fast path that reuses an
@@ -116,9 +101,7 @@ pub(super) fn extract_binary_strings(bytes: &[u8], strings: &mut Strings, xor: X
 pub(super) fn append_decoded_strings(bytes: &[u8], strings: &mut Strings, xor: XorScan) {
     let opts = string_opts_for(xor, bytes);
     let extracted = stng::extract_strings_with_options(bytes, &opts);
-    if !extracted.is_empty() {
-        strings.text.append_rows(&extracted);
-    }
+    strings.text.append_rows(&extracted, MAX_TEXT_ROWS);
 }
 
 /// Extract strings from a goblin object the caller already parsed, so the
@@ -157,27 +140,28 @@ pub(super) fn extract_binary_strings_from_object<'d>(
 /// stng scans only input it judges binary, so the gate matters for a script
 /// with binary content appended, not for plain source.
 pub(super) fn has_xor_intent(bytes: &[u8]) -> bool {
-    if memchr::memchr(b'^', bytes).is_some() {
-        return true;
-    }
-    static XOR_WORD: std::sync::OnceLock<Option<aho_corasick::AhoCorasick>> =
-        std::sync::OnceLock::new();
-    XOR_WORD
-        .get_or_init(|| {
-            aho_corasick::AhoCorasick::builder()
-                .ascii_case_insensitive(true)
-                .build(["xor"])
-                .ok()
-        })
-        .as_ref()
-        .is_some_and(|ac| ac.find(bytes).is_some())
+    static XOR_WORD: LazyLock<Option<aho_corasick::AhoCorasick>> = LazyLock::new(|| {
+        aho_corasick::AhoCorasick::builder()
+            .ascii_case_insensitive(true)
+            .build(["xor"])
+            .ok()
+    });
+    memchr::memchr(b'^', bytes).is_some()
+        || XOR_WORD.as_ref().is_some_and(|ac| ac.find(bytes).is_some())
 }
 
 /// `strings(1)`-tier byte view for a text/source member. Mirrors
 /// [`extract_binary_strings`] but for text/source bytes; callers gate source
 /// files on [`has_xor_intent`].
 pub(super) fn extract_text_strings(bytes: &[u8], strings: &mut Strings, xor: XorScan) {
-    if extract_malformed_utf16_bom_text_strings(bytes, strings, xor) {
+    if let Some(payload) = malformed_utf16_bom_payload(bytes) {
+        let opts = string_opts_for(xor, payload);
+        let mut rows = stng::extract_strings_with_options(payload, &opts);
+        // Offsets are into the file, past the two-byte BOM.
+        for row in &mut rows {
+            row.data_offset = row.data_offset.saturating_add(2);
+        }
+        push_stng_strings(rows, strings);
         return;
     }
     let opts = string_opts_for(xor, bytes);
@@ -214,18 +198,6 @@ pub(crate) fn basename(path: &str) -> &str {
     }
 }
 
-/// Whether `name` ends with `suffix`, ignoring ASCII case. Member names from
-/// a hostile archive arrive in any case, and the readers that matter match
-/// them case-insensitively: Windows (`.PYD`), OPC part names (`.XML`,
-/// `.RELS`), and the JDK's `META-INF/*.SF` lookup.
-#[must_use]
-pub(crate) fn ends_with_ci(name: &str, suffix: &str) -> bool {
-    name.len()
-        .checked_sub(suffix.len())
-        .and_then(|start| name.as_bytes().get(start..))
-        .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix.as_bytes()))
-}
-
 /// Whether `name` starts with `prefix`, ignoring ASCII case.
 #[must_use]
 pub(crate) fn starts_with_ci(name: &str, prefix: &str) -> bool {
@@ -243,12 +215,12 @@ pub(crate) fn starts_with_ci(name: &str, prefix: &str) -> bool {
 /// Pure function on basenames; callers should pass the output of
 /// [`basename`] when starting from a path.
 #[must_use]
-pub(crate) fn stem(name: &str) -> String {
+pub(crate) fn stem(name: &str) -> &str {
     // Leading-dot files have no extension to strip.
     let body_start = name.bytes().take_while(|b| *b == b'.').count();
     let body = &name[body_start..];
     let stem_end = body.rfind('.').unwrap_or(body.len());
-    format!("{}{}", &name[..body_start], &body[..stem_end])
+    &name[..body_start + stem_end]
 }
 
 /// Convenience wrapper for emitting an integer-typed value at a checked key.
@@ -277,7 +249,7 @@ pub(super) fn recover_natively(
     symbols: &mut crate::Symbols,
     metrics: &mut crate::output::Metrics,
 ) -> Option<u32> {
-    Some(apply_native(&native(layout, symbols)?, symbols, metrics))
+    Some(native(layout, symbols)?.functions.apply(symbols, metrics))
 }
 
 /// binform's answer for the binary `layout` describes, or `None` when
@@ -287,32 +259,25 @@ pub(super) fn native(
     layout: Option<&binform::Binary<'_>>,
     symbols: &crate::Symbols,
 ) -> Option<crate::functions::Native> {
-    if symbols
-        .iter()
-        .any(|symbol| symbol.kind() == crate::SymbolKind::Function)
-    {
+    if has_functions(symbols) {
         return None;
     }
     crate::functions::recover(layout)
 }
 
-/// Add binform's functions and their calls to the typed views; returns how
-/// many functions it added. The section, import and export views are
-/// binform's already: each format extractor reads them from its layout.
-pub(super) fn apply_native(
-    native: &crate::functions::Native,
-    symbols: &mut crate::Symbols,
-    metrics: &mut crate::output::Metrics,
-) -> u32 {
-    native.functions.apply(symbols, metrics)
+/// Whether `symbols` already holds a function inventory: a symbol table's,
+/// Go's pclntab's, or binform's.
+pub(crate) fn has_functions(symbols: &crate::Symbols) -> bool {
+    symbols
+        .iter_kind(crate::SymbolKind::Function)
+        .next()
+        .is_some()
 }
 
-/// Emit `pe.recovered_function_count`: how many functions binform recovered
-/// for a PE whose format parser named none.
-pub(super) fn recovered_function_count(functions: u32, metrics: &mut crate::output::Metrics) {
-    if functions > 0 {
-        metrics.insert(metric!("pe.recovered_function_count"), f64::from(functions));
-    }
+/// The name an import or export by ordinal alone goes by in the typed
+/// views, the spelling binform gives PE exports: `Ordinal_<n>`.
+pub(super) fn unnamed_ordinal(ordinal: impl std::fmt::Display) -> String {
+    format!("Ordinal_{ordinal}")
 }
 
 /// The layout binform reads from `bytes`: the section, import and export
@@ -322,24 +287,17 @@ pub(super) fn recovered_function_count(functions: u32, metrics: &mut crate::outp
 ///
 /// When binform cannot read it, the reason is returned rather than recorded:
 /// a caller records it only when goblin read the file, since goblin's own
-/// error otherwise says the same.
+/// error otherwise says the same. A panic in binform is caught and returned
+/// the same way, so goblin's facts survive it.
 pub(super) fn read_layout(bytes: &[u8]) -> Result<binform::Binary<'_>, String> {
-    binform::parse(bytes).map_err(|error| format!("layout: {error}"))
+    crate::panic_guard::catch_infallible(|| binform::parse(bytes))
+        .map_err(|panic| format!("layout: binform panicked: {panic}"))?
+        .map_err(|error| format!("layout: {error}"))
 }
-
-/// Panic-safe fixed-width integer reads. Each helper bounds-checks
-/// via `slice::get`, so an out-of-range offset returns `None` instead
-/// of panicking — the right idiom for parsing untrusted input where
-/// callers may have a bug in their length-check.
-///
-/// Per-format extractors that need a non-`Option` return type can
-/// wrap the call in `.unwrap_or(0)` to keep their existing signature;
-/// the panic surface is gone either way.
-pub(super) use crate::bytes as bytes_at;
 
 /// Lowercase hex encoding of arbitrary bytes. Used wherever a hash
 /// digest or serial number needs a stable, comparable representation.
-pub(super) fn hex_encode(bytes: &[u8]) -> String {
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     // Nibbles are always below the radix, so no digit is dropped.
     out.extend(
@@ -386,32 +344,6 @@ pub(super) fn format_guid(b: &[u8; 16]) -> String {
         hex_encode(&b[8..10]),
         hex_encode(&b[10..16])
     )
-}
-
-/// Sort `(file_offset, size, tag)` ranges and clip each against the ones
-/// before it, so no file byte is visited twice however the headers overlap
-/// their sections. A range running past `file_len` keeps its in-file head (a
-/// truncated binary still holds the start of its code); empty, overflowing,
-/// and fully covered ranges are dropped. The tag rides along with the part of
-/// its range that survives.
-pub(super) fn disjoint_file_ranges<T>(
-    mut ranges: Vec<(usize, usize, T)>,
-    file_len: usize,
-) -> Vec<(std::ops::Range<usize>, T)> {
-    ranges.sort_unstable_by_key(|&(start, size, _)| (start, size));
-    let mut covered = 0;
-    ranges
-        .into_iter()
-        .filter_map(|(start, size, tag)| {
-            let end = start.checked_add(size)?.min(file_len);
-            if end <= start || end <= covered {
-                return None;
-            }
-            let start = start.max(covered);
-            covered = end;
-            Some((start..end, tag))
-        })
-        .collect()
 }
 
 /// Read an unsigned LEB128 (Go's "uvarint") at `*offset`, advancing past it.
@@ -462,13 +394,11 @@ pub(super) fn plist_to_json(value: plist::Value, depth: u8) -> JsonValue {
                 .map(|v| plist_to_json(v, depth + 1))
                 .collect(),
         ),
-        P::Dictionary(dict) => {
-            let mut obj = serde_json::Map::new();
-            for (k, v) in dict {
-                obj.insert(k, plist_to_json(v, depth + 1));
-            }
-            JsonValue::Object(obj)
-        }
+        P::Dictionary(dict) => JsonValue::Object(
+            dict.into_iter()
+                .map(|(k, v)| (k, plist_to_json(v, depth + 1)))
+                .collect(),
+        ),
         _ => JsonValue::Null,
     }
 }

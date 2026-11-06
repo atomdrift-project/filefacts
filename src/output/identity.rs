@@ -229,10 +229,12 @@ pub enum Trust {
     /// chain (Mach-O `CS_ADHOC`), whose page hashes match the code.
     /// Integrity without identity.
     AdHoc,
-    /// A verified signature by a certificate that is its own issuer —
+    /// A verified signature by a certificate that is its own issuer, or that
+    /// no issuer's key verifiably signed whatever issuer it names —
     /// asserts an identity nothing else vouches for.
     SelfSigned,
-    /// A verified signature whose certificate was issued by another, but
+    /// A verified signature whose certificate another's key verifiably
+    /// signed, but
     /// whose chain does not end at a pinned vendor root (or does, for a
     /// third-party leaf). Which issuing CAs to trust is left to consumers
     /// pinning `chain_sha256`; nothing here checks a public CA store.
@@ -242,7 +244,8 @@ pub enum Trust {
     DeveloperId,
     /// The platform vendor's own signature: verified, chaining to a pinned
     /// Microsoft or Apple root, by a leaf whose organization is exactly
-    /// `Microsoft Corporation` or `Apple Inc.`.
+    /// `Microsoft Corporation` or `Apple Inc.` — for Apple, a leaf issued by
+    /// Apple's own code-signing CA rather than a developer or App Store CA.
     Platform,
     /// A first-party operating-system component: a Mach-O `Platform`
     /// signature over a CodeDirectory whose platform byte is set. The byte
@@ -335,23 +338,8 @@ impl Identity {
     /// `true` when no identity claim of any kind was found and the
     /// artifact is unsigned — nothing worth showing.
     pub fn is_empty(&self) -> bool {
-        self.name.is_none()
-            && self.title.is_none()
-            && self.identifier.is_none()
-            && self.project.is_none()
-            && self.version.is_none()
-            && self.description.is_none()
-            && self.authors.is_empty()
-            && self.organization.is_none()
-            && self.copyright.is_none()
-            && self.producer.is_none()
-            && self.build_path.is_none()
-            && self.signer.is_none()
-            && self.trust == Trust::Unsigned
-            && self.team_id.is_none()
-            && self.emails.is_empty()
-            && self.urls.is_empty()
-            && self.unique_ids.is_empty()
+        // The default is every field empty and the trust `Unsigned`.
+        *self == Self::default()
     }
 }
 

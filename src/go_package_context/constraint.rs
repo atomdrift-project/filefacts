@@ -187,6 +187,9 @@ pub(super) enum Expr {
     Not(Box<Expr>),
     And(Box<Expr>, Box<Expr>),
     Or(Box<Expr>, Box<Expr>),
+    /// Every one of a file's `// +build` lines, each a shallow expression.
+    /// Flat, so that neither evaluating nor dropping it recurses per line.
+    All(Vec<Expr>),
 }
 
 impl Expr {
@@ -197,6 +200,7 @@ impl Expr {
             Self::Not(x) => !x.eval(tag),
             Self::And(x, y) => x.eval(tag) && y.eval(tag),
             Self::Or(x, y) => x.eval(tag) || y.eval(tag),
+            Self::All(lines) => lines.iter().all(|line| line.eval(tag)),
         }
     }
 
@@ -243,20 +247,26 @@ pub(super) fn file_constraint(content: &str) -> Result<Option<Expr>, ConstraintE
             .map(Some)
             .map_err(ConstraintError::Syntax);
     }
-    let mut constraint: Option<Expr> = None;
+    let mut lines = Vec::new();
     for line in header.lines().map(str::trim) {
-        let Some(expr) = line.strip_prefix("//").and_then(plus_build) else {
+        // A `// +build` line: `+build`, then whitespace or the line's end.
+        let Some(rest) = line
+            .strip_prefix("//")
+            .and_then(|comment| comment.trim().strip_prefix("+build"))
+        else {
             continue;
         };
-        // A malformed `+build` line is ignored, as `go/build` ignores it.
-        if let Some(expr) = parse_plus_build(expr) {
-            constraint = Some(match constraint {
-                Some(previous) => Expr::and(previous, expr),
-                None => expr,
-            });
+        if !(rest.is_empty() || rest.starts_with(char::is_whitespace)) {
+            continue;
         }
+        // A malformed `+build` line is ignored, as `go/build` ignores it.
+        lines.extend(parse_plus_build(rest.trim()));
     }
-    Ok(constraint)
+    Ok(match lines.len() {
+        0 => None,
+        1 => lines.pop(),
+        _ => Some(Expr::All(lines)),
+    })
 }
 
 /// The leading comment block of `content` (`parseFileHeader` in
@@ -279,7 +289,11 @@ fn file_header(content: &str) -> Result<(&str, Option<&str>), ConstraintError> {
         if !line.starts_with("//") {
             ended = true;
         }
-        if !in_block_comment && is_go_build(line) {
+        // `//go:build` itself, not, say, `//go:buildx`.
+        let is_go_build = line
+            .strip_prefix("//go:build")
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace));
+        if !in_block_comment && is_go_build {
             if go_build.is_some() {
                 return Err(ConstraintError::MultipleGoBuild);
             }
@@ -306,20 +320,6 @@ fn file_header(content: &str) -> Result<(&str, Option<&str>), ConstraintError> {
         }
     }
     Ok((&content[..end], go_build))
-}
-
-/// Whether trimmed `line` is a `//go:build` line rather than, say,
-/// `//go:buildx`.
-fn is_go_build(line: &str) -> bool {
-    line.strip_prefix("//go:build")
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
-}
-
-/// The expression of a `+build` comment body (the text after `//`), or
-/// `None` when it is not one.
-fn plus_build(comment: &str) -> Option<&str> {
-    let rest = comment.trim().strip_prefix("+build")?;
-    (rest.is_empty() || rest.starts_with(char::is_whitespace)).then(|| rest.trim())
 }
 
 /// Most operators a `+build` line may combine, as in `go/build/constraint`.
@@ -420,7 +420,7 @@ struct ExprParser<'a> {
     size: usize,
 }
 
-impl<'a> ExprParser<'a> {
+impl ExprParser<'_> {
     fn lex(&mut self) -> Result<(), &'static str> {
         let rest = &self.text[self.pos..];
         let trimmed = rest.trim_start_matches([' ', '\t']);

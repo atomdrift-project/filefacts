@@ -154,15 +154,10 @@ fn take_hex_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, n: usiz
     // (`\u12"`) leaves the digits in place to be emitted verbatim rather than
     // swallowing them.
     let mut lookahead = chars.clone();
-    let mut digits = String::with_capacity(n);
+    let mut value = 0;
     for _ in 0..n {
-        let d = lookahead.next()?;
-        if !d.is_ascii_hexdigit() {
-            return None;
-        }
-        digits.push(d);
+        value = value * 16 + lookahead.next()?.to_digit(16)?;
     }
-    let value = u32::from_str_radix(&digits, 16).ok()?;
     *chars = lookahead;
     Some(value)
 }
@@ -182,20 +177,17 @@ fn decode_unicode_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -
 fn decode_unicode_escape_inner(
     chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
 ) -> Option<char> {
-    if chars.peek() == Some(&'{') {
-        chars.next();
-        let mut digits = String::new();
-        while let Some(&d) = chars.peek() {
-            chars.next();
+    if chars.next_if_eq(&'{').is_some() {
+        // One to six hex digits; every character before the `}` is one.
+        let mut value = 0;
+        for (digits, d) in chars.by_ref().enumerate() {
             if d == '}' {
-                return u32::from_str_radix(&digits, 16)
-                    .ok()
-                    .and_then(char::from_u32);
+                return (digits > 0).then_some(value).and_then(char::from_u32);
             }
-            if !d.is_ascii_hexdigit() || digits.len() >= 6 {
+            if digits == 6 {
                 return None;
             }
-            digits.push(d);
+            value = value * 16 + d.to_digit(16)?;
         }
         return None;
     }

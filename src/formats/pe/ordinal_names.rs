@@ -4,6 +4,25 @@
 //! Ghidra's export lists; Windows CE's from its SDK's export files); do
 //! not edit. The imphash does not use these: it names ordinals only as
 //! pefile does (see `ordinals.rs`). Sorted by ordinal.
+//!
+//! Generated with:
+//!
+//! ```text
+//! unrecorded: regenerate with the inputs below to record the command
+//! ```
+//!
+//! Sources:
+//! - Windows build the msi, comctl32 (5.82, 6.0) and cabinet DLLs were
+//!   copied from: unrecorded
+//! - Ghidra release of `mfc42.exports` and `mfc42u.exports`: unrecorded
+//! - Windows CE 5.0 Standard SDK MSI (`STANDARD_SDK.msi`) of the coredll
+//!   and commctrl export files: unrecorded
+//!
+//! Inputs (file, bytes, SHA-256):
+//!
+//! ```text
+//! unrecorded
+//! ```
 
 /// `cabinet.dll`, from cabinet.dll.
 pub(super) const CABINET: &[(u16, &str)] = &[

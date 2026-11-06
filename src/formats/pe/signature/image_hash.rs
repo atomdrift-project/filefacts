@@ -38,6 +38,7 @@ use sha1::Sha1;
 use sha2::digest::DynDigest;
 use sha2::{Digest, Sha256, Sha384, Sha512};
 
+use crate::bytes::sat_usize;
 use crate::formats::cms::Signature;
 use crate::formats::common::hex_encode;
 use crate::formats::pe::layout::{self, CERTIFICATE_DIRECTORY};
@@ -239,12 +240,12 @@ fn wanted_algorithms(signatures: &[Signature]) -> Vec<HashAlg> {
 /// can't be hashed canonically.
 fn derive_regions(pe: &PE<'_>, bytes: &[u8]) -> Option<Regions> {
     let opt = pe.header.optional_header.as_ref()?;
-    let pe_pointer = pe.header.dos_header.pe_pointer as usize;
+    let pe_pointer = sat_usize(pe.header.dos_header.pe_pointer);
     let magic = opt.standard_fields.magic;
     let checksum_offset = layout::checksum_offset(pe_pointer, magic)?;
     let cert_dir_offset = layout::data_directory_offset(pe_pointer, magic, CERTIFICATE_DIRECTORY)?;
 
-    let size_of_headers = opt.windows_fields.size_of_headers as usize;
+    let size_of_headers = sat_usize(opt.windows_fields.size_of_headers);
     if checksum_offset + 4 > bytes.len()
         || cert_dir_offset + 8 > bytes.len()
         || size_of_headers > bytes.len()
@@ -273,8 +274,8 @@ fn derive_regions(pe: &PE<'_>, bytes: &[u8]) -> Option<Regions> {
 
     let mut last_raw_end = size_of_headers;
     for s in &by_raw_offset {
-        let start = s.pointer_to_raw_data as usize;
-        let end = start.checked_add(s.size_of_raw_data as usize)?;
+        let start = sat_usize(s.pointer_to_raw_data);
+        let end = start.checked_add(sat_usize(s.size_of_raw_data))?;
         if end > bytes.len() {
             return None;
         }
@@ -300,7 +301,7 @@ fn derive_regions(pe: &PE<'_>, bytes: &[u8]) -> Option<Regions> {
     let mut overlay_padding = 0_u64;
     if file_size > (last_raw_end as u64).saturating_add(cert_table_size) {
         let extra_start = last_raw_end;
-        let extra_end = crate::bytes::sat_usize(file_size - cert_table_size);
+        let extra_end = sat_usize(file_size - cert_table_size);
         if extra_start < extra_end && extra_end <= bytes.len() {
             ranges.push(extra_start..extra_end);
             overlay_padding = (extra_end - extra_start) as u64;

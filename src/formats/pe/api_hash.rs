@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 
 use goblin::pe::PE;
-use goblin::pe::section_table::SectionTable;
+use goblin::pe::section_table::{IMAGE_SCN_MEM_EXECUTE, SectionTable};
 use iced_x86::{
     Decoder, DecoderOptions, FlowControl, Instruction, InstructionInfoFactory, Mnemonic, OpAccess,
     OpKind, Register,
@@ -22,7 +22,7 @@ use memchr::memmem;
 use serde_json::Value as JsonValue;
 
 use super::layout::va_to_file_offset;
-use crate::formats::common::bytes_at::u32_le;
+use crate::bytes::{sat_usize, u32_le};
 use crate::metric;
 use crate::output::{Metrics, Values};
 use crate::value_key;
@@ -31,9 +31,6 @@ use crate::value_key;
 /// six-byte `fs:[0x30]` needle per match would otherwise let a file of
 /// repeated opcodes emit a JSON object for every six bytes it holds.
 const MAX_NATIVE_SITES: usize = 4096;
-
-/// `IMAGE_SCN_MEM_EXECUTE`.
-const SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 
 /// The resolver mechanics [`native_resolver_signals`] located, for the call
 /// graph correlation in [`recover_api_hash_requests`]: the same records it
@@ -164,16 +161,16 @@ pub(super) fn native_resolver_signals(
     let ranges = pe
         .sections
         .iter()
-        .filter(|section| section.characteristics & SCN_MEM_EXECUTE != 0)
+        .filter(|section| section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0)
         .map(|section| {
             (
-                section.pointer_to_raw_data as usize,
-                section.size_of_raw_data as usize,
+                sat_usize(section.pointer_to_raw_data),
+                sat_usize(section.size_of_raw_data),
                 section,
             )
         })
         .collect();
-    for (range, section) in crate::formats::common::disjoint_file_ranges(ranges, bytes.len()) {
+    for (range, section) in disjoint_file_ranges(ranges, bytes.len()) {
         let start = range.start;
         let Some(code) = bytes.get(range) else {
             continue;
@@ -309,7 +306,7 @@ struct Site<'a> {
 
 impl<'a> Site<'a> {
     fn new(pe: &PE<'_>, section: &'a SectionTable, file_offset: usize) -> Self {
-        let delta = file_offset.saturating_sub(section.pointer_to_raw_data as usize);
+        let delta = file_offset.saturating_sub(sat_usize(section.pointer_to_raw_data));
         let rva = u64::from(section.virtual_address).saturating_add(delta as u64);
         Self {
             file_offset,
@@ -329,17 +326,6 @@ impl<'a> Site<'a> {
         }
         fact
     }
-}
-
-/// Whether `bytes` is a compact PE with no imports: the shape of a
-/// resolver or hash stub, whose calls are worth correlating with the
-/// API-hash walkers (see [`recover_api_hash_requests`]).
-pub(super) fn is_importless(bytes: &[u8], symbols: &crate::Symbols) -> bool {
-    const MAX_IMPORTLESS_ANALYSIS_BYTES: usize = 5 * 1024 * 1024;
-    bytes.len() <= MAX_IMPORTLESS_ANALYSIS_BYTES
-        && !symbols
-            .iter()
-            .any(|symbol| symbol.kind() == crate::SymbolKind::Import)
 }
 
 /// Correlate manual export walkers with their concrete callsites. This
@@ -959,6 +945,32 @@ const WINDOWS_API_HASH_CANDIDATES: &[(&str, &str)] = &[
     ("ws2_32.dll", "send"),
     ("ws2_32.dll", "socket"),
 ];
+
+/// Sort `(file_offset, size, section)` ranges and clip each against the ones
+/// before it, so no file byte is visited twice however the headers overlap
+/// their sections. A range running past `file_len` keeps its in-file head (a
+/// truncated binary still holds the start of its code); empty, overflowing,
+/// and fully covered ranges are dropped. The section rides along with the part
+/// of its range that survives.
+fn disjoint_file_ranges(
+    mut ranges: Vec<(usize, usize, &SectionTable)>,
+    file_len: usize,
+) -> Vec<(std::ops::Range<usize>, &SectionTable)> {
+    ranges.sort_unstable_by_key(|&(start, size, _)| (start, size));
+    let mut covered = 0;
+    ranges
+        .into_iter()
+        .filter_map(|(start, size, section)| {
+            let end = start.checked_add(size)?.min(file_len);
+            if end <= start || end <= covered {
+                return None;
+            }
+            let start = start.max(covered);
+            covered = end;
+            Some((start..end, section))
+        })
+        .collect()
+}
 
 #[cfg(test)]
 mod tests;

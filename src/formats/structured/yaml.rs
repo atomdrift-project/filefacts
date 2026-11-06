@@ -27,7 +27,6 @@ const YAML_MAX_REPLAYED_EVENTS: usize = 100_000;
 const YAML_MAX_REPLAYED_BYTES: usize = 16 << 20;
 
 /// A YAML node, with its plain scalars resolved (see [`parse_yaml`]).
-#[derive(Clone)]
 enum Yaml {
     Null,
     Bool(bool),
@@ -251,7 +250,8 @@ impl<'a, 'i> Composer<'a, 'i> {
                     return Err(format!("unknown YAML anchor{}", location(span)));
                 };
                 self.replaying += 1;
-                let node = self.node(&mut start.clone(), depth);
+                let mut replay = start;
+                let node = self.node(&mut replay, depth);
                 self.replaying -= 1;
                 return node;
             }
@@ -288,7 +288,7 @@ impl<'a, 'i> Composer<'a, 'i> {
                     if !seen.insert(key_identity(&key)) {
                         return Err(format!(
                             "duplicate YAML mapping key {}{}",
-                            key_spelling(&key),
+                            key_spelling(key),
                             key_span.map(location).unwrap_or_default()
                         ));
                     }
@@ -358,8 +358,8 @@ fn resolve_scalar(
             "tag:yaml.org,2002:float" => parse_f64(value)
                 .map(Yaml::Float)
                 .ok_or_else(|| invalid("a float")),
-            "tag:yaml.org,2002:null" => parse_null(value)
-                .map(|()| Yaml::Null)
+            "tag:yaml.org,2002:null" => is_null(value)
+                .then_some(Yaml::Null)
                 .ok_or_else(|| invalid("null")),
             _ => Ok(Yaml::String(value.to_string())),
         };
@@ -372,7 +372,7 @@ fn resolve_scalar(
 
 /// Resolve an untagged plain scalar.
 fn resolve_plain(value: &str) -> Yaml {
-    if value.is_empty() || parse_null(value).is_some() {
+    if value.is_empty() || is_null(value) {
         return Yaml::Null;
     }
     if let Some(b) = parse_bool(value) {
@@ -381,10 +381,10 @@ fn resolve_plain(value: &str) -> Yaml {
     if let Some(int) = resolve_int(value) {
         return int;
     }
-    if !digits_but_not_number(value) {
-        if let Some(float) = parse_f64(value) {
-            return Yaml::Float(float);
-        }
+    if !digits_but_not_number(value)
+        && let Some(float) = parse_f64(value)
+    {
+        return Yaml::Float(float);
     }
     Yaml::String(value.to_string())
 }
@@ -398,22 +398,19 @@ fn resolve_int(value: &str) -> Option<Yaml> {
     if let Some(int) = parse_negative_int(value, i64::from_str_radix) {
         return Some(Yaml::Int(i128::from(int)));
     }
+    // A decimal integer of any width, as YAML 1.2's core schema reads one.
+    let digits = value.strip_prefix(['-', '+']).unwrap_or(value);
+    let decimal = !digits.is_empty()
+        && digits.bytes().all(|b| b.is_ascii_digit())
+        && !digits_but_not_number(value);
     let wide = parse_unsigned_int(value, u128::from_str_radix).is_some()
         || parse_negative_int(value, i128::from_str_radix).is_some()
-        || is_decimal_integer(value);
+        || decimal;
     wide.then(|| Yaml::String(value.to_string()))
 }
 
-/// A decimal integer of any width, as YAML 1.2's core schema reads one.
-fn is_decimal_integer(value: &str) -> bool {
-    let digits = value.strip_prefix(['-', '+']).unwrap_or(value);
-    !digits.is_empty()
-        && digits.bytes().all(|b| b.is_ascii_digit())
-        && !digits_but_not_number(value)
-}
-
-fn parse_null(value: &str) -> Option<()> {
-    matches!(value, "null" | "Null" | "NULL" | "~").then_some(())
+fn is_null(value: &str) -> bool {
+    matches!(value, "null" | "Null" | "NULL" | "~")
 }
 
 fn parse_bool(value: &str) -> Option<bool> {
@@ -452,10 +449,10 @@ fn parse_negative_int<T>(
     from_str_radix: fn(&str, u32) -> Result<T, std::num::ParseIntError>,
 ) -> Option<T> {
     for (prefix, radix) in [("-0x", 16), ("-0o", 8), ("-0b", 2)] {
-        if let Some(rest) = value.strip_prefix(prefix) {
-            if let Ok(int) = from_str_radix(&format!("-{rest}"), radix) {
-                return Some(int);
-            }
+        if let Some(rest) = value.strip_prefix(prefix)
+            && let Ok(int) = from_str_radix(&format!("-{rest}"), radix)
+        {
+            return Some(int);
         }
     }
     if digits_but_not_number(value) {
@@ -507,7 +504,7 @@ fn yaml_to_json(value: Yaml) -> JsonValue {
         Yaml::Mapping(map) => {
             let mut obj = Map::new();
             for (k, v) in map {
-                obj.insert(key_spelling(&k), yaml_to_json(v));
+                obj.insert(key_spelling(k), yaml_to_json(v));
             }
             JsonValue::Object(obj)
         }
@@ -519,13 +516,13 @@ fn yaml_to_json(value: Yaml) -> JsonValue {
 /// or number is its JSON text (`null`, `true`, `31`, `1.5`), with YAML's
 /// `.inf`, `-.inf` and `.nan` for the floats JSON cannot write; a collection
 /// is its compact JSON. A key's tag is dropped, as a value's is.
-fn key_spelling(key: &Yaml) -> String {
+fn key_spelling(key: Yaml) -> String {
     match key {
-        Yaml::String(s) => s.clone(),
+        Yaml::String(s) => s,
         Yaml::Float(f) if f.is_nan() => ".nan".to_string(),
-        Yaml::Float(f) if f.is_infinite() => if *f > 0.0 { ".inf" } else { "-.inf" }.to_string(),
-        Yaml::Tagged(_, inner) => key_spelling(inner),
-        other => yaml_to_json(other.clone()).to_string(),
+        Yaml::Float(f) if f.is_infinite() => if f > 0.0 { ".inf" } else { "-.inf" }.to_string(),
+        Yaml::Tagged(_, inner) => key_spelling(*inner),
+        other => yaml_to_json(other).to_string(),
     }
 }
 

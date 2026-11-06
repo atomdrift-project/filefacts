@@ -258,7 +258,7 @@ fn yaml_not_misclassified() {
 fn json_data_detects_as_generic_json() {
     let det = detect(Path::new("data.json"), b"{\"key\": \"value\"}").unwrap();
     assert_eq!(det.file_type, FileType::Json);
-    assert!(det.file_type.is_program());
+    assert!(det.file_type.is_analyzed());
 }
 
 #[test]

@@ -115,14 +115,13 @@ fn realistic_dir_stream() -> Vec<u8> {
 
 #[test]
 fn modules_are_found_past_the_version_quirk_and_the_references() {
-    // Walking from byte zero by id/size reaches no module on a real file:
-    // PROJECTVERSION lies about its length and the references have their
-    // own layouts. Anchoring on PROJECTMODULES steps over both.
+    // PROJECTVERSION's Size field says 4 but six bytes follow; every other
+    // record, the references included, is a plain id/size record.
     let infos = parse_dir_stream(&realistic_dir_stream()).modules;
     assert_eq!(infos.len(), 1, "expected one module");
     assert_eq!(infos[0].name, "ThisDocument");
     assert_eq!(infos[0].stream_name, "ThisDocument");
-    assert_eq!(infos[0].offset, 0x2A);
+    assert_eq!(infos[0].offset, Some(0x2A));
 }
 
 #[test]
@@ -233,24 +232,24 @@ fn dir_stream_parser_handles_multiple_modules() {
     assert_eq!(infos.len(), 2);
     assert_eq!(infos[0].name, "Module1");
     assert_eq!(infos[0].stream_name, "Stream1");
-    assert_eq!(infos[0].offset, 10);
+    assert_eq!(infos[0].offset, Some(10));
     assert!(matches!(infos[0].module_type, VbaModuleType::Standard));
     assert_eq!(infos[1].name, "ClassMod");
-    assert_eq!(infos[1].offset, 20);
+    assert_eq!(infos[1].offset, Some(20));
     assert!(matches!(infos[1].module_type, VbaModuleType::Class));
 }
 
 #[test]
 fn dir_stream_parser_stops_at_terminator() {
     let mut d = Vec::new();
-    // First module then a MODULETERMINATOR_PROJECT (0x000F) —
-    // parser should stop, not pick up further records.
+    // First module then the dir-stream terminator (0x0010) — parser
+    // should stop, not pick up further records.
     d.extend_from_slice(&0x0019_u16.to_le_bytes());
     d.extend_from_slice(&3u32.to_le_bytes());
     d.extend_from_slice(b"Foo");
     d.extend_from_slice(&0x002B_u16.to_le_bytes());
     d.extend_from_slice(&0u32.to_le_bytes());
-    d.extend_from_slice(&0x000F_u16.to_le_bytes());
+    d.extend_from_slice(&0x0010_u16.to_le_bytes());
     d.extend_from_slice(&0u32.to_le_bytes());
     // Ghost module past the terminator — shouldn't be parsed.
     d.extend_from_slice(&0x0019_u16.to_le_bytes());
@@ -314,7 +313,7 @@ fn dir_stream_parser_extracts_single_module() {
     assert_eq!(infos.len(), 1);
     assert_eq!(infos[0].name, "Foo");
     assert_eq!(infos[0].stream_name, "Bar");
-    assert_eq!(infos[0].offset, 42);
+    assert_eq!(infos[0].offset, Some(42));
 }
 
 /// Wrap raw bytes as a single uncompressed MS-OVBA chunk so the
@@ -328,6 +327,37 @@ fn ovba_store(raw: &[u8]) -> Vec<u8> {
 
 #[test]
 fn ooxml_vbaproject_member_is_decompressed() {
+    let (values, metrics, errors) = run_ooxml_project("word/vbaProject.bin", None);
+    assert!(errors.is_empty(), "{errors:?}");
+
+    let modules = values
+        .get("office.vba.modules")
+        .and_then(|v| v.as_array())
+        .expect("office.vba.modules populated from OOXML vbaProject.bin");
+    assert_eq!(modules.len(), 1);
+    let src = modules[0]
+        .get("source")
+        .and_then(|v| v.as_str())
+        .expect("module source present");
+    assert!(src.contains("AutoOpen"), "decompressed source: {src}");
+    assert!(src.contains("Shell"));
+    assert_eq!(metrics.get("office.vba.module_count"), Some(1.0));
+}
+
+/// OPC part names compare without regard to ASCII case, so Office loads a
+/// project its relationship names as `word/PROJECT.BIN` from the part
+/// stored as `word/project.bin`. Matching the name exactly read no macros
+/// from such a package.
+#[test]
+fn a_declared_project_part_is_found_whatever_its_case() {
+    let (values, _, errors) = run_ooxml_project("word/project.bin", Some("word/PROJECT.BIN"));
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(module_names(&values), ["Module1"]);
+}
+
+/// A one-module VBA project stored in a zip as `part`, with `declared` (if
+/// any) in `office.macros` as the package's own name for it.
+fn run_ooxml_project(part: &str, declared: Option<&str>) -> (Values, Metrics, Errors) {
     use std::io::{Cursor, Write};
 
     // dir stream describing one standard module "Module1" whose
@@ -363,18 +393,18 @@ fn ooxml_vbaproject_member_is_decompressed() {
     }
     let vba_bin = buf.into_inner();
 
-    // Wrap it in an OOXML-style zip under word/vbaProject.bin.
+    // Wrap it in an OOXML-style zip.
     let mut zw = zip::ZipWriter::new(Cursor::new(Vec::<u8>::new()));
-    zw.start_file(
-        "word/vbaProject.bin",
-        zip::write::SimpleFileOptions::default(),
-    )
-    .unwrap();
+    zw.start_file(part, zip::write::SimpleFileOptions::default())
+        .unwrap();
     zw.write_all(&vba_bin).unwrap();
     let zip_bytes = zw.finish().unwrap().into_inner();
 
     let mut zip = zip::ZipArchive::new(Cursor::new(zip_bytes)).unwrap();
     let mut values = Values::new();
+    if let Some(declared) = declared {
+        values.insert("office.macros", serde_json::json!([declared]));
+    }
     let mut metrics = Metrics::new();
     let mut symbols = crate::output::Symbols::new();
     let mut errors = Errors::new();
@@ -385,20 +415,7 @@ fn ooxml_vbaproject_member_is_decompressed() {
         &mut symbols,
         &mut errors,
     );
-    assert!(errors.is_empty(), "{errors:?}");
-
-    let modules = values
-        .get("office.vba.modules")
-        .and_then(|v| v.as_array())
-        .expect("office.vba.modules populated from OOXML vbaProject.bin");
-    assert_eq!(modules.len(), 1);
-    let src = modules[0]
-        .get("source")
-        .and_then(|v| v.as_str())
-        .expect("module source present");
-    assert!(src.contains("AutoOpen"), "decompressed source: {src}");
-    assert!(src.contains("Shell"));
-    assert_eq!(metrics.get("office.vba.module_count"), Some(1.0));
+    (values, metrics, errors)
 }
 
 /// A dir stream with PROJECTMODULES and one module record per
@@ -440,7 +457,7 @@ fn run_ole(bytes: &[u8]) -> (Values, Errors) {
     let mut values = Values::new();
     let mut errors = Errors::new();
     extract(
-        bytes,
+        &mut cfb::CompoundFile::open(Cursor::new(bytes)).unwrap(),
         &mut values,
         &mut Metrics::new(),
         &mut crate::output::Symbols::new(),
@@ -564,7 +581,7 @@ fn the_decompression_cap_is_a_limit_not_an_error() {
     );
     let mut errors = Errors::new();
     extract(
-        &bytes,
+        &mut cfb::CompoundFile::open(Cursor::new(&bytes[..])).unwrap(),
         &mut values,
         &mut Metrics::new(),
         &mut crate::output::Symbols::new(),
@@ -655,4 +672,118 @@ fn modules_share_one_decompression_budget() {
         .unwrap();
     assert_eq!(limits.len(), modules - read, "{limits:?}");
     assert!(limits.iter().all(|l| l["stage"] == "vba-decompress-cap"));
+}
+
+#[test]
+fn a_decoy_projectmodules_inside_a_constant_moves_nothing() {
+    // PROJECTCONSTANTS text holding the PROJECTMODULES header bytes and a
+    // forged module record: a byte search lands inside it.
+    let mut decoy = vec![0x0F, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00];
+    decoy.extend_from_slice(&0x0019u16.to_le_bytes());
+    decoy.extend_from_slice(&4u32.to_le_bytes());
+    decoy.extend_from_slice(b"Evil");
+    decoy.extend_from_slice(&0x002Bu16.to_le_bytes());
+    decoy.extend_from_slice(&0u32.to_le_bytes());
+    let mut d = 0x000Cu16.to_le_bytes().to_vec();
+    d.extend_from_slice(&(decoy.len() as u32).to_le_bytes());
+    d.extend_from_slice(&decoy);
+    d.extend_from_slice(&realistic_dir_stream());
+    let names: Vec<String> = parse_dir_stream(&d)
+        .modules
+        .into_iter()
+        .map(|m| m.name)
+        .collect();
+    assert_eq!(names, ["ThisDocument"]);
+}
+
+#[test]
+fn projectmodules_is_not_the_terminator() {
+    // 0x000F is PROJECTMODULES, which precedes the modules; MS-OVBA's
+    // dir-stream terminator is 0x0010.
+    let d = dir_for(&[("Module1", 0)]);
+    assert!(d.starts_with(&[0x0F, 0x00]));
+    let mut walked = 0x0010u16.to_le_bytes().to_vec();
+    walked.extend_from_slice(&0u32.to_le_bytes());
+    assert_eq!(parse_dir_stream(&d).modules.len(), 1);
+    assert!(parse_dir_stream(&walked).modules.is_empty());
+}
+
+#[test]
+fn modules_are_read_from_the_storage_when_the_dir_stream_names_none() {
+    // One compressed chunk of literal tokens: a flag byte of zeros before
+    // every eight bytes, as a compressor writes a source's opening.
+    let source = b"Attribute VB_Name = \"M\"\r\nSub AutoOpen()\r\nEnd Sub\r\n";
+    let tokens: Vec<u8> = source
+        .chunks(8)
+        .flat_map(|group| std::iter::once(0).chain(group.iter().copied()))
+        .collect();
+    let mut stream = b"p-code".to_vec();
+    stream.push(0x01);
+    stream.extend_from_slice(&(0xB000 | (tokens.len() as u16 + 2 - 3)).to_le_bytes());
+    stream.extend_from_slice(&tokens);
+    let bytes = compound_file(&[
+        ("/VBA/dir", ovba_store(&dir_for(&[]))),
+        ("/VBA/_VBA_PROJECT", vec![0xCC, 0x61]),
+        ("/VBA/Module1", stream),
+    ]);
+    let (values, errors) = run_ole(&bytes);
+    assert_eq!(module_names(&values), ["Module1"]);
+    assert!(!errors.is_empty(), "the empty dir stream is recorded");
+}
+
+/// A module whose source decompresses past the cap still costs the work
+/// done up to it. Every module may name one small stream that does, and
+/// 256 of them inflated 2.5 GiB before each was refused, so the work spent
+/// on refused modules comes out of the project budget too, and once it is
+/// gone the remaining modules are not decompressed at all.
+#[test]
+fn refused_modules_spend_the_decompression_budget() {
+    let mut source = vec![0x01u8];
+    for _ in 0..(MAX_DECOMPRESSED_SIZE / 4098 + 2) {
+        source.extend_from_slice(&(0x8000u16 | 0x3000 | 2).to_le_bytes());
+        source.push(0x01);
+        source.extend_from_slice(&0x0FFFu16.to_le_bytes());
+    }
+    let names: Vec<String> = (0..MAX_MODULES).map(|i| format!("M{i}")).collect();
+    let mut dir = Vec::new();
+    let rec = |d: &mut Vec<u8>, id: u16, body: &[u8]| {
+        d.extend_from_slice(&id.to_le_bytes());
+        d.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        d.extend_from_slice(body);
+    };
+    for name in &names {
+        rec(&mut dir, 0x0019, name.as_bytes());
+        rec(&mut dir, 0x001A, b"Over");
+        rec(&mut dir, 0x0031, &0u32.to_le_bytes());
+        rec(&mut dir, 0x002B, &[]);
+    }
+    // Stored as uncompressed chunks, 4096 bytes each.
+    let mut stored = vec![0x01u8];
+    for chunk in dir.chunks(4096) {
+        let mut chunk = chunk.to_vec();
+        chunk.resize(4096, 0);
+        stored.extend_from_slice(&0u16.to_le_bytes());
+        stored.extend_from_slice(&chunk);
+    }
+    let bytes = compound_file(&[("/VBA/dir", stored), ("/VBA/Over", source)]);
+    let (values, errors) = run_ole(&bytes);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert!(module_names(&values).is_empty());
+    let limits = values
+        .get("office.limits")
+        .and_then(JsonValue::as_array)
+        .unwrap();
+    assert_eq!(limits.len(), MAX_MODULES, "{limits:?}");
+    let decompressed = limits
+        .iter()
+        .filter(|l| {
+            l["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("decompresses past"))
+        })
+        .count();
+    assert_eq!(
+        decompressed,
+        MAX_PROJECT_SOURCE.div_ceil(MAX_DECOMPRESSED_SIZE)
+    );
 }

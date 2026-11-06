@@ -34,7 +34,7 @@ fn header_metrics_are_in_the_catalog() {
 fn terminal_bundle_shows_every_bundled_view() {
     let parsed = open(Path::new("example.py"), SOURCE);
     let text = format_terminal(COLOR, Path::new("example.py"), &parsed, None).unwrap();
-    for view in View::ALL.into_iter().filter(|v| v.bundled()) {
+    for view in View::ALL.iter().copied().filter(|v| v.bundled()) {
         let label = COLOR.bold(heading_color(view), &view.name().to_uppercase());
         assert!(
             text.contains(&label),
@@ -50,7 +50,7 @@ fn terminal_bundle_shows_every_bundled_view() {
 #[test]
 fn plain_style_writes_no_escape_sequences() {
     let parsed = open(Path::new("example.py"), SOURCE);
-    let views = View::ALL.into_iter().map(Some);
+    let views = View::ALL.iter().copied().map(Some);
     for view in std::iter::once(None).chain(views) {
         let text = format_terminal(PLAIN, Path::new("example.py"), &parsed, view).unwrap();
         assert!(!text.contains('\x1b'), "{view:?}: {text}");
@@ -256,7 +256,7 @@ fn control_characters_from_the_file_are_escaped_in_every_view() {
     ];
     for (name, bytes) in files {
         let parsed = open(Path::new(name), bytes);
-        let views = View::ALL.into_iter().map(Some);
+        let views = View::ALL.iter().copied().map(Some);
         for view in std::iter::once(None).chain(views) {
             let text = format_terminal(COLOR, Path::new(name), &parsed, view).unwrap();
             assert_eq!(
@@ -350,4 +350,25 @@ fn offsets_align_to_the_widest() {
         "{text:?}"
     );
     assert!(text.contains("  0x123456  b\n"), "{text:?}");
+}
+
+/// Characters that draw nothing let a file-derived name read as another
+/// (`Create\u{200b}RemoteThread`) or carry text the analyst cannot see but a
+/// copy of the output still holds (Unicode tag characters). They are written
+/// as escapes; joiners that shape scripts and emoji are left alone.
+#[test]
+fn invisible_characters_from_the_file_are_escaped() {
+    for (raw, shown) in [
+        ("Create\u{200b}RemoteThread", "Create\\u{200b}RemoteThread"),
+        ("a\u{2028}b\u{2029}c", "a\\u{2028}b\\u{2029}c"),
+        ("x\u{2060}\u{2064}y", "x\\u{2060}\\u{2064}y"),
+        ("\u{feff}bom", "\\u{feff}bom"),
+        ("ok\u{e0041}\u{e007f}", "ok\\u{e0041}\\u{e007f}"),
+    ] {
+        assert_eq!(escape_controls(raw), shown, "{raw:?}");
+        assert_eq!(escape_controls(shown), shown, "idempotent: {shown}");
+    }
+    for kept in ["\u{1f468}\u{200d}\u{1f469}", "\u{200c}\u{0645}", "naïve"] {
+        assert_eq!(escape_controls(kept), kept);
+    }
 }

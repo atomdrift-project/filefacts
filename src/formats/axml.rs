@@ -11,31 +11,54 @@
 //! defeat parsers is a fact worth reporting, not a reason to return nothing,
 //! so a bad chunk stops the walk and keeps what came before it.
 
-use super::common::bytes_at::{u16_le, u32_le};
+use crate::bytes::{u16_le, u32_le};
 use crate::value_key;
 
 /// One parsed element: its tag name and resolved attributes.
 pub(super) struct Element {
     pub name: String,
-    pub attrs: Vec<(String, String)>,
+    pub attrs: Vec<Attribute>,
+}
+
+/// One resolved attribute.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct Attribute {
+    /// The attribute is in a namespace (`android:name`). Android reads some
+    /// attributes, the manifest's `package` among them, by name in no
+    /// namespace, so a namespaced one of the same name is a different
+    /// attribute.
+    pub namespaced: bool,
+    pub name: String,
+    pub value: String,
 }
 
 const TYPE_STRING_POOL: u16 = 0x0001;
 const TYPE_START_ELEMENT: u16 = 0x0102;
 const UTF8_FLAG: u32 = 1 << 8;
+/// The string-pool index meaning "no string".
+const NO_STRING: u32 = u32::MAX;
 
-/// Chunks to walk before giving up. A manifest has a few hundred elements;
+/// Largest document taken for AXML.
+const MAX_DOCUMENT_BYTES: usize = 16 * 1024 * 1024;
+
+/// Start elements kept before the walk stops. A manifest has a few hundred;
 /// this bounds a crafted file without truncating a real one.
 const MAX_ELEMENTS: usize = 4096;
 
+/// Attributes read per element.
+const MAX_ATTRIBUTES: usize = 512;
+
+/// String-pool entries decoded.
+const MAX_POOL_ENTRIES: usize = 65_536;
+
 /// Decoded string-pool text kept across the document. Pool offsets are not
-/// required to be distinct, so every one of 65,536 entries can name the same
-/// multi-MiB string; real manifests decode a few tens of KiB. Entries past
-/// the budget are dropped and resolve as empty.
+/// required to be distinct, so every one of `MAX_POOL_ENTRIES` entries can
+/// name the same multi-MiB string; real manifests decode a few tens of KiB.
+/// Entries past the budget are dropped and resolve as empty.
 const MAX_POOL_TEXT: usize = 16 << 20;
 
 /// Element and attribute text resolved out of the pool. Every name and value
-/// is a copy of a pool entry, and `MAX_ELEMENTS` elements of 512 attributes
+/// is a copy of a pool entry, and `MAX_ELEMENTS` elements of `MAX_ATTRIBUTES`
 /// can each name the largest one. The walk stops when this is spent.
 const MAX_ELEMENT_TEXT: usize = 16 << 20;
 
@@ -52,7 +75,7 @@ fn charge(budget: &mut usize, len: usize) -> Option<()> {
 /// Identify a compiled Android XML document before passing arbitrary XML or
 /// binary data through the tolerant chunk walker.
 pub(super) fn looks_like_axml(data: &[u8]) -> bool {
-    if data.len() < 12 || data.len() > 16 * 1024 * 1024 {
+    if data.len() < 12 || data.len() > MAX_DOCUMENT_BYTES {
         return false;
     }
     u16_le(data, 0) == Some(0x0003)
@@ -65,18 +88,15 @@ pub(super) fn looks_like_axml(data: &[u8]) -> bool {
 /// pool sets `UTF8_FLAG`; both use a length prefix that extends to two units
 /// when the high bit is set. Decoding stops once `budget` is spent.
 fn parse_string_pool(chunk: &[u8], budget: &mut usize) -> Vec<String> {
-    let Some(count) = u32_le(chunk, 8).map(|v| v as usize) else {
+    let (Some(count), Some(flags), Some(strings_start)) =
+        (u32_le(chunk, 8), u32_le(chunk, 16), u32_le(chunk, 20))
+    else {
         return Vec::new();
     };
-    let Some(flags) = u32_le(chunk, 16) else {
-        return Vec::new();
-    };
-    let Some(strings_start) = u32_le(chunk, 20).map(|v| v as usize) else {
-        return Vec::new();
-    };
+    let (count, strings_start) = (count as usize, strings_start as usize);
     let utf8 = flags & UTF8_FLAG != 0;
     let mut out = Vec::with_capacity(count.min(4096));
-    for i in 0..count.min(65_536) {
+    for i in 0..count.min(MAX_POOL_ENTRIES) {
         let Some(offset) = u32_le(chunk, 28 + i * 4).map(|v| v as usize) else {
             break;
         };
@@ -100,10 +120,10 @@ fn decode_string(chunk: &[u8], at: usize, utf8: bool) -> Option<String> {
         let end = after.checked_add(len)?;
         Some(String::from_utf8_lossy(chunk.get(after..end)?).into_owned())
     } else {
-        let first = u16_le(chunk, at)? as usize;
+        let first = usize::from(u16_le(chunk, at)?);
         let (len, start) = if first & 0x8000 != 0 {
             // High bit set: the length spans two units.
-            let low = u16_le(chunk, at.checked_add(2)?)? as usize;
+            let low = usize::from(u16_le(chunk, at.checked_add(2)?)?);
             ((((first & 0x7fff) << 16) | low), at.checked_add(4)?)
         } else {
             (first, at.checked_add(2)?)
@@ -122,9 +142,9 @@ fn decode_string(chunk: &[u8], at: usize, utf8: bool) -> Option<String> {
 
 /// One- or two-byte varint used by the UTF-8 pool encoding.
 fn varint8(chunk: &[u8], at: usize) -> Option<(usize, usize)> {
-    let first = *chunk.get(at)? as usize;
+    let first = usize::from(*chunk.get(at)?);
     if first & 0x80 != 0 {
-        let second = *chunk.get(at + 1)? as usize;
+        let second = usize::from(*chunk.get(at + 1)?);
         Some((((first & 0x7f) << 8) | second, at + 2))
     } else {
         Some((first, at + 1))
@@ -134,8 +154,7 @@ fn varint8(chunk: &[u8], at: usize) -> Option<(usize, usize)> {
 /// A copy of pool entry `index`, charged to `budget`; `None` once the budget
 /// is spent.
 fn pool_str(pool: &[String], index: u32, budget: &mut usize) -> Option<String> {
-    // 0xFFFFFFFF is the "no string" sentinel.
-    if index == u32::MAX {
+    if index == NO_STRING {
         return Some(String::new());
     }
     let text = pool.get(index as usize).map_or("", String::as_str);
@@ -205,17 +224,14 @@ pub(super) fn parse(bytes: &[u8]) -> Vec<Element> {
 /// lock screens and overlays.
 pub(super) fn extract_values(bytes: &[u8], values: &mut crate::output::Values) {
     let elements = parse(bytes);
-    if elements.is_empty() {
-        return;
-    }
     let flattened: Vec<_> = elements
         .iter()
         .flat_map(|element| {
-            element.attrs.iter().map(|(attribute, value)| {
+            element.attrs.iter().map(|attribute| {
                 serde_json::json!({
                     "element": element.name,
-                    "attribute": attribute,
-                    "value": value,
+                    "attribute": attribute.name,
+                    "value": attribute.value,
                 })
             })
         })
@@ -234,9 +250,9 @@ fn parse_start_element(chunk: &[u8], pool: &[String], budget: &mut usize) -> Opt
     // header: type/headerSize/size (8) + lineNumber (4) + comment (4)
     // body:   ns (4) + name (4) + attrStart (2) + attrSize (2) + attrCount (2)
     let name = pool_str(pool, u32_le(chunk, 20)?, budget)?;
-    let attr_start = u16_le(chunk, 24)? as usize;
-    let attr_size = u16_le(chunk, 26)? as usize;
-    let attr_count = u16_le(chunk, 28)? as usize;
+    let attr_start = usize::from(u16_le(chunk, 24)?);
+    let attr_size = usize::from(u16_le(chunk, 26)?);
+    let attr_count = usize::from(u16_le(chunk, 28)?);
     let mut attrs = Vec::new();
     // The first 20 bytes are ns/name/rawValue plus the typed value. Android
     // uses the declared stride, so future or protected manifests can append
@@ -244,29 +260,30 @@ fn parse_start_element(chunk: &[u8], pool: &[String], budget: &mut usize) -> Opt
     if attr_size < 20 {
         return Some(Element { name, attrs });
     }
-    for i in 0..attr_count.min(512) {
+    for i in 0..attr_count.min(MAX_ATTRIBUTES) {
         let at = 16 + attr_start + i * attr_size;
-        let Some(name_idx) = u32_le(chunk, at + 4) else {
-            break;
-        };
-        let Some(raw_idx) = u32_le(chunk, at + 8) else {
-            break;
-        };
-        let Some(data_type) = chunk.get(at + 15).copied() else {
-            break;
-        };
-        let Some(data) = u32_le(chunk, at + 16) else {
+        let (Some(ns_idx), Some(name_idx), Some(raw_idx), Some(&data_type), Some(data)) = (
+            u32_le(chunk, at),
+            u32_le(chunk, at + 4),
+            u32_le(chunk, at + 8),
+            chunk.get(at + 15),
+            u32_le(chunk, at + 16),
+        ) else {
             break;
         };
         let attr_name = pool_str(pool, name_idx, budget)?;
         // The raw string is authoritative when present; otherwise fall back to
         // the typed value.
-        let value = if raw_idx == u32::MAX {
+        let value = if raw_idx == NO_STRING {
             typed_value(pool, data_type, data, budget)?
         } else {
             pool_str(pool, raw_idx, budget)?
         };
-        attrs.push((attr_name, value));
+        attrs.push(Attribute {
+            namespaced: ns_idx != NO_STRING,
+            name: attr_name,
+            value,
+        });
     }
     Some(Element { name, attrs })
 }

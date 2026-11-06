@@ -448,12 +448,12 @@ fn function_ratios_use_the_extracted_counts() {
         .open(source.as_bytes());
     let metrics = parsed.metrics();
     assert_eq!(
-        metrics.get_key(&metric!("text.imports_to_functions_ratio")),
+        metrics.lookup(&metric!("text.imports_to_functions_ratio")),
         Some(1.0)
     );
     assert!(
         metrics
-            .get_key(&metric!("text.strings_to_functions_ratio"))
+            .lookup(&metric!("text.strings_to_functions_ratio"))
             .is_some()
     );
 }
@@ -894,18 +894,6 @@ fn concat_chain_is_measured_at_its_outermost_node() {
     };
     assert_eq!(metric("y = a + b + c + (d + e);\n"), Some(4.0));
     assert_eq!(metric("y = a + b - c;\n"), None);
-}
-
-#[test]
-fn go_package_clause_comes_from_the_syntax_tree() {
-    assert_eq!(
-        go_package_clause("package demo\nfunc main(){}\n", None).as_deref(),
-        Some("demo")
-    );
-    assert_eq!(
-        go_package_clause("func main(){}\n", None).as_deref(),
-        Some("")
-    );
 }
 
 /// Helper: parse `src` as a source file with the given extension
@@ -1701,4 +1689,17 @@ fn lua_long_bracket_literals_and_call_arguments_agree() {
                 })
         );
     }
+}
+
+/// The flow analyses copy an import path into every name read through its
+/// alias, so a path longer than [`MAX_ALIAS_BYTES`] expands none of them.
+#[test]
+fn long_alias_paths_do_not_expand() {
+    let long = "m".repeat(MAX_ALIAS_BYTES + 1);
+    assert_eq!(expand_alias("x.f", |_| Some(long.as_str())), None);
+    let fits = "m".repeat(MAX_ALIAS_BYTES);
+    assert_eq!(
+        expand_alias("x.f", |_| Some(fits.as_str())),
+        Some(format!("{fits}.f"))
+    );
 }

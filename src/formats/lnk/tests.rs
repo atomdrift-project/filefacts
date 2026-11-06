@@ -432,3 +432,82 @@ fn argument_whitespace_metrics_count_leading_tabs() {
     assert_eq!(m.get("lnk.arguments_leading_tabs"), Some(55.0));
     assert_eq!(m.get("lnk.arguments_max_whitespace_run"), Some(55.0));
 }
+
+/// Header times are Unix seconds, signed, like every other format's: a
+/// FILETIME before 1970 stays visible as a negative time.
+#[test]
+fn header_times_are_unix_seconds() {
+    let mut h = header_bytes(0, 0, 1);
+    // 2024-01-15T08:00:00Z and 1900-01-01T00:00:00Z as FILETIME ticks.
+    h[28..36].copy_from_slice(&((1_705_305_600u64 + 11_644_473_600) * 10_000_000).to_le_bytes());
+    h[44..52].copy_from_slice(&((11_644_473_600u64 - 2_208_988_800) * 10_000_000).to_le_bytes());
+    let (v, _) = run(&h);
+    assert_eq!(
+        v.get("lnk.header.creation_time")
+            .and_then(JsonValue::as_i64),
+        Some(1_705_305_600)
+    );
+    assert_eq!(
+        v.get("lnk.header.write_time").and_then(JsonValue::as_i64),
+        Some(-2_208_988_800)
+    );
+}
+
+/// An EnvironmentVariableDataBlock whose Unicode target is `target`.
+fn environment_block(target: &str) -> Vec<u8> {
+    let mut block = vec![0u8; 788];
+    block[0..4].copy_from_slice(&788u32.to_le_bytes());
+    block[4..8].copy_from_slice(&EXTRA_ENVIRONMENT_VARIABLE_DATA.to_le_bytes());
+    for (i, unit) in target.encode_utf16().enumerate() {
+        block[268 + i * 2..268 + i * 2 + 2].copy_from_slice(&unit.to_le_bytes());
+    }
+    block
+}
+
+/// The shell reads the first block of a signature; a second
+/// EnvironmentVariableDataBlock must not replace the target it names.
+#[test]
+fn the_first_extra_data_block_of_a_signature_is_the_one_read() {
+    let real = "%COMSPEC% /c powershell -enc AAAA";
+    let mut lnk = header_bytes(0x200, 0, 1);
+    let block_start = lnk.len();
+    lnk.extend_from_slice(&environment_block(real));
+    lnk.extend_from_slice(&environment_block("%windir%\\notepad.exe"));
+    lnk.extend_from_slice(&[0u8; 4]);
+    let (v, _) = run(&lnk);
+    assert_eq!(
+        v.get("lnk.environment_target").and_then(|x| x.as_str()),
+        Some(real)
+    );
+    assert_eq!(
+        v.get("lnk.environment_target_offset")
+            .and_then(|x| x.as_u64()),
+        Some((block_start + 268) as u64)
+    );
+    assert_eq!(
+        v.get("lnk.blocks"),
+        Some(&serde_json::json!(["environment_variable"]))
+    );
+}
+
+/// A run of repeated small blocks lists each signature once, not once per
+/// block: a file of a few MiB of 8-byte blocks listed a million names.
+#[test]
+fn repeated_extra_data_blocks_are_listed_once() {
+    let mut lnk = header_bytes(0, 0, 1);
+    for _ in 0..10_000 {
+        lnk.extend_from_slice(&8u32.to_le_bytes());
+        lnk.extend_from_slice(&EXTRA_CONSOLE_DATA.to_le_bytes());
+    }
+    lnk.extend_from_slice(&[0u8; 4]);
+    let (v, _) = run(&lnk);
+    assert_eq!(v.get("lnk.blocks"), Some(&serde_json::json!(["console"])));
+}
+
+/// Digit keys are VK 0x30..=0x39, the ASCII digits themselves.
+#[test]
+fn digit_hotkeys_name_the_digit() {
+    assert_eq!(format_hotkey(0x0237), "ctrl+7");
+    assert_eq!(format_hotkey(0x0530), "shift+alt+0");
+    assert_eq!(format_hotkey(0x0641), "ctrl+alt+A");
+}

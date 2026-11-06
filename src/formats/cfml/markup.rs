@@ -139,11 +139,10 @@ impl Markup {
                             return None;
                         }
                     }
-                } else if !cf_closing
-                    && condition_depth > 0
-                    && (cf.eq_ignore_ascii_case(b"cfelse") || cf.eq_ignore_ascii_case(b"cfelseif"))
+                } else if cf_closing
+                    || condition_depth == 0
+                    || !(cf.eq_ignore_ascii_case(b"cfelse") || cf.eq_ignore_ascii_case(b"cfelseif"))
                 {
-                } else {
                     mixed_unknown = true;
                 }
                 while let Some(&c) = bytes.get(end)

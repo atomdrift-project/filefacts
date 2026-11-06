@@ -1,40 +1,147 @@
-//! Bounded DEX method/call facts. Reads bytecode without loading any class.
-//! Literal arguments are propagated only within a straight-line basic block;
-//! branch targets and unknown writes invalidate their bindings.
-use crate::output::{Arg, Literal, Literals, Symbol, Symbols, Values};
-use crate::value_key;
+//! Bounded DEX method and call facts, read from the bytecode without
+//! loading any class.
+//!
+//! Every method with code becomes a `Function` symbol naming its callees,
+//! every `invoke-*` a `Call` symbol with the literal arguments known at the
+//! call, every method of a class the file does not define an `Import`, and
+//! every string constant the bytecode loads a literal. Literal arguments are
+//! propagated only within a straight-line basic block: a branch target, or
+//! an instruction that writes a register in a way not modelled, forgets what
+//! the registers held.
+//!
+//! Every table, string, method body and output view is capped, so a forged
+//! header costs bounded work; a cap that ends the walk early is recorded in
+//! `dex.limits`.
+
 use std::collections::{HashMap, HashSet};
 
-fn u16at(b: &[u8], p: usize) -> Option<u16> {
-    Some(u16::from_le_bytes(
-        b.get(p..p.checked_add(2)?)?.try_into().ok()?,
-    ))
+use crate::bytes::{u16_le, u32_le};
+use crate::formats::common::read_uleb128;
+use crate::output::{Arg, Literal, Literals, Symbol, Symbols, Values};
+use crate::value_key;
+
+/// `sizeof(header_item)`.
+const HEADER_LEN: usize = 0x70;
+/// `header_item.endian_tag` of a little-endian file, the only kind Android
+/// writes.
+const ENDIAN_CONSTANT: u32 = 0x1234_5678;
+/// `header_item` offsets: the endian tag, then each `(size, offset)` pair
+/// of the id tables read here.
+const ENDIAN_TAG_AT: usize = 40;
+const STRING_IDS_AT: usize = 56;
+const TYPE_IDS_AT: usize = 64;
+const PROTO_IDS_AT: usize = 72;
+const METHOD_IDS_AT: usize = 88;
+const CLASS_DEFS_AT: usize = 96;
+
+/// Entry sizes of the id tables.
+const STRING_ID_LEN: usize = 4;
+const TYPE_ID_LEN: usize = 4;
+const PROTO_ID_LEN: usize = 12;
+const METHOD_ID_LEN: usize = 8;
+const CLASS_DEF_LEN: usize = 32;
+/// `class_def_item.class_data_off`.
+const CLASS_DATA_OFF_AT: usize = 24;
+/// The `ident` code units that open the payload pseudo-instructions.
+const PACKED_SWITCH_PAYLOAD: u16 = 0x0100;
+const SPARSE_SWITCH_PAYLOAD: u16 = 0x0200;
+const FILL_ARRAY_DATA_PAYLOAD: u16 = 0x0300;
+/// `code_item.insns_size`, and where the instructions follow it.
+const INSNS_SIZE_AT: usize = 12;
+const INSNS_AT: usize = 16;
+
+/// Strings read from the string table. Real apps hold well under a million
+/// strings across all their DEX files.
+const MAX_STRINGS: usize = 1 << 18;
+/// Types, prototypes, methods and classes read: every reference to them is
+/// a 16-bit index, so a larger table cannot be referenced whole.
+const MAX_IDS: usize = 1 << 16;
+/// Bytes scanned for string terminators, across the whole string table.
+const MAX_STRING_SCAN: usize = 32 << 20;
+/// The longest string decoded, and the most string bytes decoded in all.
+const MAX_STRING_LEN: usize = 8192;
+const MAX_STRING_BYTES: usize = 16 << 20;
+/// Parameters a prototype may list: the VM's limit on argument registers.
+const MAX_PARAMS: usize = 255;
+/// Code units in one method body, and across every body walked.
+const MAX_METHOD_CODE_UNITS: usize = 2 << 20;
+const MAX_CODE_UNITS: usize = 8 << 20;
+/// Switch-table targets followed in one method body.
+const MAX_SWITCH_TARGETS: usize = 100_000;
+/// Fields and methods one class's data may declare, and class-data entries
+/// across every class.
+const MAX_CLASS_MEMBERS: u32 = 1 << 16;
+const MAX_CLASS_DATA_ENTRIES: usize = 2 << 20;
+/// Literal bytes and literals recorded, and symbols pushed.
+const MAX_LITERAL_BYTES: usize = 8 << 20;
+const MAX_LITERALS: usize = 100_000;
+const MAX_SYMBOLS: usize = 500_000;
+/// Registers whose values are tracked at once; past this the block's
+/// bindings are dropped.
+const MAX_TRACKED_REGISTERS: usize = 256;
+/// Bytes of `class->name` method names built for the method table. Each name
+/// joins a type and a name string of up to [`MAX_STRING_LEN`] bytes, and
+/// every one of 65,536 `method_id_item`s may name the same two: a gigabyte
+/// of names from a file of half a megabyte. Real tables hold a few MiB.
+const MAX_METHOD_NAME_BYTES: usize = 32 << 20;
+/// Method-name bytes copied into symbols: import, call-target, callee and
+/// function names. Every call to a method repeats its name, so a long name
+/// called from a few hundred thousand sites multiplies without this. The
+/// largest real files copy well under half of it.
+const MAX_SYMBOL_NAME_BYTES: usize = 128 << 20;
+
+/// What the walk of every method body may still spend.
+struct Budget {
+    /// Code units.
+    code: usize,
+    /// Literal bytes.
+    literals: usize,
+    /// Method-name bytes copied into symbols.
+    names: usize,
 }
-fn u32at(b: &[u8], p: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(
-        b.get(p..p.checked_add(4)?)?.try_into().ok()?,
-    ))
+
+/// Take `len` bytes from `budget`, or spend it entirely and fail.
+fn charge(budget: &mut usize, len: usize) -> Option<()> {
+    let Some(left) = budget.checked_sub(len) else {
+        *budget = 0;
+        return None;
+    };
+    *budget = left;
+    Some(())
 }
-fn uleb(b: &[u8], p: &mut usize) -> Option<u32> {
-    let mut v = 0u32;
-    for shift in (0..35).step_by(7) {
-        let x = *b.get(*p)?;
-        *p += 1;
-        if shift == 28 && x > 15 {
-            return None;
-        }
-        v |= u32::from(x & 127) << shift;
-        if x & 128 == 0 {
-            return Some(v);
-        }
+
+/// A DEX `uleb128`, which encodes at most 32 bits.
+fn uleb(bytes: &[u8], pos: &mut usize) -> Option<u32> {
+    u32::try_from(read_uleb128(bytes, pos)?).ok()
+}
+
+/// An id table: where its entries start and how many there are.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Table {
+    offset: usize,
+    len: usize,
+}
+
+impl Table {
+    /// The table whose `(size, offset)` pair is at `header` in `bytes`, of
+    /// `width`-byte entries: `None` when it holds more than `cap` entries or
+    /// runs past the file.
+    fn read(bytes: &[u8], header: usize, width: usize, cap: usize) -> Option<Self> {
+        let len = crate::bytes::sat_usize(u32_le(bytes, header)?);
+        let offset = crate::bytes::sat_usize(u32_le(bytes, header + 4)?);
+        (len <= cap && offset.checked_add(len.checked_mul(width)?)? <= bytes.len())
+            .then_some(Self { offset, len })
     }
-    None
+
+    /// The file offset of entry `index`, `width` bytes each.
+    fn entry(self, index: usize, width: usize) -> usize {
+        self.offset + index * width
+    }
 }
-fn table(b: &[u8], header: usize, width: usize, cap: usize) -> Option<(usize, usize)> {
-    let n = u32at(b, header)? as usize;
-    let p = u32at(b, header + 4)? as usize;
-    (n <= cap && p.checked_add(n.checked_mul(width)?)? <= b.len()).then_some((p, n))
-}
+
+/// Decode a Modified UTF-8 string (the DEX and JVM encoding: NUL as two
+/// bytes, supplementary characters as surrogate pairs). `None` for bytes
+/// that are not one.
 fn mutf8(bytes: &[u8]) -> Option<String> {
     let mut units = Vec::new();
     let mut p = 0;
@@ -72,116 +179,144 @@ fn mutf8(bytes: &[u8]) -> Option<String> {
     }
     String::from_utf16(&units).ok()
 }
-#[derive(Clone)]
+
+/// A method a `method_id_item` names.
 struct Method {
+    /// `Lpackage/Class;->name`.
     name: String,
+    /// For each parameter, whether it is wide (`J` or `D`), taking two
+    /// registers.
     params: Vec<bool>,
+    /// Whether its class is defined in another file: an import.
     external: bool,
 }
+
+/// The tables of one DEX file a walk of its code needs.
 struct Dex<'a> {
     bytes: &'a [u8],
+    /// The string table, `None` for an entry past the caps or not Modified
+    /// UTF-8.
     strings: Vec<Option<String>>,
+    /// The method table, `None` for an entry whose class, name or
+    /// prototype is out of range.
     methods: Vec<Option<Method>>,
-    classes: (usize, usize),
+    classes: Table,
 }
+
 impl<'a> Dex<'a> {
-    fn parse(b: &'a [u8]) -> Option<Self> {
-        if b.len() < 112
-            || !b.starts_with(b"dex\n")
-            || *b.get(7)? != 0
-            || u32at(b, 40)? != 0x12345678
+    fn parse(bytes: &'a [u8]) -> Option<Self> {
+        if bytes.len() < HEADER_LEN
+            || !bytes.starts_with(b"dex\n")
+            || *bytes.get(7)? != 0
+            || u32_le(bytes, ENDIAN_TAG_AT)? != ENDIAN_CONSTANT
         {
             return None;
         }
-        let (sp, sn) = table(b, 56, 4, 262144)?;
-        let mut strings = Vec::with_capacity(sn);
-        let mut string_bytes = 0;
-        let mut string_work = 32 * 1024 * 1024usize;
-        for i in 0..sn {
-            let mut p = u32at(b, sp + i * 4)? as usize;
-            let _ = uleb(b, &mut p)?;
-            let probe = b.get(p..)?;
-            let probe_len = probe.len().min(8193).min(string_work);
-            let end = probe.iter().take(probe_len).position(|v| *v == 0);
-            string_work -= end.map_or(probe_len, |n| n + 1);
+        let string_ids = Table::read(bytes, STRING_IDS_AT, STRING_ID_LEN, MAX_STRINGS)?;
+        let mut strings = Vec::with_capacity(string_ids.len);
+        let mut decoded_bytes = 0;
+        let mut scan_left = MAX_STRING_SCAN;
+        for i in 0..string_ids.len {
+            let mut pos =
+                crate::bytes::sat_usize(u32_le(bytes, string_ids.entry(i, STRING_ID_LEN))?);
+            // The UTF-16 length, which the terminator makes redundant.
+            uleb(bytes, &mut pos)?;
+            let probe = bytes.get(pos..)?;
+            let probe_len = probe.len().min(MAX_STRING_LEN + 1).min(scan_left);
+            let end = probe.iter().take(probe_len).position(|&b| b == 0);
+            scan_left -= end.map_or(probe_len, |n| n + 1);
             let text = end.and_then(|n| {
-                if n > 8192 || string_bytes + n > 16 * 1024 * 1024 {
+                if n > MAX_STRING_LEN || decoded_bytes + n > MAX_STRING_BYTES {
                     return None;
                 }
-                string_bytes += n;
+                decoded_bytes += n;
                 mutf8(probe.get(..n)?)
             });
             strings.push(text);
         }
-        let (tp, tn) = table(b, 64, 4, 65536)?;
-        let mut types = Vec::with_capacity(tn);
-        for i in 0..tn {
-            types.push(u32at(b, tp + i * 4)? as usize);
+        let type_ids = Table::read(bytes, TYPE_IDS_AT, TYPE_ID_LEN, MAX_IDS)?;
+        let mut types = Vec::with_capacity(type_ids.len);
+        for i in 0..type_ids.len {
+            types.push(crate::bytes::sat_usize(u32_le(
+                bytes,
+                type_ids.entry(i, TYPE_ID_LEN),
+            )?));
         }
-        let classes = table(b, 96, 32, 65536)?;
+        let classes = Table::read(bytes, CLASS_DEFS_AT, CLASS_DEF_LEN, MAX_IDS)?;
         let mut defined = HashSet::new();
-        for i in 0..classes.1 {
-            defined.insert(u32at(b, classes.0 + i * 32)? as usize);
+        for i in 0..classes.len {
+            defined.insert(crate::bytes::sat_usize(u32_le(
+                bytes,
+                classes.entry(i, CLASS_DEF_LEN),
+            )?));
         }
-        let (pp, pn) = table(b, 72, 12, 65536)?;
-        let mut protos = Vec::with_capacity(pn);
-        for i in 0..pn {
-            let off = u32at(b, pp + i * 12 + 8)? as usize;
+        let type_name = |index: usize| types.get(index).and_then(|&i| strings.get(i)?.as_deref());
+        let proto_ids = Table::read(bytes, PROTO_IDS_AT, PROTO_ID_LEN, MAX_IDS)?;
+        let mut protos = Vec::with_capacity(proto_ids.len);
+        for i in 0..proto_ids.len {
+            // `proto_id_item.parameters_off`: a `type_list`, or none.
+            let list =
+                crate::bytes::sat_usize(u32_le(bytes, proto_ids.entry(i, PROTO_ID_LEN) + 8)?);
             let mut params = Vec::new();
-            if off != 0 {
-                let n = u32at(b, off)? as usize;
-                if n > 255 || off.checked_add(4 + n * 2)? > b.len() {
+            if list != 0 {
+                let count = crate::bytes::sat_usize(u32_le(bytes, list)?);
+                if count > MAX_PARAMS || list.checked_add(4 + count * 2)? > bytes.len() {
                     return None;
                 }
-                for j in 0..n {
-                    let ti = u16at(b, off + 4 + j * 2)? as usize;
-                    let text = types
-                        .get(ti)
-                        .and_then(|x| strings.get(*x))
-                        .and_then(Option::as_deref);
-                    params.push(matches!(text, Some("J" | "D")));
+                for j in 0..count {
+                    let param = usize::from(u16_le(bytes, list + 4 + j * 2)?);
+                    params.push(matches!(type_name(param), Some("J" | "D")));
                 }
             }
             protos.push(params);
         }
-        let (mp, mn) = table(b, 88, 8, 65536)?;
-        let mut methods = Vec::with_capacity(mn);
-        for i in 0..mn {
-            let owner = u16at(b, mp + i * 8)? as usize;
-            let proto = u16at(b, mp + i * 8 + 2)? as usize;
-            let ni = u32at(b, mp + i * 8 + 4)? as usize;
-            let method = types
-                .get(owner)
-                .and_then(|i| strings.get(*i))
-                .and_then(Option::as_ref)
-                .zip(strings.get(ni).and_then(Option::as_ref))
+        let method_ids = Table::read(bytes, METHOD_IDS_AT, METHOD_ID_LEN, MAX_IDS)?;
+        let mut methods = Vec::with_capacity(method_ids.len);
+        let mut name_budget = MAX_METHOD_NAME_BYTES;
+        for i in 0..method_ids.len {
+            let at = method_ids.entry(i, METHOD_ID_LEN);
+            let class = usize::from(u16_le(bytes, at)?);
+            let proto = usize::from(u16_le(bytes, at + 2)?);
+            let name = crate::bytes::sat_usize(u32_le(bytes, at + 4)?);
+            // A name past the budget leaves its method unresolved, as an
+            // out-of-range index does.
+            let method = type_name(class)
+                .zip(strings.get(name).and_then(Option::as_ref))
                 .zip(protos.get(proto))
-                .map(|((c, n), p)| Method {
-                    name: format!("{c}->{n}"),
-                    params: p.clone(),
-                    external: !defined.contains(&owner),
+                .filter(|((class_name, name), _)| {
+                    charge(&mut name_budget, class_name.len() + 2 + name.len()).is_some()
+                })
+                .map(|((class_name, name), params)| Method {
+                    name: format!("{class_name}->{name}"),
+                    params: params.clone(),
+                    external: !defined.contains(&class),
                 });
             methods.push(method);
         }
         Some(Self {
-            bytes: b,
+            bytes,
             strings,
             methods,
             classes,
         })
     }
 }
+
+/// The width in code units of the instruction at `pc`, the payload
+/// pseudo-instructions (`packed-switch`, `sparse-switch`,
+/// `fill-array-data`) included; `None` for an opcode the format does not
+/// define or an instruction running past `code`.
 fn width(code: &[u16], pc: usize) -> Option<usize> {
     let v = *code.get(pc)?;
     let [op, _] = v.to_le_bytes();
     let n = match op {
-        0 if v == 0x0100 => 4 + 2 * usize::from(*code.get(pc + 1)?),
-        0 if v == 0x0200 => 2 + 4 * usize::from(*code.get(pc + 1)?),
-        0 if v == 0x0300 => {
+        0 if v == PACKED_SWITCH_PAYLOAD => 4 + 2 * usize::from(*code.get(pc + 1)?),
+        0 if v == SPARSE_SWITCH_PAYLOAD => 2 + 4 * usize::from(*code.get(pc + 1)?),
+        0 if v == FILL_ARRAY_DATA_PAYLOAD => {
             let size = u32::from(*code.get(pc + 2)?) | (u32::from(*code.get(pc + 3)?) << 16);
             4usize.checked_add(
                 usize::from(*code.get(pc + 1)?)
-                    .checked_mul(size as usize)?
+                    .checked_mul(crate::bytes::sat_usize(size))?
                     .div_ceil(2),
             )?
         }
@@ -235,16 +370,28 @@ fn width(code: &[u16], pc: usize) -> Option<usize> {
     };
     (pc.checked_add(n)? <= code.len()).then_some(n)
 }
+/// The offset `off` code units from `pc`, when it lies inside `len` units of
+/// code.
 fn relative(pc: usize, off: i32, len: usize) -> Option<usize> {
     let target = pc.checked_add_signed(isize::try_from(off).ok()?)?;
     (target < len).then_some(target)
 }
+/// The signed 32-bit value two code units at `pc` hold, low unit first.
 fn pair(code: &[u16], pc: usize) -> Option<i32> {
     Some((u32::from(*code.get(pc)?) | (u32::from(*code.get(pc + 1)?) << 16)).cast_signed())
 }
+/// Every branch and switch target in `code`: the instructions where a basic
+/// block starts. `None` when the switch tables name more targets than
+/// [`MAX_SWITCH_TARGETS`] or than `code` has units.
+///
+/// Each payload is read once, however many switches name it, and an honest
+/// payload spends at least two code units per target, so the walk costs no
+/// more than the body's length: without both bounds, a few thousand switches
+/// naming one large payload cost each of thousands of bodies the whole cap.
 fn targets(code: &[u16]) -> Option<HashSet<usize>> {
-    let mut label_budget = 100000usize;
+    let mut label_budget = MAX_SWITCH_TARGETS.min(code.len());
     let mut labels = HashSet::new();
+    let mut payloads = HashSet::new();
     let mut pc = 0;
     while let Some(n) = width(code, pc) {
         let v = *code.get(pc)?;
@@ -258,25 +405,25 @@ fn targets(code: &[u16]) -> Option<HashSet<usize>> {
         if let Some(t) = jump.and_then(|off| relative(pc, off, code.len())) {
             labels.insert(t);
         }
-        if matches!(op, 0x2b | 0x2c) {
-            if let Some(p) = pair(code, pc + 1).and_then(|off| relative(pc, off, code.len())) {
-                if let Some(size) = code.get(p + 1).copied() {
-                    let start = if op == 0x2b {
-                        p + 4
-                    } else {
-                        p + 2 + 2 * usize::from(size)
-                    };
-                    for j in 0..usize::from(size) {
-                        if label_budget == 0 {
-                            return None;
-                        }
-                        label_budget -= 1;
-                        if let Some(t) =
-                            pair(code, start + j * 2).and_then(|off| relative(pc, off, code.len()))
-                        {
-                            labels.insert(t);
-                        }
-                    }
+        if matches!(op, 0x2b | 0x2c)
+            && let Some(p) = pair(code, pc + 1).and_then(|off| relative(pc, off, code.len()))
+            && let Some(size) = code.get(p + 1).copied()
+            && payloads.insert(p)
+        {
+            let start = if op == 0x2b {
+                p + 4
+            } else {
+                p + 2 + 2 * usize::from(size)
+            };
+            for j in 0..usize::from(size) {
+                if label_budget == 0 {
+                    return None;
+                }
+                label_budget -= 1;
+                if let Some(t) =
+                    pair(code, start + j * 2).and_then(|off| relative(pc, off, code.len()))
+                {
+                    labels.insert(t);
                 }
             }
         }
@@ -284,77 +431,59 @@ fn targets(code: &[u16]) -> Option<HashSet<usize>> {
     }
     Some(labels)
 }
+/// Walk the body of method `idx`, whose `code_item` is at `off`: push its
+/// calls and a `Function` symbol naming its callees to `symbols`, and the
+/// string constants it loads to `literals`, spending `budget`. `None` for a
+/// body that is malformed or past the budget; a symbol whose name the name
+/// budget cannot cover ends the walk, its body's symbols kept.
 fn inspect(
-    d: &Dex<'_>,
+    dex: &Dex<'_>,
     idx: usize,
     off: usize,
     symbols: &mut Symbols,
     literals: &mut Literals,
-    literal_budget: &mut usize,
-    budget: &mut usize,
+    budget: &mut Budget,
 ) -> Option<()> {
-    let method = d.methods.get(idx)?.as_ref()?;
-    let count = u32at(d.bytes, off + 12)? as usize;
-    if count > 2 * 1024 * 1024 || off.checked_add(16 + count * 2)? > d.bytes.len() {
+    let method = dex.methods.get(idx)?.as_ref()?;
+    let count = crate::bytes::sat_usize(u32_le(dex.bytes, off + INSNS_SIZE_AT)?);
+    if count > MAX_METHOD_CODE_UNITS || off.checked_add(INSNS_AT + count * 2)? > dex.bytes.len() {
         return None;
     }
     // Charge the full bytecode walk, including malformed/undecodable code,
     // before allocation and the branch-target prepass.
-    if count > *budget {
-        *budget = 0;
-        return None;
-    }
-    *budget -= count;
-    let code: Vec<u16> = d
+    charge(&mut budget.code, count)?;
+    let code: Vec<u16> = dex
         .bytes
-        .get(off + 16..off + 16 + count * 2)?
+        .get(off + INSNS_AT..off + INSNS_AT + count * 2)?
         .as_chunks::<2>()
         .0
         .iter()
         .copied()
         .map(u16::from_le_bytes)
         .collect();
-    let maybe_labels = targets(&code);
-    let propagate = maybe_labels.is_some();
-    let labels = maybe_labels.unwrap_or_default();
+    // Without the block starts, no value is carried past an instruction.
+    let labels = targets(&code);
     let mut regs: HashMap<u16, Arg> = HashMap::new();
     let mut pc = 0;
     let mut callees = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen: HashSet<&str> = HashSet::new();
     while let Some(n) = width(&code, pc) {
-        if !propagate || labels.contains(&pc) {
+        if labels.as_ref().is_none_or(|labels| labels.contains(&pc)) {
             regs.clear();
         }
         let v = *code.get(pc)?;
         let [op, _] = v.to_le_bytes();
         let a = v >> 8;
         match op {
-            0x12 => {
-                let val = i64::from(v.cast_signed() >> 12);
+            // const/4, const/16, const.
+            0x12..=0x14 => {
+                let (dest, val) = match op {
+                    0x12 => ((v >> 8) & 15, i64::from(v.cast_signed() >> 12)),
+                    0x13 => (a, i64::from(code.get(pc + 1)?.cast_signed())),
+                    _ => (a, i64::from(pair(&code, pc + 1)?)),
+                };
                 regs.insert(
-                    (v >> 8) & 15,
-                    Arg::Number {
-                        text: val.to_string(),
-                        value: val,
-                        radix: 10,
-                    },
-                );
-            }
-            0x13 => {
-                let val = i64::from(code.get(pc + 1)?.cast_signed());
-                regs.insert(
-                    a,
-                    Arg::Number {
-                        text: val.to_string(),
-                        value: val,
-                        radix: 10,
-                    },
-                );
-            }
-            0x14 => {
-                let val = i64::from(pair(&code, pc + 1)?);
-                regs.insert(
-                    a,
+                    dest,
                     Arg::Number {
                         text: val.to_string(),
                         value: val,
@@ -369,12 +498,12 @@ fn inspect(
                     usize::try_from(pair(&code, pc + 1)?.cast_unsigned()).ok()?
                 };
                 regs.remove(&a);
-                if let Some(Some(s)) = d.strings.get(si) {
+                if let Some(Some(s)) = dex.strings.get(si) {
                     // Record bytecode-referenced constants, never unused string
                     // pool entries. The source location is the const-string site.
-                    if s.len() <= *literal_budget && literals.len() < 100000 {
-                        *literal_budget -= s.len();
-                        literals.push(Literal::new(s.clone(), (off + 16 + pc * 2) as u64));
+                    if s.len() <= budget.literals && literals.len() < MAX_LITERALS {
+                        budget.literals -= s.len();
+                        literals.push(Literal::new(s.clone(), (off + INSNS_AT + pc * 2) as u64));
                     }
                     regs.insert(a, Arg::String { value: s.clone() });
                 }
@@ -417,8 +546,9 @@ fn inspect(
                 regs.remove(&a.wrapping_add(1));
             }
             0x6e..=0x72 | 0x74..=0x78 => {
-                if let Some(Some(callee)) = d.methods.get(usize::from(*code.get(pc + 1)?)) {
-                    if seen.insert(callee.name.clone()) {
+                if let Some(Some(callee)) = dex.methods.get(usize::from(*code.get(pc + 1)?)) {
+                    if seen.insert(&callee.name) {
+                        charge(&mut budget.names, callee.name.len())?;
                         callees.push(callee.name.clone());
                     }
                     let rs = *code.get(pc + 2)?;
@@ -446,11 +576,12 @@ fn inspect(
                         );
                         position += if *wide { 2 } else { 1 };
                     }
-                    if symbols.len() < 500000 {
+                    if symbols.len() < MAX_SYMBOLS {
+                        charge(&mut budget.names, callee.name.len())?;
                         symbols.push(Symbol::Call {
                             target: Some(callee.name.clone()),
                             args,
-                            offset: Some((off + 16 + pc * 2) as u64),
+                            offset: Some((off + INSNS_AT + pc * 2) as u64),
                         });
                     }
                 }
@@ -466,63 +597,96 @@ fn inspect(
             | 0x67..=0x6d => {}
             _ => regs.clear(),
         }
-        if regs.len() > 256 {
+        if regs.len() > MAX_TRACKED_REGISTERS {
             regs.clear();
         }
         pc += n;
     }
+    charge(&mut budget.names, method.name.len())?;
     symbols.push(Symbol::Function {
         name: method.name.clone(),
-        offset: Some((off + 16) as u64),
+        offset: Some((off + INSNS_AT) as u64),
         complexity: None,
         callees,
     });
     Some(())
 }
+/// Read the methods, calls, imports and string literals of the DEX file in
+/// `bytes` into `symbols` and `literals`. A file that is not DEX, or whose
+/// tables are malformed, yields nothing; a cap that ends the walk is
+/// recorded in `dex.limits`.
 pub(super) fn extract(
     bytes: &[u8],
     symbols: &mut Symbols,
     literals: &mut Literals,
     values: &mut Values,
 ) {
-    let Some(d) = Dex::parse(bytes) else {
+    let Some(dex) = Dex::parse(bytes) else {
         return;
     };
-    for (idx, method) in d.methods.iter().enumerate() {
+    let mut budget = Budget {
+        code: MAX_CODE_UNITS,
+        literals: MAX_LITERAL_BYTES,
+        names: MAX_SYMBOL_NAME_BYTES,
+    };
+    let method_ids = crate::bytes::sat_usize(u32_le(bytes, METHOD_IDS_AT + 4).unwrap_or(0));
+    for (idx, method) in dex.methods.iter().enumerate() {
         if let Some(m) = method.as_ref().filter(|m| m.external) {
+            if charge(&mut budget.names, m.name.len()).is_none() {
+                break;
+            }
             symbols.push(Symbol::Import {
                 name: m.name.clone(),
                 alias: None,
                 library: None,
-                offset: Some((u32at(bytes, 92).unwrap_or(0) as usize + idx * 8) as u64),
+                // The method's `method_id_item`.
+                offset: Some((method_ids + idx * METHOD_ID_LEN) as u64),
                 ordinal: None,
             });
         }
     }
-    let mut budget = 8 * 1024 * 1024usize;
-    let mut literal_budget = 8 * 1024 * 1024usize;
-    let mut class_data_entries = 2 * 1024 * 1024usize;
-    for i in 0..d.classes.1 {
-        let Some(mut p) = u32at(bytes, d.classes.0 + i * 32 + 24)
-            .map(|v| v as usize)
-            .filter(|p| *p != 0)
-        else {
+    // The budget that ran out, recorded as the walk's limit.
+    let spent = |budget: &Budget| {
+        if budget.code == 0 {
+            Some(serde_json::json!({"code_unit_budget":true}))
+        } else if budget.names == 0 {
+            Some(serde_json::json!({"name_budget":true}))
+        } else {
+            None
+        }
+    };
+    if let Some(limit) = spent(&budget) {
+        values.insert_key(value_key!("dex.limits"), limit);
+        return;
+    }
+    let mut class_data_entries = MAX_CLASS_DATA_ENTRIES;
+    for i in 0..dex.classes.len {
+        let Some(mut pos) = u32_le(
+            bytes,
+            dex.classes.entry(i, CLASS_DEF_LEN) + CLASS_DATA_OFF_AT,
+        )
+        .map(crate::bytes::sat_usize)
+        .filter(|&pos| pos != 0) else {
             continue;
         };
-        let Some((sf, inf, dm, vm)) = (|| {
+        // `class_data_item`: static and instance field counts, then direct
+        // and virtual method counts.
+        let Some((static_fields, instance_fields, direct_methods, virtual_methods)) = (|| {
             Some((
-                uleb(bytes, &mut p)?,
-                uleb(bytes, &mut p)?,
-                uleb(bytes, &mut p)?,
-                uleb(bytes, &mut p)?,
+                uleb(bytes, &mut pos)?,
+                uleb(bytes, &mut pos)?,
+                uleb(bytes, &mut pos)?,
+                uleb(bytes, &mut pos)?,
             ))
         })() else {
             continue;
         };
-        if sf.saturating_add(inf) > 65536 || dm.saturating_add(vm) > 65536 {
+        let fields = static_fields.saturating_add(instance_fields);
+        let methods = direct_methods.saturating_add(virtual_methods);
+        if fields > MAX_CLASS_MEMBERS || methods > MAX_CLASS_MEMBERS {
             continue;
         }
-        let entries = (sf + inf + dm + vm) as usize;
+        let entries = crate::bytes::sat_usize(fields + methods);
         if entries > class_data_entries {
             values.insert_key(
                 value_key!("dex.limits"),
@@ -531,43 +695,43 @@ pub(super) fn extract(
             return;
         }
         class_data_entries -= entries;
+        // Each `encoded_field`: an index delta and access flags.
         let fields_ok =
-            (0..sf + inf).all(|_| uleb(bytes, &mut p).is_some() && uleb(bytes, &mut p).is_some());
+            (0..fields).all(|_| uleb(bytes, &mut pos).is_some() && uleb(bytes, &mut pos).is_some());
         if !fields_ok {
             continue;
         }
-        for n in [dm, vm] {
+        for count in [direct_methods, virtual_methods] {
+            // Each `encoded_method`: an index delta from the previous method
+            // of its list, access flags, and its `code_item` offset.
             let mut idx = 0usize;
-            for _ in 0..n {
-                let Some(delta) = uleb(bytes, &mut p) else {
+            for _ in 0..count {
+                let Some(delta) = uleb(bytes, &mut pos) else {
                     break;
                 };
-                let Some(_access) = uleb(bytes, &mut p) else {
+                let Some(_access) = uleb(bytes, &mut pos) else {
                     break;
                 };
-                let Some(off) = uleb(bytes, &mut p) else {
+                let Some(code) = uleb(bytes, &mut pos) else {
                     break;
                 };
-                let Some(next) = idx.checked_add(delta as usize) else {
+                let Some(next) = idx.checked_add(crate::bytes::sat_usize(delta)) else {
                     break;
                 };
                 idx = next;
-                if off != 0 {
+                if code != 0 {
+                    // A malformed body costs that method alone.
                     let _ = inspect(
-                        &d,
+                        &dex,
                         idx,
-                        off as usize,
+                        crate::bytes::sat_usize(code),
                         symbols,
                         literals,
-                        &mut literal_budget,
                         &mut budget,
                     );
                 }
-                if budget == 0 {
-                    values.insert_key(
-                        value_key!("dex.limits"),
-                        serde_json::json!({"code_unit_budget":true}),
-                    );
+                if let Some(limit) = spent(&budget) {
+                    values.insert_key(value_key!("dex.limits"), limit);
                     return;
                 }
             }
@@ -576,179 +740,4 @@ pub(super) fn extract(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    fn observed(code: &[u16], literal_budget: usize) -> (Vec<Symbol>, Literals) {
-        let mut bytes = vec![0; 16];
-        bytes[12..16].copy_from_slice(&(code.len() as u32).to_le_bytes());
-        for unit in code {
-            bytes.extend(unit.to_le_bytes());
-        }
-        let d = Dex {
-            bytes: &bytes,
-            strings: vec![Some("/data/".to_owned())],
-            classes: (0, 0),
-            methods: vec![
-                Some(Method {
-                    name: "LExample;->run".to_owned(),
-                    params: vec![],
-                    external: false,
-                }),
-                Some(Method {
-                    name: "Landroid/net/wifi/WifiManager;->setWifiEnabled".to_owned(),
-                    params: vec![false],
-                    external: true,
-                }),
-                Some(Method {
-                    name: "LExample;->remove".to_owned(),
-                    params: vec![false],
-                    external: false,
-                }),
-            ],
-        };
-        let mut result = Symbols::new();
-        let mut budget = 1000;
-        let mut literals = Literals::new();
-        let mut literal_budget = literal_budget;
-        inspect(
-            &d,
-            0,
-            0,
-            &mut result,
-            &mut literals,
-            &mut literal_budget,
-            &mut budget,
-        )
-        .unwrap();
-        let calls = result
-            .iter()
-            .filter(|s| matches!(s, Symbol::Call { .. }))
-            .cloned()
-            .collect();
-        (calls, literals)
-    }
-    fn calls(code: &[u16]) -> Vec<Symbol> {
-        observed(code, 8192).0
-    }
-    #[test]
-    fn only_referenced_constants_become_literals() {
-        assert!(observed(&[0x000e], 8192).1.is_empty());
-        let (_, literals) = observed(&[0x001a, 0, 0x000e], 8192);
-        assert_eq!(literals.len(), 1);
-        assert_eq!(literals.as_slice()[0].value, "/data/");
-        assert_eq!(literals.as_slice()[0].offset, 16);
-        assert!(observed(&[0x001a, 0, 0x000e], 2).1.is_empty());
-    }
-    #[test]
-    fn jumbo_string_reference_becomes_literal() {
-        let (_, literals) = observed(&[0x001b, 0, 0, 0x000e], 8192);
-        assert_eq!(literals.as_slice()[0].value, "/data/");
-    }
-    #[test]
-    fn distinguishes_true_and_false() {
-        for value in [0, 1] {
-            let out = calls(&[(value << 12) | 0x0112, 0x206e, 1, 0x0010, 0x000e]);
-            assert!(
-                matches!(&out[0],Symbol::Call{args,..} if matches!(&args[0],Arg::Number{value:v,..} if *v==i64::from(value)))
-            );
-        }
-    }
-    #[test]
-    fn signed_constants_retain_their_values() {
-        for (mut code, expected) in [
-            (vec![0x8112], -8),
-            (vec![0x7112], 7),
-            (vec![0x0113, 0x8000], i64::from(i16::MIN)),
-            (vec![0x0113, 0x7fff], i64::from(i16::MAX)),
-            (vec![0x0114, 0, 0x8000], i64::from(i32::MIN)),
-            (vec![0x0114, 0xffff, 0x7fff], i64::from(i32::MAX)),
-        ] {
-            code.extend([0x1071, 2, 1, 0x000e]);
-            let out = calls(&code);
-            assert!(matches!(&out[0], Symbol::Call { args, .. }
-                    if matches!(&args[0], Arg::Number { value, .. } if *value == expected)));
-        }
-    }
-    #[test]
-    fn branch_offsets_retain_their_sign() {
-        for code in [
-            vec![0x0128, 0xff28],
-            vec![0x0000, 0x0029, 0xffff],
-            vec![0x0000, 0x002a, 0xffff, 0xffff],
-        ] {
-            assert!(targets(&code).unwrap().contains(&0));
-        }
-        assert_eq!(relative(0, -1, 10), None);
-        assert_eq!(relative(5, 5, 10), None);
-        assert_eq!(relative(5, -5, 10), Some(0));
-        assert_eq!(relative(usize::MAX, 1, usize::MAX), None);
-        assert_eq!(
-            relative(usize::MAX - 1, -1, usize::MAX),
-            Some(usize::MAX - 2)
-        );
-    }
-    #[test]
-    fn string_argument_and_moved_register() {
-        let out = calls(&[0x001a, 0, 0x0107, 0x1071, 2, 0x0001, 0x000e]);
-        assert!(
-            matches!(&out[0],Symbol::Call{args,..} if matches!(&args[0],Arg::String{value} if value=="/data/"))
-        );
-    }
-    #[test]
-    fn range_invoke_argument() {
-        let out = calls(&[0x011a, 0, 0x0177, 2, 1, 0x000e]);
-        assert!(
-            matches!(&out[0],Symbol::Call{args,..} if matches!(&args[0],Arg::String{value} if value=="/data/"))
-        );
-    }
-    #[test]
-    fn branch_target_drops_stale_constant() {
-        let out = calls(&[0x0112, 0x0038, 2, 0x206e, 1, 0x0010, 0x000e]);
-        assert!(matches!(&out[0],Symbol::Call{args,..} if matches!(&args[0],Arg::Expression)));
-    }
-    #[test]
-    fn unknown_write_drops_literal() {
-        let out = calls(&[0x011a, 0, 0x0122, 0, 0x0177, 2, 1, 0x000e]);
-        assert!(matches!(&out[0],Symbol::Call{args,..} if matches!(&args[0],Arg::Expression)));
-    }
-    #[test]
-    fn unrelated_field_read_preserves_literal() {
-        let out = calls(&[0x011a, 0, 0x2054, 0, 0x0177, 2, 1, 0x000e]);
-        assert!(
-            matches!(&out[0],Symbol::Call{args,..} if matches!(&args[0],Arg::String{value} if value=="/data/"))
-        );
-    }
-    #[test]
-    fn field_destination_discards_literal() {
-        let out = calls(&[0x011a, 0, 0x2154, 0, 0x0177, 2, 1, 0x000e]);
-        assert!(matches!(&out[0],Symbol::Call{args,..} if matches!(&args[0],Arg::Expression)));
-    }
-    #[test]
-    fn wide_write_discards_second_register() {
-        let out = calls(&[0x011a, 0, 0x0016, 0, 0x0177, 2, 1, 0x000e]);
-        assert!(matches!(&out[0],Symbol::Call{args,..} if matches!(&args[0],Arg::Expression)));
-    }
-    #[test]
-    fn truncated_instructions_and_headers_do_not_panic() {
-        for code in [
-            vec![0x1a],
-            vec![0x0100],
-            vec![0x0300, 0xffff, 0xffff, 0xffff],
-            vec![0xff],
-        ] {
-            assert!(calls(&code).is_empty());
-        }
-        for n in 0..112 {
-            assert!(Dex::parse(&vec![0; n]).is_none());
-        }
-    }
-    #[test]
-    fn modified_utf8_retains_nul_and_surrogate_pair() {
-        assert_eq!(
-            mutf8(b"A\xc0\x80\xed\xa0\xbd\xed\xb8\x80"),
-            Some("A\0😀".to_owned())
-        );
-        assert!(mutf8(b"\xed\xa0\xbd").is_none());
-        assert!(mutf8(b"\xc1\x81").is_none());
-    }
-}
+mod tests;

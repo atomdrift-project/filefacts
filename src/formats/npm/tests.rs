@@ -19,17 +19,9 @@ fn tgz(members: &[(&str, &[u8])]) -> Vec<u8> {
 }
 
 fn run_tgz(bytes: &[u8]) -> (Values, Errors) {
-    let mut v = Values::new();
-    let mut e = Errors::new();
-    extract(
-        bytes,
-        FileType::Npm,
-        &mut v,
-        &mut Metrics::new(),
-        &mut Vec::new(),
-        &mut e,
-    )
-    .unwrap();
+    let mut sinks = crate::formats::Sinks::default();
+    extract(bytes, sinks.ctx()).unwrap();
+    let (v, e) = (sinks.values, sinks.errors);
     (v, e)
 }
 
@@ -75,7 +67,7 @@ fn corrupt_gzip_stream_records_one_tar_parse_error() {
 
 #[test]
 fn oversized_manifest_is_a_limit_not_an_error() {
-    let big = vec![b' '; MAX_MANIFEST as usize + 1];
+    let big = vec![b' '; MAX_MANIFEST_BYTES as usize + 1];
     let (v, e) = run_tgz(&tgz(&[(MANIFEST, &big)]));
     assert!(e.is_empty(), "{e:?}");
     let limits = v.get("npm.limits").and_then(JsonValue::as_array).unwrap();
@@ -310,4 +302,30 @@ fn publisher_repo_owner_mismatch_abstains_without_both_sides() {
     assert_eq!(publisher_repo("", "https://github.com/a/b"), None);
     // A URL that names no owner.
     assert_eq!(publisher_repo("krabt", "https://example.com/thing"), None);
+}
+
+/// npm unpacks a tarball with its first path component stripped, whatever
+/// that component is called, so `pkg/package.json` is the manifest it
+/// installs from, install hooks and all. Only `package/` was read.
+#[test]
+fn manifest_under_any_top_directory_is_read() {
+    let manifest = br#"{"name": "demo", "scripts": {"postinstall": "node x.js"}}"#;
+    let (v, e) = run_tgz(&tgz(&[("pkg/package.json", manifest)]));
+    assert!(e.is_empty(), "{e:?}");
+    assert_eq!(v.get("npm.name").and_then(JsonValue::as_str), Some("demo"));
+    // Deeper `package.json` files belong to bundled dependencies.
+    let (v, _) = run_tgz(&tgz(&[("pkg/node_modules/x/package.json", manifest)]));
+    assert!(v.get("npm.name").is_none());
+}
+
+/// npm extracts every member, so a later `package.json` replaces an earlier
+/// one: the identity is the last one's.
+#[test]
+fn the_last_manifest_in_the_tarball_is_the_packages() {
+    let (v, e) = run_tgz(&tgz(&[
+        (MANIFEST, br#"{"name": "decoy"}"#),
+        ("other/package.json", br#"{"name": "real"}"#),
+    ]));
+    assert!(e.is_empty(), "{e:?}");
+    assert_eq!(v.get("npm.name").and_then(JsonValue::as_str), Some("real"));
 }

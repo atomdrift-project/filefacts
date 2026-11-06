@@ -27,6 +27,24 @@ pub(super) const MAX_ARCHIVE_MEMBERS: usize = 65_536;
 /// small fraction of this for [`MAX_ARCHIVE_MEMBERS`] paths.
 pub(super) const MAX_PATH_BYTES: usize = 64 << 20;
 
+/// Bytes one directory extent of a disc image (ISO 9660, UDF) is read to.
+pub(super) const MAX_DIR_EXTENT: usize = 32 << 20;
+
+/// Directory-extent bytes one disc-image tree walk reads in all. A walk
+/// keys the directories it has visited on where they are, so records that
+/// name one extent with ever-different lengths, extents a sector apart, or
+/// distinct UDF ICBs pointing at one run of identifiers each read up to
+/// [`MAX_DIR_EXTENT`] again: a quarter-terabyte from a 32 MiB image. Real
+/// trees spend a few hundred bytes per record, far below this for
+/// [`MAX_ARCHIVE_MEMBERS`] members.
+pub(super) const MAX_DIR_BYTES_TOTAL: usize = 128 << 20;
+
+/// Bytes of a package manifest (`package.json`, `Cargo.toml`, a `.nuspec`,
+/// Core Metadata, a `.PKGINFO`, …) read before it is refused as padding.
+/// Real manifests are a few KiB; one past this cap is hostile or broken, and
+/// is reported as a limit rather than parsed.
+pub(super) const MAX_MANIFEST_BYTES: u64 = 1 << 20;
+
 /// Inflated bytes a gzipped-tar manifest search reads before giving up.
 /// Package manifests sit near the front of the tarball, so this only
 /// bounds the walk past them: a small `.tgz` can inflate a thousandfold.
@@ -60,10 +78,10 @@ pub(super) fn xz_decoder<R: Read>(input: R) -> lzma_rust2::XzReader<R> {
 }
 
 /// One bound a walk hit: the stage it was in, and what was cut short.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct Limit {
-    pub(super) stage: &'static str,
-    pub(super) reason: String,
+#[derive(Debug)]
+struct Limit {
+    stage: &'static str,
+    reason: String,
 }
 
 /// The bounds one extractor hit, written once to its `<format>.limits` key
@@ -87,7 +105,7 @@ impl Limits {
             return;
         }
         let mut list = values
-            .get_key(key)
+            .lookup(key)
             .and_then(JsonValue::as_array)
             .cloned()
             .unwrap_or_default();
@@ -101,23 +119,45 @@ impl Limits {
 }
 
 /// The first bytes of a member, read through a cap.
-pub(super) struct MemberPrefix {
+pub(crate) struct MemberPrefix {
     /// At most the cap's worth of the member.
-    pub(super) bytes: Vec<u8>,
+    pub(crate) bytes: Vec<u8>,
     /// The member continued past the cap.
-    pub(super) truncated: bool,
+    pub(crate) truncated: bool,
+}
+
+/// What [`inflate_capped`] does with the bytes a decoder produced before it
+/// failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OnError {
+    /// Drop them and return the error: for a member that is parsed whole
+    /// (a manifest, a header block), a cut-off copy would only fail to parse.
+    Discard,
+    /// Keep them, logging the error: for a stream whose damaged tail does
+    /// not touch what came before it (a PDF stream a viewer renders up to
+    /// the damage, an Alpine package's control segment ahead of a broken
+    /// data segment). The error is returned only when nothing decoded.
+    KeepPartial,
 }
 
 /// Read (and so, through a decoder, inflate) `reader` to at most `cap`
 /// bytes, reading one more to tell a member exactly at the cap from one
-/// past it. Whatever a decoder produced before an error is discarded with
-/// the error: a cut-off member would only fail to parse.
-pub(super) fn inflate_capped(reader: impl Read, cap: u64) -> io::Result<MemberPrefix> {
+/// past it. A read error is handled as `on_error` says.
+pub(crate) fn inflate_capped(
+    reader: impl Read,
+    cap: u64,
+    on_error: OnError,
+) -> io::Result<MemberPrefix> {
     let mut bytes = Vec::new();
-    reader.take(cap.saturating_add(1)).read_to_end(&mut bytes)?;
+    if let Err(error) = reader.take(cap.saturating_add(1)).read_to_end(&mut bytes) {
+        if on_error == OnError::Discard || bytes.is_empty() {
+            return Err(error);
+        }
+        tracing::debug!(target: "filefacts::bounded", stage = "inflate", len = bytes.len(), %error, "stream damaged; keeping what decoded before it");
+    }
     let truncated = bytes.len() as u64 > cap;
     if truncated {
-        bytes.truncate(usize::try_from(cap).unwrap_or(usize::MAX));
+        bytes.truncate(crate::bytes::sat_usize(cap));
     }
     Ok(MemberPrefix { bytes, truncated })
 }
@@ -140,11 +180,12 @@ pub(super) fn utf8_prefix(prefix: MemberPrefix) -> Result<String, FromUtf8Error>
 
 /// What a gzipped-tar member search found.
 pub(super) enum TarGzSearch {
-    /// The first member whose path matched, and its capped bytes.
+    /// The last member whose path matched, and its capped bytes.
     Found { path: String, prefix: MemberPrefix },
     /// The tarball holds no matching member.
     Absent,
-    /// [`MAX_TARGZ_SEARCH`] inflated bytes went by without a match.
+    /// [`MAX_TARGZ_SEARCH`] inflated bytes went by before the tarball's
+    /// end, so a match seen so far could still be replaced by a later one.
     InflateCapped,
 }
 
@@ -210,26 +251,13 @@ impl std::error::Error for MemberFailure {
     }
 }
 
-impl fmt::Display for TarGzError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Walk(e) => write!(f, "tarball unreadable: {e}"),
-            Self::Member { path, source } => write!(f, "{path}: {source}"),
-        }
-    }
-}
-
-impl std::error::Error for TarGzError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Walk(e) | Self::Member { source: e, .. } => Some(e),
-        }
-    }
-}
-
-/// Find the first member of the gzipped tar `bytes` whose path satisfies
-/// `matches`, and read it through a `max_member` cap. Decompression stops at
-/// the match, and never runs past [`MAX_TARGZ_SEARCH`] inflated bytes.
+/// Find the last member of the gzipped tar `bytes` whose path satisfies
+/// `matches`, and read it through a `max_member` cap. Package managers
+/// extract every member, so a later member with the same path replaces an
+/// earlier one: the whole tarball is walked, and never past
+/// [`MAX_TARGZ_SEARCH`] inflated bytes. A tar error fails the search even
+/// after a match, since an extractor that resynchronises past the damage
+/// (node-tar does) may find a later member there.
 pub(super) fn find_targz_member(
     bytes: &[u8],
     matches: impl Fn(&str) -> bool,
@@ -248,12 +276,13 @@ fn find_targz_member_within(
 ) -> Result<TarGzSearch, TarGzError> {
     let mut archive = tar::Archive::new(GzDecoder::new(bytes).take(max_inflate));
     let entries = archive.entries().map_err(TarGzError::Walk)?;
-    let mut walk_error = None;
+    let mut found = None;
+    let mut failure = None;
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
             Err(e) => {
-                walk_error = Some(e);
+                failure = Some(TarGzError::Walk(e));
                 break;
             }
         };
@@ -263,10 +292,16 @@ fn find_targz_member_within(
         if !matches(&path) {
             continue;
         }
-        return match inflate_capped(entry, max_member) {
-            Ok(prefix) => Ok(TarGzSearch::Found { path, prefix }),
-            Err(source) => Err(TarGzError::Member { path, source }),
-        };
+        if found.is_some() {
+            tracing::debug!(target: "filefacts::bounded", stage = "targz-search", path = %path, "member repeated; the later one replaces the earlier");
+        }
+        match inflate_capped(entry, max_member, OnError::Discard) {
+            Ok(prefix) => found = Some(TarGzSearch::Found { path, prefix }),
+            Err(source) => {
+                failure = Some(TarGzError::Member { path, source });
+                break;
+            }
+        }
     }
     // The budget is spent when the `Take` has nothing left: whatever the
     // tar reader made of the cut-off stream, the search ran out, not the
@@ -274,9 +309,9 @@ fn find_targz_member_within(
     if archive.into_inner().limit() == 0 {
         return Ok(TarGzSearch::InflateCapped);
     }
-    match walk_error {
-        Some(e) => Err(TarGzError::Walk(e)),
-        None => Ok(TarGzSearch::Absent),
+    match failure {
+        Some(failure) => Err(failure),
+        None => Ok(found.unwrap_or(TarGzSearch::Absent)),
     }
 }
 

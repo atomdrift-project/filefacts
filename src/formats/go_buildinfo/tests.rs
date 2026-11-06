@@ -1,26 +1,6 @@
 use super::*;
 
 #[test]
-fn pclntab_magic_recognizes_known_versions() {
-    // Go 1.18 (LE) and Go 1.20 (BE) headers, with a plausible tail.
-    assert!(has_pclntab_magic(&[0xf0, 0xff, 0xff, 0xff, 0, 0, 1, 8]));
-    assert!(has_pclntab_magic(&[0xff, 0xff, 0xff, 0xf1, 0, 0, 1, 8]));
-    // Go 1.2 / 1.16 little-endian.
-    assert!(has_pclntab_magic(&[0xfb, 0xff, 0xff, 0xff]));
-    assert!(has_pclntab_magic(&[0xfa, 0xff, 0xff, 0xff]));
-}
-
-#[test]
-fn pclntab_magic_rejects_decoys_and_short_input() {
-    // A section named like pclntab but without a real magic must NOT pass —
-    // otherwise a decoy could downgrade analysis and hide functions.
-    assert!(!has_pclntab_magic(b"not a pclntab"));
-    assert!(!has_pclntab_magic(&[0x00, 0x00, 0x00, 0x00]));
-    assert!(!has_pclntab_magic(&[0xf0, 0xff, 0xff])); // too short
-    assert!(!has_pclntab_magic(&[])); // empty
-}
-
-#[test]
 fn uvarint_decodes_small_values() {
     // 0x96 0x01 → 150. Standard Go uvarint test vector.
     let mut buf = vec![0x96, 0x01];
@@ -234,4 +214,40 @@ fn pointer_layout_follows_the_target_byte_order() {
         &sections,
     );
     assert_eq!(values.get("elf.go").unwrap()["version"], "go1.10.3");
+}
+
+/// The linker's sentinels, as `cmd/go` writes them around the modinfo.
+const INFO_START: &[u8; 16] = b"\x30\x77\xaf\x0c\x92\x74\x08\x02\x41\xe1\xc1\x07\xe6\xd6\x18\xe6";
+const INFO_END: &[u8; 16] = b"\xf9\x32\x43\x31\x86\x18\x20\x72\x00\x82\x42\x10\x41\x16\xd8\xf2";
+
+#[test]
+fn framed_modinfo_records_lie_between_the_sentinels() {
+    let mut blob = INFO_START.to_vec();
+    blob.extend_from_slice(b"path\texample.com/app\nmod\texample.com/app\tv1.2.3\t\n");
+    blob.extend_from_slice(INFO_END);
+    let mut out = Map::new();
+    parse_modinfo(&blob, &mut out);
+    assert_eq!(out["path"], "example.com/app");
+    assert_eq!(out["module"]["version"], "v1.2.3");
+}
+
+/// Go strips the closing sentinel by position, so a `path` line written in
+/// its 16 bytes is not a record, and must not replace the real one.
+#[test]
+fn a_record_hidden_in_the_closing_sentinel_is_not_read() {
+    let mut blob = INFO_START.to_vec();
+    blob.extend_from_slice(b"path\texample.com/evil\nmod\texample.com/evil\t(devel)\t\n");
+    blob.extend_from_slice(b"path\tgoogle.com\n");
+    assert_eq!(blob[blob.len() - 17], b'\n');
+    let mut out = Map::new();
+    parse_modinfo(&blob, &mut out);
+    assert_eq!(out["path"], "example.com/evil");
+    // Nor does one in the opening sentinel lead the records.
+    let mut blob = b"path\tgoogle.com\n".to_vec();
+    blob.extend_from_slice(b"mod\texample.com/evil\t(devel)\t\n");
+    blob.extend_from_slice(INFO_END);
+    let mut out = Map::new();
+    parse_modinfo(&blob, &mut out);
+    assert!(out.get("path").is_none());
+    assert_eq!(out["module"]["path"], "example.com/evil");
 }

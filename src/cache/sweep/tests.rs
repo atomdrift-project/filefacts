@@ -277,3 +277,18 @@ fn a_panicking_sweep_releases_its_root() {
     assert!(caught.is_err());
     assert!(Sweep::claim(tmp.path()).is_some());
 }
+
+#[cfg(unix)]
+#[test]
+fn group_writable_dir_is_untrusted_even_for_this_users_group() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("shared");
+    fs::create_dir(&dir).unwrap();
+    // On macOS every account's primary group is `staff`, so the group being
+    // this user's says nothing about who else can write.
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o775)).unwrap();
+    assert_eq!(trusted_dir(&dir), None);
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(trusted_dir(&dir).is_some());
+}

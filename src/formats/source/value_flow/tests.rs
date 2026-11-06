@@ -596,7 +596,7 @@ fn flow_is_lazy_cached_and_uses_the_existing_parse() {
     );
 }
 
-/// Run `f` on a thread with a 2 MiB stack, the size of a rayon worker's, so a
+/// Run `f` on a thread with a 2 MiB stack, a typical host worker's, so a
 /// recursion that only fits the 8 MiB main stack fails here.
 fn on_small_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
     std::thread::Builder::new()

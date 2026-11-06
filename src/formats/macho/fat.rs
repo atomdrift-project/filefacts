@@ -5,8 +5,7 @@
 use goblin::mach::{MachO, fat::FatArch};
 use serde_json::Value as JsonValue;
 
-use super::{extract_header_and_loads, extract_sections, go_build_info, symbols};
-use super::{image_end_of, single_arch};
+use super::{Views, go_build_info, image_end_of, sections_of, single_arch};
 use crate::formats::goblin_safe;
 use crate::metric;
 use crate::output::{Errors, Metrics, Section, SymbolKind, Values};
@@ -29,8 +28,6 @@ pub(super) struct Analysed {
     /// The end of the furthest slice's image in whole-file offsets (see
     /// [`image_end_of`]); `None` when no slice parsed.
     pub(super) image_end: Option<u64>,
-    /// Whether the primary slice carries a real Go pclntab.
-    pub(super) has_go_pclntab: bool,
     /// Where the primary slice starts in the file; `None` when no slice
     /// parsed.
     pub(super) primary: Option<u64>,
@@ -44,21 +41,16 @@ pub(super) struct Analysed {
 /// and symbols, its `macho.*` subtree is its slice entry, and functions are
 /// recovered from it. What any slice's extraction records in `errors` is
 /// kept.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn analyse(
     bytes: &[u8],
     arches: &[FatArch],
     layouts: &[Layout<'_>],
-    values: &mut Values,
-    metrics: &mut Metrics,
-    sections_out: &mut Vec<Section>,
-    symbols_out: &mut Symbols,
-    errors_out: &mut Errors,
+    out: &mut Views<'_>,
 ) -> Analysed {
+    let errors_out = &mut *out.errors;
     let mut slices: Vec<JsonValue> = Vec::new();
-    let mut out = Analysed {
+    let mut analysed_out = Analysed {
         image_end: None,
-        has_go_pclntab: false,
         primary: None,
     };
     let mut images = Vec::new();
@@ -125,44 +117,36 @@ pub(super) fn analyse(
         .map_or(0, |(i, _)| i);
     for (i, (arch, start, slice_bytes, macho)) in images.into_iter().enumerate() {
         let layout = layout_at(layouts, u64::from(arch.offset));
-        let slice_end = u64::from(arch.offset).saturating_add(image_end_of(&macho));
-        out.image_end = out.image_end.max(Some(slice_end));
+        let sections = sections_of(&macho);
+        let slice_end = u64::from(arch.offset).saturating_add(image_end_of(&macho, &sections));
+        analysed_out.image_end = analysed_out.image_end.max(Some(slice_end));
         let mut entry = if i == primary {
-            out.primary = Some(u64::from(arch.offset));
+            analysed_out.primary = Some(u64::from(arch.offset));
             let (first_section, imports, exports) = (
-                sections_out.len(),
-                symbols_out.iter_kind(SymbolKind::Import).count(),
-                symbols_out.iter_kind(SymbolKind::Export).count(),
+                out.sections.len(),
+                out.symbols.iter_kind(SymbolKind::Import).count(),
+                out.symbols.iter_kind(SymbolKind::Export).count(),
             );
-            single_arch(
-                &macho,
-                layout,
-                slice_bytes,
-                values,
-                metrics,
-                sections_out,
-                symbols_out,
-                errors_out,
-            );
+            single_arch(&macho, &sections, layout, slice_bytes, out);
             // Taken before Go decoding adds `macho.go`, which no slice entry
             // carries.
             let entry = slice_entry(
-                values.get("macho").cloned(),
-                symbols_out.iter_kind(SymbolKind::Import).count() - imports,
-                symbols_out.iter_kind(SymbolKind::Export).count() - exports,
-                sections_out.len() - first_section,
+                out.values.get("macho").cloned(),
+                out.symbols.iter_kind(SymbolKind::Import).count() - imports,
+                out.symbols.iter_kind(SymbolKind::Export).count() - exports,
+                out.sections.len() - first_section,
             );
-            out.has_go_pclntab = go_build_info(&macho, slice_bytes, values, symbols_out);
+            go_build_info(&macho, &sections, slice_bytes, out.values, out.symbols);
             // Unified sections address the whole input; load-command offsets
             // address the slice. Entropy was already computed on slice bytes.
-            for section in sections_out.iter_mut().skip(first_section) {
+            for section in out.sections.iter_mut().skip(first_section) {
                 if section.file_size > 0 {
                     section.file_offset = section.file_offset.saturating_add(start as u64);
                 }
             }
             entry
         } else {
-            analyse_slice(&macho, layout, slice_bytes, errors_out)
+            analyse_slice(&macho, &sections, layout, slice_bytes, out.errors)
         };
         if let JsonValue::Object(ref mut obj) = entry {
             obj.insert("file_offset".into(), JsonValue::Number(arch.offset.into()));
@@ -170,9 +154,11 @@ pub(super) fn analyse(
         }
         slices.push(entry);
     }
-    metrics.insert(metric!("macho.slice_count"), slices.len() as f64);
-    values.insert_key(value_key!("macho.slices"), JsonValue::Array(slices));
-    out
+    out.metrics
+        .insert(metric!("macho.slice_count"), slices.len() as f64);
+    out.values
+        .insert_key(value_key!("macho.slices"), JsonValue::Array(slices));
+    analysed_out
 }
 
 /// How strongly a slice is preferred as the primary, by the instruction set
@@ -196,19 +182,27 @@ fn preference(layout: Option<&binform::Binary<'_>>) -> u8 {
 /// dropped: the top-level views describe the primary slice.
 fn analyse_slice(
     macho: &MachO<'_>,
+    macho_sections: &[super::MachSection<'_>],
     layout: Option<&binform::Binary<'_>>,
     slice_bytes: &[u8],
     errors: &mut Errors,
 ) -> JsonValue {
     let mut values = Values::new();
-    let mut metrics = Metrics::new();
     let mut sections: Vec<Section> = Vec::new();
     let mut slice_symbols = Symbols::new();
-    super::record_forged_binds(macho, slice_bytes, errors);
-    extract_sections(layout, slice_bytes, &mut sections);
-    extract_header_and_loads(macho, slice_bytes, &mut values, &mut metrics);
-    symbols::extract(macho, layout, slice_bytes, &mut slice_symbols);
-    super::hashes::emit(macho, slice_bytes, &mut values, &slice_symbols);
+    single_arch(
+        macho,
+        macho_sections,
+        layout,
+        slice_bytes,
+        &mut Views {
+            values: &mut values,
+            metrics: &mut Metrics::new(),
+            sections: &mut sections,
+            symbols: &mut slice_symbols,
+            errors,
+        },
+    );
     slice_entry(
         values.into_json().get_mut("macho").map(JsonValue::take),
         slice_symbols.iter_kind(SymbolKind::Import).count(),

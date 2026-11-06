@@ -40,45 +40,46 @@ pub(super) fn detect(bytes: &[u8], values: &mut Values) {
     }
 }
 
-/// `true` when either the `"UPX!"` four-byte magic or the
-/// `$Info: This file is packed with the UPX executable packer`
-/// copyright banner appears anywhere in the file. The banner is the
-/// safer signal — `"UPX!"` is short enough to land inside random
-/// compressed data — but we accept the magic too because the banner
-/// is sometimes overwritten by re-packers.
+/// Where UPX writes its stub and the packed payload's header: the start of
+/// the packed file, in all three executable formats.
+const STUB_WINDOW: usize = 16 * 1024;
+
+/// The longest version token taken from the banner (`3.96`, `4.2.4`,
+/// `3.96w`, `5.0.0-git`).
+const MAX_VERSION_LEN: usize = 16;
+
+/// `true` when the `"UPX!"` four-byte magic or the `$Info: This file is
+/// packed with the UPX executable packer` copyright banner lies where UPX
+/// writes it into the file it packs: the stub at the head of the file, or
+/// (the magic only) the trailer at its very end. The banner is the safer
+/// signal — `"UPX!"` is short enough to land inside random compressed data
+/// — but the magic counts too because re-packers sometimes overwrite the
+/// banner. Either signature deeper in the file belongs to something the
+/// file carries, such as an embedded UPX-packed payload, not to the file.
 fn has_upx_signature(bytes: &[u8]) -> bool {
-    if memmem::find(bytes, b"$Info: This file is packed with the UPX").is_some() {
-        return true;
-    }
-    // Magic only matches when it lands inside the stub region (first
-    // 16 KiB) or at the very end of the file. UPX places the magic
-    // at the compressed-payload header, which sits near the start
-    // for both PE and ELF and at the tail-marker for ELF. Restricting
-    // the search avoids false positives from random `UPX!` triples
-    // inside arbitrary file content.
-    let head_window = bytes.get(..16 * 1024).unwrap_or(bytes);
-    if memmem::find(head_window, b"UPX!").is_some() {
-        return true;
-    }
-    if let Some(tail) = bytes.last_chunk::<64>()
-        && memmem::find(tail, b"UPX!").is_some()
-    {
-        return true;
-    }
-    false
+    let head = bytes.get(..STUB_WINDOW).unwrap_or(bytes);
+    memmem::find(head, b"$Info: This file is packed with the UPX").is_some()
+        || memmem::find(head, b"UPX!").is_some()
+        || bytes
+            .last_chunk::<64>()
+            .is_some_and(|tail| memmem::find(tail, b"UPX!").is_some())
 }
 
 /// Pull the UPX version out of the copyright banner. The banner
 /// reads `$Id: UPX <version> Copyright (C) <years> the UPX Team. All
-/// Rights Reserved. $`; we keep just the `<version>` token.
+/// Rights Reserved. $`; we keep just the `<version>` token, when it is a
+/// short run of version characters.
 fn extract_version(bytes: &[u8]) -> Option<String> {
     let needle = b"$Id: UPX ";
     let start = memmem::find(bytes, needle)? + needle.len();
     let rest = bytes.get(start..)?;
-    // Version runs up to the next whitespace.
-    let end = rest.iter().position(|&b| b == b' ' || b == b'\t')?;
-    let v = rest.get(..end)?;
-    std::str::from_utf8(v).ok().map(str::to_string)
+    let rest = rest.get(..=MAX_VERSION_LEN).unwrap_or(rest);
+    let token = rest.get(..rest.iter().position(|&b| b == b' ' || b == b'\t')?)?;
+    let valid = !token.is_empty()
+        && token
+            .iter()
+            .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'));
+    valid.then(|| String::from_utf8_lossy(token).into_owned())
 }
 
 #[cfg(test)]

@@ -105,7 +105,6 @@ fn producer_rows_convert_on_push() {
     lits.push(ExtractedString {
         value: "x".into(),
         offset: 9,
-        ..ExtractedString::default()
     });
     assert_eq!(lits.as_slice(), &[Literal::new("x", 9)]);
 }

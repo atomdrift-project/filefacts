@@ -1,8 +1,9 @@
 //! Error types for the public API.
 
 use std::error::Error as StdError;
+use std::fmt::Write as _;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
@@ -24,10 +25,11 @@ pub enum Error {
     /// I/O error while reading the input file, from [`crate::from_path`] or
     /// [`crate::read_input`].
     ///
-    /// The `open*` constructors take a byte slice and never return it. View
-    /// access may read and write the disk cache ([`crate::cache`]), but
-    /// cache I/O is best-effort and its failures are not reported here.
-    #[error("{}", io_context(.path.as_ref()))]
+    /// [`crate::open`] and [`crate::OpenOptions::open`] take a byte slice and
+    /// cannot fail. View access may read and write the disk cache
+    /// ([`crate::cache`]), but cache I/O is best-effort and its failures are
+    /// not reported here.
+    #[error("{}", io_context(.path.as_deref()))]
     #[non_exhaustive]
     Io {
         /// The file being read, when the failure is tied to one.
@@ -80,7 +82,7 @@ pub enum Error {
 }
 
 /// `Display` text for [`Error::Io`].
-fn io_context(path: Option<&PathBuf>) -> String {
+fn io_context(path: Option<&Path>) -> String {
     match path {
         Some(path) => format!("cannot read {}", path.display()),
         None => "i/o error".to_string(),
@@ -153,8 +155,8 @@ pub(crate) fn display_chain(err: &(dyn StdError + 'static)) -> String {
     let mut text = err.to_string();
     let mut cause = err.source();
     while let Some(err) = cause {
-        text.push_str(": ");
-        text.push_str(&err.to_string());
+        // Writing to a `String` cannot fail.
+        let _ = write!(text, ": {err}");
         cause = err.source();
     }
     text

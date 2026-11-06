@@ -14,7 +14,7 @@ with GNU make and BSD make:
 ```sh
 make            # debug build
 make test       # cargo test
-make lint       # rustfmt --check, then clippy --all-targets --all-features -D warnings
+make lint       # rustfmt, clippy (all features; library alone), rustdoc: -D warnings
 make fix        # apply clippy's fixes, then rustfmt
 make release    # optimized binary in out/
 ```
@@ -61,18 +61,22 @@ cargo build --config 'patch."https://github.com/atomdrift-project/filefacts".fil
   and no anecdotes about particular samples. History belongs in
   [CHANGELOG.md](CHANGELOG.md) and commit messages; a consumer's needs are
   stated as the contract they rely on.
-- **`unsafe`** is denied crate-wide. The few process-control calls that need
-  it carry a scoped `#[allow(unsafe_code)]` and a `// SAFETY:` comment.
+- **`unsafe`** is denied crate-wide. The few places that need it carry a
+  scoped `#[allow(unsafe_code)]` and a `// SAFETY:` comment: `geteuid` in
+  the cache sweep's ownership check, the CLI's jemalloc configuration symbol
+  (`#[unsafe(export_name)]`), and `getrusage` in `tests/hostile_inputs.rs`.
 
 ## Tests
 
 - A module `foo.rs` keeps its unit tests in `foo/tests.rs`, declared as
-  `#[cfg(test)] mod tests;`. Integration tests live in `tests/`.
+  `#[cfg(test)] mod tests;`; a crate root (`lib.rs`, `main.rs`) keeps them in
+  `tests.rs` beside it. Integration tests live in `tests/`.
 - Assert behaviour, not timing: prefer work counts or budget steps over
   wall-clock limits, which flake under a loaded parallel test run.
-- Open files hermetically in tests, with
-  `OpenOptions::new().cache(false).rizin(false)` unless the test is about the
-  cache or rizin.
+- Open files hermetically in tests, with `OpenOptions::new().cache(false)`
+  (the default, spelled out) unless the test is about the cache.
+- A test that touches every view should go through `touch_all` in
+  `tests/common/mod.rs`, which also fails on any panic the pipeline caught.
 - An input that crashed or hung belongs in `tests/hostile_inputs.rs`.
 
 ## Fixtures

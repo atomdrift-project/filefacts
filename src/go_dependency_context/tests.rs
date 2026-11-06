@@ -249,3 +249,55 @@ fn budgets_come_from_context_limits() {
         );
     }
 }
+
+/// A replacement is matched on the structured module and version it
+/// replaces, never on its display-only evidence text.
+#[test]
+fn replacement_matches_structured_fields_not_evidence() {
+    let parsed = |path: &str, text: &str| {
+        crate::OpenOptions::new()
+            .path(std::path::Path::new(path))
+            .open(text.as_bytes())
+            .references()
+            .to_vec()
+    };
+    let main = parsed("go.mod", "module app\nrequire example.test/lib v1.0.0\n");
+    let mut replace = parsed(
+        "go.work",
+        "go 1.22\nuse .\nreplace example.test/lib v1.0.0 => example.test/fork v2.0.0\n",
+    );
+    let directive = replace
+        .iter_mut()
+        .find(|r| r.source == source::WORK_REPLACE)
+        .unwrap();
+    assert_eq!(
+        directive.replaces,
+        Some(crate::Replaced {
+            module: "example.test/lib".into(),
+            version: Some("v1.0.0".into()),
+        })
+    );
+    directive.evidence = "rewritten for display".into();
+    let facts = go_dependency_context(
+        &[
+            ReferenceMember {
+                path: "go.mod",
+                references: &main,
+            },
+            ReferenceMember {
+                path: "go.work",
+                references: &replace,
+            },
+        ],
+        &ContextLimits::default(),
+    );
+    let lib = facts["go.mod"]
+        .iter()
+        .find(|r| r.kind == RefKind::Dependency)
+        .unwrap();
+    assert_eq!(lib.resolution, Some(Resolution::Replaced), "{lib:?}");
+    assert_eq!(
+        lib.locator,
+        RefLocator::Purl("pkg:golang/example.test/fork@v2.0.0".into())
+    );
+}

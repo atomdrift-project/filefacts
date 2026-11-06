@@ -21,9 +21,9 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
-// Every guard in filefacts (this one, goblin_safe's, and the per-stage
-// guards in `lib.rs`) turns a
-// parser panic into a recorded error by unwinding. Under `panic = "abort"`
+// Every guard in filefacts (identification, the per-stage guards in
+// `lib.rs`, and the ones around individual goblin calls) turns a parser
+// panic into a recorded error by unwinding. Under `panic = "abort"`
 // `catch_unwind` catches nothing and one malformed file kills the host
 // process, so refuse to build that way rather than silently lose the
 // guarantee.
@@ -45,7 +45,8 @@ thread_local! {
 /// This is deliberately process-global — a panic hook cannot be anything
 /// else — but it is installed at most once and only filters: it chains to
 /// whatever hook was installed before it (the host's, or std's default), and
-/// silences a panic only while the panicking thread is inside a guard. Panics anywhere else reach the previous hook untouched.
+/// silences a panic only while the panicking thread is inside a guard.
+/// Panics anywhere else reach the previous hook untouched.
 /// A host that installs its own hook *after* filefacts' first parse replaces
 /// this one, which costs only the suppression of expected parser panics.
 fn install_suppression_hook() {
@@ -61,12 +62,13 @@ fn install_suppression_hook() {
     });
 }
 
-fn run<T, F>(f: F) -> std::thread::Result<T>
+/// Catch panics around an infallible call into a parser of untrusted bytes
+/// (filefacts' own, or goblin, binform, tree-sitter, …), returning the
+/// panic's message as the error.
+pub(crate) fn catch_infallible<T, F>(f: F) -> Result<T, String>
 where
     F: FnOnce() -> T,
 {
-    install_suppression_hook();
-
     /// Puts back the flag as the guard found it, so a guard nested inside
     /// another leaves the outer one still suppressing when it returns.
     struct Restore(bool);
@@ -76,17 +78,9 @@ where
         }
     }
 
+    install_suppression_hook();
     let _restore = Restore(SUPPRESS_PANIC_OUTPUT.with(|flag| flag.replace(true)));
-    panic::catch_unwind(panic::AssertUnwindSafe(f))
-}
-
-/// Catch panics around an infallible call (a lazy goblin walk, or any
-/// other parse of untrusted bytes), returning the panic's message as the error.
-pub(crate) fn catch_infallible<T, F>(f: F) -> Result<T, String>
-where
-    F: FnOnce() -> T,
-{
-    run(f).map_err(|payload| panic_message(&*payload))
+    panic::catch_unwind(panic::AssertUnwindSafe(f)).map_err(|payload| panic_message(&*payload))
 }
 
 #[cfg(test)]

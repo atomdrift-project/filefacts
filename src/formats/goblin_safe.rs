@@ -1,27 +1,33 @@
 //! Panic-safe wrappers around the [`goblin`] crate's binary parsers.
 //!
-//! `goblin` is fast but has a long history of panicking on malformed
-//! inputs (out-of-range slice indexing in PE resource walkers,
-//! fat-header arithmetic overflow in Mach-O, malformed dynamic
-//! sections in ELF). Forensic-grade callers need parsing to *fail
-//! softly* on hostile inputs — a `None` is fine, a process abort is
-//! not. This module is the single chokepoint through which the
-//! format extractors talk to goblin.
+//! goblin parses the format-specific metadata of PE, ELF and Mach-O images
+//! (headers, load commands, resources, debug and TLS directories, notes,
+//! dynamic tables); binform reads their sections, imports, exports and
+//! functions. goblin has a long history of panicking on malformed inputs
+//! (out-of-range slice indexing in PE resource walkers, fat-header
+//! arithmetic overflow in Mach-O, malformed dynamic sections in ELF), and
+//! forensic-grade callers need parsing to *fail softly* on hostile inputs:
+//! a `None` is fine, a process abort is not. Every goblin parse and lazy
+//! walk goes through this module.
 //!
-//! ## Three protections, layered
+//! ## Protections, layered
 //!
-//! 1. **Header pre-validation** — before goblin sees the bytes,
-//!    [`validate_pe_header`] rejects PEs whose COFF section count or
-//!    data-directory size make goblin's lazy walkers degenerate into
-//!    massive allocations or hangs.
-//! 2. **catch_unwind around every goblin call** — including lazy
-//!    walks performed *after* `PE::parse` returns. The resource-tree
-//!    walker (`pe.resource_data.entries()`) slices with unchecked
-//!    header offsets and panics on truncated tables, so the parse-
-//!    time safety is not enough by itself.
-//! 3. **Strict→permissive fallback** — `PE::parse_with_opts(...,
-//!    Permissive)` recovers more imports/exports on packed binaries
-//!    that strict mode rejects.
+//! 1. **Header pre-validation**: before goblin sees a PE,
+//!    [`validate_pe_header`] rejects one whose COFF section count or
+//!    data-directory sizes make goblin's walkers degenerate into massive
+//!    allocations or hangs, and [`prepare_pe`] keeps from goblin the
+//!    structures it cannot survive.
+//! 2. **No work nothing reads**: goblin's PE import walk and
+//!    attribute-certificate parse are switched off; the imports are
+//!    binform's and Authenticode is read in-house.
+//! 3. **catch_unwind around every goblin call**, including lazy walks
+//!    performed *after* `PE::parse` returns. The resource-tree walker
+//!    (`pe.resource_data.entries()`) slices with unchecked header offsets
+//!    and panics on truncated tables, so parse-time safety is not enough by
+//!    itself.
+//! 4. **Strict→permissive fallback**: a PE strict mode rejects is parsed
+//!    again in `ParseMode::Permissive`, which recovers more of a packed
+//!    binary.
 //!
 //! ## When to use what
 //!
@@ -36,8 +42,8 @@
 //! | A non-`Result` lazy access (e.g. `resource_data.count()`) | [`crate::panic_guard::catch_infallible`] |
 //! | A lazy iterator (notes, debug entries, symbol versions) | [`drain`] / [`drain_or_record`] |
 //!
-//! `parse_pe` already does the strict→permissive fallback internally;
-//! callers should not reach for `PE::parse_with_opts` directly.
+//! `parse_pe` does the strict→permissive fallback itself; callers should not
+//! reach for `PE::parse_with_opts` directly.
 
 use std::borrow::Cow;
 
@@ -46,12 +52,16 @@ use goblin::error::Error as GoblinError;
 use goblin::mach::{Mach, MachO};
 use goblin::pe::PE;
 use goblin::pe::header::Header as PeHeader;
+use goblin::pe::optional_header::OptionalHeader;
+use goblin::pe::resource::{
+    IMAGE_RESOURCE_DATA_IS_DIRECTORY, IMAGE_RESOURCE_NAME_IS_STRING, RT_MANIFEST, RT_VERSION,
+};
+use goblin::pe::section_table::SectionTable;
 use std::fmt;
 
 use crate::Stage;
-use crate::formats::common::bytes_at::{u16_le, u32_le};
-use crate::formats::common::read_uleb128;
-use crate::formats::pe::layout::{self, EXPORT_DIRECTORY, IMPORT_DIRECTORY, RESOURCE_DIRECTORY};
+use crate::bytes::{sat_usize, u16_le, u32_le};
+use crate::formats::pe::layout::{self, EXPORT_DIRECTORY, MAX_SECTIONS, RESOURCE_DIRECTORY};
 use crate::output::Errors;
 
 /// Outcome of a goblin operation, distinguishing a normal `Err` from
@@ -74,7 +84,7 @@ impl<T> GoblinOutcome<T> {
     pub(crate) fn ok(self) -> Option<T> {
         match self {
             Self::Ok(t) => Some(t),
-            _ => None,
+            Self::Failed(_) | Self::Panicked(_) => None,
         }
     }
 }
@@ -86,30 +96,17 @@ impl<T> GoblinOutcome<T> {
 pub(crate) enum Rejection {
     /// COFF `NumberOfSections` far past what any loader accepts.
     TooManySections(u16),
-    /// Optional-header `NumberOfRvaAndSizes` past the spec's 16.
+    /// Optional-header `NumberOfRvaAndSizes` past [`MAX_DATA_DIRECTORIES`].
     TooManyDataDirectories(u32),
-    /// An import or resource directory `size` beyond the file or 10 MiB.
+    /// A resource directory `size` beyond the file or
+    /// [`MAX_RESOURCE_DIRECTORY_SIZE`].
     OversizedDirectory { table: &'static str, size: u32 },
-    /// An import descriptor array with no terminator within budget.
-    UnterminatedImportDirectory,
-    /// Import lookup tables too long to walk within budget.
-    OversizedImportLookupTables,
-    /// Import names, summed over every lookup entry, past budget.
-    OversizedImportNames,
     /// Export and forwarder names, summed over every name pointer, past
     /// budget.
     OversizedExportNames,
-    /// Mach-O bind opcodes that would make goblin synthesize more imports
-    /// than [`MAX_MACHO_BIND_IMPORTS`].
-    OversizedBindStream { stream: &'static str, imports: u64 },
-    /// Mach-O bind opcodes that bind through a dylib ordinal or segment index
-    /// past the binary's own tables, which goblin indexes without a check.
-    BindIndexOutOfRange {
-        stream: &'static str,
-        table: &'static str,
-        index: u64,
-        len: usize,
-    },
+    /// The resource directories under `RT_VERSION` or `RT_MANIFEST` nested
+    /// past [`MAX_RESOURCE_DEPTH`].
+    DeepResourceTree,
 }
 
 impl fmt::Display for Rejection {
@@ -120,33 +117,15 @@ impl fmt::Display for Rejection {
             Self::OversizedDirectory { table, size } => {
                 write!(f, "malformed {table} table size ({size} bytes)")
             }
-            Self::UnterminatedImportDirectory => write!(
-                f,
-                "import directory exceeds {MAX_IMPORT_DESCRIPTORS} descriptors without terminating"
-            ),
-            Self::OversizedImportLookupTables => write!(
-                f,
-                "import lookup tables exceed {MAX_IMPORT_LOOKUP_ENTRIES} entries"
-            ),
-            Self::OversizedImportNames => {
-                write!(f, "import names exceed {MAX_SYMBOL_NAME_BYTES} bytes")
-            }
             Self::OversizedExportNames => {
                 write!(f, "export names exceed {MAX_SYMBOL_NAME_BYTES} bytes")
             }
-            Self::OversizedBindStream { stream, imports } => write!(
-                f,
-                "{stream} bind opcodes declare at least {imports} imports, past {MAX_MACHO_BIND_IMPORTS}"
-            ),
-            Self::BindIndexOutOfRange {
-                stream,
-                table,
-                index,
-                len,
-            } => write!(
-                f,
-                "{stream} bind opcodes bind through {table} {index} of {len}"
-            ),
+            Self::DeepResourceTree => {
+                write!(
+                    f,
+                    "resource directories nested past {MAX_RESOURCE_DEPTH} levels"
+                )
+            }
         }
     }
 }
@@ -172,35 +151,36 @@ pub(crate) struct PreparedPe<'a> {
     pub(crate) bytes: Cow<'a, [u8]>,
     /// The header failed the pre-validation, so goblin must not see it.
     rejected: Option<Rejection>,
-    /// `Some(reason)` when the import directory could not be walked within
-    /// budget, so the PE is parsed with imports disabled. Callers should
-    /// surface it: an unwalkable import table is a fact about the sample,
-    /// not an internal detail.
-    pub(crate) imports_skipped: Option<Rejection>,
     /// `Some(reason)` when the export directory's names exceed the budget,
     /// so its slot is cleared in `bytes` and goblin parses no exports.
+    /// Callers should surface it: a forged export table is a fact about the
+    /// sample, not an internal detail.
     pub(crate) exports_skipped: Option<Rejection>,
+    /// `Some(reason)` when goblin's walk of the resource tree would be
+    /// unbounded, so goblin parses no resources. Surfaced like
+    /// `exports_skipped`.
+    pub(crate) resources_skipped: Option<Rejection>,
 }
 
 /// Check a PE's headers before goblin sees them, and neutralize what goblin
 /// cannot survive, on at most one copy of `data`:
 ///
 /// - a header [`validate_pe_header`] rejects is never parsed;
-/// - a Rich header that goblin would reject as fatal has its `Rich` magic
-///   cleared;
+/// - a Rich header that goblin would reject as fatal has every `Rich`
+///   magic in the DOS stub cleared;
 /// - an export table whose names would cost goblin a quadratic walk has its
 ///   data-directory slot cleared, since goblin cannot be told to skip
 ///   exports;
-/// - an import table past budget is noted, and parsed with imports off.
+/// - a resource tree goblin would descend without bound is marked to be
+///   skipped.
 ///
-/// The headers and section table are parsed once, for both budgets. Every
-/// copy-free path stays copy-free.
+/// Every copy-free path stays copy-free.
 pub(crate) fn prepare_pe(data: &[u8]) -> PreparedPe<'_> {
     let mut prepared = PreparedPe {
         bytes: Cow::Borrowed(data),
         rejected: validate_pe_header(data).err(),
-        imports_skipped: None,
         exports_skipped: None,
+        resources_skipped: None,
     };
     if let Some(reason) = prepared.rejected {
         tracing::debug!(
@@ -214,96 +194,91 @@ pub(crate) fn prepare_pe(data: &[u8]) -> PreparedPe<'_> {
         return prepared;
     }
     // goblin 0.10 parses the Rich header inside both `PE::parse` and the
-    // header-only `Header::parse`, and a `Rich` marker with no XOR-decodable
-    // `DanS` table behind it aborts the *entire* parse, strict and permissive
-    // alike, leaving every section- and import-scoped fact blind. Packed and
-    // mangled binaries carry forged Rich stubs routinely. Zeroing the 4-byte
-    // magic makes goblin's marker scan find nothing and treat the header as
-    // absent; the Rich-header extractor still reads the untouched bytes, so a
-    // genuine Rich hash is unaffected.
-    if let Some(rich) = crate::formats::pe::rich::locate(data)
-        && rich.dans_pos.is_none()
-        && let Some(end) = rich
-            .rich_pos
-            .checked_add(4)
-            .filter(|&end| end <= data.len())
+    // header-only `Header::parse`, strict and permissive alike, and any
+    // failure there aborts the *entire* parse, leaving every section-scoped
+    // fact blind. It decodes the first `Rich` marker after the DOS header
+    // and fails when no `DanS` anywhere in the stub decodes under its key,
+    // or the table between them is not whole words: a forged or decoy
+    // marker, which packed and mangled binaries carry routinely, and which
+    // the loader never reads. When goblin's own decode fails, every marker
+    // in the stub is cleared, so goblin finds none and treats the header
+    // as absent; the Rich-header extractor still reads the untouched bytes.
+    if !matches!(
+        catch(|| goblin::pe::header::RichHeader::parse(data)),
+        GoblinOutcome::Ok(_)
+    ) && let Some(pe_pointer) = u32_le(data, 0x3c).map(sat_usize)
+        && let Some(stub) = data.get(..pe_pointer.min(data.len()))
     {
-        tracing::debug!(
-            target: "filefacts::goblin_safe",
-            format = "pe",
-            stage = "rich-header",
-            offset = rich.rich_pos,
-            "Rich marker with no decodable table cleared for goblin"
-        );
-        if let Some(magic) = prepared.bytes.to_mut().get_mut(rich.rich_pos..end) {
-            magic.fill(0);
+        let markers: Vec<usize> = memchr::memmem::find_iter(stub, b"Rich").collect();
+        if !markers.is_empty() {
+            tracing::debug!(
+                target: "filefacts::goblin_safe",
+                format = "pe",
+                stage = "rich-header",
+                markers = markers.len(),
+                "Rich header goblin cannot decode cleared for goblin"
+            );
+            let copy = prepared.bytes.to_mut();
+            for at in markers {
+                if let Some(magic) = copy.get_mut(at..at + 4) {
+                    magic.fill(0);
+                }
+            }
         }
     }
-    let Some((header, sections)) = header_and_sections(&prepared.bytes) else {
+    let Some((pe_pointer, optional, sections)) = header_and_sections(&prepared.bytes) else {
         return prepared;
     };
-    prepared.imports_skipped =
-        import_walk_budget(&prepared.bytes, &sections, &header.optional).err();
-    if let Err(reason) = export_walk_budget(&prepared.bytes, &sections, &header.optional)
+    if let Err(reason) = export_walk_budget(&prepared.bytes, &sections, &optional)
         && let Some(slot) = layout::data_directory_offset(
-            header.pe_pointer,
-            header.optional.standard_fields.magic,
+            pe_pointer,
+            optional.standard_fields.magic,
             EXPORT_DIRECTORY,
         )
         && let Some(end) = slot.checked_add(8).filter(|&end| end <= data.len())
         && let Some(entry) = prepared.bytes.to_mut().get_mut(slot..end)
     {
+        tracing::debug!(
+            target: "filefacts::goblin_safe",
+            format = "pe",
+            stage = "exports",
+            reason = %reason,
+            "export directory past budget; kept from goblin"
+        );
         entry.fill(0);
         prepared.exports_skipped = Some(reason);
     }
-    for (stage, reason) in [
-        ("imports", prepared.imports_skipped),
-        ("exports", prepared.exports_skipped),
-    ] {
-        if let Some(reason) = reason {
-            tracing::debug!(
-                target: "filefacts::goblin_safe",
-                format = "pe",
-                stage,
-                reason = %reason,
-                "directory past budget; kept from goblin"
-            );
-        }
+    if let Err(reason) = resource_walk_budget(&prepared.bytes, &sections, &optional) {
+        tracing::debug!(
+            target: "filefacts::goblin_safe",
+            format = "pe",
+            stage = "resources",
+            reason = %reason,
+            "resource directory past budget; kept from goblin"
+        );
+        prepared.resources_skipped = Some(reason);
     }
     prepared
 }
 
-/// The parts of a PE header the budgets need, owned so the bytes they were
-/// read from can still be patched.
-struct PeLayout {
-    pe_pointer: usize,
-    optional: goblin::pe::optional_header::OptionalHeader,
-}
-
-/// The headers and section table, read the way `PE::parse` reads them.
-/// `None` when they do not parse: the full parse then fails on the same bytes
-/// before it reaches imports or exports, so the budgets fail open.
-fn header_and_sections(
-    data: &[u8],
-) -> Option<(PeLayout, Vec<goblin::pe::section_table::SectionTable>)> {
+/// The PE signature's offset (`e_lfanew`), the optional header and the
+/// section table, read the way `PE::parse` reads them and owned so the bytes
+/// they were read from can still be patched. `None` when they do not parse:
+/// the full parse then fails on the same bytes before it reaches the
+/// exports, so the budget fails open.
+fn header_and_sections(data: &[u8]) -> Option<(usize, OptionalHeader, Vec<SectionTable>)> {
     let GoblinOutcome::Ok(header) = parse_pe_header(data) else {
         return None;
     };
     let optional = header.optional_header?;
-    let pe_pointer = header.dos_header.pe_pointer as usize;
+    let pe_pointer = sat_usize(header.dos_header.pe_pointer);
     let mut offset = layout::optional_header_offset(pe_pointer)?
         .saturating_add(usize::from(header.coff_header.size_of_optional_header));
     let GoblinOutcome::Ok(sections) = catch(|| header.coff_header.sections(data, &mut offset))
     else {
         return None;
     };
-    Some((
-        PeLayout {
-            pe_pointer,
-            optional,
-        },
-        sections,
-    ))
+    Some((pe_pointer, optional, sections))
 }
 
 /// Parse a prepared PE, panic-safe and with built-in permissive fallback.
@@ -311,58 +286,38 @@ fn header_and_sections(
 /// Strict mode is tried first; if it fails OR panics, the call is retried
 /// with `ParseMode::Permissive`. Returns the strict failure only when the
 /// permissive retry itself panicked (in which case the strict error is the
-/// more actionable signal). An import table past budget is parsed with
-/// imports off: a few hundred well-formed descriptors that all share one
-/// long table of ordinal entries make even strict goblin synthesize
-/// descriptors x entries imports, billions from a megabyte, so the budget
-/// runs before any full parse.
+/// more actionable signal). goblin's import walk and attribute-certificate
+/// parse are off in both: nothing reads them, and a forged import table
+/// makes the walk quadratic in the file size.
 pub(crate) fn parse_pe<'a>(prepared: &'a PreparedPe<'_>) -> GoblinOutcome<PE<'a>> {
     if let Some(reason) = prepared.rejected {
         return GoblinOutcome::Failed(GoblinError::Malformed(reason.to_string()));
     }
     let data: &'a [u8] = &prepared.bytes;
-    let base_opts = goblin::pe::options::ParseOptions::default()
-        .with_parse_mode(goblin::options::ParseMode::Permissive);
-    if prepared.imports_skipped.is_some() {
-        // A forged import directory. Keep every other fact (headers, sections,
-        // exports, resources, Authenticode) rather than failing the whole PE:
-        // with imports off the parse is bounded.
-        let importless_opts = base_opts.with_parse_imports(false);
-        return catch(|| PE::parse_with_opts(data, &importless_opts));
+    let mut strict = goblin::pe::options::ParseOptions::default()
+        .with_parse_imports(false)
+        .with_parse_resources(prepared.resources_skipped.is_none());
+    strict.parse_attribute_certificates = false;
+    let permissive = strict.with_parse_mode(goblin::options::ParseMode::Permissive);
+    let first = catch(|| PE::parse_with_opts(data, &strict));
+    if matches!(first, GoblinOutcome::Ok(_)) {
+        return first;
     }
-
-    let strict = catch(|| PE::parse(data));
-    if matches!(strict, GoblinOutcome::Ok(_)) {
-        return strict;
-    }
-
-    let permissive = catch(|| PE::parse_with_opts(data, &base_opts));
-    match (&strict, &permissive) {
+    let second = catch(|| PE::parse_with_opts(data, &permissive));
+    match (&first, &second) {
         // Strict failed cleanly; permissive panicked — prefer the
         // clean failure message.
-        (GoblinOutcome::Failed(_), GoblinOutcome::Panicked(_)) => strict,
-        _ => permissive,
+        (GoblinOutcome::Failed(_), GoblinOutcome::Panicked(_)) => first,
+        _ => second,
     }
 }
 
-/// Import-directory descriptors a real PE ever declares. Linkers emit one per
-/// imported DLL: a handful is typical, a hundred is a heavyweight application.
-/// Past this the array is not an import table.
-const MAX_IMPORT_DESCRIPTORS: usize = 256;
-
-/// Import-lookup-table entries goblin may be asked to synthesize across the
-/// whole file. Each entry costs it a `Vec` push, an RVA resolution, a
-/// hint/name read and — on a bad RVA — a `warn!`, so this is the real budget;
-/// the descriptor cap alone does not bound the product.
-const MAX_IMPORT_LOOKUP_ENTRIES: usize = 256 * 1024;
-
-/// Name bytes goblin may be asked to read across one import or export table.
+/// Name bytes goblin may be asked to read across one export table.
 ///
-/// goblin reads each lookup entry's or name pointer's string afresh, scanning
-/// to its NUL, and filefacts then copies each into its symbol view. Neither
-/// the entry budget nor the file size bounds that product: a quarter-million
-/// entries may all point at one name a megabyte long, a quarter of a terabyte
-/// to scan and to copy from a file of a few megabytes. Real tables total well
+/// goblin reads each name pointer's string afresh, scanning to its NUL.
+/// The entry count does not bound that product: a quarter-million name
+/// pointers may all point at one name a megabyte long, a quarter of a
+/// terabyte to scan from a file of a few megabytes. Real tables total well
 /// under a megabyte of names, the largest C++ export tables a few.
 const MAX_SYMBOL_NAME_BYTES: usize = 32 * 1024 * 1024;
 
@@ -373,118 +328,6 @@ fn name_len(data: &[u8], offset: usize, budget: usize) -> Option<usize> {
     let window = tail.get(..budget.saturating_add(1)).unwrap_or(tail);
     let len = memchr::memchr(0, window).unwrap_or(window.len());
     (len <= budget).then_some(len)
-}
-
-/// Decide whether goblin's import walk over `data` is bounded, in either
-/// parse mode.
-///
-/// `ImportData::parse_with_opts` walks 20-byte descriptors from the import
-/// data directory until one is null or "not possibly valid", and walks each
-/// descriptor's lookup table until a zero entry. In permissive mode a
-/// malformed entry is *skipped* rather than fatal, so a forged directory
-/// pointing into dense non-zero bytes yields `file_len / 20` descriptors, each
-/// re-walking a lookup table of up to `file_len / entry_size` entries. That
-/// product is quadratic in the file size and does not finish in practice: a
-/// worker thread stuck inside `ImportData::parse_with_opts` parks every other
-/// worker in a shared pool behind it. Strict mode is exposed too: well-formed
-/// descriptors may all share one long lookup table, and goblin materialises
-/// an `Import` per descriptor per entry.
-///
-/// goblin offers no cap of its own (`ParseOptions::parse_imports` is
-/// all-or-nothing), so this walks the same structure first, using goblin's own
-/// `find_offset` so the traversal agrees with the one being budgeted, but
-/// without the allocation, name parsing, or logging that makes goblin's
-/// version orders of magnitude more expensive per entry. It reads at most
-/// `MAX_IMPORT_LOOKUP_ENTRIES` entries, and [`MAX_SYMBOL_NAME_BYTES`] of the
-/// hint/name strings they point at, before giving its answer.
-///
-/// Fails open: anything it cannot resolve counts as within budget, so a PE
-/// shape this pre-walk does not model is parsed as goblin parses it.
-fn import_walk_budget(
-    data: &[u8],
-    sections: &[goblin::pe::section_table::SectionTable],
-    optional_header: &goblin::pe::optional_header::OptionalHeader,
-) -> Result<(), Rejection> {
-    use goblin::pe::import::SIZEOF_IMPORT_DIRECTORY_ENTRY;
-    use goblin::pe::options::ParseOptions;
-
-    let Some(import_table) = optional_header.data_directories.get_import_table() else {
-        return Ok(());
-    };
-    let file_alignment = optional_header.windows_fields.file_alignment;
-    // PE32 lookup entries are 4 bytes, PE32+ are 8: the optional-header magic
-    // is the same bit goblin's `is_64` reads to pick the `Bitfield` width it
-    // walks the table with.
-    let entry_size =
-        if optional_header.standard_fields.magic == goblin::pe::optional_header::MAGIC_64 {
-            8
-        } else {
-            4
-        };
-    let opts = ParseOptions::default().with_parse_mode(goblin::options::ParseMode::Permissive);
-
-    let resolve =
-        |rva: u32| goblin::pe::utils::find_offset(rva as usize, sections, file_alignment, &opts);
-
-    let Some(mut offset) = resolve(import_table.virtual_address) else {
-        return Ok(());
-    };
-
-    let mut descriptors = 0usize;
-    let mut entries = 0usize;
-    let mut name_bytes = 0usize;
-    while offset + SIZEOF_IMPORT_DIRECTORY_ENTRY <= data.len() {
-        // Field layout of `ImportDirectoryEntry`, little-endian: lookup-table
-        // RVA, timestamp, forwarder chain, name RVA, address-table RVA.
-        // In bounds by the loop guard; a short read would yield the all-zero
-        // terminator, ending the walk as running out of bytes does.
-        let word = |i: usize| -> u32 { u32_le(data, offset + i * 4).unwrap_or(0) };
-        let (lookup_rva, name_rva, address_rva) = (word(0), word(3), word(4));
-        let is_null = (0..5).all(|i| word(i) == 0);
-        // Mirrors `ImportDirectoryEntry::is_possibly_valid`.
-        let is_possibly_valid = name_rva != 0 && address_rva != 0;
-        if is_null || !is_possibly_valid {
-            return Ok(());
-        }
-
-        descriptors += 1;
-        if descriptors > MAX_IMPORT_DESCRIPTORS {
-            return Err(Rejection::UnterminatedImportDirectory);
-        }
-
-        // goblin prefers the lookup table and falls back to the address table.
-        if let Some(mut cursor) = resolve(lookup_rva).or_else(|| resolve(address_rva)) {
-            while let Some(entry) = data.get(cursor..cursor + entry_size) {
-                if entry.iter().all(|&b| b == 0) {
-                    break;
-                }
-                entries += 1;
-                if entries > MAX_IMPORT_LOOKUP_ENTRIES {
-                    return Err(Rejection::OversizedImportLookupTables);
-                }
-                // A clear top bit names a hint/name entry, whose string goblin
-                // reads past the two-byte hint (`Bitfield::to_rva`).
-                let value = entry
-                    .iter()
-                    .rev()
-                    .fold(0u64, |acc, &b| (acc << 8) | u64::from(b));
-                let by_ordinal = value >> (entry_size * 8 - 1) != 0;
-                if !by_ordinal && let Some(at) = resolve(crate::bytes::sat_u32(value & 0x7fff_ffff))
-                {
-                    let left = MAX_SYMBOL_NAME_BYTES - name_bytes;
-                    let Some(len) = name_len(data, at.saturating_add(2), left) else {
-                        return Err(Rejection::OversizedImportNames);
-                    };
-                    name_bytes += len;
-                }
-                cursor += entry_size;
-            }
-        }
-
-        offset += SIZEOF_IMPORT_DIRECTORY_ENTRY;
-    }
-
-    Ok(())
 }
 
 /// Decide whether goblin's export walk over `data` reads a bounded number of
@@ -500,12 +343,12 @@ fn import_walk_budget(
 /// the walk with goblin's own `find_offset`, summing the string lengths, and
 /// stops once they pass [`MAX_SYMBOL_NAME_BYTES`].
 ///
-/// Fails open like [`import_walk_budget`]: a table goblin would itself reject
-/// or cannot resolve counts as within budget.
+/// Fails open: a table goblin would itself reject or cannot resolve counts as
+/// within budget.
 fn export_walk_budget(
     data: &[u8],
-    sections: &[goblin::pe::section_table::SectionTable],
-    optional_header: &goblin::pe::optional_header::OptionalHeader,
+    sections: &[SectionTable],
+    optional_header: &OptionalHeader,
 ) -> Result<(), Rejection> {
     use goblin::pe::options::ParseOptions;
 
@@ -515,7 +358,7 @@ fn export_walk_budget(
     let file_alignment = optional_header.windows_fields.file_alignment;
     let opts = ParseOptions::default().with_parse_mode(goblin::options::ParseMode::Permissive);
     let resolve =
-        |rva: u32| goblin::pe::utils::find_offset(rva as usize, sections, file_alignment, &opts);
+        |rva: u32| goblin::pe::utils::find_offset(sat_usize(rva), sections, file_alignment, &opts);
 
     // IMAGE_EXPORT_DIRECTORY: AddressTableEntries at 20, NumberOfNamePointers
     // at 24, then the address, name-pointer and ordinal table RVAs.
@@ -529,10 +372,7 @@ fn export_walk_budget(
         return Ok(());
     };
     // goblin refuses either count past the file length outright.
-    let (address_entries, name_pointers) = (
-        crate::bytes::sat_usize(address_entries),
-        crate::bytes::sat_usize(name_pointers),
-    );
+    let (address_entries, name_pointers) = (sat_usize(address_entries), sat_usize(name_pointers));
     if address_entries > data.len() || name_pointers > data.len() {
         return Ok(());
     }
@@ -564,42 +404,119 @@ fn export_walk_budget(
             .map(usize::from)
             .filter(|&ordinal| ordinal < address_entries)
             .zip(eat)
-            .and_then(|(ordinal, table)| u32_le(data, table.saturating_add(ordinal * 4)))
+            .and_then(|(ordinal, table)| {
+                u32_le(data, table.saturating_add(ordinal.saturating_mul(4)))
+            })
             .filter(|&rva| forwarders.contains(&u64::from(rva)));
         count(forwarder.and_then(resolve))?;
     }
     Ok(())
 }
 
+/// Directory levels goblin may descend below a resource type. The loader
+/// reads three (type, name, language); goblin follows each directory's
+/// first entry for as long as it is another directory.
+const MAX_RESOURCE_DEPTH: usize = 8;
+
+/// Decide whether goblin's resource parse descends a bounded number of
+/// directories.
+///
+/// To find the version and manifest resources, `ResourceData::parse`
+/// starts at the first root entry with the `RT_VERSION` (then
+/// `RT_MANIFEST`) id and moves to the first entry of the directory it
+/// points at while that entry is a directory, collecting every entry of
+/// each directory on the way. Directories may overlap, so a chain of them,
+/// each claiming 65535 entries, makes the walk quadratic in the resource
+/// size: minutes for a few megabytes. This replays the descent, reading
+/// only each directory's header and first entry, and stops it past
+/// [`MAX_RESOURCE_DEPTH`].
+///
+/// Fails open: a tree goblin would reject before descending that far counts
+/// as within budget, since goblin then stops as quickly.
+fn resource_walk_budget(
+    data: &[u8],
+    sections: &[SectionTable],
+    optional_header: &OptionalHeader,
+) -> Result<(), Rejection> {
+    use goblin::pe::options::ParseOptions;
+
+    let Some(table) = optional_header.data_directories.get_resource_table() else {
+        return Ok(());
+    };
+    let opts = ParseOptions::default().with_parse_mode(goblin::options::ParseMode::Permissive);
+    let Some(tree) = goblin::pe::utils::find_offset(
+        sat_usize(table.virtual_address),
+        sections,
+        optional_header.windows_fields.file_alignment,
+        &opts,
+    )
+    .and_then(|start| data.get(start..start.checked_add(sat_usize(table.size))?)) else {
+        return Ok(());
+    };
+    // The entries of the directory at `offset` in the tree, as goblin reads
+    // them: all of them in bounds, or none.
+    let entries = |offset: usize| -> Option<&[u8]> {
+        let named = u16_le(tree, offset.checked_add(12)?)?;
+        let ids = u16_le(tree, offset.checked_add(14)?)?;
+        let start = offset.checked_add(16)?;
+        tree.get(start..start.checked_add(usize::from(named.saturating_add(ids)) * 8)?)
+    };
+    let Some(root) = entries(0) else {
+        return Ok(());
+    };
+    for id in [RT_VERSION, RT_MANIFEST] {
+        // `ResourceEntryIterator::find_by_id`: the first entry whose id, a
+        // name that is not a string, is `id` in its low 16 bits.
+        let Some(mut target) = root.as_chunks::<8>().0.iter().find_map(|entry| {
+            let name = u32_le(entry, 0)?;
+            (name & IMAGE_RESOURCE_NAME_IS_STRING == 0 && name & 0xffff == u32::from(id))
+                .then(|| u32_le(entry, 4))?
+        }) else {
+            continue;
+        };
+        // Each step reads the first entry of the directory `target` points
+        // at, and goes on while that entry is a directory itself.
+        let mut depth = 0;
+        while let Some(next) = entries(sat_usize(target & !IMAGE_RESOURCE_DATA_IS_DIRECTORY))
+            .and_then(|entries| u32_le(entries, 4))
+            .filter(|next| next & IMAGE_RESOURCE_DATA_IS_DIRECTORY != 0)
+        {
+            depth += 1;
+            if depth > MAX_RESOURCE_DEPTH {
+                return Err(Rejection::DeepResourceTree);
+            }
+            target = next;
+        }
+    }
+    Ok(())
+}
+
+/// The data-directory slots the PE specification defines.
+const MAX_DATA_DIRECTORIES: u32 = 16;
+
+/// Largest resource directory goblin is handed.
+const MAX_RESOURCE_DIRECTORY_SIZE: u32 = 10 * 1024 * 1024;
+
 /// Basic structural validation of PE headers, run *before* goblin
 /// sees the bytes. Defends against known panic / OOM triggers:
 ///
-/// - COFF `NumberOfSections > 192` (PE spec caps at 96; real-world
-///   Windows tolerates a bit more, but four-figure counts are a
-///   forged header crashing the section walker).
-/// - Optional-header `NumberOfRvaAndSizes > 16` (spec maximum).
-/// - Import / resource data-directory `size > 10 MiB` or `> file
-///   size` (forged sizes cause goblin to allocate gigabytes for the
-///   import table).
+/// - COFF `NumberOfSections` past [`MAX_SECTIONS`]: four-figure counts are
+///   a forged header crashing the section walker.
+/// - Optional-header `NumberOfRvaAndSizes` past [`MAX_DATA_DIRECTORIES`].
+/// - A resource data-directory `size` past [`MAX_RESOURCE_DIRECTORY_SIZE`]
+///   or the file size: a forged size makes goblin allocate gigabytes for
+///   the resource tree.
 fn validate_pe_header(data: &[u8]) -> Result<(), Rejection> {
-    if data.len() < 64 {
+    if data.len() < 64 || !data.starts_with(b"MZ") {
         return Ok(());
     }
-
-    if !data.starts_with(b"MZ") {
-        return Ok(());
-    }
-
-    let pe_ptr_offset = 0x3C;
-    let Some(pe_offset) = u32_le(data, pe_ptr_offset) else {
+    // `e_lfanew`, the PE signature's offset.
+    let Some(pe_offset) = u32_le(data, 0x3C).map(sat_usize) else {
         return Ok(());
     };
-    let pe_offset = pe_offset as usize;
-
-    if pe_offset + 24 > data.len() {
-        return Ok(());
-    }
-    if data.get(pe_offset..pe_offset + 4) != Some(b"PE\0\0".as_slice()) {
+    if pe_offset.saturating_add(24) > data.len()
+        || data.get(pe_offset..pe_offset + 4) != Some(b"PE\0\0".as_slice())
+    {
         return Ok(());
     }
 
@@ -607,35 +524,32 @@ fn validate_pe_header(data: &[u8]) -> Result<(), Rejection> {
     let Some(n_sections) = u16_le(data, coff_offset + 2) else {
         return Ok(());
     };
-    if n_sections > 192 {
+    if usize::from(n_sections) > MAX_SECTIONS {
         return Err(Rejection::TooManySections(n_sections));
     }
 
     let Some(magic) = u16_le(data, coff_offset + 20) else {
         return Ok(());
     };
-    let Some(n_dirs) =
-        layout::directory_count_offset(pe_offset, magic).and_then(|at| u32_le(data, at))
+    // `NumberOfRvaAndSizes` is the word just before the data-directory array.
+    let Some(n_dirs) = layout::data_directory_offset(pe_offset, magic, 0)
+        .and_then(|at| u32_le(data, at.checked_sub(4)?))
     else {
         return Ok(());
     };
-    if n_dirs > 16 {
+    if n_dirs > MAX_DATA_DIRECTORIES {
         return Err(Rejection::TooManyDataDirectories(n_dirs));
     }
 
-    // The import and resource directories are the two whose forged `size`
-    // field most reliably blows up goblin.
-    for (index, table) in [
-        (IMPORT_DIRECTORY, "import"),
-        (RESOURCE_DIRECTORY, "resource"),
-    ] {
-        if n_dirs as usize > index
-            && let Some(size) = layout::data_directory_offset(pe_offset, magic, index)
-                .and_then(|at| u32_le(data, at.checked_add(4)?))
-            && (size > 10 * 1024 * 1024 || size as usize > data.len())
-        {
-            return Err(Rejection::OversizedDirectory { table, size });
-        }
+    if sat_usize(n_dirs) > RESOURCE_DIRECTORY
+        && let Some(size) = layout::data_directory_offset(pe_offset, magic, RESOURCE_DIRECTORY)
+            .and_then(|at| u32_le(data, at.checked_add(4)?))
+        && (size > MAX_RESOURCE_DIRECTORY_SIZE || sat_usize(size) > data.len())
+    {
+        return Err(Rejection::OversizedDirectory {
+            table: "resource",
+            size,
+        });
     }
 
     Ok(())
@@ -759,171 +673,6 @@ pub(crate) fn parse_mach(data: &[u8]) -> GoblinOutcome<Mach<'_>> {
 /// reads only the fat header; every slice is a full parse of its own.
 pub(crate) fn parse_macho_slice(data: &[u8]) -> GoblinOutcome<MachO<'_>> {
     catch(|| MachO::parse(data, 0))
-}
-
-/// Imports goblin's bind interpreter may synthesize across a Mach-O's bind
-/// and lazy-bind streams. Each costs an `Import` (about 100 bytes) plus a
-/// symbol downstream; the largest frameworks bind tens of thousands of slots,
-/// so this is generous for real binaries and still bounds the allocation.
-pub(crate) const MAX_MACHO_BIND_IMPORTS: u64 = 256 * 1024;
-
-/// Pre-validate the dyld bind opcodes before `macho.imports()` runs them.
-///
-/// goblin's `BindInterpreter::run` (mach/imports.rs, 0.10.7) executes
-/// `BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB` as `for _ in 0..count {
-/// imports.push(..) }` with `count` read straight from a ULEB, so the seven
-/// bytes `C0 FF FF FF FF 0F 00` ask for four billion imports. The process runs out of
-/// memory long before anything panics, and an allocation failure aborts rather
-/// than unwinding, so [`catch`] cannot contain it.
-///
-/// This replays the same opcode streams goblin will (the last `LC_DYLD_INFO`
-/// or `LC_DYLD_INFO_ONLY` wins, bind stream then lazy-bind stream) and counts
-/// the imports they would produce without materialising any. A stream goblin
-/// would itself reject (a truncated ULEB or symbol name) is waved through:
-/// goblin stops there with its own `Err`.
-pub(crate) fn validate_bind_opcodes(macho: &MachO<'_>, bytes: &[u8]) -> Result<(), Rejection> {
-    use goblin::mach::load_command::CommandVariant;
-    let mut streams = None;
-    for lc in &macho.load_commands {
-        if let CommandVariant::DyldInfo(c) | CommandVariant::DyldInfoOnly(c) = &lc.command {
-            streams = Some([
-                ("bind", c.bind_off as usize, c.bind_size as usize),
-                ("lazy", c.lazy_bind_off as usize, c.lazy_bind_size as usize),
-            ]);
-        }
-    }
-    let tables = BindTables {
-        libs: macho.libs.len(),
-        segments: macho.segments.len(),
-    };
-    let mut imports = 0u64;
-    for (stream, off, size) in streams.into_iter().flatten() {
-        imports = walk_bind_stream(bytes, off, off.saturating_add(size), imports, tables).map_err(
-            |(table, index, len)| Rejection::BindIndexOutOfRange {
-                stream,
-                table,
-                index,
-                len,
-            },
-        )?;
-        if imports > MAX_MACHO_BIND_IMPORTS {
-            return Err(Rejection::OversizedBindStream { stream, imports });
-        }
-    }
-    Ok(())
-}
-
-/// A ULEB dylib ordinal as goblin's interpreter stores it: its low byte.
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "goblin truncates the ordinal to u8; the walk must index what goblin will"
-)]
-fn goblin_ordinal(value: u64) -> u8 {
-    value as u8
-}
-
-/// The table sizes a bind stream's indices must stay within.
-#[derive(Clone, Copy)]
-struct BindTables {
-    libs: usize,
-    segments: usize,
-}
-
-/// Replay one bind-opcode stream at `start..end` as goblin's interpreter
-/// does, adding the imports it would produce to `imports`. Each import
-/// goblin builds indexes `libs[ordinal]` and `segments[segment]` unchecked,
-/// so a bind through either past `tables` is returned as
-/// `(table, index, len)` instead.
-fn walk_bind_stream(
-    bytes: &[u8],
-    start: usize,
-    end: usize,
-    mut imports: u64,
-    tables: BindTables,
-) -> Result<u64, (&'static str, u64, usize)> {
-    use goblin::mach::bind_opcodes::{
-        BIND_IMMEDIATE_MASK, BIND_OPCODE_ADD_ADDR_ULEB, BIND_OPCODE_DO_BIND,
-        BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED, BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB,
-        BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB, BIND_OPCODE_DONE, BIND_OPCODE_MASK,
-        BIND_OPCODE_SET_ADDEND_SLEB, BIND_OPCODE_SET_DYLIB_ORDINAL_IMM,
-        BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB, BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB,
-        BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM,
-    };
-    // goblin's `BindInformation` state: both start at 0, and `DONE` resets
-    // them. The ULEB ordinal is truncated to `u8`, as goblin stores it.
-    let mut ordinal: u8 = 0;
-    let mut segment: u8 = 0;
-    let bind = |imports: u64, ordinal: u8, segment: u8| {
-        if usize::from(ordinal) >= tables.libs {
-            return Err(("dylib ordinal", u64::from(ordinal), tables.libs));
-        }
-        if usize::from(segment) >= tables.segments {
-            return Err(("segment", u64::from(segment), tables.segments));
-        }
-        Ok(imports)
-    };
-    let mut offset = start;
-    while offset < end && imports <= MAX_MACHO_BIND_IMPORTS {
-        let Some(&opcode) = bytes.get(offset) else {
-            break;
-        };
-        offset += 1;
-        let immediate = opcode & BIND_IMMEDIATE_MASK;
-        let operand = match opcode & BIND_OPCODE_MASK {
-            BIND_OPCODE_DONE => {
-                ordinal = 0;
-                segment = 0;
-                Some(())
-            }
-            BIND_OPCODE_SET_DYLIB_ORDINAL_IMM => {
-                ordinal = immediate;
-                Some(())
-            }
-            BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB => read_uleb128(bytes, &mut offset).map(|value| {
-                ordinal = goblin_ordinal(value);
-            }),
-            BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB => {
-                segment = immediate;
-                read_uleb128(bytes, &mut offset).map(|_| ())
-            }
-            BIND_OPCODE_ADD_ADDR_ULEB => read_uleb128(bytes, &mut offset).map(|_| ()),
-            // SLEB and ULEB share the continuation-bit framing.
-            BIND_OPCODE_SET_ADDEND_SLEB => read_uleb128(bytes, &mut offset).map(|_| ()),
-            BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM => bytes
-                .get(offset..)
-                .and_then(|rest| rest.iter().position(|&b| b == 0))
-                .map(|len| offset += len + 1),
-            BIND_OPCODE_DO_BIND | BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED => {
-                imports = bind(imports, ordinal, segment)? + 1;
-                Some(())
-            }
-            BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB => {
-                imports = bind(imports, ordinal, segment)? + 1;
-                read_uleb128(bytes, &mut offset).map(|_| ())
-            }
-            BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB => {
-                let Some(count) = read_uleb128(bytes, &mut offset) else {
-                    break;
-                };
-                // goblin reads the skip before pushing anything, and pushes
-                // nothing, so indexes nothing, for a count of 0.
-                if read_uleb128(bytes, &mut offset).is_none() {
-                    break;
-                }
-                if count > 0 {
-                    imports = bind(imports, ordinal, segment)?;
-                }
-                imports = imports.saturating_add(count);
-                Some(())
-            }
-            _ => Some(()),
-        };
-        if operand.is_none() {
-            // goblin's own read fails here and ends the walk with `Err`.
-            break;
-        }
-    }
-    Ok(imports)
 }
 
 #[cfg(test)]

@@ -11,18 +11,20 @@
 //! else one binform decodes, else the first) at the top level so simple
 //! consumers don't have to enumerate the array.
 
+mod bind;
 mod code_signature;
 mod fat;
 mod hashes;
 mod symbols;
 
+use goblin::mach::load_command::CommandVariant as Cmd;
 use goblin::mach::{self, Mach, MachO};
 use serde_json::Value as JsonValue;
 
 use crate::bytes;
 use crate::formats::common::{
-    XorScan, extract_binary_strings, extract_binary_strings_from_object, plist_to_json, put_str,
-    put_u64, recover_natively, section_entropy,
+    XorScan, extract_binary_strings, extract_binary_strings_from_object, hex_encode, plist_to_json,
+    put_str, put_u64, recover_natively, section_entropy,
 };
 use crate::formats::goblin_safe;
 use crate::metric;
@@ -34,65 +36,74 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
         values,
         strings,
         metrics,
-        sections: sections_out,
-        symbols: symbols_out,
-        errors: errors_out,
+        sections,
+        symbols,
+        errors,
         image_end,
         ..
     } = ctx;
+    let mut out = Views {
+        values,
+        metrics,
+        sections,
+        symbols,
+        errors,
+    };
     // goblin has panicked on fat-header arithmetic overflow in malformed
     // Mach-O; `parse_mach` turns that into an outcome. A failed parse is
     // recorded in `errors`, and the byte-level facts the generic pass already
-    // put in `metrics` and `strings` stand.
+    // put in `metrics` and `strings` stand, with binform's views of a thin
+    // image binform reads.
     let parsed = match goblin_safe::parse_mach(bytes) {
         goblin_safe::GoblinOutcome::Ok(m) => m,
         goblin_safe::GoblinOutcome::Failed(e) => {
             // Parse failed: let stng parse the bytes itself so strings are
             // still recovered from the malformed input.
             extract_binary_strings(bytes, strings, XorScan::Yes);
-            errors_out.record_malformed(crate::Stage::MachoParse, e.to_string());
-            metrics.insert(metric!("macho.parse_failed"), 1.0);
+            out.errors
+                .record_malformed(crate::Stage::MachoParse, e.to_string());
+            out.metrics.insert(metric!("macho.parse_failed"), 1.0);
+            layout_only(bytes, &mut out);
             return;
         }
         goblin_safe::GoblinOutcome::Panicked(msg) => {
             extract_binary_strings(bytes, strings, XorScan::Yes);
-            errors_out.record_panic(crate::Stage::MachoParse, msg);
-            metrics.insert(metric!("macho.parse_panicked"), 1.0);
+            out.errors.record_panic(crate::Stage::MachoParse, msg);
+            out.metrics.insert(metric!("macho.parse_panicked"), 1.0);
+            layout_only(bytes, &mut out);
             return;
         }
-    };
-    // A fat header claiming more entries than the file can hold is not a
-    // universal binary anything downstream can use, and walks that trust the
-    // count (stng's walk of a parsed object) visit every claimed entry,
-    // up to `u32::MAX` of them.
-    let fat_table_fits = match &parsed {
-        Mach::Fat(fat) => fat::table_fits(fat.narches, bytes.len()),
-        Mach::Binary(_) => true,
-    };
-    // goblin reads a fat arch table lazily; walk it once, guarded. Entries
-    // are contiguous, so the first unreadable one ends it.
-    let arches = match &parsed {
-        Mach::Fat(fat) => goblin_safe::drain_or_record(
-            fat.iter_arches()
-                .take(fat::MAX_ARCHES)
-                .map_while(Result::ok),
-            errors_out,
-            crate::Stage::MachoParse,
-        ),
-        Mach::Binary(_) => Vec::new(),
     };
     // binform reads each image once, a thin file or each slice of a
     // universal one: the section, import and export views, stng's string
     // passes and function recovery all take that one layout.
-    let layouts = match &parsed {
+    let (fat_table_fits, arches, layouts) = match &parsed {
         Mach::Binary(_) => {
             let read = super::common::read_layout(bytes);
             if let Err(error) = &read {
-                errors_out.record_malformed(crate::Stage::MachoParse, error.clone());
+                out.errors
+                    .record_malformed(crate::Stage::MachoParse, error.clone());
             }
-            vec![(0, read)]
+            (true, Vec::new(), vec![(0, read)])
         }
-        Mach::Fat(_) => fat::layouts(bytes, &arches),
+        Mach::Fat(fat) => {
+            // goblin reads a fat arch table lazily; walk it once, guarded.
+            // Entries are contiguous, so the first unreadable one ends it.
+            let arches = goblin_safe::drain_or_record(
+                fat.iter_arches()
+                    .take(fat::MAX_ARCHES)
+                    .map_while(Result::ok),
+                out.errors,
+                crate::Stage::MachoParse,
+            );
+            let layouts = fat::layouts(bytes, &arches);
+            // A fat header claiming more entries than the file can hold is
+            // not a universal binary anything downstream can use, and walks
+            // that trust the count (stng's walk of a parsed object) visit
+            // every claimed entry, up to `u32::MAX` of them.
+            let fits = fat::table_fits(fat.narches, bytes.len());
+            (fits, arches, layouts)
+        }
     };
     // Reuse this parse for string extraction instead of having stng parse
     // the binary a second time.
@@ -103,80 +114,102 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
     } else {
         extract_binary_strings(bytes, strings, XorScan::Yes);
     }
+    // Constructed as `Object::Mach` above.
     let goblin::Object::Mach(parsed) = object else {
-        unreachable!("constructed as Object::Mach")
+        return;
     };
     // Where the image the top-level views describe starts: the whole file,
     // or a universal binary's primary slice. Functions are recovered from
     // that image too, so their addresses fall in the sections listed.
     let primary = match parsed {
         Mach::Binary(macho) => {
+            let sections = sections_of(&macho);
             single_arch(
                 &macho,
+                &sections,
                 fat::layout_at(&layouts, 0),
                 bytes,
-                values,
-                metrics,
-                sections_out,
-                symbols_out,
-                errors_out,
+                &mut out,
             );
-            *image_end = Some(image_end_of(&macho));
-            go_build_info(&macho, bytes, values, symbols_out);
+            *image_end = Some(image_end_of(&macho, &sections));
+            go_build_info(&macho, &sections, bytes, out.values, out.symbols);
             Some(0)
         }
         Mach::Fat(_) => {
-            let analysed = fat::analyse(
-                bytes,
-                &arches,
-                &layouts,
-                values,
-                metrics,
-                sections_out,
-                symbols_out,
-                errors_out,
-            );
+            let analysed = fat::analyse(bytes, &arches, &layouts, &mut out);
             *image_end = analysed.image_end;
             analysed.primary
         }
     };
     if fat_table_fits {
         let layout = primary.and_then(|at| fat::layout_at(&layouts, at));
-        recover_natively(layout, symbols_out, metrics);
+        recover_natively(layout, out.symbols, out.metrics);
     }
-    super::upx::detect(bytes, values);
+    super::upx::detect(bytes, out.values);
 }
 
-/// A segment's sections, which goblin reads lazily from the load command on
-/// each call; guarded like every other post-parse walk. `None` when goblin
-/// rejects or panics on the table.
-fn segment_sections<'a>(
-    segment: &mach::segment::Segment<'a>,
-) -> Option<Vec<(mach::segment::Section, mach::segment::SectionData<'a>)>> {
-    goblin_safe::catch(|| segment.sections()).ok()
+/// Where one image's extraction writes: the top-level views, or a
+/// non-primary fat slice's own.
+pub(super) struct Views<'v> {
+    pub(super) values: &'v mut Values,
+    pub(super) metrics: &'v mut Metrics,
+    pub(super) sections: &'v mut Vec<Section>,
+    pub(super) symbols: &'v mut crate::Symbols,
+    pub(super) errors: &'v mut Errors,
+}
+
+/// binform's views and functions, for a thin Mach-O goblin could not
+/// parse. A universal binary's slices are not placed in the file without
+/// goblin's reading of its fat header, so it gets none.
+fn layout_only(bytes: &[u8], out: &mut Views<'_>) {
+    if matches!(bytes.get(..4), Some([0xca, 0xfe, 0xba, 0xbe | 0xbf])) {
+        return;
+    }
+    let Ok(layout) = super::common::read_layout(bytes) else {
+        return;
+    };
+    extract_sections(Some(&layout), bytes, out.sections);
+    symbols::extract(None, Some(&layout), bytes, out.symbols);
+    recover_natively(Some(&layout), out.symbols, out.metrics);
+}
+
+/// A section of a Mach-O image, with its bytes in the image.
+pub(super) type MachSection<'a> = (mach::segment::Section, &'a [u8]);
+
+/// Every section of `macho`, read once from its load commands. goblin reads
+/// a segment's sections lazily on each call, so the walk is guarded like
+/// every other post-parse walk; a segment whose table goblin rejects or
+/// panics on contributes none.
+pub(super) fn sections_of<'a>(macho: &MachO<'a>) -> Vec<MachSection<'a>> {
+    macho
+        .segments
+        .iter()
+        .filter_map(|segment| goblin_safe::catch(|| segment.sections()).ok())
+        .flatten()
+        .collect()
 }
 
 /// Decode Go build info from the Mach-O image in `bytes` into `macho.go`,
-/// add the functions `__TEXT,__gopclntab` names to `symbols_out` (see
-/// [`super::go_pclntab`]), and report whether it holds a real Go pclntab.
+/// and add the functions a real `__TEXT,__gopclntab` names to `symbols_out`
+/// (see [`super::go_pclntab`]).
 ///
 /// The build-info blob is looked for where Go's `debug/buildinfo` looks: the
 /// `__go_buildinfo` section, else the first non-empty segment mapped
 /// read-write (initial and maximum protection both). Pre-1.18 pointers
 /// resolve through the segments' file extents.
-fn go_build_info(
+pub(super) fn go_build_info(
     macho: &MachO<'_>,
+    sections: &[MachSection<'_>],
     bytes: &[u8],
     values: &mut Values,
     symbols_out: &mut crate::Symbols,
-) -> bool {
+) {
     const VM_PROT_RW: u32 = 0x3;
     let (mut buildinfo, mut pclntab, mut const_data, mut rodata) = (None, None, None, None);
     let mut writable_segment = None;
     let mut code = Vec::new();
     let mut text = None;
     for segment in &macho.segments {
-        let segment_name = segment.name().unwrap_or("");
         if writable_segment.is_none()
             && segment.vmaddr != 0
             && segment.filesize != 0
@@ -187,25 +220,25 @@ fn go_build_info(
             let end = start.saturating_add(bytes::sat_usize(segment.filesize));
             writable_segment = bytes.get(start..end.min(bytes.len()));
         }
-        let Some(secs) = segment_sections(segment) else {
-            continue;
-        };
-        for (section, data) in secs {
-            if section.flags
-                & (mach::constants::S_ATTR_PURE_INSTRUCTIONS
-                    | mach::constants::S_ATTR_SOME_INSTRUCTIONS)
-                != 0
-            {
-                code.push((section.addr, section.size));
-            }
-            match (segment_name, section.name().unwrap_or("")) {
-                (_, "__go_buildinfo") if buildinfo.is_none() => buildinfo = Some(data),
-                ("__TEXT", "__gopclntab") => pclntab = Some(data),
-                ("__TEXT", "__text") => text = Some(section.addr),
-                ("__TEXT", "__const") => const_data = Some(data),
-                ("__TEXT", "__rodata") => rodata = Some(data),
-                _ => {}
-            }
+    }
+    for &(ref section, data) in sections {
+        if section.flags
+            & (mach::constants::S_ATTR_PURE_INSTRUCTIONS
+                | mach::constants::S_ATTR_SOME_INSTRUCTIONS)
+            != 0
+        {
+            code.push((section.addr, section.size));
+        }
+        match (
+            section.segname().unwrap_or(""),
+            section.name().unwrap_or(""),
+        ) {
+            (_, "__go_buildinfo") if buildinfo.is_none() => buildinfo = Some(data),
+            ("__TEXT", "__gopclntab") => pclntab = Some(data),
+            ("__TEXT", "__text") => text = Some(section.addr),
+            ("__TEXT", "__const") => const_data = Some(data),
+            ("__TEXT", "__rodata") => rodata = Some(data),
+            _ => {}
         }
     }
     let resolve = |va: u64| {
@@ -216,7 +249,7 @@ fn go_build_info(
                 .and_then(|offset| usize::try_from(offset).ok())
         })
     };
-    let sections = super::go_buildinfo::GoSections {
+    let go_sections = super::go_buildinfo::GoSections {
         buildinfo: buildinfo.or(writable_segment),
         buildid_note: None,
         pclntab,
@@ -227,11 +260,10 @@ fn go_build_info(
         values,
         value_key!("macho.go"),
         Some(&resolve),
-        &sections,
+        &go_sections,
     );
-    let Some(pclntab) = pclntab.filter(|table| super::go_buildinfo::has_pclntab_magic(table))
-    else {
-        return false;
+    let Some(pclntab) = pclntab.filter(|table| super::go_pclntab::has_magic(table)) else {
+        return;
     };
     if let Some(functions) = super::go_pclntab::Code::of(code)
         .zip(text)
@@ -241,7 +273,6 @@ fn go_build_info(
             symbols_out.push(function);
         }
     }
-    true
 }
 
 /// File offset one past the last byte the image itself accounts for:
@@ -255,9 +286,7 @@ fn go_build_info(
 /// Offsets are relative to the start of this Mach-O (a fat slice's
 /// start, not the fat file's). Declared extents are not clamped to the
 /// input: an end past EOF simply means there is no overlay.
-fn image_end_of(macho: &MachO<'_>) -> u64 {
-    use goblin::mach::load_command::CommandVariant as Cmd;
-
+pub(super) fn image_end_of(macho: &MachO<'_>, sections: &[MachSection<'_>]) -> u64 {
     fn extent(off: u32, count: u32, entry_size: u64) -> u64 {
         if count == 0 {
             return 0;
@@ -275,13 +304,11 @@ fn image_end_of(macho: &MachO<'_>) -> u64 {
         if segment.filesize > 0 {
             end = end.max(segment.fileoff.saturating_add(segment.filesize));
         }
-        // `MH_OBJECT` relocation entries (8 bytes each) live outside
-        // any segment.
-        if let Some(sections) = segment_sections(segment) {
-            for (section, _) in sections {
-                end = end.max(extent(section.reloff, section.nreloc, 8));
-            }
-        }
+    }
+    // `MH_OBJECT` relocation entries (8 bytes each) live outside any
+    // segment.
+    for (section, _) in sections {
+        end = end.max(extent(section.reloff, section.nreloc, 8));
     }
     for lc in &macho.load_commands {
         let blob_end = match &lc.command {
@@ -312,35 +339,27 @@ fn image_end_of(macho: &MachO<'_>) -> u64 {
     end
 }
 
-/// The full single-arch extraction of one Mach-O image into the top-level
-/// outputs: sections, header and load commands, symbols, similarity hashes
-/// and toolchain attribution.
-#[allow(clippy::too_many_arguments)]
-fn single_arch(
+/// The full single-arch extraction of one Mach-O image into `out`:
+/// sections, header and load commands, symbols, similarity hashes and
+/// toolchain attribution.
+pub(super) fn single_arch(
     macho: &MachO<'_>,
+    sections: &[MachSection<'_>],
     layout: Option<&binform::Binary<'_>>,
     bytes: &[u8],
-    values: &mut Values,
-    metrics: &mut Metrics,
-    sections_out: &mut Vec<Section>,
-    symbols_out: &mut crate::Symbols,
-    errors_out: &mut Errors,
+    out: &mut Views<'_>,
 ) {
-    record_forged_binds(macho, bytes, errors_out);
-    extract_sections(layout, bytes, sections_out);
-    extract_header_and_loads(macho, bytes, values, metrics);
-    symbols::extract(macho, layout, bytes, symbols_out);
-    hashes::emit(macho, bytes, values, symbols_out);
-    super::build_toolchain::from_macho(values, sections_out);
-}
-
-/// Record bind opcodes whose repeat counts or indexes goblin's interpreter
-/// could not survive: binform reads each symbol once, but a forged stream is
-/// a fact about the sample.
-pub(super) fn record_forged_binds(macho: &MachO<'_>, bytes: &[u8], errors: &mut Errors) {
-    if let Err(reason) = goblin_safe::validate_bind_opcodes(macho, bytes) {
-        errors.record_malformed(crate::Stage::MachoParse, reason.to_string());
+    // A bind stream dyld would refuse or no linker emits (see [`bind`]): a
+    // forged stream is a fact about the sample.
+    if let Some(anomaly) = bind::check(macho, bytes) {
+        out.errors
+            .record_malformed(crate::Stage::MachoParse, anomaly.to_string());
     }
+    extract_sections(layout, bytes, out.sections);
+    extract_header_and_loads(macho, sections, bytes, out.values, out.metrics);
+    symbols::extract(Some(macho), layout, bytes, out.symbols);
+    hashes::emit(macho, bytes, out.values, out.symbols);
+    super::build_toolchain::from_macho(out.values, out.sections);
 }
 
 /// The section table, from binform: Mach-O nests sections inside segments;
@@ -397,14 +416,20 @@ fn extract_sections(
                 | mach::constants::S_ATTR_SOME_INSTRUCTIONS)
             != 0
             || flags_word & mach::constants::SECTION_TYPE == mach::constants::S_SYMBOL_STUBS;
-        let section_flags = macho_segment_flags(initprot)
-            .into_iter()
-            .chain(std::iter::once(if contains_instructions {
-                SectionFlag::Code
-            } else {
-                SectionFlag::Data
-            }))
-            .collect();
+        // VM_PROT_READ = 1, VM_PROT_WRITE = 2, VM_PROT_EXECUTE = 4.
+        let section_flags = [
+            (1, SectionFlag::Readable),
+            (2, SectionFlag::Writable),
+            (4, SectionFlag::Executable),
+        ]
+        .into_iter()
+        .filter_map(|(bit, flag)| (initprot & bit != 0).then_some(flag))
+        .chain(std::iter::once(if contains_instructions {
+            SectionFlag::Code
+        } else {
+            SectionFlag::Data
+        }))
+        .collect();
         sections_out.push(Section {
             name: display,
             vaddr: section.addr,
@@ -418,20 +443,9 @@ fn extract_sections(
     }
 }
 
-fn macho_segment_flags(initprot: u32) -> Vec<SectionFlag> {
-    // VM_PROT_READ = 1, VM_PROT_WRITE = 2, VM_PROT_EXECUTE = 4.
-    [
-        (1, SectionFlag::Readable),
-        (2, SectionFlag::Writable),
-        (4, SectionFlag::Executable),
-    ]
-    .into_iter()
-    .filter_map(|(bit, flag)| (initprot & bit != 0).then_some(flag))
-    .collect()
-}
-
 fn extract_header_and_loads(
     macho: &MachO<'_>,
+    sections: &[MachSection<'_>],
     bytes: &[u8],
     values: &mut Values,
     metrics: &mut Metrics,
@@ -548,7 +562,7 @@ fn extract_header_and_loads(
     // `macho.code_signature.*` field IS the "is this binary signed"
     // signal; we don't emit a separate boolean for it.
     let code_sig = macho.load_commands.iter().find_map(|lc| match lc.command {
-        mach::load_command::CommandVariant::CodeSignature(cs) => Some(cs),
+        Cmd::CodeSignature(cs) => Some(cs),
         _ => None,
     });
     if let Some(cs) = code_sig {
@@ -575,7 +589,7 @@ fn extract_header_and_loads(
     // text form is the lowercase 8-4-4-4-12 hyphenated layout that
     // `dwarfdump --uuid` emits.
     if let Some((uuid, lc_offset)) = macho.load_commands.iter().find_map(|lc| match lc.command {
-        mach::load_command::CommandVariant::Uuid(c) => Some((c.uuid, lc.offset)),
+        Cmd::Uuid(c) => Some((c.uuid, lc.offset)),
         _ => None,
     }) {
         put_str(values, value_key!("macho.uuid"), format_macho_uuid(&uuid));
@@ -595,16 +609,16 @@ fn extract_header_and_loads(
     // valuable: the plist carries `CFBundleIdentifier`, executable
     // name, and any `LSEnvironment` / `LSUIElement` flags that affect
     // load behaviour.
-    info_plist_section(macho, bytes, values);
+    info_plist_section(sections, bytes, values);
     build_version(macho, bytes, values);
     source_version(macho, values);
     install_name(macho, values);
     load_dylinker(macho, bytes, values);
     load_dylibs(macho, values);
     linker_options(macho, bytes, values);
-    objc_image_info(macho, bytes, values);
-    swift_sections(macho, values);
-    segment_analysis(macho, values, metrics);
+    objc_image_info(macho, sections, bytes, values);
+    swift_sections(sections, values);
+    segment_analysis(macho, sections, values, metrics);
     chained_fixups_marker(macho, metrics);
     function_starts(macho, bytes, values, metrics);
     data_in_code_kinds(macho, bytes, values);
@@ -633,7 +647,12 @@ fn extract_header_and_loads(
 ///   outside every load segment (extremely rare; tampered binary).
 /// - `macho.segments[]` (values)  — typed program-header listing,
 ///   mirroring `elf.segments[]`.
-fn segment_analysis(macho: &MachO<'_>, values: &mut Values, metrics: &mut Metrics) {
+fn segment_analysis(
+    macho: &MachO<'_>,
+    sections: &[MachSection<'_>],
+    values: &mut Values,
+    metrics: &mut Metrics,
+) {
     // VM_PROT_* flags (bits in `initprot`/`maxprot`).
     const VM_PROT_READ: u32 = 0x1;
     const VM_PROT_WRITE: u32 = 0x2;
@@ -651,7 +670,6 @@ fn segment_analysis(macho: &MachO<'_>, values: &mut Values, metrics: &mut Metric
     let mut pagezero_size: u64 = 0;
     let mut entry_in_writable = false;
     let mut entry_in_segment = false;
-    let mut entry_section: Option<String> = None;
     let mut has_data_const = false;
     let mut segments_out: Vec<JsonValue> = Vec::new();
     for segment in &macho.segments {
@@ -681,22 +699,6 @@ fn segment_analysis(macho: &MachO<'_>, values: &mut Values, metrics: &mut Metric
                 entry_in_segment = true;
                 if writable {
                     entry_in_writable = true;
-                }
-                // Resolve the entry to the section holding it, so a
-                // redirected entry in a grafted section (`__evil`,
-                // `.attack`) is nameable — the Mach-O analogue of ELF's
-                // entry_section / entry_in_nonstandard_section.
-                if entry_section.is_none()
-                    && let Some(secs) = segment_sections(segment)
-                {
-                    for (section, _data) in secs {
-                        let s_addr = section.addr;
-                        let s_end = s_addr.saturating_add(section.size);
-                        if section.size > 0 && entry >= s_addr && entry < s_end {
-                            entry_section = Some(section.name().unwrap_or("").to_string());
-                            break;
-                        }
-                    }
                 }
             }
         }
@@ -731,6 +733,17 @@ fn segment_analysis(macho: &MachO<'_>, values: &mut Values, metrics: &mut Metric
         );
         segments_out.push(JsonValue::Object(entry_obj));
     }
+    // Resolve the entry to the section holding it, so a redirected entry in
+    // a grafted section (`__evil`, `.attack`) is nameable — the Mach-O
+    // analogue of ELF's entry_section / entry_in_nonstandard_section.
+    let entry_section = (entry_in_segment)
+        .then(|| {
+            sections.iter().find(|(section, _)| {
+                section.size > 0 && entry.wrapping_sub(section.addr) < section.size
+            })
+        })
+        .flatten()
+        .map(|(section, _)| section.name().unwrap_or("").to_string());
     metrics.insert(metric!("macho.wx_segment_count"), wx_count as f64);
     metrics.insert(
         metric!("macho.executable_segment_count"),
@@ -790,30 +803,29 @@ fn chained_fixups_marker(macho: &MachO<'_>, metrics: &mut Metrics) {
             has_chained = true;
         }
         match lc.command {
-            mach::load_command::CommandVariant::DyldInfo(_)
-            | mach::load_command::CommandVariant::DyldInfoOnly(_) => {
+            Cmd::DyldInfo(_) | Cmd::DyldInfoOnly(_) => {
                 has_legacy_dyld_info = true;
             }
-            mach::load_command::CommandVariant::EncryptionInfo32(e) if e.cryptid != 0 => {
+            Cmd::EncryptionInfo32(e) if e.cryptid != 0 => {
                 has_encrypted = true;
             }
-            mach::load_command::CommandVariant::EncryptionInfo64(e) if e.cryptid != 0 => {
+            Cmd::EncryptionInfo64(e) if e.cryptid != 0 => {
                 has_encrypted = true;
             }
-            mach::load_command::CommandVariant::VersionMinMacosx(_)
-            | mach::load_command::CommandVariant::VersionMinIphoneos(_)
-            | mach::load_command::CommandVariant::VersionMinTvos(_)
-            | mach::load_command::CommandVariant::VersionMinWatchos(_) => {
+            Cmd::VersionMinMacosx(_)
+            | Cmd::VersionMinIphoneos(_)
+            | Cmd::VersionMinTvos(_)
+            | Cmd::VersionMinWatchos(_) => {
                 uses_legacy_version_min = true;
             }
-            mach::load_command::CommandVariant::DataInCode(c) => {
+            Cmd::DataInCode(c) => {
                 // Each entry is 8 bytes (offset:u32, length:u16, kind:u16).
                 data_in_code_count = c.datasize / 8;
             }
-            mach::load_command::CommandVariant::Main(_) => {
+            Cmd::Main(_) => {
                 has_main_command = true;
             }
-            mach::load_command::CommandVariant::Unixthread(_) => {
+            Cmd::Unixthread(_) => {
                 has_unixthread_command = true;
             }
             _ => {}
@@ -854,7 +866,7 @@ fn chained_fixups_marker(macho: &MachO<'_>, metrics: &mut Metrics) {
 /// a metric.
 fn function_starts(macho: &MachO<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Metrics) {
     let Some(fs) = macho.load_commands.iter().find_map(|lc| match lc.command {
-        mach::load_command::CommandVariant::FunctionStarts(c) => Some(c),
+        Cmd::FunctionStarts(c) => Some(c),
         _ => None,
     }) else {
         return;
@@ -862,10 +874,8 @@ fn function_starts(macho: &MachO<'_>, bytes: &[u8], values: &mut Values, metrics
     let start = fs.dataoff as usize;
     let size = fs.datasize as usize;
     let end = start.saturating_add(size).min(bytes.len());
-    if start >= bytes.len() || start >= end {
-        return;
-    }
-    let Some(data) = bytes.get(start..end) else {
+    // An empty or out-of-file table records no count at all.
+    let Some(data) = bytes.get(start..end).filter(|data| !data.is_empty()) else {
         return;
     };
     // One ULEB128 delta per function. Zero is the stream terminator and
@@ -892,7 +902,7 @@ fn function_starts(macho: &MachO<'_>, bytes: &[u8], values: &mut Values, metrics
 /// compiler's switch-statement codegen.
 fn data_in_code_kinds(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) {
     let Some(dic) = macho.load_commands.iter().find_map(|lc| match lc.command {
-        mach::load_command::CommandVariant::DataInCode(c) => Some(c),
+        Cmd::DataInCode(c) => Some(c),
         _ => None,
     }) else {
         return;
@@ -949,7 +959,7 @@ fn linker_options(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) {
     let read_u32 = u32_reader(macho);
     let mut all: Vec<JsonValue> = Vec::new();
     for lc in &macho.load_commands {
-        let mach::load_command::CommandVariant::LinkerOption(c) = lc.command else {
+        let Cmd::LinkerOption(c) = lc.command else {
             continue;
         };
         let cmd_offset = lc.offset;
@@ -957,7 +967,7 @@ fn linker_options(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) {
         let header_size = 12_usize; // cmd + cmdsize + count
         let body_start = cmd_offset.saturating_add(header_size);
         let body_end = cmd_offset.saturating_add(cmd_size).min(bytes.len());
-        if body_start + 4 > body_end {
+        if body_start.saturating_add(4) > body_end {
             continue;
         }
         let Some(count) = read_u32(bytes, cmd_offset.saturating_add(8)) else {
@@ -996,63 +1006,63 @@ const MAX_LINKER_OPTIONS: usize = 4096;
 /// section: `(version: u32, flags: u32)`. The Swift ABI version
 /// lives in `flags[15:8]`; presence alone signals the binary
 /// links the Objective-C runtime.
-fn objc_image_info(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) {
-    for segment in &macho.segments {
-        let Some(sections) = segment_sections(segment) else {
+fn objc_image_info(
+    macho: &MachO<'_>,
+    sections: &[MachSection<'_>],
+    bytes: &[u8],
+    values: &mut Values,
+) {
+    for (section, _data) in sections {
+        let name = section.name().unwrap_or("");
+        if name != "__image_info" && name != "__objc_imageinfo" {
             continue;
-        };
-        for (section, _data) in sections {
-            let name = section.name().unwrap_or("");
-            if name != "__image_info" && name != "__objc_imageinfo" {
-                continue;
-            }
-            let off = section.offset as usize;
-            let len = usize::try_from(section.size).unwrap_or(usize::MAX);
-            let end = off.saturating_add(len).min(bytes.len());
-            if end < off + 8 {
-                return;
-            }
-            let read_u32 = u32_reader(macho);
-            // `flags` follows the unused `version` word.
-            let Some(flags) = read_u32(bytes, off + 4) else {
-                return;
-            };
-            let swift_version = (flags >> 8) & 0xff;
-            let mut obj = serde_json::Map::new();
-            obj.insert(
-                "flags_raw".into(),
-                JsonValue::Number(u64::from(flags).into()),
-            );
-            if swift_version != 0 {
-                obj.insert(
-                    "swift_version".into(),
-                    JsonValue::Number(u64::from(swift_version).into()),
-                );
-                if let Some(label) = swift_version_label(swift_version as u8) {
-                    obj.insert(
-                        "swift_version_label".into(),
-                        JsonValue::String(label.to_string()),
-                    );
-                }
-            }
-            // Bit 3: OBJC_IMAGE_OPTIMIZED_BY_DYLD.
-            // Bit 5: OBJC_IMAGE_IS_SIMULATED.
-            // Bit 6: OBJC_IMAGE_HAS_CATEGORY_CLASS_PROPERTIES.
-            if flags & (1 << 3) != 0 {
-                obj.insert("optimized_by_dyld".into(), JsonValue::Bool(true));
-            }
-            if flags & (1 << 5) != 0 {
-                obj.insert("simulator".into(), JsonValue::Bool(true));
-            }
-            if flags & (1 << 6) != 0 {
-                obj.insert(
-                    "has_category_class_properties".into(),
-                    JsonValue::Bool(true),
-                );
-            }
-            values.insert_key(value_key!("macho.objc"), JsonValue::Object(obj));
+        }
+        let off = section.offset as usize;
+        let len = usize::try_from(section.size).unwrap_or(usize::MAX);
+        let end = off.saturating_add(len).min(bytes.len());
+        if end < off.saturating_add(8) {
             return;
         }
+        let read_u32 = u32_reader(macho);
+        // `flags` follows the unused `version` word.
+        let Some(flags) = read_u32(bytes, off.saturating_add(4)) else {
+            return;
+        };
+        let swift_version = (flags >> 8) & 0xff;
+        let mut obj = serde_json::Map::new();
+        obj.insert(
+            "flags_raw".into(),
+            JsonValue::Number(u64::from(flags).into()),
+        );
+        if swift_version != 0 {
+            obj.insert(
+                "swift_version".into(),
+                JsonValue::Number(u64::from(swift_version).into()),
+            );
+            if let Some(label) = swift_version_label(swift_version as u8) {
+                obj.insert(
+                    "swift_version_label".into(),
+                    JsonValue::String(label.to_string()),
+                );
+            }
+        }
+        // Bit 3: OBJC_IMAGE_OPTIMIZED_BY_DYLD.
+        // Bit 5: OBJC_IMAGE_IS_SIMULATED.
+        // Bit 6: OBJC_IMAGE_HAS_CATEGORY_CLASS_PROPERTIES.
+        if flags & (1 << 3) != 0 {
+            obj.insert("optimized_by_dyld".into(), JsonValue::Bool(true));
+        }
+        if flags & (1 << 5) != 0 {
+            obj.insert("simulator".into(), JsonValue::Bool(true));
+        }
+        if flags & (1 << 6) != 0 {
+            obj.insert(
+                "has_category_class_properties".into(),
+                JsonValue::Bool(true),
+            );
+        }
+        values.insert_key(value_key!("macho.objc"), JsonValue::Object(obj));
+        return;
     }
 }
 
@@ -1077,26 +1087,17 @@ fn swift_version_label(byte: u8) -> Option<&'static str> {
 /// present pins the Swift compiler version (acfuncs ≥ 5.5, mpenum
 /// newer, …). Emitted as `macho.swift_sections[]` (sorted, deduped
 /// section names with their `__` prefix).
-fn swift_sections(macho: &MachO<'_>, values: &mut Values) {
-    let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for segment in &macho.segments {
-        if segment.name().unwrap_or("") != "__TEXT" {
-            continue;
-        }
-        let Some(sections) = segment_sections(segment) else {
-            continue;
-        };
-        for (section, _data) in sections {
-            let name = section.name().unwrap_or("");
-            if name.starts_with("__swift5_") {
-                out.insert(name.to_string());
-            }
-        }
-    }
+fn swift_sections(sections: &[MachSection<'_>], values: &mut Values) {
+    let out: std::collections::BTreeSet<&str> = sections
+        .iter()
+        .filter(|(section, _)| section.segname().is_ok_and(|segment| segment == "__TEXT"))
+        .filter_map(|(section, _)| section.name().ok())
+        .filter(|name| name.starts_with("__swift5_"))
+        .collect();
     if !out.is_empty() {
         values.insert_key(
             value_key!("macho.swift_sections"),
-            JsonValue::Array(out.into_iter().map(JsonValue::String).collect()),
+            JsonValue::Array(out.into_iter().map(JsonValue::from).collect()),
         );
     }
 }
@@ -1113,11 +1114,11 @@ fn load_dylibs(macho: &MachO<'_>, values: &mut Values) {
     let mut entries: Vec<JsonValue> = Vec::new();
     for lc in &macho.load_commands {
         let (kind, dylib) = match lc.command {
-            mach::load_command::CommandVariant::LoadDylib(c) => ("load", c.dylib),
-            mach::load_command::CommandVariant::LoadWeakDylib(c) => ("load_weak", c.dylib),
-            mach::load_command::CommandVariant::ReexportDylib(c) => ("reexport", c.dylib),
-            mach::load_command::CommandVariant::LazyLoadDylib(c) => ("lazy_load", c.dylib),
-            mach::load_command::CommandVariant::LoadUpwardDylib(c) => ("upward", c.dylib),
+            Cmd::LoadDylib(c) => ("load", c.dylib),
+            Cmd::LoadWeakDylib(c) => ("load_weak", c.dylib),
+            Cmd::ReexportDylib(c) => ("reexport", c.dylib),
+            Cmd::LazyLoadDylib(c) => ("lazy_load", c.dylib),
+            Cmd::LoadUpwardDylib(c) => ("upward", c.dylib),
             _ => continue,
         };
         // The dylib name is an `LcStr` (offset into the command's
@@ -1181,7 +1182,7 @@ fn load_dylibs(macho: &MachO<'_>, values: &mut Values) {
 /// `ntools` × 8-byte `BuildToolVersion` array that follows.
 fn build_version(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) {
     let Some((lc_offset, bv)) = macho.load_commands.iter().find_map(|lc| match lc.command {
-        mach::load_command::CommandVariant::BuildVersion(c) => Some((lc.offset, c)),
+        Cmd::BuildVersion(c) => Some((lc.offset, c)),
         _ => None,
     }) else {
         return;
@@ -1277,7 +1278,7 @@ fn build_tool_name(tool: u32) -> &'static str {
 /// explicitly threads a version through the linker.
 fn source_version(macho: &MachO<'_>, values: &mut Values) {
     let Some(sv) = macho.load_commands.iter().find_map(|lc| match lc.command {
-        mach::load_command::CommandVariant::SourceVersion(c) => Some(c.version),
+        Cmd::SourceVersion(c) => Some(c.version),
         _ => None,
     }) else {
         return;
@@ -1304,7 +1305,7 @@ fn install_name(macho: &MachO<'_>, values: &mut Values) {
     if !macho
         .load_commands
         .iter()
-        .any(|lc| matches!(lc.command, mach::load_command::CommandVariant::IdDylib(_)))
+        .any(|lc| matches!(lc.command, Cmd::IdDylib(_)))
     {
         return;
     }
@@ -1313,15 +1314,16 @@ fn install_name(macho: &MachO<'_>, values: &mut Values) {
     // ID_DYLIB slot at index 0 (or "self" for non-dylibs). For the
     // install-name field we want the resolved string — pull it from
     // `libs[0]` when the binary is a dylib and the slot isn't `self`.
-    if let Some(name) = macho.libs.first().copied() {
-        if !name.is_empty() && name != "self" {
-            put_str(values, value_key!("macho.install_name"), name);
-            put_str(
-                values,
-                value_key!("macho.install_name_kind"),
-                install_name_kind(name),
-            );
-        }
+    if let Some(name) = macho.libs.first().copied()
+        && !name.is_empty()
+        && name != "self"
+    {
+        put_str(values, value_key!("macho.install_name"), name);
+        put_str(
+            values,
+            value_key!("macho.install_name_kind"),
+            install_name_kind(name),
+        );
     }
 }
 
@@ -1354,9 +1356,7 @@ fn install_name_kind(path: &str) -> &'static str {
 fn load_dylinker(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) {
     let Some((lc_offset, name_offset)) =
         macho.load_commands.iter().find_map(|lc| match lc.command {
-            mach::load_command::CommandVariant::LoadDylinker(c) => {
-                Some((lc.offset, c.name as usize))
-            }
+            Cmd::LoadDylinker(c) => Some((lc.offset, c.name as usize)),
             _ => None,
         })
     else {
@@ -1368,10 +1368,10 @@ fn load_dylinker(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) {
     }
     let tail = bytes.get(start..).unwrap_or_default();
     let name = tail.split(|&b| b == 0).next().unwrap_or(tail);
-    if let Ok(s) = std::str::from_utf8(name) {
-        if !s.is_empty() {
-            put_str(values, value_key!("macho.dyld_path"), s);
-        }
+    if let Ok(s) = std::str::from_utf8(name)
+        && !s.is_empty()
+    {
+        put_str(values, value_key!("macho.dyld_path"), s);
     }
 }
 
@@ -1417,7 +1417,7 @@ fn binary_flags(macho: &MachO<'_>, metrics: &mut Metrics) {
     // A declared empty LC_SYMTAB supplies no full-table symbols. This
     // observes table state and does not establish a removal operation.
     let nsyms = macho.load_commands.iter().find_map(|lc| match lc.command {
-        mach::load_command::CommandVariant::Symtab(st) => Some(st.nsyms),
+        Cmd::Symtab(st) => Some(st.nsyms),
         _ => None,
     });
     let is_stripped = nsyms.is_some_and(|n| n == 0);
@@ -1432,7 +1432,7 @@ fn binary_flags(macho: &MachO<'_>, metrics: &mut Metrics) {
     );
 }
 
-fn info_plist_section(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) {
+fn info_plist_section(sections: &[MachSection<'_>], bytes: &[u8], values: &mut Values) {
     // Both sections live under `__TEXT` and store a serialized plist
     // dictionary (XML or binary). `__info_plist` carries the CFBundle
     // metadata; `__launchd_plist` carries the launchd job spec for
@@ -1443,7 +1443,7 @@ fn info_plist_section(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) {
         ("__info_plist", value_key!("macho.info_plist")),
         ("__launchd_plist", value_key!("macho.launchd_plist")),
     ] {
-        emit_embedded_plist(macho, bytes, values, section_name, key);
+        emit_embedded_plist(sections, bytes, values, section_name, key);
     }
 }
 
@@ -1454,160 +1454,99 @@ fn info_plist_section(macho: &MachO<'_>, bytes: &[u8], values: &mut Values) {
 const MAX_EMBEDDED_PLIST_BYTES: usize = 8 << 20;
 
 fn emit_embedded_plist(
-    macho: &MachO<'_>,
+    sections: &[MachSection<'_>],
     bytes: &[u8],
     values: &mut Values,
     section_name: &str,
     key: ValueKey,
 ) {
-    for segment in &macho.segments {
-        let Some(sections) = segment_sections(segment) else {
+    for (section, _data) in sections {
+        if section.name().unwrap_or("") != section_name {
             continue;
-        };
-        for (section, _data) in sections {
-            if section.name().unwrap_or("") != section_name {
-                continue;
-            }
-            let off = section.offset as usize;
-            let skip = |reason: &str| {
-                tracing::debug!(
-                    target: "filefacts::macho",
-                    stage = "embedded_plist",
-                    section = section_name,
-                    offset = off,
-                    len = section.size,
-                    reason,
-                    "embedded plist not parsed"
-                );
-            };
-            // `size` is a u64 from the file: don't let a 32-bit host truncate
-            // it into a plausible length.
-            let plist_bytes = usize::try_from(section.size)
-                .ok()
-                .filter(|&len| len != 0)
-                .and_then(|len| bytes.get(off..off.checked_add(len)?));
-            match plist_bytes {
-                None => skip("empty or outside the file"),
-                Some(b) if b.len() > MAX_EMBEDDED_PLIST_BYTES => skip("over the size cap"),
-                Some(b) => match super::plist_guard::parse(b) {
-                    Ok(parsed) => values.insert_key(key, plist_to_json(parsed, 0)),
-                    Err(_) => skip("does not parse as a plist"),
-                },
-            }
-            return;
         }
+        let off = section.offset as usize;
+        let skip = |reason: &str| {
+            tracing::debug!(
+                target: "filefacts::macho",
+                stage = "embedded_plist",
+                section = section_name,
+                offset = off,
+                len = section.size,
+                reason,
+                "embedded plist not parsed"
+            );
+        };
+        // `size` is a u64 from the file: don't let a 32-bit host truncate
+        // it into a plausible length.
+        let plist_bytes = usize::try_from(section.size)
+            .ok()
+            .filter(|&len| len != 0)
+            .and_then(|len| bytes.get(off..off.checked_add(len)?));
+        match plist_bytes {
+            None => skip("empty or outside the file"),
+            Some(b) if b.len() > MAX_EMBEDDED_PLIST_BYTES => skip("over the size cap"),
+            Some(b) => match super::plist_guard::parse(b) {
+                Ok(parsed) => values.insert_key(key, plist_to_json(parsed, 0)),
+                Err(_) => skip("does not parse as a plist"),
+            },
+        }
+        return;
     }
 }
 
 fn format_macho_uuid(b: &[u8; 16]) -> String {
-    // RFC-4122-style hyphenation, kept lowercase to match every Apple
-    // tool's output (codesign, dwarfdump, otool -l).
+    // RFC-4122-style hyphenation of the bytes in order, kept lowercase to
+    // match every Apple tool's output (codesign, dwarfdump, otool -l).
     format!(
-        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        b[0],
-        b[1],
-        b[2],
-        b[3],
-        b[4],
-        b[5],
-        b[6],
-        b[7],
-        b[8],
-        b[9],
-        b[10],
-        b[11],
-        b[12],
-        b[13],
-        b[14],
-        b[15]
+        "{}-{}-{}-{}-{}",
+        hex_encode(&b[..4]),
+        hex_encode(&b[4..6]),
+        hex_encode(&b[6..8]),
+        hex_encode(&b[8..10]),
+        hex_encode(&b[10..])
     )
 }
 
-/// Decompose Mach-O header flags into a Pike-style array of names.
-/// Values from `<mach-o/loader.h>` `MH_*`; word boundaries are
-/// preserved so the names read naturally instead of running the
-/// loader.h symbol's letters together.
+/// `<mach-o/loader.h>` `MH_*` header flags, each with the name it is
+/// reported by. Word boundaries are kept so the names read naturally
+/// instead of running the loader.h symbol's letters together.
+const MH_FLAGS: [(u32, &str); 26] = [
+    (0x0000_0001, "no_undefs"),
+    (0x0000_0002, "incremental_link"),
+    (0x0000_0004, "dyld_link"),
+    (0x0000_0008, "bind_at_load"),
+    (0x0000_0010, "pre_bound"),
+    (0x0000_0020, "split_segments"),
+    (0x0000_0040, "lazy_init"),
+    (0x0000_0080, "two_level"),
+    (0x0000_0100, "force_flat"),
+    (0x0000_0200, "no_multi_defs"),
+    (0x0000_0400, "no_fix_pre_binding"),
+    (0x0000_0800, "pre_bindable"),
+    (0x0000_1000, "all_mods_bound"),
+    (0x0000_2000, "subsections_via_symbols"),
+    (0x0000_4000, "canonical"),
+    (0x0000_8000, "weak_defines"),
+    (0x0001_0000, "binds_to_weak"),
+    (0x0002_0000, "allow_stack_execution"),
+    (0x0004_0000, "root_safe"),
+    (0x0008_0000, "setuid_safe"),
+    (0x0010_0000, "no_reexported_dylibs"),
+    (0x0020_0000, "pie"),
+    (0x0040_0000, "dead_strippable_dylib"),
+    (0x0080_0000, "has_tlv_descriptors"),
+    (0x0100_0000, "no_heap_execution"),
+    (0x0200_0000, "app_extension_safe"),
+];
+
+/// Decompose Mach-O header flags into a Pike-style array of names, in bit
+/// order.
 fn mh_flag_names(flags: u32) -> Vec<&'static str> {
-    let mut out = Vec::new();
-    if flags & 0x0000_0001 != 0 {
-        out.push("no_undefs");
-    }
-    if flags & 0x0000_0002 != 0 {
-        out.push("incremental_link");
-    }
-    if flags & 0x0000_0004 != 0 {
-        out.push("dyld_link");
-    }
-    if flags & 0x0000_0008 != 0 {
-        out.push("bind_at_load");
-    }
-    if flags & 0x0000_0010 != 0 {
-        out.push("pre_bound");
-    }
-    if flags & 0x0000_0020 != 0 {
-        out.push("split_segments");
-    }
-    if flags & 0x0000_0040 != 0 {
-        out.push("lazy_init");
-    }
-    if flags & 0x0000_0080 != 0 {
-        out.push("two_level");
-    }
-    if flags & 0x0000_0100 != 0 {
-        out.push("force_flat");
-    }
-    if flags & 0x0000_0200 != 0 {
-        out.push("no_multi_defs");
-    }
-    if flags & 0x0000_0400 != 0 {
-        out.push("no_fix_pre_binding");
-    }
-    if flags & 0x0000_0800 != 0 {
-        out.push("pre_bindable");
-    }
-    if flags & 0x0000_1000 != 0 {
-        out.push("all_mods_bound");
-    }
-    if flags & 0x0000_2000 != 0 {
-        out.push("subsections_via_symbols");
-    }
-    if flags & 0x0000_4000 != 0 {
-        out.push("canonical");
-    }
-    if flags & 0x0000_8000 != 0 {
-        out.push("weak_defines");
-    }
-    if flags & 0x0001_0000 != 0 {
-        out.push("binds_to_weak");
-    }
-    if flags & 0x0002_0000 != 0 {
-        out.push("allow_stack_execution");
-    }
-    if flags & 0x0004_0000 != 0 {
-        out.push("root_safe");
-    }
-    if flags & 0x0008_0000 != 0 {
-        out.push("setuid_safe");
-    }
-    if flags & 0x0010_0000 != 0 {
-        out.push("no_reexported_dylibs");
-    }
-    if flags & 0x0020_0000 != 0 {
-        out.push("pie");
-    }
-    if flags & 0x0040_0000 != 0 {
-        out.push("dead_strippable_dylib");
-    }
-    if flags & 0x0080_0000 != 0 {
-        out.push("has_tlv_descriptors");
-    }
-    if flags & 0x0100_0000 != 0 {
-        out.push("no_heap_execution");
-    }
-    if flags & 0x0200_0000 != 0 {
-        out.push("app_extension_safe");
-    }
-    out
+    MH_FLAGS
+        .iter()
+        .filter(|&&(bit, _)| flags & bit != 0)
+        .map(|&(_, name)| name)
+        .collect()
 }
 
 fn cpu_type_string(cpu_type: u32) -> &'static str {

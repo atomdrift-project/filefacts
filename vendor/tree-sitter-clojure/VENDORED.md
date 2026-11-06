@@ -13,12 +13,13 @@ v0.0.13 (2024-05-15). It is unmodified.
 ## Licenses
 
 - Rust binding (`src/lib.rs`, `build.rs`, manifest): MIT, as published.
+  Upstream ships no license text; `LICENSE` here supplies it.
 - Grammar (`grammar-src/`): CC0 1.0, see `grammar-src/COPYING.txt`.
 
 ## Changes from upstream
 
-The only functional change: the `tree-sitter` dependency is `0.28` instead of
-`0.25.6`, because filefacts uses tree-sitter 0.28 and `links = "tree-sitter"`
+The only functional change: the `tree-sitter` dev-dependency is `0.28` instead
+of `0.25.6`, because filefacts uses tree-sitter 0.28 and `links = "tree-sitter"`
 permits only one copy in a build. The grammar binds through
 `tree-sitter-language`'s `LanguageFn` ABI, and its `parser.c` (ABI 14) loads
 unchanged under 0.28.
@@ -31,6 +32,9 @@ Packaging cleanups, with no effect on the built library:
   `tree-sitter-clojure` instead of `parser`.
 - Packaging artifacts (`.cargo-ok`, `.cargo_vcs_info.json`,
   `Cargo.toml.orig`, `.gitmodules`, `Cargo.lock`) are removed.
+- `tree-sitter` is a dev-dependency, since only the binding's test and
+  doctest use it, and `include` keeps the grammar's corpus tests and
+  documentation out of the package.
 
 ## Updating
 

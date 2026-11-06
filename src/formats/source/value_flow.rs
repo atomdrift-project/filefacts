@@ -1,7 +1,7 @@
 //! Source-language producer for the shared flow view.
 use super::langs::{Lang, LangConfig};
 use super::scope::Scope;
-use super::{MAX_FLOW_DEPTH, ast_walk, named_children, text};
+use super::{MAX_FLOW_DEPTH, ast_walk, expand_alias, named_children, text};
 use crate::{Arg, Flow, FlowFunction, FlowKind, FlowValue, Limitation, Symbol, Symbols};
 use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::Node;
@@ -200,12 +200,12 @@ impl Builder<'_> {
                 return self.add(FlowKind::Merge, node, inputs);
             }
         }
-        if self.config.lang == Lang::Lua && node.kind() == "variable_declaration" {
-            if let Some(names) = named_children(node).find(|child| child.kind() == "variable_list")
-            {
-                self.bind(names, 0, bindings);
-                return 0;
-            }
+        if self.config.lang == Lang::Lua
+            && node.kind() == "variable_declaration"
+            && let Some(names) = named_children(node).find(|child| child.kind() == "variable_list")
+        {
+            self.bind(names, 0, bindings);
+            return 0;
         }
         // Some grammars name the `+=` form directly; others reuse the plain
         // assignment kind and hang the operator off it. Each kind is named
@@ -273,21 +273,12 @@ impl Builder<'_> {
         }
         if self.config.call_kinds.contains(&node.kind()) {
             let callee = self.config.callee(node);
-            let mut inputs = Vec::new();
-            if self.config.arguments_field == "argument" {
-                let mut cursor = node.walk();
-                for arg in node.children_by_field_name("argument", &mut cursor) {
-                    inputs.push(self.eval(arg, bindings, returns, depth + 1));
-                }
-            } else if let Some(args) = self.config.argument_list(node) {
-                if self.config.is_single_argument(args) {
-                    inputs.push(self.eval(args, bindings, returns, depth + 1));
-                } else {
-                    for arg in named_children(args) {
-                        inputs.push(self.eval(arg, bindings, returns, depth + 1));
-                    }
-                }
-            }
+            let inputs: Vec<usize> = self
+                .config
+                .arguments(node)
+                .into_iter()
+                .map(|arg| self.eval(arg, bindings, returns, depth + 1))
+                .collect();
             let receiver = callee
                 .and_then(|n| n.child_by_field_name(self.config.member_object_field))
                 .map(|n| self.eval(n, bindings, returns, depth + 1));
@@ -312,13 +303,17 @@ impl Builder<'_> {
                         .then(|| format!(".{}", self.text(property)))
                 })
             });
-            if let Some(raw) = target.as_ref() {
-                let end = raw.find(['.', ':', '(']).unwrap_or(raw.len());
-                if bindings.get(&raw[..end]).is_none() {
-                    if let Some(prefix) = self.aliases.get(&raw[..end]) {
-                        target = Some(format!("{prefix}{}", &raw[end..]));
-                    }
-                }
+            // A local binding shadows an import of the same name.
+            if let Some(expanded) = target.as_deref().and_then(|raw| {
+                expand_alias(raw, |head| {
+                    bindings
+                        .get(head)
+                        .is_none()
+                        .then(|| self.aliases.get(head).map(String::as_str))
+                        .flatten()
+                })
+            }) {
+                target = Some(expanded);
             }
             if id != 0
                 && let Some(value) = self.flow.values.get_mut(id)
@@ -370,21 +365,16 @@ impl Builder<'_> {
             // Go's initializer executes before the condition and is visible
             // in both branches. Short declarations belong to the implicit if
             // scope; ordinary assignments still update the surrounding scope.
-            let mut shadowed = BTreeMap::new();
-            if self.config.lang == Lang::Go {
-                if let Some(initializer) = node.child_by_field_name("initializer") {
-                    if initializer.kind() == "short_var_declaration" {
-                        if let Some(pattern) = initializer.child_by_field_name("left") {
-                            let mut declared = Bindings::default();
-                            self.bind(pattern, 0, &mut declared);
-                            for name in declared.into_names() {
-                                let previous = bindings.get(&name);
-                                shadowed.insert(name, previous);
-                            }
-                        }
-                    }
-                    self.eval(initializer, bindings, returns, depth + 1);
+            let mut shadowed = Vec::new();
+            if let Some(initializer) = node.child_by_field_name("initializer") {
+                if initializer.kind() == "short_var_declaration"
+                    && let Some(pattern) = initializer.child_by_field_name("left")
+                {
+                    let mut declared = Bindings::default();
+                    self.bind(pattern, 0, &mut declared);
+                    shadowed = bindings.save(declared.into_names());
                 }
+                self.eval(initializer, bindings, returns, depth + 1);
             }
             if let Some(condition) = node.child_by_field_name("condition") {
                 self.eval(condition, bindings, returns, depth + 1);
@@ -430,13 +420,7 @@ impl Builder<'_> {
             for (name, id) in merged {
                 bindings.insert(name, id);
             }
-            for (name, previous) in shadowed {
-                if let Some(id) = previous {
-                    bindings.insert(name, id);
-                } else {
-                    bindings.remove(&name);
-                }
-            }
+            bindings.restore(shadowed);
             return self.add(FlowKind::Merge, node, values);
         }
         let sequential = matches!(
@@ -450,17 +434,7 @@ impl Builder<'_> {
         );
         let scoped = sequential
             && !matches!(node.kind(), "source_file" | "program" | "module")
-            && matches!(
-                self.config.lang,
-                Lang::Rust
-                    | Lang::Go
-                    | Lang::JavaScript
-                    | Lang::TypeScript
-                    | Lang::C
-                    | Lang::Cpp
-                    | Lang::Java
-                    | Lang::CSharp
-            );
+            && self.config.block_scoped;
         let mut declared = Bindings::default();
         if scoped {
             for child in named_children(node) {
@@ -483,39 +457,24 @@ impl Builder<'_> {
                             | "variable_declarator"
                             | "var_spec"
                             | "init_declarator"
-                    ) {
-                        if let Some(pattern) = declaration
-                            .child_by_field_name("pattern")
-                            .or_else(|| declaration.child_by_field_name("left"))
-                            .or_else(|| declaration.child_by_field_name("name"))
-                            .or_else(|| declaration.child_by_field_name("declarator"))
-                        {
-                            self.bind(pattern, 0, &mut declared);
-                        }
+                    ) && let Some(pattern) = declaration
+                        .child_by_field_name("pattern")
+                        .or_else(|| declaration.child_by_field_name("left"))
+                        .or_else(|| declaration.child_by_field_name("name"))
+                        .or_else(|| declaration.child_by_field_name("declarator"))
+                    {
+                        self.bind(pattern, 0, &mut declared);
                     }
                 }
             }
         }
-        // Only the names the block declares are restored after it, so only
-        // theirs are saved: copying every binding per block is quadratic.
-        let before: Vec<(String, Option<usize>)> = declared
-            .into_names()
-            .map(|name| {
-                let previous = bindings.get(&name);
-                (name, previous)
-            })
-            .collect();
+        // The names the block declares are restored after it.
+        let saved = bindings.save(declared.into_names());
         let mut inputs = Vec::new();
         for child in named_children(node) {
             inputs.push(self.eval(child, bindings, returns, depth + 1));
         }
-        for (name, previous) in before {
-            if let Some(previous) = previous {
-                bindings.insert(name, previous);
-            } else {
-                bindings.remove(&name);
-            }
-        }
+        bindings.restore(saved);
         if node.kind().starts_with("return") {
             returns.extend(inputs.iter().copied());
         }
@@ -604,7 +563,7 @@ pub(super) fn build(root: Node<'_>, source: &str, config: &LangConfig, symbols: 
                 }
                 if let Some(body) = node.child_by_field_name("body") {
                     let tail = builder.eval(body, &mut bindings, &mut function.returns, 0);
-                    if config.lang == Lang::Rust {
+                    if config.tail_returns {
                         function.returns.push(tail);
                     }
                 }

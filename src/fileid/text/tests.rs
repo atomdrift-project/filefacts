@@ -27,3 +27,13 @@ fn case_insensitive_search() {
     assert!(starts_ci(b"REM x", b"rem"));
     assert!(!contains(b"anything", b""));
 }
+
+#[test]
+fn binary_judgement_reads_past_a_utf8_bom() {
+    let mut data = b"\xEF\xBB\xBF".to_vec();
+    data.extend_from_slice(b"\x01\x02\x03\x04\x05\x06\x07\x08 mostly text\n");
+    assert!(is_object_code(&data));
+    assert!(!is_object_code(
+        b"\xEF\xBB\xBF#import <Foundation/Foundation.h>\n"
+    ));
+}

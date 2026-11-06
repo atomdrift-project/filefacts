@@ -193,12 +193,9 @@ fn build_minimal_rpm() -> Vec<u8> {
 }
 
 fn run(bytes: &[u8]) -> (Values, Metrics, Errors) {
-    let mut v = Values::new();
-    let mut s = Strings::default();
-    let mut m = Metrics::new();
-    let mut e = Errors::new();
-    extract(bytes, &mut v, &mut s, &mut m, &mut e).unwrap();
-    (v, m, e)
+    let mut sinks = crate::formats::Sinks::default();
+    extract(bytes, sinks.ctx()).unwrap();
+    (sinks.values, sinks.metrics, sinks.errors)
 }
 
 /// The one recorded error's stage, kind and message.

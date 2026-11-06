@@ -27,19 +27,19 @@ pub(super) struct FormField {
 }
 
 impl FormField {
-    pub(super) fn to_json(&self) -> JsonValue {
+    pub(super) fn into_json(self) -> JsonValue {
         let mut entry = serde_json::Map::new();
         if let Some(id) = self.object_id {
             entry.insert("object_id".into(), json!(id));
         }
         for (key, field) in [
-            ("name", &self.name),
-            ("field_type", &self.field_type),
-            ("rect", &self.rect),
-            ("value", &self.value),
+            ("name", self.name),
+            ("field_type", self.field_type),
+            ("rect", self.rect),
+            ("value", self.value),
         ] {
             if let Some(text) = field {
-                entry.insert(key.into(), JsonValue::String(text.clone()));
+                entry.insert(key.into(), JsonValue::String(text));
             }
         }
         JsonValue::Object(entry)

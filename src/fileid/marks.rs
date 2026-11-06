@@ -2,13 +2,9 @@
 //! scorer, which a document quoting another language's keywords can fool.
 
 use super::{
-    FileType,
-    heuristics::SCAN_LIMIT,
-    scripts,
+    FileType, scripts,
     sniff::Sniff,
-    text::{
-        Controls, UTF8_BOM, contains, contains_ci, find_ci, is_binary, starts_ci, strip_utf8_bom,
-    },
+    text::{Controls, contains, contains_ci, find_ci, is_binary, starts_ci},
 };
 
 /// How much of a body [`unmistakable`] reads for most marks.
@@ -23,17 +19,6 @@ const MARK_WINDOW: usize = 2048;
 pub(super) fn unmistakable(sniff: &Sniff<'_>) -> Option<FileType> {
     let data = sniff.text();
     let head = data.get(..MARK_WINDOW).unwrap_or(data);
-    // The whole-file answer reads these same bytes when the body fits the
-    // window, so it is reused rather than computed again.
-    let git_config =
-        if sniff.decoded().is_none() && head.len() == data.len() && !head.starts_with(UTF8_BOM) {
-            sniff.looks_like_git_config()
-        } else {
-            looks_like_git_config(head)
-        };
-    if git_config {
-        return Some(FileType::Text);
-    }
     // Manual pages are troff input, not source code. Roff's short requests
     // (for example `.B`, `.I`, and `.PP`) collide with source-language
     // tokens, so recognize a page title together with several distinct
@@ -89,133 +74,6 @@ pub(super) fn unmistakable(sniff: &Sniff<'_>) -> Option<FileType> {
     None
 }
 
-/// Recognize Git's config syntax from a bounded prefix. `.git/config` has no
-/// extension and content is its only reliable identity; content must also win
-/// over a misleading filename such as `Makefile` or `settings.py`.
-pub(super) fn looks_like_git_config(data: &[u8]) -> bool {
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Section {
-        Core,
-        Remote,
-        Branch,
-        Filter,
-        User,
-        Other,
-    }
-
-    let data = strip_utf8_bom(data);
-    let head = data.get(..SCAN_LIMIT).unwrap_or(data);
-    if head.is_empty() || is_binary(head, Controls::Text) {
-        return false;
-    }
-
-    let mut section = Section::Other;
-    let mut recognized_section = false;
-    let mut recognized_key = false;
-    let mut meaningful_lines = 0usize;
-    let mut config_lines = 0usize;
-
-    for raw_line in head.split(|&byte| byte == b'\n') {
-        let line = raw_line.trim_ascii();
-        if line.is_empty() || line.starts_with(b"#") || line.starts_with(b";") {
-            continue;
-        }
-        meaningful_lines += 1;
-
-        if let Some(name) = line.strip_prefix(b"[").and_then(|l| l.strip_suffix(b"]")) {
-            section = if name.eq_ignore_ascii_case(b"core") {
-                recognized_section = true;
-                Section::Core
-            } else if git_config_subsection(name, b"remote") {
-                recognized_section = true;
-                Section::Remote
-            } else if git_config_subsection(name, b"branch") {
-                recognized_section = true;
-                Section::Branch
-            } else if git_config_subsection(name, b"filter") {
-                recognized_section = true;
-                Section::Filter
-            } else if name.eq_ignore_ascii_case(b"user") {
-                recognized_section = true;
-                Section::User
-            } else {
-                Section::Other
-            };
-            config_lines += 1;
-            continue;
-        }
-
-        let Some(key) = line
-            .iter()
-            .position(|&byte| byte == b'=')
-            .and_then(|equal| line.get(..equal))
-        else {
-            continue;
-        };
-        let key = key.trim_ascii();
-        if key.is_empty()
-            || !key
-                .iter()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'.'))
-        {
-            continue;
-        }
-        config_lines += 1;
-        let known = match section {
-            Section::Core => [
-                b"repositoryformatversion".as_slice(),
-                b"filemode",
-                b"bare",
-                b"logallrefupdates",
-                b"ignorecase",
-                b"precomposeunicode",
-                b"symlinks",
-                b"worktree",
-                b"fsmonitor",
-                b"hookspath",
-                b"excludesfile",
-            ]
-            .iter()
-            .any(|candidate| key.eq_ignore_ascii_case(candidate)),
-            Section::Remote => [
-                b"url".as_slice(),
-                b"fetch",
-                b"pushurl",
-                b"mirror",
-                b"tagopt",
-            ]
-            .iter()
-            .any(|candidate| key.eq_ignore_ascii_case(candidate)),
-            Section::Branch => [b"remote".as_slice(), b"merge", b"rebase", b"pushremote"]
-                .iter()
-                .any(|candidate| key.eq_ignore_ascii_case(candidate)),
-            Section::Filter => [b"clean".as_slice(), b"smudge", b"process", b"required"]
-                .iter()
-                .any(|candidate| key.eq_ignore_ascii_case(candidate)),
-            Section::User => [b"name".as_slice(), b"email", b"signingkey"]
-                .iter()
-                .any(|candidate| key.eq_ignore_ascii_case(candidate)),
-            Section::Other => false,
-        };
-        recognized_key |= known;
-    }
-
-    recognized_section
-        && recognized_key
-        && meaningful_lines >= 2
-        && config_lines * 10 >= meaningful_lines * 9
-}
-
-fn git_config_subsection(header: &[u8], name: &[u8]) -> bool {
-    let Some((prefix, rest)) = header.split_at_checked(name.len()) else {
-        return false;
-    };
-    prefix.eq_ignore_ascii_case(name)
-        && rest.starts_with(b" \"")
-        && rest.len() > 3
-        && rest.ends_with(b"\"")
-}
-
 /// Recognize traditional `man` pages by their title request and a varied set
 /// of formatting requests. A single `.TH` or `.SH` line in code or prose is
 /// too weak; distinct requests make the roff document structure explicit.
@@ -258,6 +116,7 @@ fn looks_like_roff_man_page(head: &[u8]) -> bool {
 /// library-specific include fragments; a target followed by a tab-indented
 /// recipe covers ordinary build files.
 fn looks_like_makefile(head: &[u8]) -> bool {
+    const OPERATORS: [&[u8]; 4] = [b"?=", b":=", b"+=", b"="];
     if is_binary(head, Controls::Text) {
         return false;
     }
@@ -309,13 +168,7 @@ fn looks_like_makefile(head: &[u8]) -> bool {
             make_variable_lines += 1;
         }
 
-        let operators = [
-            b"?=".as_slice(),
-            b":=".as_slice(),
-            b"+=".as_slice(),
-            b"=".as_slice(),
-        ];
-        if let Some(index) = operators
+        if let Some(index) = OPERATORS
             .iter()
             .find_map(|operator| trimmed.windows(operator.len()).position(|w| w == *operator))
         {
@@ -327,7 +180,8 @@ fn looks_like_makefile(head: &[u8]) -> bool {
             {
                 assignments += 1;
             }
-        } else if line == trimmed && !trimmed.starts_with(b"//") {
+        } else if !line.first().is_some_and(u8::is_ascii_whitespace) && !trimmed.starts_with(b"//")
+        {
             // Make target definitions start in column zero. Requiring that
             // also prevents indented source comments such as `//post:` from
             // combining with unrelated tab-indented code into a false match.
@@ -418,27 +272,4 @@ fn looks_like_yara(head: &[u8]) -> bool {
 }
 
 #[cfg(test)]
-mod makefile_regression_tests {
-    use super::looks_like_makefile;
-
-    #[test]
-    fn target_and_recipe_must_be_related_text() {
-        assert!(looks_like_makefile(b"all:\n\tcc main.c\n"));
-        assert!(looks_like_makefile(b"all:\n# comment\n\n\tcc main.c\n"));
-        assert!(looks_like_makefile(
-            b"OUT := out\nSOURCES := $(OUT)/a $(OUT)/b\nDATA := $(OUT)/c\n"
-        ));
-        assert!(!looks_like_makefile(
-            b"<%@ Page Language=\"C#\"%>\nlabel:\n<script>\n\tcode();\n"
-        ));
-        assert!(!looks_like_makefile(
-            b"Content-Type: text/html;\n\tcharset=\"utf-8\"\n"
-        ));
-        assert!(!looks_like_makefile(
-            b"-(void)handle:(id)sender {\n\t[self process];\n}"
-        ));
-        assert!(!looks_like_makefile(
-            b"title:\n\x00\x01\x02\x03\x04\x05\x06\x07\n\tcommand\n"
-        ));
-    }
-}
+mod tests;

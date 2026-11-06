@@ -25,7 +25,7 @@ use super::value_keys::ValueKey;
 /// which manifest format they're looking at.
 ///
 /// Every key filefacts writes is declared in
-/// [`VALUE_CATALOG`](crate::VALUE_CATALOG) and written through a key checked
+/// [`known_values`](crate::known_values) and written through a key checked
 /// against it at compile time, so a rename fails filefacts' build instead of
 /// silently emptying a reader. The view is read-only outside filefacts.
 /// [`crate::values`] reads the facts consumers act on as typed structs; a
@@ -71,7 +71,9 @@ impl Values {
     ///
     /// Callers must not give one key both a value and children. Path
     /// segments containing `[`, `]`, or `.` are not supported — those
-    /// characters are reserved for the lookup grammar.
+    /// characters are reserved for the lookup grammar. A path nests at most
+    /// [`MAX_PATH_SEGMENTS`] objects; the rest of a longer one is the last
+    /// key, dots and all.
     ///
     /// The path is unchecked, so filefacts' own extractors use
     /// [`Self::insert_key`] instead, and a unit test rejects calls to this
@@ -107,18 +109,18 @@ impl Values {
     }
 
     /// [`Self::get`] for a catalog-checked key:
-    /// `values.get_key(value_key!("…"))` fails to build on a key that is not
+    /// `values.lookup(value_key!("…"))` fails to build on a key that is not
     /// declared, where `get` would just return `None` forever.
-    pub(crate) fn get_key(&self, key: ValueKey) -> Option<&JsonValue> {
+    pub(crate) fn lookup(&self, key: ValueKey) -> Option<&JsonValue> {
         self.get(key.as_str())
     }
 
-    /// [`Self::get_key`], then `rest` relative to it, for a key whose tail is
+    /// [`Self::lookup`], then `rest` relative to it, for a key whose tail is
     /// data: an array index (`"[0]"`, `"[0].subject"`) or a field below an
-    /// object (`"name"`). `get_key_at(k, "[0].x")` reads what `get` reads at
-    /// `"<k>[0].x"`, and `get_key_at(k, "x")` what it reads at `"<k>.x"`.
-    pub(crate) fn get_key_at(&self, key: ValueKey, rest: &str) -> Option<&JsonValue> {
-        navigate(self.get_key(key)?, rest)
+    /// object (`"name"`). `lookup_at(k, "[0].x")` reads what `get` reads at
+    /// `"<k>[0].x"`, and `lookup_at(k, "x")` what it reads at `"<k>.x"`.
+    pub(crate) fn lookup_at(&self, key: ValueKey, rest: &str) -> Option<&JsonValue> {
+        navigate(self.lookup(key)?, rest)
     }
 
     /// Borrow the underlying JSON representation. Useful when integrating
@@ -156,11 +158,24 @@ impl From<JsonValue> for Values {
     }
 }
 
+/// Most objects a path nests. Declared keys are a few levels deep, and a data
+/// tail adds one; a tail read from the file may be all dots, and a tree
+/// nested once per dot overflows the stack when it is dropped or serialized.
+const MAX_PATH_SEGMENTS: usize = 16;
+
 fn insert_path(root: &mut Map<String, JsonValue>, path: &str, value: JsonValue) {
-    let mut segments = path.split('.').peekable();
+    let mut segments = path.splitn(MAX_PATH_SEGMENTS, '.').peekable();
     let mut cur = root;
     while let Some(seg) = segments.next() {
         if segments.peek().is_none() {
+            if seg.contains('.') {
+                tracing::debug!(
+                    target: "filefacts::values",
+                    depth = MAX_PATH_SEGMENTS,
+                    len = path.len(),
+                    "value path nests too deep; its tail is one key"
+                );
+            }
             cur.insert(seg.to_string(), value);
             return;
         }
@@ -197,43 +212,11 @@ fn navigate<'a>(value: &'a JsonValue, path: &str) -> Option<&'a JsonValue> {
 /// non-object lookup — matching the principle that path parsing is
 /// forgiving but lookups are strict.
 fn split_index(segment: &str) -> (&str, Option<usize>) {
-    let Some(open) = segment.find('[') else {
-        return (segment, None);
-    };
-    if !segment.ends_with(']') {
-        return (segment, None);
-    }
-    let key = &segment[..open];
-    let idx_str = &segment[open + 1..segment.len() - 1];
-    match idx_str.parse::<usize>() {
-        Ok(i) => (key, Some(i)),
-        Err(_) => (segment, None),
-    }
-}
-
-#[cfg(test)]
-mod split_index_tests {
-    use super::split_index;
-
-    #[test]
-    fn plain_key() {
-        assert_eq!(split_index("plain"), ("plain", None));
-    }
-
-    #[test]
-    fn indexed_key() {
-        assert_eq!(split_index("members[0]"), ("members", Some(0)));
-        assert_eq!(split_index("a[42]"), ("a", Some(42)));
-    }
-
-    #[test]
-    fn malformed_falls_through() {
-        // Strict parsing here would force every caller to handle the
-        // "malformed input" case. Returning the segment unchanged lets
-        // `navigate` fail naturally on the subsequent object lookup.
-        assert_eq!(split_index("members["), ("members[", None));
-        assert_eq!(split_index("members[a]"), ("members[a]", None));
-    }
+    segment
+        .strip_suffix(']')
+        .and_then(|s| s.split_once('['))
+        .and_then(|(key, idx)| Some((key, Some(idx.parse().ok()?))))
+        .unwrap_or((segment, None))
 }
 
 #[cfg(test)]

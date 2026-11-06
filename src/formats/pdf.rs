@@ -49,7 +49,7 @@ mod objects;
 mod streams;
 mod tokens;
 
-use actions::{Action, JsScan};
+use actions::{Action, ActionKind, JsScan};
 use lex::value_after_key;
 use objects::{DictRegion, MAX_DICT_REGIONS, ObjectIndex, ObjectStreams, TypeCounts};
 use tokens::{INFO_KEYS, Tok, TokenScan};
@@ -149,7 +149,7 @@ pub(super) fn extract(
         .collect();
     javascript(bytes, regions, &object_index, &mut limits, values, metrics);
     let embedded = embedded_files(bytes, regions, &object_index, values, metrics);
-    stream_inventory(bytes, regions, values, metrics);
+    stream_inventory(bytes, regions, &mut limits, values, metrics);
 
     // Per-page ratios — number of annotations / URI actions per
     // page. Surfacing these as derived metrics keeps trait rules
@@ -157,7 +157,7 @@ pub(super) fn extract(
     // thirty-page PDF with one URI annotation per page produce the
     // same `uri_actions_per_page = 1.0` rather than two unrelated
     // raw counts. Zero pages → no ratio (rather than NaN).
-    let uri_actions = actions.iter().filter(|a| a.kind == "uri").count();
+    let uri_actions = actions.iter().filter(|a| a.kind == ActionKind::Uri).count();
     if types.page > 0 {
         let pages = types.page as f64;
         metrics.insert(
@@ -224,7 +224,7 @@ fn header_version(bytes: &[u8], header_at: usize) -> Option<String> {
     let version: String = tail
         .iter()
         .take_while(|&&b| b.is_ascii_digit() || b == b'.')
-        .map(|&b| b as char)
+        .map(|&b| char::from(b))
         .collect();
     (!version.is_empty()).then_some(version)
 }
@@ -460,20 +460,20 @@ fn action_sites(
     if actions.is_empty() {
         return actions;
     }
-    let of_kind = |kind: &str| actions.iter().filter(|a| a.kind == kind).count();
+    let of_kind = |kind| actions.iter().filter(|a| a.kind == kind).count();
     let counts = [
         (
             metric!("pdf.javascript_action_count"),
-            of_kind("javascript"),
+            of_kind(ActionKind::JavaScript),
         ),
-        (metric!("pdf.uri_action_count"), of_kind("uri")),
+        (metric!("pdf.uri_action_count"), of_kind(ActionKind::Uri)),
         // URI actions whose path is a CMS upload directory. One such
         // citation is ordinary; a doorway is built out of many of them.
         (
             metric!("pdf.upload_directory_uri_count"),
             actions
                 .iter()
-                .filter(|a| a.kind == "uri")
+                .filter(|a| a.kind == ActionKind::Uri)
                 .filter(|a| {
                     let lower = a.snippet.to_ascii_lowercase();
                     lower.contains("/wp-content/uploads/")
@@ -493,7 +493,7 @@ fn action_sites(
         JsonValue::Array(
             actions
                 .iter()
-                .map(|a| json!({"kind": a.kind, "source": a.source, "snippet": a.snippet}))
+                .map(|a| json!({"kind": a.kind.as_str(), "source": a.source, "snippet": a.snippet}))
                 .collect(),
         ),
     );
@@ -562,6 +562,7 @@ fn embedded_files(
 fn stream_inventory(
     bytes: &[u8],
     regions: &[DictRegion],
+    limits: &mut Limits,
     values: &mut Values,
     metrics: &mut Metrics,
 ) {
@@ -571,7 +572,25 @@ fn stream_inventory(
     if !chains.is_empty() {
         values.insert_key(value_key!("pdf.filter_chains"), json!(chains));
     }
-    let streams = streams::scan_streams(bytes, regions);
+    let mut stages = filters::StageBudget::default();
+    let streams = streams::scan_streams(bytes, regions, &mut stages);
+    if stages.refused() > 0 {
+        tracing::debug!(
+            target: "filefacts::pdf",
+            stage = "streams",
+            refused = stages.refused(),
+            cap = filters::MAX_STAGE_TOTAL,
+            "multi-filter streams past the filter-stage budget not decoded"
+        );
+        limits.push(
+            "filter-stage-budget",
+            format!(
+                "{} multi-filter stream(s) not decoded for pdf.streams: the {}-byte filter-stage budget was spent",
+                stages.refused(),
+                filters::MAX_STAGE_TOTAL
+            ),
+        );
+    }
     if !streams.is_empty() {
         values.insert_key(value_key!("pdf.streams"), JsonValue::Array(streams));
     }
@@ -581,7 +600,12 @@ fn stream_inventory(
         metrics.insert(metric!("pdf.form_field_count"), fields.len() as f64);
         values.insert_key(
             value_key!("pdf.form_fields"),
-            JsonValue::Array(fields.iter().map(forms::FormField::to_json).collect()),
+            JsonValue::Array(
+                fields
+                    .into_iter()
+                    .map(forms::FormField::into_json)
+                    .collect(),
+            ),
         );
     }
 }

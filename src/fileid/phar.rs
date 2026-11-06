@@ -73,20 +73,43 @@ pub(crate) struct Trailer {
 }
 
 /// Whether `data` is a native phar, by a parse of its manifest. Cheap for
-/// most input: it needs a trailing `GBMB` (every signed phar), or a PHP or
-/// shebang opening (the usual stub of an unsigned one), and the stub's end
-/// within [`MAX_DETECT_STUB`] bytes, before it parses. The parse reads the
-/// manifest and the trailer's shape, not the digest.
+/// most input: it needs a trailing `GBMB` (every signed phar), or a stub that
+/// opens as PHP (every unsigned one PHP can run), and the stub's end within
+/// [`MAX_DETECT_STUB`] bytes, before it parses. The parse reads the manifest
+/// and the trailer's shape, not the digest.
 pub(crate) fn is_phar(data: &[u8]) -> bool {
     let signed = data.ends_with(SIGNATURE_MAGIC);
-    let head = data.trim_ascii_start();
-    let php_stub = head.starts_with(b"<?") || head.starts_with(b"#!");
+    if !signed && !opens_as_php(data) {
+        return false;
+    }
     let window = data
         .get(..MAX_DETECT_STUB + HALT_TOKEN.len())
         .unwrap_or(data);
-    (signed || php_stub)
-        && memchr::memmem::find(window, HALT_TOKEN).is_some()
-        && parse(data, DETECT_ENTRY_CAP).is_ok()
+    memchr::memmem::find(window, HALT_TOKEN).is_some() && parse(data, DETECT_ENTRY_CAP).is_ok()
+}
+
+/// Whether `data` opens with a PHP tag -- `<?php` or a short `<?` before
+/// whitespace, or `<?=` -- after leading whitespace and an optional shebang
+/// line, as a stub run by `php` or executed directly does.
+fn opens_as_php(data: &[u8]) -> bool {
+    let mut head = data.trim_ascii_start();
+    if head.starts_with(b"#!") {
+        let Some(line_end) = memchr::memchr(b'\n', head) else {
+            return false;
+        };
+        head = head
+            .get(line_end + 1..)
+            .unwrap_or_default()
+            .trim_ascii_start();
+    }
+    let Some(after) = head.strip_prefix(b"<?") else {
+        return false;
+    };
+    let after = match after.get(..3) {
+        Some(php) if php.eq_ignore_ascii_case(b"php") => after.get(3..).unwrap_or_default(),
+        _ => after,
+    };
+    after.starts_with(b"=") || after.first().is_some_and(u8::is_ascii_whitespace)
 }
 
 /// Parse the stub boundary, manifest and signature trailer of a native phar,
@@ -102,7 +125,7 @@ pub(crate) fn parse(data: &[u8], entry_cap: usize) -> Result<Phar<'_>, Error> {
         return Err(Error::malformed("phar", "manifest larger than 100 MB"));
     }
     let manifest_start = stub_size + 4;
-    let data_offset = manifest_start + manifest_size as usize;
+    let data_offset = manifest_start + bytes::sat_usize(manifest_size);
     let manifest = data
         .get(manifest_start..data_offset)
         .ok_or_else(|| Error::malformed("phar", "manifest extends past end of file"))?;

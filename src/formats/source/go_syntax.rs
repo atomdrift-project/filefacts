@@ -7,15 +7,52 @@ use serde_json::json;
 use std::collections::HashMap;
 use tree_sitter::Node;
 
+/// The package clause's name as `go/build` reads it, without a parse: the
+/// first token after whitespace and comments must be `package`, and the
+/// name is the identifier after it. `""` when the source does not open with
+/// a package clause.
+pub(crate) fn package_clause(source: &str) -> &str {
+    let mut rest = source.strip_prefix('\u{feff}').unwrap_or(source);
+    let mut keyword = false;
+    loop {
+        rest = rest.trim_start_matches([' ', '\t', '\r', '\n']);
+        if let Some(comment) = rest.strip_prefix("//") {
+            rest = comment.find('\n').map_or("", |end| &comment[end..]);
+        } else if let Some(comment) = rest.strip_prefix("/*") {
+            let Some(end) = comment.find("*/") else {
+                return "";
+            };
+            rest = &comment[end + 2..];
+        } else if keyword {
+            let is_name = |c: char| c.is_alphanumeric() || c == '_';
+            let len = rest.find(|c| !is_name(c)).unwrap_or(rest.len());
+            let name = &rest[..len];
+            return if name.starts_with(|c: char| c.is_numeric()) {
+                ""
+            } else {
+                name
+            };
+        } else {
+            match rest.strip_prefix("package") {
+                Some(after) if !after.starts_with(|c: char| c.is_alphanumeric() || c == '_') => {
+                    keyword = true;
+                    rest = after;
+                }
+                _ => return "",
+            }
+        }
+    }
+}
+
 /// The name in the file's package clause, `""` without one. A later clause
 /// overrides an earlier one, as in [`execution_facts`].
 pub(super) fn package_name<'s>(root: Node<'_>, source: &'s str) -> &'s str {
     let mut package = "";
     for node in named_children(root) {
-        if node.kind() == "package_clause" {
-            if let Some(n) = node.named_child(0) {
-                package = text(n, source);
-            }
+        if node.kind() == "package_clause"
+            && let Some(n) = node.named_child(0)
+        {
+            package = text(n, source);
         }
     }
     package
@@ -77,7 +114,7 @@ fn words(line: &str) -> Option<Vec<String>> {
             if !rest.is_empty() && !rest.starts_with([' ', '\t']) {
                 return None;
             }
-            out.push(super::decode_source_escapes(&word[1..word.len() - 1]));
+            out.push(super::escapes::decode(&word[1..word.len() - 1]));
         } else {
             let end = rest.find([' ', '\t']).unwrap_or(rest.len());
             out.push(rest[..end].to_string());
@@ -90,6 +127,11 @@ fn words(line: &str) -> Option<Vec<String>> {
     }
     Some(out)
 }
+
+/// Bytes of `go:generate` argv recorded per file, summed over directives. A
+/// `-command` alias is copied into every directive that names it, so without
+/// a bound a long alias and many short directives multiply.
+const MAX_GENERATE_ARGV_BYTES: usize = 1 << 20;
 
 pub(super) fn execution_facts(root: Node<'_>, source: &str, values: &mut Values) {
     let mut init_count = 0;
@@ -127,6 +169,7 @@ pub(super) fn execution_facts(root: Node<'_>, source: &str, values: &mut Values)
     let mut directives = Vec::new();
     let mut aliases: HashMap<String, Vec<String>> = HashMap::new();
     let mut malformed = false;
+    let mut argv_bytes = 0usize;
     for (line, text) in source.lines().enumerate() {
         // Match cmd/go's exact line prefix, even inside raw strings: generate
         // explicitly does not parse Go source. Indented/examples do not execute.
@@ -154,6 +197,21 @@ pub(super) fn execution_facts(root: Node<'_>, source: &str, values: &mut Values)
         }
         if let Some(expanded) = args.first().and_then(|s| aliases.get(s)).cloned() {
             args.splice(..1, expanded);
+        }
+        argv_bytes = args
+            .iter()
+            .map(String::len)
+            .fold(argv_bytes, usize::saturating_add);
+        if argv_bytes > MAX_GENERATE_ARGV_BYTES {
+            tracing::debug!(
+                target: "filefacts::source",
+                format = "go",
+                line = line + 1,
+                budget = MAX_GENERATE_ARGV_BYTES,
+                "go:generate argv budget spent; later directives omitted"
+            );
+            malformed = true;
+            break;
         }
         let Some(program) = args.first() else {
             continue;

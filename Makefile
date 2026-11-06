@@ -17,7 +17,7 @@ BENCH_PATH ?=
 
 FUZZ_TARGET ?= open_all_views
 
-.PHONY: all build release install install-hooks test lint fix fmt clean help bench-build sampled-benchmark heap-build heap-benchmark bench-path fuzz
+.PHONY: all build release install install-hooks test lint doc fix fmt clean help bench-build sampled-benchmark heap-build heap-benchmark bench-path fuzz
 
 all: build
 
@@ -31,7 +31,8 @@ help: ## Show this help
 	@echo "  install            - Install release binary to first writeable PATH dir"
 	@echo "  install-hooks      - Install the git pre-commit hook (lint + test + Cargo.toml check)"
 	@echo "  test               - Run all tests"
-	@echo "  lint               - Run rustfmt --check + clippy -D warnings"
+	@echo "  lint               - Run rustfmt --check, clippy and rustdoc with -D warnings"
+	@echo "  doc                - Build the API docs, failing on any rustdoc warning"
 	@echo "  fix                - Auto-fix clippy lints, then format with rustfmt"
 	@echo "  fmt                - Format code with rustfmt"
 	@echo "  fuzz               - Run a cargo-fuzz target (FUZZ_TARGET=$(FUZZ_TARGET); needs nightly)"
@@ -88,9 +89,18 @@ fix:
 	$(CARGO) clippy --fix --all-targets --all-features --allow-dirty --allow-staged
 	$(CARGO) fmt --all
 
-lint:
+# What CI lints: the library and CLI with every feature, the library alone as
+# a dependency builds it (no default features), the fuzz crate, and the docs.
+lint: doc
 	$(CARGO) fmt --all --check
 	$(CARGO) clippy --all-targets --all-features -- -D warnings
+	$(CARGO) clippy --lib --no-default-features -- -D warnings
+	$(CARGO) clippy -p filefacts-fuzz --all-targets -- -D warnings
+
+# The public docs, then the private items too: a broken link in either fails.
+doc:
+	RUSTDOCFLAGS="-D warnings" $(CARGO) doc --no-deps
+	RUSTDOCFLAGS="-D warnings" $(CARGO) doc --no-deps --document-private-items
 
 clean:
 	$(CARGO) clean

@@ -3,65 +3,48 @@
 //! rewritten DOS stub, a stale checksum, and malformed data directories.
 
 use goblin::pe::PE;
-use goblin::pe::header::Header;
+use goblin::pe::section_table::{IMAGE_SCN_MEM_WRITE, SectionTable};
 use serde_json::Value as JsonValue;
 
 use super::layout::{self, CERTIFICATE_DIRECTORY, DIRECTORY_NAMES};
-use crate::formats::common::bytes_at::{u16_le, u32_le};
+use crate::bytes::{sat_usize, u16_le, u32_le};
 use crate::formats::common::put_str;
 use crate::metric;
 use crate::output::{Metrics, Values};
 use crate::value_key;
 
-/// `IMAGE_SCN_MEM_WRITE`.
-const SCN_MEM_WRITE: u32 = 0x8000_0000;
-
-/// Section extents past the end of the file, read from the raw section table
-/// when goblin could not parse the image. Only a complete, bounded table
-/// counts: a truncated one says nothing about how many sections overflow.
+/// Section extents past the end of the file, from binform's reading of the
+/// section table when goblin could not parse the image. Only a complete,
+/// bounded table counts: one holding fewer than the COFF header's `count`
+/// sections says nothing about how many overflow.
 pub(super) fn partial_section_overflows(
+    sections: &[SectionTable],
+    count: u16,
     bytes: &[u8],
-    header: &Header<'_>,
     values: &mut Values,
     metrics: &mut Metrics,
 ) {
-    let count = usize::from(header.coff_header.number_of_sections);
-    if count == 0 || count > 96 {
-        return;
-    }
-    let Some(start) = layout::optional_header_offset(header.dos_header.pe_pointer as usize)
-        .and_then(|optional| {
-            optional.checked_add(usize::from(header.coff_header.size_of_optional_header))
-        })
-    else {
-        return;
-    };
-    let Some(end) = count.checked_mul(40).and_then(|n| start.checked_add(n)) else {
-        return;
-    };
-    let Some(table) = bytes.get(start..end) else {
+    let count = usize::from(count);
+    if count == 0 || count > layout::MAX_SECTIONS || sections.len() != count {
         tracing::debug!(
             target: "filefacts::pe",
             format = "pe",
             stage = "section-table",
-            offset = start,
-            len = end - start,
-            "section table runs past the file; overflow count not reported"
+            declared = count,
+            read = sections.len(),
+            "section table incomplete or unbounded; overflow count not reported"
         );
         return;
-    };
-    let mut names = Vec::new();
-    for section in table.as_chunks::<40>().0 {
-        let (Some(size), Some(offset)) = (u32_le(section, 16), u32_le(section, 20)) else {
-            return;
-        };
-        if size != 0 && u64::from(offset) + u64::from(size) > bytes.len() as u64 {
-            let name = section[..8].split(|&b| b == 0).next().unwrap_or_default();
-            names.push(JsonValue::String(
-                String::from_utf8_lossy(name).into_owned(),
-            ));
-        }
     }
+    let names: Vec<JsonValue> = sections
+        .iter()
+        .filter(|s| {
+            s.size_of_raw_data != 0
+                && u64::from(s.pointer_to_raw_data) + u64::from(s.size_of_raw_data)
+                    > bytes.len() as u64
+        })
+        .map(|s| JsonValue::String(s.real_name.clone().unwrap_or_default()))
+        .collect();
     metrics.insert(metric!("pe.section_overflow_count"), names.len() as f64);
     if !names.is_empty() {
         values.insert_key(
@@ -125,7 +108,7 @@ pub(super) fn entry_and_overlay(
 
     let entry_section = layout::section_containing(&pe.sections, ep_rva);
     if let Some(section) = entry_section {
-        if section.characteristics & SCN_MEM_WRITE != 0 {
+        if section.characteristics & IMAGE_SCN_MEM_WRITE != 0 {
             metrics.insert(metric!("pe.entry_in_writable_section"), 1.0);
         }
         if let Ok(name) = section.name() {
@@ -149,10 +132,13 @@ pub(super) fn entry_and_overlay(
 
     // Overlay = file bytes past the last on-disk section extent, with
     // the Certificate Table (Authenticode blob) excluded — signed PEs
-    // would otherwise always show a giant overlay.
+    // would otherwise always show a giant overlay. A section without raw
+    // data has no on-disk extent: the loader ignores its pointer, and so
+    // must the overlay, or a pointer past the end of the file hides it.
     let sections_end: u64 = pe
         .sections
         .iter()
+        .filter(|s| s.size_of_raw_data != 0)
         .map(|s| u64::from(s.pointer_to_raw_data).saturating_add(u64::from(s.size_of_raw_data)))
         .max()
         .unwrap_or(0);
@@ -160,9 +146,14 @@ pub(super) fn entry_and_overlay(
     if sections_end == 0 || sections_end >= file_size {
         return;
     }
+    // Authenticode appends the table at the end of the file; one declared
+    // short of the end leaves the bytes past it in the overlay.
     let overlay_end = opt
         .data_directories
         .get_certificate_table()
+        .filter(|dir| {
+            u64::from(dir.virtual_address).saturating_add(u64::from(dir.size)) >= file_size
+        })
         .map(|dir| u64::from(dir.virtual_address))
         .filter(|&cert_start| cert_start >= sections_end && cert_start < file_size)
         .unwrap_or(file_size);
@@ -298,7 +289,7 @@ pub(super) fn section_anomalies(
 /// in DOS mode" banner here; absent / zeroed regions are minor evasion
 /// or hand-rolled-builder tells.
 pub(super) fn dos_stub_anomalies(pe: &PE<'_>, bytes: &[u8], metrics: &mut Metrics) {
-    let pe_offset = pe.header.dos_header.pe_pointer as usize;
+    let pe_offset = sat_usize(pe.header.dos_header.pe_pointer);
     if pe_offset <= 0x40 {
         return;
     }
@@ -333,7 +324,7 @@ pub(super) fn checksum(pe: &PE<'_>, bytes: &[u8], metrics: &mut Metrics) {
     let stored = opt.windows_fields.check_sum;
     metrics.insert(metric!("pe.checksum"), f64::from(stored));
     let Some(checksum_offset) = layout::checksum_offset(
-        pe.header.dos_header.pe_pointer as usize,
+        sat_usize(pe.header.dos_header.pe_pointer),
         opt.standard_fields.magic,
     ) else {
         return;
@@ -406,7 +397,7 @@ pub(super) fn data_directory_anomalies(
         return;
     };
     let Some(directory_offset) = layout::data_directory_offset(
-        pe.header.dos_header.pe_pointer as usize,
+        sat_usize(pe.header.dos_header.pe_pointer),
         opt.standard_fields.magic,
         0,
     ) else {

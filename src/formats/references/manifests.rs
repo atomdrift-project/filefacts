@@ -124,7 +124,8 @@ fn cargo_table(
         }
         let kind = if let Some(registry) = spec.get("registry").and_then(JsonValue::as_str) {
             purl.push_str(if purl.contains('?') { "&" } else { "?" });
-            purl.push_str(&format!("registry={}", encode(registry)));
+            purl.push_str("registry=");
+            purl.push_str(&encode(registry));
             RefKind::Undefined // named private registry requires configuration resolution
         } else {
             kind
@@ -169,17 +170,14 @@ pub(super) fn pyproject(values: &Values, out: &mut Refs<'_>) {
         .and_then(JsonValue::as_object)
     {
         for (group, deps) in groups {
+            let source = format!("pyproject.toml:project.optional-dependencies.{group}");
             for spec in deps
                 .as_array()
                 .into_iter()
                 .flatten()
                 .filter_map(JsonValue::as_str)
             {
-                python_requirement(
-                    spec,
-                    &format!("pyproject.toml:project.optional-dependencies.{group}"),
-                    out,
-                );
+                python_requirement(spec, &source, out);
             }
         }
     }
@@ -187,29 +185,27 @@ pub(super) fn pyproject(values: &Values, out: &mut Refs<'_>) {
         .get("build-system")
         .and_then(|v| v.get("build-backend"))
         .and_then(JsonValue::as_str)
-    {
-        if let Some(paths) = root
+        && let Some(paths) = root
             .get("build-system")
             .and_then(|v| v.get("backend-path"))
             .and_then(JsonValue::as_array)
-        {
-            let module = backend
-                .split(':')
-                .next()
-                .unwrap_or(backend)
-                .replace('.', "/");
-            for path in paths.iter().filter_map(JsonValue::as_str) {
-                push_local_ref(
-                    out,
-                    &format!("{path}/{module}.py"),
-                    "pyproject.toml:build-system.build-backend",
-                );
-                push_local_ref(
-                    out,
-                    &format!("{path}/{module}/__init__.py"),
-                    "pyproject.toml:build-system.build-backend",
-                );
-            }
+    {
+        let module = backend
+            .split(':')
+            .next()
+            .unwrap_or(backend)
+            .replace('.', "/");
+        for path in paths.iter().filter_map(JsonValue::as_str) {
+            push_local_ref(
+                out,
+                &format!("{path}/{module}.py"),
+                "pyproject.toml:build-system.build-backend",
+            );
+            push_local_ref(
+                out,
+                &format!("{path}/{module}/__init__.py"),
+                "pyproject.toml:build-system.build-backend",
+            );
         }
     }
 }
@@ -221,12 +217,7 @@ pub(super) fn pkginfo(values: &Values, out: &mut Refs<'_>) {
     let Some(field) = values.as_json().get("requires-dist") else {
         return;
     };
-    let specs: Vec<&str> = match field {
-        JsonValue::String(s) => vec![s],
-        JsonValue::Array(a) => a.iter().filter_map(JsonValue::as_str).collect(),
-        _ => return,
-    };
-    for spec in specs {
+    for spec in super::str_array(Some(field)) {
         let start = out.refs.len();
         python_requirement(spec, "pkg-info:Requires-Dist", out);
         if let Some(r) = out.refs.get_mut(start) {
@@ -271,7 +262,9 @@ fn python_requirement(spec: &str, source: &str, out: &mut Refs<'_>) {
         return;
     }
     rest = rest.trim_matches(['(', ')']).trim();
-    let base = pypi_purl(name, "").trim_end_matches('@').to_string();
+    let mut base = pypi_purl(name, "");
+    // Drop the empty version's `@`.
+    base.pop();
     let mut purl = if let Some(exact) = rest
         .strip_prefix("==")
         .filter(|v| !v.contains([',', '*', ' ']))
@@ -284,7 +277,8 @@ fn python_requirement(spec: &str, source: &str, out: &mut Refs<'_>) {
     };
     if let Some(marker) = marker {
         purl.push_str(if purl.contains('?') { "&" } else { "?" });
-        purl.push_str(&format!("environment_marker={}", encode(marker)));
+        purl.push_str("environment_marker=");
+        purl.push_str(&encode(marker));
     }
     out.push(
         RefLocator::Purl(purl),

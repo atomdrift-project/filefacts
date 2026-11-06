@@ -17,11 +17,24 @@ type HttpParent = (Option<usize>, Vec<(usize, usize)>);
 // Variables is the default template assignment scope. Functions are not
 // analyzed here, so local/arguments aliases must not be guessed.
 fn normalize_binding(name: &str) -> String {
-    let name = name.to_ascii_lowercase();
-    name.strip_prefix("variables.")
-        .filter(|s| !s.contains('.'))
-        .unwrap_or(&name)
-        .to_string()
+    const SCOPE: &str = "variables.";
+    let mut name = name.to_ascii_lowercase();
+    if name
+        .strip_prefix(SCOPE)
+        .is_some_and(|short| !short.contains('.'))
+    {
+        name.drain(..SCOPE.len());
+    }
+    name
+}
+
+/// `a`, `a.b_1`, …: one or more `.`-separated identifiers.
+fn is_dotted_name(text: &[u8]) -> bool {
+    text.split(|b| *b == b'.').all(|part| {
+        part.first()
+            .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
+            && part.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+    })
 }
 
 fn defined_guard(bytes: &[u8], range: Range<usize>) -> Option<(String, String)> {
@@ -74,7 +87,30 @@ struct Builder<'a> {
     symbol_literal_bytes: usize,
 }
 
-impl Builder<'_> {
+impl<'a> Builder<'a> {
+    /// A builder over `bytes` whose flow holds only the unknown value 0.
+    fn new(bytes: &'a [u8]) -> Self {
+        let mut b = Self {
+            bytes,
+            bindings: Bindings::new(),
+            branches: Vec::new(),
+            implicit_scope: true,
+            folded_bytes: 0,
+            symbol_literal_bytes: 0,
+            result: Parsed {
+                symbols: Symbols::new(),
+                flow: Flow {
+                    version: 1,
+                    producer: "cfml-tags".into(),
+                    language: "cfml".into(),
+                    ..Flow::default()
+                },
+            },
+        };
+        b.add(FlowKind::Unknown, 0, Vec::new());
+        b
+    }
+
     fn condition_calls(&mut self, range: Range<usize>) {
         let (calls, limited) = super::script::calls(self.bytes, range);
         if limited {
@@ -103,16 +139,7 @@ impl Builder<'_> {
         let Some((left, right)) = operands else {
             return;
         };
-        let identifier = |s: &str| {
-            !s.is_empty()
-                && s.split('.').all(|part| {
-                    part.as_bytes()
-                        .first()
-                        .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
-                        && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-                })
-        };
-        if !identifier(left) || !identifier(right) {
+        if !is_dotted_name(left.as_bytes()) || !is_dotted_name(right.as_bytes()) {
             return;
         }
         let left_name = left.to_ascii_lowercase();
@@ -168,18 +195,10 @@ impl Builder<'_> {
         while let Some(&byte) = text.get(at)
             && (byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.'))
         {
-            path.push((byte as char).to_ascii_lowercase());
+            path.push(char::from(byte.to_ascii_lowercase()));
             at += 1;
         }
-        if path.is_empty()
-            || path.split('.').any(|s| {
-                s.is_empty()
-                    || !s
-                        .as_bytes()
-                        .first()
-                        .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
-            })
-        {
+        if !is_dotted_name(path.as_bytes()) {
             self.gap(Limitation::UnsupportedIndexedMember);
             return 0;
         }
@@ -214,9 +233,11 @@ impl Builder<'_> {
                     return 0;
                 }
                 path.push('.');
-                path.push_str(
-                    &String::from_utf8_lossy(text.get(start..at).unwrap_or_default())
-                        .to_ascii_lowercase(),
+                path.extend(
+                    text.get(start..at)
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|b| char::from(b.to_ascii_lowercase())),
                 );
                 continue;
             }
@@ -269,7 +290,7 @@ impl Builder<'_> {
                     .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
             {
                 path.push('.');
-                path.push_str(&String::from_utf8_lossy(inner).to_ascii_lowercase());
+                path.extend(inner.iter().map(|b| char::from(b.to_ascii_lowercase())));
             } else if raw.is_empty() {
                 self.gap(Limitation::MalformedExpression);
                 return 0;
@@ -405,7 +426,7 @@ impl Builder<'_> {
             return 0;
         }
         if let Some(total) = total {
-            if total > super::MAX_BYTES - self.folded_bytes {
+            if total > super::MAX_BYTES.saturating_sub(self.folded_bytes) {
                 self.gap(Limitation::ConstantStringBudget);
                 return id;
             }
@@ -538,15 +559,7 @@ impl Builder<'_> {
                 let prefix = self.trim(r.start..open);
                 let prefix_bytes = bytes.get(prefix.clone()).unwrap_or_default();
                 let prefix_text = String::from_utf8_lossy(prefix_bytes);
-                let valid_name = |s: &str| {
-                    !s.is_empty()
-                        && s.split('.').all(|part| {
-                            part.as_bytes()
-                                .first()
-                                .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
-                                && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-                        })
-                };
+                let valid_name = |s: &str| is_dotted_name(s.as_bytes());
                 let static_name = if valid_name(&prefix_text) {
                     Some(prefix_text.to_ascii_lowercase())
                 } else if prefix_text.split('.').take(MAX_EXPR_PARTS + 1).count() <= MAX_EXPR_PARTS
@@ -623,7 +636,9 @@ impl Builder<'_> {
                         .filter_map(|input| values.get(*input))
                         .map(|value| {
                             if let Some(Arg::String { value: text }) = &value.literal {
-                                if text.len() > super::MAX_BYTES - self.symbol_literal_bytes {
+                                if text.len()
+                                    > super::MAX_BYTES.saturating_sub(self.symbol_literal_bytes)
+                                {
                                     truncated = true;
                                     return Arg::Expression;
                                 }
@@ -725,49 +740,42 @@ impl Builder<'_> {
         if range.is_empty() {
             return;
         }
-        if assignments {
-            if let Some(equals) = self.separators(range.clone(), b'=') {
-                if let Some(&eq) = equals.first() {
-                    let lhs = self.trim(range.start..eq);
-                    let text = self.bytes.get(lhs.clone()).unwrap_or_default();
-                    let simple = !text.is_empty()
-                        && text.split(|b| *b == b'.').all(|part| {
-                            part.first()
-                                .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
-                                && part.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'_')
-                        });
-                    if simple && equals.len() == 1 && self.bytes.get(eq + 1) != Some(&b'=') {
-                        let before = self.result.symbols.len();
-                        self.assignment(&Tag {
-                            name: lhs,
-                            body: range.clone(),
-                            span: range.clone(),
-                            closing: false,
-                        });
-                        // Preserve lexical call observations even when a complex
-                        // RHS remains opaque to value analysis. Avoid duplicates.
-                        let seen: BTreeSet<_> = self
-                            .result
-                            .symbols
-                            .iter()
-                            .skip(before)
-                            .filter_map(|s| match s {
-                                Symbol::Call { offset, .. } => *offset,
-                                _ => None,
-                            })
-                            .collect();
-                        let (calls, limited) = super::script::calls(self.bytes, eq + 1..range.end);
-                        if limited {
-                            self.gap(Limitation::ScriptCallSyntaxOrBudget);
-                        }
-                        for call in calls {
-                            if !seen.contains(&(call.start as u64)) {
-                                self.expr(call, 0);
-                            }
-                        }
-                        return;
+        if assignments
+            && let Some(equals) = self.separators(range.clone(), b'=')
+            && let Some(&eq) = equals.first()
+        {
+            let lhs = self.trim(range.start..eq);
+            let text = self.bytes.get(lhs.clone()).unwrap_or_default();
+            if is_dotted_name(text) && equals.len() == 1 && self.bytes.get(eq + 1) != Some(&b'=') {
+                let before = self.result.symbols.len();
+                self.assignment(&Tag {
+                    name: lhs,
+                    body: range.clone(),
+                    span: range.clone(),
+                    closing: false,
+                });
+                // Preserve lexical call observations even when a complex
+                // RHS remains opaque to value analysis. Avoid duplicates.
+                let seen: BTreeSet<_> = self
+                    .result
+                    .symbols
+                    .iter()
+                    .skip(before)
+                    .filter_map(|s| match s {
+                        Symbol::Call { offset, .. } => *offset,
+                        _ => None,
+                    })
+                    .collect();
+                let (calls, limited) = super::script::calls(self.bytes, eq + 1..range.end);
+                if limited {
+                    self.gap(Limitation::ScriptCallSyntaxOrBudget);
+                }
+                for call in calls {
+                    if !seen.contains(&(call.start as u64)) {
+                        self.expr(call, 0);
                     }
                 }
+                return;
             }
         }
         let (calls, limited) = super::script::calls(self.bytes, range.clone());
@@ -804,17 +812,7 @@ impl Builder<'_> {
         let name = normalize_binding(&String::from_utf8_lossy(
             self.bytes.get(lhs.clone()).unwrap_or_default(),
         ));
-        if name.is_empty()
-            || name.split('.').any(|part| {
-                !part
-                    .as_bytes()
-                    .first()
-                    .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
-            })
-            || !name
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.'))
-        {
+        if !is_dotted_name(name.as_bytes()) {
             self.gap(Limitation::UnsupportedAssignmentTarget);
             self.bindings.clear();
             return;
@@ -856,13 +854,7 @@ impl Builder<'_> {
                 .is_some_and(f64::is_finite)
         {
             shape = ArgShape::Number;
-        } else if !raw.is_empty()
-            && raw.split(|b| *b == b'.').all(|part| {
-                part.first()
-                    .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
-                    && part.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'_')
-            })
-        {
+        } else if is_dotted_name(raw) {
             shape = ArgShape::Identifier;
         } else if self
             .result
@@ -886,7 +878,7 @@ impl Builder<'_> {
         self.bindings.insert(name, value);
     }
     // Attribute values are complete strings, never contributing fragments.
-    fn tag_string(&self, object: usize, field: &str) -> Option<String> {
+    fn tag_string(&self, object: usize, field: &str) -> Option<&str> {
         let values = self
             .result
             .flow
@@ -902,7 +894,7 @@ impl Builder<'_> {
             .get(value.value)
             .and_then(|v| v.literal.as_ref())
         {
-            Some(Arg::String { value }) if value.len() <= 256 => Some(value.clone()),
+            Some(Arg::String { value }) if value.len() <= 256 => Some(value),
             _ => None,
         }
     }
@@ -936,9 +928,7 @@ impl Builder<'_> {
         {
             return;
         }
-        let name = self
-            .tag_string(object, "variable")
-            .map(|s| normalize_binding(&s));
+        let name = self.tag_string(object, "variable").map(normalize_binding);
         let Some(name) = name.filter(|name| {
             name.as_bytes()
                 .first()
@@ -997,12 +987,11 @@ impl Builder<'_> {
         if call == 0 {
             return;
         }
-        let target = "cfoutput:expression".to_string();
         if let Some(value) = self.result.flow.values.get_mut(call) {
-            value.target = Some(target.clone());
+            value.target = Some("cfoutput:expression".into());
         }
         self.result.symbols.push(Symbol::Call {
-            target: Some(target),
+            target: Some("cfoutput:expression".into()),
             args: vec![Arg::Expression],
             offset: Some(offset as u64),
         });
@@ -1152,24 +1141,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Parsed {
         Some(super::script::mask_comments(bytes, &syntax.scripts))
     };
     let expression_bytes = masked.as_deref().unwrap_or(bytes);
-    let mut b = Builder {
-        bytes: expression_bytes,
-        bindings: Bindings::new(),
-        branches: Vec::new(),
-        implicit_scope: true,
-        folded_bytes: 0,
-        symbol_literal_bytes: 0,
-        result: Parsed {
-            symbols: Symbols::new(),
-            flow: Flow {
-                version: 1,
-                producer: "cfml-tags".into(),
-                language: "cfml".into(),
-                ..Flow::default()
-            },
-        },
-    };
-    b.add(FlowKind::Unknown, 0, Vec::new());
+    let mut b = Builder::new(expression_bytes);
     // The scope of every graph rather than a gap in this one.
     b.result
         .flow
@@ -1237,7 +1209,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Parsed {
                     for event in events {
                         match event {
                             super::script::Event::Statement(range, allowed) => {
-                                b.script_statement(range, allowed)
+                                b.script_statement(range, allowed);
                             }
                             super::script::Event::Barrier => b.bindings.clear(),
                         }
@@ -1395,10 +1367,9 @@ pub(crate) fn parse(bytes: &[u8]) -> Parsed {
                     unknown_output_scopes -= 1;
                 }
             }
-            ("cfapplication", true)
-            | (
-                "cfexecute" | "cffile" | "cfdirectory" | "cfinput" | "cftextarea" | "cfselect"
-                | "cfheader" | "cfcontent",
+            (
+                "cfapplication" | "cfexecute" | "cffile" | "cfdirectory" | "cfinput" | "cftextarea"
+                | "cfselect" | "cfheader" | "cfcontent",
                 true,
             ) => {}
             // Do not let unknown control flow or calls preserve stale aliases.

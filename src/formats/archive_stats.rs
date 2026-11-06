@@ -39,6 +39,16 @@ pub(super) enum Scope {
     Files,
 }
 
+impl Scope {
+    /// The aggregate over this scope's members.
+    fn pick<T>(self, all: T, files: T) -> T {
+        match self {
+            Self::All => all,
+            Self::Files => files,
+        }
+    }
+}
+
 /// How `archive.timing.mtime_dominant_*` groups members by timestamp.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Dominance {
@@ -245,15 +255,19 @@ impl ArchiveStats {
             && member.size_bytes > 0
         {
             let ratio = member.size_bytes as f64 / c as f64;
-            if ratio > self.bomb_all {
-                self.bomb_all = ratio;
-            }
-            if reading.file && ratio > self.bomb_files {
-                self.bomb_files = ratio;
+            self.bomb_all = self.bomb_all.max(ratio);
+            if reading.file {
+                self.bomb_files = self.bomb_files.max(ratio);
             }
         }
         if let Some(method) = member.compression.method.as_deref() {
-            count_key(&mut self.methods, method);
+            // Bump the count without allocating when the method is known.
+            match self.methods.get_mut(method) {
+                Some(n) => *n += 1,
+                None => {
+                    self.methods.insert(method.to_owned(), 1);
+                }
+            }
         }
         *self.entry_types.entry(entry_type).or_default() += 1;
 
@@ -333,10 +347,6 @@ impl ArchiveStats {
     }
 
     fn emit_one(&self, agg: Agg, values: &mut Values, metrics: &mut Metrics) {
-        let pick = |scope: Scope, all: u64, files: u64| match scope {
-            Scope::All => all,
-            Scope::Files => files,
-        };
         match agg {
             Agg::MemberCount => {
                 metrics.insert(metric!("archive.member_count"), self.members as f64)
@@ -347,7 +357,7 @@ impl ArchiveStats {
             }
             Agg::UncompressedSize(scope) => metrics.insert(
                 metric!("archive.uncompressed_size"),
-                pick(scope, self.size_all, self.size_files) as f64,
+                scope.pick(self.size_all, self.size_files) as f64,
             ),
             Agg::CompressedSize => {
                 metrics.insert(metric!("archive.compressed_size"), self.compressed as f64);
@@ -364,7 +374,7 @@ impl ArchiveStats {
                 if always || !self.methods.is_empty() {
                     values.insert_key(
                         value_key!("archive.compression.methods"),
-                        key_list(&self.methods),
+                        string_list(self.methods.keys()),
                     );
                     for (method, count) in &self.methods {
                         metrics.insert(crate::archive_method_count(method), *count as f64);
@@ -416,7 +426,7 @@ impl ArchiveStats {
             }
             Agg::PathTraversal(scope) => metrics.insert(
                 metric!("archive.path_traversal_count"),
-                pick(scope, self.traversal_all, self.traversal_files) as f64,
+                scope.pick(self.traversal_all, self.traversal_files) as f64,
             ),
             Agg::NameTricks => {
                 metrics.insert(
@@ -452,10 +462,7 @@ impl ArchiveStats {
                 self.duplicates as f64,
             ),
             Agg::ZipBombRatio(scope) => {
-                let ratio = match scope {
-                    Scope::All => self.bomb_all,
-                    Scope::Files => self.bomb_files,
-                };
+                let ratio = scope.pick(self.bomb_all, self.bomb_files);
                 if ratio > 0.0 {
                     metrics.insert(metric!("archive.zip_bomb_ratio"), ratio);
                 }
@@ -535,18 +542,15 @@ impl ArchiveStats {
             Dominance::UntimedGroup => dominant(self.times.iter().copied()),
             Dominance::TimedOnly => dominant(timed.iter().copied().map(Some)),
         };
+        // A dominant group has at least one member, so `total` is nonzero.
         let Some((stamp, count)) = dominant else {
             return;
         };
-        if total == 0 {
-            return;
-        }
-        let fraction = match dominance {
-            Dominance::UntimedGroup => count as f64 / total as f64,
-            Dominance::TimedOnly => count as f64 / total.max(1) as f64,
-        };
         metrics.insert(metric!("archive.timing.mtime_dominant_count"), count as f64);
-        metrics.insert(metric!("archive.timing.mtime_dominant_ratio"), fraction);
+        metrics.insert(
+            metric!("archive.timing.mtime_dominant_ratio"),
+            count as f64 / total as f64,
+        );
         if count.saturating_mul(2) <= total || count >= total {
             return;
         }
@@ -596,26 +600,8 @@ fn dominant(times: impl Iterator<Item = Option<i64>>) -> Option<(Option<i64>, u6
     counts.into_iter().max_by_key(|(_, count)| *count)
 }
 
-/// Bump `key`'s count without allocating when it is already present.
-fn count_key(counts: &mut BTreeMap<String, u64>, key: &str) {
-    if let Some(n) = counts.get_mut(key) {
-        *n += 1;
-    } else {
-        counts.insert(key.to_owned(), 1);
-    }
-}
-
-fn key_list(counts: &BTreeMap<String, u64>) -> JsonValue {
-    JsonValue::Array(
-        counts
-            .keys()
-            .map(|k| JsonValue::String(k.clone()))
-            .collect(),
-    )
-}
-
-fn string_list(set: &BTreeSet<String>) -> JsonValue {
-    JsonValue::Array(set.iter().map(|s| JsonValue::String(s.clone())).collect())
+fn string_list<'a>(items: impl IntoIterator<Item = &'a String>) -> JsonValue {
+    JsonValue::Array(items.into_iter().cloned().map(JsonValue::String).collect())
 }
 
 /// The `archive.members[]` value for one typed member: its serde form, to
@@ -651,15 +637,18 @@ pub(super) fn classify_filename(path: &str) -> FilenameClass {
         is_hidden: path
             .split('/')
             .any(|p| p.starts_with('.') && p != "." && p != ".."),
-        // Path traversal: any `..` component, or an absolute path (leading
-        // `/` or a Windows drive letter).
-        has_path_traversal: path.split('/').any(|p| p == "..")
-            || path.starts_with('/')
+        // Path traversal: any `..` component, or an absolute path (a leading
+        // separator or a Windows drive letter). Windows extractors split on
+        // `\\` as well as `/`, so either one separates components.
+        has_path_traversal: path.split(['/', '\\']).any(|p| p == "..")
+            || path.starts_with(['/', '\\'])
             || path
                 .chars()
                 .next()
                 .is_some_and(|ch| ch.is_ascii_alphabetic())
-                && path.get(1..).is_some_and(|rest| rest.starts_with(":\\")),
+                && path
+                    .get(1..)
+                    .is_some_and(|rest| rest.starts_with(":\\") || rest.starts_with(":/")),
         // Non-ASCII content anywhere in the path.
         is_unicode: !path.is_ascii(),
         // Homoglyphs: Cyrillic / Greek look-alikes for ASCII Latin letters.
@@ -668,7 +657,7 @@ pub(super) fn classify_filename(path: &str) -> FilenameClass {
         // Right-to-left override and related bidi-format control chars.
         has_rtlo: path
             .chars()
-            .any(|ch| matches!(ch as u32, 0x202A..=0x202E | 0x2066..=0x2069)),
+            .any(|ch| matches!(ch, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')),
         ..FilenameClass::default()
     };
 

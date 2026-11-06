@@ -5,7 +5,7 @@
 #   1. Cargo.toml has no local sibling-repo overrides (path dependencies that
 #      escape the repo, e.g. ../sibling). The vendored `path = "vendor/..."`
 #      dep and remote git patches are allowed.
-#   2. `make lint` passes (rustfmt --check + clippy -D warnings).
+#   2. `make lint` passes (rustfmt, clippy and rustdoc, warnings denied).
 #   3. `make test` passes.
 #
 # Install with: make install-hooks

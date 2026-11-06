@@ -12,7 +12,7 @@
 //! [`metric!`](crate::metric) does for metrics. It resolves a literal against
 //! [`VALUE_CATALOG`] at compile time. Writers
 //! ([`Values::insert_key`](super::Values::insert_key)) and readers
-//! ([`Values::get_key`](super::Values::get_key)) both take the resulting
+//! ([`Values::lookup`](super::Values::lookup)) both take the resulting
 //! [`ValueKey`], so both sides are checked against the same list. A key that
 //! is not declared below is a build failure at the call site.
 //!
@@ -24,7 +24,7 @@
 //!
 //! When a key's tail is data, such as an array index or a manifest field name,
 //! the fixed base is cataloged, and the call site supplies the rest through
-//! [`Values::get_key_at`](super::Values::get_key_at) or
+//! [`Values::lookup_at`](super::Values::lookup_at) or
 //! [`Values::insert_key_at`](super::Values::insert_key_at).
 //!
 //! Two kinds of path are not listed, because the input names them rather than
@@ -96,7 +96,7 @@ pub(crate) const fn declared_value_key(name: &'static str) -> ValueKey {
 ///
 /// ```ignore
 /// values.insert_key(value_key!("pe.signatures"), signatures);
-/// let first = values.get_key_at(value_key!("pe.signatures"), "[0]");
+/// let first = values.lookup_at(value_key!("pe.signatures"), "[0]");
 /// ```
 ///
 /// The literal must appear in [`VALUE_CATALOG`]. If it does not, the call
@@ -116,7 +116,7 @@ pub(crate) use value_key;
 /// `value_key!` somewhere outside a test; a unit test
 /// enforces that, so a key whose last writer goes away cannot stay here and
 /// keep its readers compiling against nothing.
-pub const VALUE_CATALOG: &[&str] = &[
+pub(crate) const VALUE_CATALOG: &[&str] = &[
     "7z.limits",
     "android.allow_backup",
     "android.app_class",
@@ -722,6 +722,7 @@ pub const VALUE_CATALOG: &[&str] = &[
     "pickle.protocol",
     "pkg",
     "pkg.checksums",
+    "pkg.limits",
     "pkg.source_github_owners",
     "pkg.url_github_owner",
     "plist.cms_wrapped",
@@ -857,6 +858,7 @@ pub const VALUE_CATALOG: &[&str] = &[
     "source.rust.initializers",
     "source.rust.modules",
     "source.rust.proc_macro",
+    "source.shell.fifo_limited",
     "source.shell.fifo_network_loops",
     "source.shell.fifos",
     "source.wordpress.plugin_name",
@@ -899,6 +901,7 @@ pub const VALUE_CATALOG: &[&str] = &[
     "whl.has_record",
     "whl.has_wheel",
     "whl.homepage",
+    "whl.limits",
     "whl.maintainers",
     "whl.purelib_shape",
     "whl.signing.has_record_jws",
@@ -920,24 +923,6 @@ pub const VALUE_CATALOG: &[&str] = &[
     "xpi.version",
     "zip.limits",
 ];
-
-/// Value keys with a data-derived segment that is not a tail, as templates in
-/// which each `<name>` stands for a non-empty run of characters other than
-/// `.` and `[`.
-///
-/// This is the values counterpart of [`FAMILIES`](crate::FAMILIES), and it is
-/// empty: no extractor writes such a key. Every key is either fixed and listed
-/// in [`VALUE_CATALOG`], or a cataloged base followed by a data tail. Where a
-/// segment is drawn from a closed set of names, as with the
-/// `pe.version.<leaf>_offset` companions or the npm lifecycle hooks, each
-/// member is cataloged on its own, so a validator can still reject a
-/// misspelled one.
-///
-/// A family belongs here only when the file supplies a segment that is
-/// followed by more path, so no cataloged base covers it. Add its template
-/// together with a constructor in this module that builds the key, as
-/// `metric_keys` does for metric families.
-pub const VALUE_FAMILIES: &[&str] = &[];
 
 #[cfg(test)]
 mod tests;

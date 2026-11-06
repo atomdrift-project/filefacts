@@ -91,7 +91,7 @@ fn macho_db_suffix_is_a_typed_data_extension_mismatch() {
 // ── AppleDouble (._<name>) resource forks ────────────────────────────
 // A macOS resource fork (`._foo.php`) is binary metadata, not the type
 // its name claims. Magic-byte detection must return Unknown so
-// `is_program()` skips analysis.
+// `is_analyzed()` skips analysis.
 
 #[test]
 fn go_mod_content_beats_unknown_and_misleading_extensions() {
@@ -125,8 +125,8 @@ fn appledouble_magic_returns_unknown() {
     // Magic detection must win over the `.php` extension fallback —
     // otherwise the body gets analyzed as PHP and entropy traits fire.
     assert!(
-        !det.file_type.is_program(),
-        "AppleDouble bodies must be skipped by is_program(), not analyzed \
+        !det.file_type.is_analyzed(),
+        "AppleDouble bodies must be skipped by is_analyzed(), not analyzed \
              as the type their name claims"
     );
 }

@@ -242,6 +242,20 @@ function loadBytenode(){return require('bytenode');}\n})();\n";
     assert_detect("rows.csv", b"name,count\nalice,1\n", FileType::Text);
 }
 
+/// Perl's POD documentation is prose markup; its indented C or Perl
+/// examples do not make it source.
+#[test]
+fn pod_documentation_is_text() {
+    let pod = b"=encoding utf-8\n\n=head1 NAME\n\nlibev - an event loop written in C\n\n\
+=head1 SYNOPSIS\n\n   #include <ev.h>\n   #include <stdio.h>\n\n   static void\n\
+   stdin_cb (EV_P_ ev_io *w, int revents)\n   {\n     puts (\"stdin ready\");\n\
+     ev_io_stop (EV_A_ w);\n   }\n\n   int\n   main (void)\n   {\n\
+     struct ev_loop *loop = EV_DEFAULT;\n     ev_run (loop, 0);\n     return 0;\n   }\n\n\
+=head1 DESCRIPTION\n\nThe newest version of this document is also available as an html-formatted\n\
+web page.\n\n=cut\n";
+    assert_detect("ev.pod", pod, FileType::Text);
+}
+
 #[test]
 fn svg_is_image_group() {
     // SVG belongs to the media (image) group so a binary renamed .svg is a
@@ -426,6 +440,28 @@ fn tab_indented_python_try_suite_is_not_a_make_recipe() {
     let make = b"try:\n\tpython -c 'import sys; print(sys.version)'\n";
     assert_detect("Makefile", make, FileType::Makefile);
     assert_detect("recipe.mk", make, FileType::Makefile);
+}
+
+/// Binary data whose bytes happen to hold a column-zero `name:` line and a
+/// tab-led line is not make syntax: model weights, database tables and
+/// training data must not be parsed as a Makefile.
+#[test]
+fn binary_data_with_target_and_tab_bytes_is_not_a_makefile() {
+    let mut blob = vec![0x18, 0, 0, 0];
+    blob.extend_from_slice(&[0xFF; 60]);
+    // A deterministic stand-in for compressed or quantised data.
+    let mut state = 0x9E37_79B9_u32;
+    for _ in 0..4096 {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        blob.push(state.to_le_bytes()[0]);
+    }
+    blob.splice(200..200, *b"\nab:\x01\x02\n\t\x03\x04");
+    for path in ["eng.traineddata", "model.onnx", "000056.ldb", "blob"] {
+        let found = detect(Path::new(path), &blob).map(|d| d.file_type);
+        assert_ne!(found, Some(FileType::Makefile), "{path}");
+    }
 }
 
 #[test]

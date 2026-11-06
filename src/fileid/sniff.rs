@@ -17,7 +17,7 @@ use super::{
     heuristics::{self, Scores},
     marks,
     scripts::{self, Evidence},
-    strip_utf8_bom, zip_probe,
+    strip_utf8_bom, text, text_shapes, zip_probe,
 };
 
 /// The path and bytes being identified, with lazily computed derivations.
@@ -27,7 +27,7 @@ pub(super) struct Sniff<'a> {
     /// The bytes, as given.
     pub(super) data: &'a [u8],
     /// `data` without a leading UTF-8 byte-order mark.
-    pub(super) body: &'a [u8],
+    body: &'a [u8],
     /// [`ext::claim`].
     claim: OnceCell<Option<Claim>>,
     /// [`heuristics::decoded_text`]: UTF-16 narrowed for the byte scorers.
@@ -40,9 +40,9 @@ pub(super) struct Sniff<'a> {
     scored: OnceCell<Option<FileType>>,
     /// [`marks::unmistakable`].
     marked: OnceCell<Option<FileType>>,
-    /// [`marks::looks_like_git_config`].
+    /// [`text_shapes::looks_like_git_config`].
     git_config: OnceCell<bool>,
-    /// [`heuristics::binary_not_source`].
+    /// [`text::is_object_code`].
     binary_not_source: OnceCell<bool>,
     /// The bytes opened as a zip, when they are one.
     zip: OnceCell<Option<zip_probe::Archive<'a>>>,
@@ -112,18 +112,25 @@ impl<'a> Sniff<'a> {
         *self.marked.get_or_init(|| marks::unmistakable(self))
     }
 
-    /// Git's config syntax in the head.
+    /// Git's config syntax in the head of [`Self::text`].
     pub(super) fn looks_like_git_config(&self) -> bool {
         *self
             .git_config
-            .get_or_init(|| marks::looks_like_git_config(self.data))
+            .get_or_init(|| text_shapes::looks_like_git_config(self.text()))
     }
 
     /// Object code, not text in any encoding.
     pub(super) fn binary_not_source(&self) -> bool {
         *self
             .binary_not_source
-            .get_or_init(|| heuristics::binary_not_source(self.data))
+            .get_or_init(|| text::is_object_code(self.data))
+    }
+
+    /// Whether [`Self::binary_not_source`] has been worked out, for tests
+    /// that assert a check was skipped.
+    #[cfg(test)]
+    pub(super) fn classified_binary(&self) -> bool {
+        self.binary_not_source.get().is_some()
     }
 
     /// The bytes opened as a zip archive, each caller with its own read

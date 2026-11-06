@@ -12,40 +12,180 @@
 //!   `ProductName`, `OriginalFilename`, `FileVersion`,
 //!   `LegalCopyright`, …
 //!
-//! Goblin parses the whole resource tree for us and exposes typed
-//! accessors. We flatten the strings into snake_case `pe.version.*`
-//! leaves (`pe.version.company`, `pe.version.file_version`, …) and
-//! decompose the `VS_FIXEDFILEINFO` into `pe.version.{os,type,subtype,flags}`
-//! with format-conventional names — flag bits as a sorted string array,
-//! OS class as a stable label.
+//! One bounded walk of the resource directory finds the `RT_VERSION`
+//! leaves, and one walk of each leaf's block tree reads both children: the
+//! strings flatten to snake_case `pe.version.*` leaves (`pe.version.company`,
+//! `pe.version.file_version`, …), each with the file offset of its value,
+//! and `VS_FIXEDFILEINFO` decomposes into `pe.version.{os,type,subtype,flags}`
+//! with format-conventional names — flag bits as a sorted string array, OS
+//! class as a stable label. The same walk serves an image goblin parsed and
+//! one it could not, given a section table.
 
 use crate::metric;
-use goblin::pe::resource::{StringFileInfo, VersionInfo, VsFixedFileInfo};
+use goblin::pe::data_directories::DataDirectory;
+use goblin::pe::resource::{IMAGE_RESOURCE_DATA_IS_DIRECTORY, RT_VERSION};
+use goblin::pe::section_table::SectionTable;
 use serde_json::Value as JsonValue;
 
-use super::layout::{self, RESOURCE_DIRECTORY};
-use crate::formats::common::bytes_at::{self, u16_le, u32_le};
+use super::layout::section_rva_to_file_offset;
+use crate::bytes::{u16_le, u32_le};
 use crate::formats::common::{put_str, put_u64};
 use crate::output::{Metrics, ValueKey, Values};
+use crate::scan::entropy;
 use crate::value_key;
 
+/// Read the `RT_VERSION` resources under the resource directory `resources`
+/// into `pe.version.*`, resolving RVAs through `sections`. Returns whether
+/// there was a `VS_VERSIONINFO` resource.
 pub(super) fn extract(
-    info: &VersionInfo<'_>,
+    sections: &[SectionTable],
+    file_alignment: Option<u32>,
+    resources: DataDirectory,
     bytes: &[u8],
     values: &mut Values,
     metrics: &mut Metrics,
-) {
-    if let Some(ref fixed) = info.fixed_info {
-        if fixed.is_valid() {
-            fixed_file_info(fixed, values);
+) -> bool {
+    let mut info = VersionInfo::default();
+    let mut found = false;
+    for (off, len) in version_leaves(sections, file_alignment, resources, bytes) {
+        let end = off.saturating_add(len);
+        let (key, _) = read_utf16_key(bytes, off.saturating_add(6), end);
+        if key != "VS_VERSION_INFO" {
+            continue;
         }
+        found = true;
+        let mut budget = MAX_VERSION_NODES;
+        walk_version_block(bytes, off, end, 0, &mut budget, &mut info);
     }
-    string_table(&info.string_info, values);
-    // goblin decodes the string-table values but hides their file offsets, so
-    // walk the raw VS_VERSIONINFO blob ourselves to anchor `pe.version.*`
-    // `value` matches in the hex view.
-    emit_value_offsets(bytes, values);
-    identity_metrics(&info.string_info, metrics);
+    info.emit(values, metrics);
+    found
+}
+
+/// `StringFileInfo` keys and the `pe.version.*` leaves their value and its
+/// file offset land at: snake_case, no `_name` filler when unambiguous, no
+/// `Legal` prefix on copyright and trademarks.
+const STRING_FIELDS: [(&str, ValueKey, ValueKey); 12] = [
+    (
+        "Comments",
+        value_key!("pe.version.comments"),
+        value_key!("pe.version.comments_offset"),
+    ),
+    (
+        "CompanyName",
+        value_key!("pe.version.company"),
+        value_key!("pe.version.company_offset"),
+    ),
+    (
+        "FileDescription",
+        value_key!("pe.version.description"),
+        value_key!("pe.version.description_offset"),
+    ),
+    (
+        "FileVersion",
+        value_key!("pe.version.file_version"),
+        value_key!("pe.version.file_version_offset"),
+    ),
+    (
+        "InternalName",
+        value_key!("pe.version.internal_name"),
+        value_key!("pe.version.internal_name_offset"),
+    ),
+    (
+        "LegalCopyright",
+        value_key!("pe.version.copyright"),
+        value_key!("pe.version.copyright_offset"),
+    ),
+    (
+        "LegalTrademarks",
+        value_key!("pe.version.trademarks"),
+        value_key!("pe.version.trademarks_offset"),
+    ),
+    (
+        "OriginalFilename",
+        value_key!("pe.version.original_filename"),
+        value_key!("pe.version.original_filename_offset"),
+    ),
+    (
+        "PrivateBuild",
+        value_key!("pe.version.private_build"),
+        value_key!("pe.version.private_build_offset"),
+    ),
+    (
+        "ProductName",
+        value_key!("pe.version.product_name"),
+        value_key!("pe.version.product_name_offset"),
+    ),
+    (
+        "ProductVersion",
+        value_key!("pe.version.product_version"),
+        value_key!("pe.version.product_version_offset"),
+    ),
+    (
+        "SpecialBuild",
+        value_key!("pe.version.special_build"),
+        value_key!("pe.version.special_build_offset"),
+    ),
+];
+
+/// What the block walk read: each known string's value and the file offset
+/// of its value, by its index in [`STRING_FIELDS`], and the fixed info. The
+/// first string table to name a key wins.
+#[derive(Default)]
+struct VersionInfo {
+    strings: [Option<(String, usize)>; STRING_FIELDS.len()],
+    fixed: Option<FixedFileInfo>,
+}
+
+/// The `VS_FIXEDFILEINFO` fields `pe.version.*` reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FixedFileInfo {
+    file_flags_mask: u32,
+    file_flags: u32,
+    file_os: u32,
+    file_type: u32,
+    file_subtype: u32,
+}
+
+/// `VS_FIXEDFILEINFO.dwSignature`.
+const FIXED_FILE_INFO_SIGNATURE: u32 = 0xfeef_04bd;
+/// `sizeof(VS_FIXEDFILEINFO)`.
+const FIXED_FILE_INFO_LEN: usize = 52;
+
+impl FixedFileInfo {
+    /// The structure at `off`, when it carries its signature.
+    fn read(bytes: &[u8], off: usize) -> Option<Self> {
+        let field = |at: usize| u32_le(bytes, off.checked_add(at)?);
+        (field(0)? == FIXED_FILE_INFO_SIGNATURE).then_some(())?;
+        Some(Self {
+            file_flags_mask: field(24)?,
+            file_flags: field(28)?,
+            file_os: field(32)?,
+            file_type: field(36)?,
+            file_subtype: field(40)?,
+        })
+    }
+}
+
+impl VersionInfo {
+    /// The value of the string `key` names, when the walk read one.
+    fn string(&self, key: &str) -> Option<&str> {
+        let index = STRING_FIELDS.iter().position(|(name, ..)| *name == key)?;
+        let (value, _) = self.strings.get(index)?.as_ref()?;
+        Some(value)
+    }
+
+    fn emit(&self, values: &mut Values, metrics: &mut Metrics) {
+        if let Some(fixed) = self.fixed {
+            fixed_file_info(&fixed, values);
+        }
+        for ((_, value_key, offset_key), string) in STRING_FIELDS.iter().zip(&self.strings) {
+            if let Some((value, offset)) = string {
+                put_str(values, *value_key, value.as_str());
+                put_u64(values, *offset_key, *offset as u64);
+            }
+        }
+        identity_metrics(self, metrics);
+    }
 }
 
 /// Maximum VS_VERSIONINFO tree depth honoured while indexing value offsets.
@@ -59,36 +199,15 @@ const MAX_VERSION_DEPTH: u8 = 8;
 /// capping the work a forged blob can demand.
 const MAX_VERSION_NODES: usize = 4096;
 
-/// Map a VS_VERSIONINFO `String` key to the `_offset` companion of the
-/// `pe.version.*` leaf the value-tree uses (must match [`string_table`]), so
-/// the emitted offset lines up with the value path a trait queries.
-fn version_offset_key(key: &str) -> Option<ValueKey> {
-    Some(match key {
-        "Comments" => value_key!("pe.version.comments_offset"),
-        "CompanyName" => value_key!("pe.version.company_offset"),
-        "FileDescription" => value_key!("pe.version.description_offset"),
-        "FileVersion" => value_key!("pe.version.file_version_offset"),
-        "InternalName" => value_key!("pe.version.internal_name_offset"),
-        "LegalCopyright" => value_key!("pe.version.copyright_offset"),
-        "LegalTrademarks" => value_key!("pe.version.trademarks_offset"),
-        "OriginalFilename" => value_key!("pe.version.original_filename_offset"),
-        "PrivateBuild" => value_key!("pe.version.private_build_offset"),
-        "ProductName" => value_key!("pe.version.product_name_offset"),
-        "ProductVersion" => value_key!("pe.version.product_version_offset"),
-        "SpecialBuild" => value_key!("pe.version.special_build_offset"),
-        _ => return None,
-    })
-}
-
 /// Read a UTF-16LE NUL-terminated key at `pos`, returning `(key, offset just
 /// past the terminator)`. Bounded by `end`.
 fn read_utf16_key(bytes: &[u8], pos: usize, end: usize) -> (String, usize) {
     let window = bytes.get(pos..end.min(bytes.len())).unwrap_or_default();
-    let key = bytes_at::utf16_until_nul(window);
+    let key = crate::bytes::utf16_until_nul(window);
     // Step over the terminator when the window holds one.
     let consumed = (key.len() + 2).min(window.len() & !1);
     (
-        bytes_at::utf16_lossy(key, bytes_at::Endian::Little),
+        crate::bytes::utf16_lossy(key, crate::bytes::Endian::Little),
         pos + consumed,
     )
 }
@@ -101,9 +220,10 @@ fn align4(n: usize) -> usize {
 
 /// Walk one length-prefixed VS_VERSIONINFO block at `off` (a file offset into
 /// `bytes`): `{u16 wLength, u16 wValueLength, u16 wType, WCHAR szKey[], pad,
-/// Value, pad, Children}`. Records `pe.version.<leaf>_offset` for `String`
-/// blocks whose key is recognised, then recurses into children. Fully bounds-
-/// and depth-checked: this parses untrusted resource bytes.
+/// Value, pad, Children}`. Reads the root's `VS_FIXEDFILEINFO` and every
+/// `String` block whose key is in [`STRING_FIELDS`] into `info`, then
+/// recurses into children. Fully bounds- and depth-checked: this parses
+/// untrusted resource bytes.
 ///
 /// `limit` is the parent's end: a block claiming to run past it is clamped
 /// there, so sibling subtrees cannot overlap and no byte is walked twice.
@@ -114,10 +234,9 @@ fn walk_version_block(
     limit: usize,
     depth: u8,
     budget: &mut usize,
-    values: &mut Values,
-    recover_strings: bool,
+    info: &mut VersionInfo,
 ) {
-    if depth >= MAX_VERSION_DEPTH || *budget == 0 || off + 6 > limit {
+    if depth >= MAX_VERSION_DEPTH || *budget == 0 || off.saturating_add(6) > limit {
         return;
     }
     *budget -= 1;
@@ -125,8 +244,8 @@ fn walk_version_block(
     else {
         return;
     };
-    let w_length = u16::from_le_bytes([l0, l1]) as usize;
-    let w_value_length = u16::from_le_bytes([v0, v1]) as usize;
+    let w_length = usize::from(u16::from_le_bytes([l0, l1]));
+    let w_value_length = usize::from(u16::from_le_bytes([v0, v1]));
     let w_type = u16::from_le_bytes([t0, t1]);
     let block_end = off.saturating_add(w_length).min(limit);
     if w_length < 6 || block_end <= off {
@@ -141,72 +260,40 @@ fn walk_version_block(
     } else {
         w_value_length
     };
+    let value = value_off
+        .checked_add(value_bytes)
+        .filter(|&end| end <= block_end)
+        .and_then(|end| bytes.get(value_off..end));
 
-    if let Some(offset_key) = version_offset_key(&key)
-        && value_off < block_end
+    if depth == 0 && value_bytes >= FIXED_FILE_INFO_LEN && value.is_some() {
+        info.fixed = info.fixed.or_else(|| FixedFileInfo::read(bytes, value_off));
+    }
+    if w_type == 1
+        && let Some(index) = STRING_FIELDS.iter().position(|(name, ..)| *name == key)
+        && let Some(slot) = info.strings.get_mut(index)
+        && slot.is_none()
+        && let Some(data) = value.filter(|data| data.len() >= 2)
     {
-        put_u64(values, offset_key, value_off as u64);
-        if recover_strings
-            && w_type == 1
-            && value_bytes >= 2
-            && value_off
-                .checked_add(value_bytes)
-                .is_some_and(|end| end <= block_end)
-            && let Some(data) = bytes.get(value_off..value_off + value_bytes)
-            && let Some(data) = data.strip_suffix(&[0, 0])
-        {
-            let text = bytes_at::utf16_lossy(data, bytes_at::Endian::Little);
-            let key = match key.as_str() {
-                "CompanyName" => Some(value_key!("pe.version.company")),
-                "FileDescription" => Some(value_key!("pe.version.description")),
-                "ProductName" => Some(value_key!("pe.version.product_name")),
-                "OriginalFilename" => Some(value_key!("pe.version.original_filename")),
-                "FileVersion" => Some(value_key!("pe.version.file_version")),
-                "ProductVersion" => Some(value_key!("pe.version.product_version")),
-                _ => None,
-            };
-            if let Some(key) = key {
-                put_str(values, key, &text);
-            }
-        }
+        let text = crate::bytes::utf16_lossy(
+            crate::bytes::utf16_until_nul(data),
+            crate::bytes::Endian::Little,
+        );
+        *slot = Some((text, value_off));
     }
 
     // Children follow the value, DWORD-aligned, up to this block's end.
     let mut child = align4(value_off.saturating_add(value_bytes));
-    while child + 6 <= block_end {
+    while child.saturating_add(6) <= block_end {
         let Some(child_len) = u16_le(bytes, child) else {
             break;
         };
-        let child_len = child_len as usize;
+        let child_len = usize::from(child_len);
         if child_len < 6 {
             break;
         }
-        walk_version_block(
-            bytes,
-            child,
-            block_end,
-            depth + 1,
-            budget,
-            values,
-            recover_strings,
-        );
+        walk_version_block(bytes, child, block_end, depth + 1, budget, info);
         child = align4(child.saturating_add(child_len));
     }
-}
-
-/// Locate the VS_VERSIONINFO blob by its `"VS_VERSION_INFO"` key (6 bytes into
-/// the root block) and walk it, recording each string value's byte offset.
-fn emit_value_offsets(bytes: &[u8], values: &mut Values) {
-    let sig: Vec<u8> = "VS_VERSION_INFO"
-        .encode_utf16()
-        .flat_map(u16::to_le_bytes)
-        .collect();
-    let Some(key_pos) = memchr::memmem::find(bytes, &sig) else {
-        return;
-    };
-    let root = key_pos.saturating_sub(6);
-    let mut budget = MAX_VERSION_NODES;
-    walk_version_block(bytes, root, bytes.len(), 0, &mut budget, values, false);
 }
 
 /// Emit randomness/non-linguisticness metrics over the human-readable identity
@@ -227,15 +314,11 @@ fn emit_value_offsets(bytes: &[u8], values: &mut Values) {
 /// The two are meant to be ANDed in a composite: high entropy alone FPs on long
 /// non-English names, high symbol ratio alone FPs on version-laden product
 /// names; together they isolate scrambled identity.
-fn identity_metrics(strings: &StringFileInfo<'_>, metrics: &mut Metrics) {
+fn identity_metrics(info: &VersionInfo, metrics: &mut Metrics) {
     let mut identity = String::new();
-    for field in [
-        strings.company_name(),
-        strings.product_name(),
-        strings.file_description(),
-    ]
-    .into_iter()
-    .flatten()
+    for field in ["CompanyName", "ProductName", "FileDescription"]
+        .into_iter()
+        .filter_map(|key| info.string(key))
     {
         identity.push_str(field.trim());
     }
@@ -245,7 +328,7 @@ fn identity_metrics(strings: &StringFileInfo<'_>, metrics: &mut Metrics) {
         metrics.insert(metric!("pe.version.identity_entropy"), entropy);
     }
 
-    module_name_consistency(strings, metrics);
+    module_name_consistency(info, metrics);
 }
 
 /// `InternalName` and `OriginalFilename` name the same module, so a linker sets
@@ -262,14 +345,11 @@ fn identity_metrics(strings: &StringFileInfo<'_>, metrics: &mut Metrics) {
 ///
 /// Emitted as 0 or 1 whenever both fields are present, so a consumer can
 /// distinguish "checked and consistent" from "not checked".
-fn module_name_consistency(strings: &StringFileInfo<'_>, metrics: &mut Metrics) {
-    let (Some(internal), Some(original)) = (strings.internal_name(), strings.original_filename())
-    else {
-        return;
-    };
-    let (Some(internal), Some(original)) =
-        (fold_module_name(&internal), fold_module_name(&original))
-    else {
+fn module_name_consistency(info: &VersionInfo, metrics: &mut Metrics) {
+    let (Some(internal), Some(original)) = (
+        info.string("InternalName").and_then(fold_module_name),
+        info.string("OriginalFilename").and_then(fold_module_name),
+    ) else {
         return;
     };
 
@@ -327,26 +407,12 @@ fn identity_scores(identity: &str) -> Option<(f64, f64)> {
         .count();
     let symbol_ratio = nonlinguistic as f64 / total as f64;
 
-    let mut freq = [0u32; 256];
-    let byte_total = identity.len() as f64;
-    for b in identity.bytes() {
-        if let Some(slot) = freq.get_mut(usize::from(b)) {
-            *slot += 1;
-        }
-    }
-    let entropy = freq
-        .iter()
-        .filter(|&&c| c > 0)
-        .map(|&c| {
-            let p = f64::from(c) / byte_total;
-            -p * p.log2()
-        })
-        .sum();
+    let entropy = entropy::shannon(identity.as_bytes());
 
     Some((symbol_ratio, entropy))
 }
 
-fn fixed_file_info(fixed: &VsFixedFileInfo, values: &mut Values) {
+fn fixed_file_info(fixed: &FixedFileInfo, values: &mut Values) {
     // VS_FIXEDFILEINFO numeric file/product versions are dropped: in
     // practice they duplicate the string-table FileVersion /
     // ProductVersion that already lives on `pe.version.{file_version,
@@ -377,51 +443,6 @@ fn fixed_file_info(fixed: &VsFixedFileInfo, values: &mut Values) {
             value_key!("pe.version.flags"),
             JsonValue::Array(flags.into_iter().map(JsonValue::String).collect()),
         );
-    }
-}
-
-fn string_table(strings: &StringFileInfo<'_>, values: &mut Values) {
-    // VS_VERSIONINFO StringFileInfo entries flatten to `pe.version.*`
-    // with snake_case keys (no `_name` filler when unambiguous, no
-    // `Legal` prefix on copyright/trademarks). The Win32 SDK key
-    // names are documented as canonical PascalCase (CompanyName etc.);
-    // we honour the *concepts* but keep the path style consistent with
-    // the rest of filefacts.
-    if let Some(v) = strings.company_name() {
-        put_str(values, value_key!("pe.version.company"), v);
-    }
-    if let Some(v) = strings.file_description() {
-        put_str(values, value_key!("pe.version.description"), v);
-    }
-    if let Some(v) = strings.file_version() {
-        put_str(values, value_key!("pe.version.file_version"), v);
-    }
-    if let Some(v) = strings.internal_name() {
-        put_str(values, value_key!("pe.version.internal_name"), v);
-    }
-    if let Some(v) = strings.legal_copyright() {
-        put_str(values, value_key!("pe.version.copyright"), v);
-    }
-    if let Some(v) = strings.legal_trademarks() {
-        put_str(values, value_key!("pe.version.trademarks"), v);
-    }
-    if let Some(v) = strings.original_filename() {
-        put_str(values, value_key!("pe.version.original_filename"), v);
-    }
-    if let Some(v) = strings.product_name() {
-        put_str(values, value_key!("pe.version.product_name"), v);
-    }
-    if let Some(v) = strings.product_version() {
-        put_str(values, value_key!("pe.version.product_version"), v);
-    }
-    if let Some(v) = strings.comments() {
-        put_str(values, value_key!("pe.version.comments"), v);
-    }
-    if let Some(v) = strings.private_build() {
-        put_str(values, value_key!("pe.version.private_build"), v);
-    }
-    if let Some(v) = strings.special_build() {
-        put_str(values, value_key!("pe.version.special_build"), v);
     }
 }
 
@@ -488,100 +509,76 @@ fn file_subtype_label(file_type: u32, subtype: u32) -> &'static str {
 
 fn file_flags(flags: u32) -> Vec<String> {
     // From verrsrc.h `VS_FF_*`.
-    let mut out = Vec::new();
-    if flags & 0x01 != 0 {
-        out.push("debug".to_string());
-    }
-    if flags & 0x02 != 0 {
-        out.push("pre_release".to_string());
-    }
-    if flags & 0x04 != 0 {
-        out.push("patched".to_string());
-    }
-    if flags & 0x08 != 0 {
-        out.push("private_build".to_string());
-    }
-    if flags & 0x10 != 0 {
-        out.push("info_inferred".to_string());
-    }
-    if flags & 0x20 != 0 {
-        out.push("special_build".to_string());
-    }
-    out
+    [
+        (0x01, "debug"),
+        (0x02, "pre_release"),
+        (0x04, "patched"),
+        (0x08, "private_build"),
+        (0x10, "info_inferred"),
+        (0x20, "special_build"),
+    ]
+    .into_iter()
+    .filter(|&(bit, _)| flags & bit != 0)
+    .map(|(_, name)| name.to_owned())
+    .collect()
 }
 
-/// Recover only RT_VERSION leaves when a full PE parse fails. In particular,
-/// large RCDATA resources must not hide an otherwise small version resource.
-/// This never relaxes goblin's resource-size guard or walks arbitrary payloads.
-pub(super) fn recover_partial(bytes: &[u8], values: &mut Values) {
-    let recover = || -> Option<Vec<(usize, usize)>> {
-        if bytes.get(..2)? != b"MZ" {
+/// The `RT_VERSION` leaves of the resource directory `resources`, as
+/// `(file offset, length)`, resolving RVAs through `sections`. Walks only
+/// the type → name → language levels under type 16, bounded in entries,
+/// leaves and the directory bytes it reads, and never the payload of any
+/// other resource: a large `RT_RCDATA` must not hide a small version
+/// resource. An empty list for a directory that is malformed anywhere on
+/// the way.
+fn version_leaves(
+    sections: &[SectionTable],
+    file_alignment: Option<u32>,
+    resources: DataDirectory,
+    bytes: &[u8],
+) -> Vec<(usize, usize)> {
+    /// Directory bytes the walk reads, and entries it visits.
+    const MAX_DIRECTORY_BYTES: usize = 1024 * 1024;
+    const MAX_ENTRIES: usize = 4096;
+    /// Leaves taken, and the largest one: real version resources are a few
+    /// KiB, and a `wLength` caps a block at 64 KiB.
+    const MAX_LEAVES: usize = 16;
+    const MAX_LEAF_LEN: usize = 65536;
+    let offset = |rva: u32, len: usize| -> Option<usize> {
+        let off = section_rva_to_file_offset(sections, file_alignment, rva)?;
+        bytes.get(off..off.checked_add(len)?)?;
+        Some(off)
+    };
+    let root = resources.virtual_address;
+    let declared = crate::bytes::sat_usize(resources.size).min(MAX_DIRECTORY_BYTES);
+    let entry_offset = |relative: usize, len: usize| -> Option<usize> {
+        if relative.checked_add(len)? > declared {
             return None;
         }
-        let pe = u32_le(bytes, 0x3c)? as usize;
-        if bytes.get(pe..pe.checked_add(4)?)? != b"PE\0\0" {
-            return None;
-        }
-        let count = u16_le(bytes, pe + 6)? as usize;
-        if count == 0 || count > 96 {
-            return None;
-        }
-        let optional = layout::optional_header_offset(pe)?;
-        let optional_size = u16_le(bytes, pe + 20)? as usize;
-        let magic = u16_le(bytes, optional)?;
-        let directory_count = layout::directory_count_offset(pe, magic)?;
-        let resource_slot = layout::data_directory_offset(pe, magic, RESOURCE_DIRECTORY)?;
-        if optional + optional_size < resource_slot + 8
-            || u32_le(bytes, directory_count)? as usize <= RESOURCE_DIRECTORY
-        {
-            return None;
-        }
-        let sections = optional.checked_add(optional_size)?;
-        bytes.get(sections..sections.checked_add(count * 40)?)?;
-        let offset = |rva: u32, len: usize| -> Option<usize> {
-            for i in 0..count {
-                let s = sections + i * 40;
-                let Some(delta) = rva.checked_sub(u32_le(bytes, s + 12)?) else {
-                    continue;
-                };
-                let delta = delta as usize;
-                if delta.checked_add(len)? <= u32_le(bytes, s + 16)? as usize {
-                    let off = (u32_le(bytes, s + 20)? as usize).checked_add(delta)?;
-                    bytes.get(off..off.checked_add(len)?)?;
-                    return Some(off);
-                }
-            }
-            None
-        };
-        let root = u32_le(bytes, resource_slot)?;
-        let declared = u32_le(bytes, resource_slot + 4)? as usize;
-        let entry_offset = |relative: usize, len: usize| -> Option<usize> {
-            if relative.checked_add(len)? > declared.min(1024 * 1024) {
-                return None;
-            }
-            offset(root.checked_add(u32::try_from(relative).ok()?)?, len)
-        };
+        offset(root.checked_add(u32::try_from(relative).ok()?)?, len)
+    };
+    let walk = || -> Option<Vec<(usize, usize)>> {
         let mut todo = vec![(0usize, 0u8)];
-        let mut budget = 4096usize;
+        let mut budget = MAX_ENTRIES;
         let mut leaves = Vec::new();
         while let Some((relative, depth)) = todo.pop() {
             let dir = entry_offset(relative, 16)?;
-            let n = (u16_le(bytes, dir + 12)? as usize)
-                .checked_add(u16_le(bytes, dir + 14)? as usize)?;
+            let n = usize::from(u16_le(bytes, dir + 12)?)
+                .checked_add(usize::from(u16_le(bytes, dir + 14)?))?;
             budget = budget.checked_sub(n)?;
             for i in 0..n {
                 let e = entry_offset(relative.checked_add(16 + i * 8)?, 8)?;
-                if depth == 0 && u32_le(bytes, e)? != 16 {
+                if depth == 0 && u32_le(bytes, e)? != u32::from(RT_VERSION) {
                     continue;
                 }
                 let target = u32_le(bytes, e + 4)?;
-                let next = (target & 0x7fff_ffff) as usize;
-                if depth < 2 && target & 0x8000_0000 != 0 {
+                let next = crate::bytes::sat_usize(target & !IMAGE_RESOURCE_DATA_IS_DIRECTORY);
+                let is_directory = target & IMAGE_RESOURCE_DATA_IS_DIRECTORY != 0;
+                if depth < 2 && is_directory {
                     todo.push((next, depth + 1));
-                } else if depth == 2 && target & 0x8000_0000 == 0 {
+                } else if depth == 2 && !is_directory {
                     let data = entry_offset(next, 16)?;
-                    let len = u32_le(bytes, data + 4)? as usize;
-                    if len < 6 || len > 65536 || leaves.len() >= 16 {
+                    let len = crate::bytes::sat_usize(u32_le(bytes, data + 4)?);
+                    if !(6..=MAX_LEAF_LEN).contains(&len) || leaves.len() >= MAX_LEAVES {
                         return None;
                     }
                     leaves.push((offset(u32_le(bytes, data)?, len)?, len));
@@ -592,17 +589,16 @@ pub(super) fn recover_partial(bytes: &[u8], values: &mut Values) {
         }
         Some(leaves)
     };
-    let Some(leaves) = recover() else {
-        return;
-    };
-    for (off, len) in leaves {
-        let (key, _) = read_utf16_key(bytes, off + 6, off + len);
-        if key != "VS_VERSION_INFO" {
-            continue;
-        }
-        let mut budget = MAX_VERSION_NODES;
-        walk_version_block(bytes, off, off + len, 0, &mut budget, values, true);
-    }
+    walk().unwrap_or_else(|| {
+        tracing::debug!(
+            target: "filefacts::pe",
+            format = "pe",
+            stage = "version-info",
+            rva = root,
+            "resource directory malformed on the way to RT_VERSION"
+        );
+        Vec::new()
+    })
 }
 
 #[cfg(test)]

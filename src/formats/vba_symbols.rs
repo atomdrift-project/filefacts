@@ -32,8 +32,8 @@ use std::sync::LazyLock;
 
 use crate::output::Symbol;
 
-/// Aggregate counters from one module's symbol extraction. Folded
-/// into the per-document `office.vba.*_count` metric keys by
+/// Aggregate counters from symbol extraction over a document's modules,
+/// published as the `office.vba.*_count` metric keys by
 /// [`crate::formats::vba::extract`]. Not exposed publicly — consumers read
 /// the metric map.
 #[derive(Debug, Default, Clone, Copy)]
@@ -48,22 +48,25 @@ pub(crate) struct VbaSymbolStats {
 }
 
 /// Run the four extractors over one module's source. Pushes records
-/// into `symbols_out` and returns the per-module aggregate counters.
+/// into `symbols_out` and adds the module's counts to `stats`, which
+/// aggregates every module of a document.
 ///
 /// Crate-internal: VBA symbols flow out through the unified
 /// [`crate::Symbols`] view populated by [`crate::formats::vba::extract`],
 /// not through a public per-module function.
-pub(crate) fn extract(source: &str, symbols_out: &mut crate::output::Symbols) -> VbaSymbolStats {
-    let mut stats = VbaSymbolStats::default();
+pub(crate) fn extract(
+    source: &str,
+    symbols_out: &mut crate::output::Symbols,
+    stats: &mut VbaSymbolStats,
+) {
     if source.is_empty() {
-        return stats;
+        return;
     }
     let prepared = preprocess(source);
-    extract_declares(&prepared, symbols_out, &mut stats);
-    extract_createobject(&prepared, symbols_out, &mut stats, false);
-    extract_createobject(&prepared, symbols_out, &mut stats, true);
-    extract_subs_and_functions(&prepared, symbols_out, &mut stats);
-    stats
+    extract_declares(&prepared, symbols_out, stats);
+    extract_createobject(&prepared, symbols_out, stats, ComCall::CreateObject);
+    extract_createobject(&prepared, symbols_out, stats, ComCall::GetObject);
+    extract_subs_and_functions(&prepared, symbols_out, stats);
 }
 
 /// Pre-processed VBA source with line-continuation joined and line
@@ -133,15 +136,14 @@ fn preprocess(source: &str) -> Prepared {
 
         // Strip line-leading `Rem` comments (case-insensitive).
         let at_line_start = text.is_empty() || text.ends_with('\n');
-        if at_line_start {
-            if let Some(head) = bytes.get(i..i + 3) {
-                let is_rem = head.eq_ignore_ascii_case(b"Rem");
-                let next = bytes.get(i + 3).copied().unwrap_or(b'\n');
-                if is_rem && (next == b' ' || next == b'\t' || next == b'\r' || next == b'\n') {
-                    i = line_end(i);
-                    continue;
-                }
-            }
+        if at_line_start
+            && bytes
+                .get(i..i + 3)
+                .is_some_and(|head| head.eq_ignore_ascii_case(b"Rem"))
+            && matches!(bytes.get(i + 3), None | Some(b' ' | b'\t' | b'\r' | b'\n'))
+        {
+            i = line_end(i);
+            continue;
         }
 
         // Strip apostrophe comments outside of string literals.
@@ -156,7 +158,7 @@ fn preprocess(source: &str) -> Prepared {
                 b'\n' => in_string = false,
                 _ => {}
             }
-            text.push(byte as char);
+            text.push(char::from(byte));
             map.push(i);
             i += 1;
         } else {
@@ -233,12 +235,7 @@ fn extract_declares(
         // Prefer the Alias when present — that's the actual exported
         // name in the DLL. Otherwise the local declared name is the
         // import name.
-        let alias = cap.get(4).map(|m| m.as_str().to_string());
-        let local = cap
-            .get(2)
-            .map(|m| m.as_str().to_string())
-            .unwrap_or_default();
-        let import_name = alias.unwrap_or(local);
+        let import_name = cap.get(4).or_else(|| cap.get(2)).map_or("", |m| m.as_str());
         if import_name.is_empty() {
             continue;
         }
@@ -249,7 +246,7 @@ fn extract_declares(
             .unwrap_or(0) as u64;
 
         symbols_out.push(Symbol::Import {
-            name: import_name,
+            name: import_name.to_string(),
             alias: None,
             library,
             offset: Some(offset),
@@ -271,45 +268,44 @@ fn string_literal(raw: &str) -> Option<&str> {
     raw.trim().strip_prefix('"')?.strip_suffix('"')
 }
 
+/// The COM activation call [`extract_createobject`] reads.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ComCall {
+    CreateObject,
+    GetObject,
+}
+
 fn extract_createobject(
     prep: &Prepared,
     symbols_out: &mut crate::output::Symbols,
     stats: &mut VbaSymbolStats,
-    is_get: bool,
+    call: ComCall,
 ) {
-    let (re, lib_label) = if is_get {
-        (&*GET_OBJECT, "com-getobject")
-    } else {
-        (&*CREATE_OBJECT, "com")
+    let (re, lib_label, count, non_literal_count) = match call {
+        ComCall::GetObject => (
+            &*GET_OBJECT,
+            "com-getobject",
+            &mut stats.getobject_count,
+            &mut stats.getobject_non_literal_count,
+        ),
+        ComCall::CreateObject => (
+            &*CREATE_OBJECT,
+            "com",
+            &mut stats.createobject_count,
+            &mut stats.createobject_non_literal_count,
+        ),
     };
 
     for cap in re.captures_iter(&prep.text) {
-        // For GetObject prefer the second arg (ProgID); otherwise
-        // the first arg is the moniker (path/URL).
-        let (raw, second_present) = if is_get {
-            match cap.get(2) {
-                Some(m) => (m.as_str(), true),
-                None => (cap.get(1).map(|m| m.as_str()).unwrap_or(""), false),
-            }
-        } else {
-            (cap.get(1).map(|m| m.as_str()).unwrap_or(""), false)
-        };
+        // GetObject's second arg is the ProgID; without one, its first arg
+        // is a moniker (path/URL). CreateObject has only the first.
+        let second_present = cap.get(2).is_some();
+        let raw = cap.get(2).or_else(|| cap.get(1)).map_or("", |m| m.as_str());
 
-        if is_get {
-            stats.getobject_count = stats.getobject_count.saturating_add(1);
-        } else {
-            stats.createobject_count = stats.createobject_count.saturating_add(1);
-        }
-
+        *count = count.saturating_add(1);
         let literal = string_literal(raw);
         if literal.is_none() {
-            if is_get {
-                stats.getobject_non_literal_count =
-                    stats.getobject_non_literal_count.saturating_add(1);
-            } else {
-                stats.createobject_non_literal_count =
-                    stats.createobject_non_literal_count.saturating_add(1);
-            }
+            *non_literal_count = non_literal_count.saturating_add(1);
         }
 
         // Only emit Imports for ProgID-style data: literal
@@ -317,7 +313,7 @@ fn extract_createobject(
         // A bare GetObject moniker (`"file:..."`) is not a ProgID, and a
         // non-literal argument has no name to record (the counts above
         // carry it).
-        let Some(name) = literal.filter(|_| !is_get || second_present) else {
+        let Some(name) = literal.filter(|_| call == ComCall::CreateObject || second_present) else {
             continue;
         };
 

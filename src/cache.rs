@@ -14,16 +14,22 @@
 //! # Layout
 //!
 //! ```text
-//! {root}/v{CACHE_SCHEMA_VERSION}/{key[0..2]}/{key}.bin
+//! {base}/filefacts/CACHEDIR.TAG
+//! {base}/filefacts/v{CACHE_SCHEMA_VERSION}/{key[0..2]}/{key}.bin
 //! ```
 //!
-//! `root` is the directory the host named with
-//! [`crate::OpenOptions::cache_dir`], or by default `atomdrift/filefacts` under
-//! the per-user cache directory ([`dirs::cache_dir`]):
-//! `~/Library/Caches` (macOS), `~/.cache` (Linux/XDG), `%LOCALAPPDATA%`
-//! (Windows). The two-character shard keeps any single directory bounded.
-//! Lookups never create directories; a shard appears with the first entry
-//! stored in it.
+//! `base` is the directory the host named with
+//! [`crate::OpenOptions::cache_dir`], or by default `atomdrift` under the
+//! per-user cache directory: `~/Library/Caches` (macOS), `$XDG_CACHE_HOME`
+//! or `~/.cache` (other Unix), `%LOCALAPPDATA%` (Windows). The cache
+//! works only inside the `filefacts` directory it creates there, private to
+//! the user and marked with a [cache directory tag]; it never prunes, sweeps
+//! or writes anywhere else in `base`, and it leaves alone a `filefacts`
+//! directory it did not tag. The two-character shard keeps any single
+//! directory bounded. Lookups create no directories below the root; a shard
+//! appears with the first entry stored in it.
+//!
+//! [cache directory tag]: https://bford.info/cachedir/
 //!
 //! # Format
 //!
@@ -40,14 +46,23 @@
 //!
 //! * **content** — the input bytes.
 //! * **`build_fingerprint`** — filefacts' crate version and a hash of its
-//!   source (`src/**` plus `Cargo.lock`), computed by `build.rs` at compile
-//!   time. Any change to the extraction logic changes the hash and so
-//!   retires every prior entry without a manual bump, however the
-//!   consuming binary was built, copied or packaged.
+//!   source (`src/**`, `Cargo.toml` and filefacts' own `Cargo.lock`),
+//!   computed by `build.rs` at compile time. Any change to filefacts'
+//!   extraction logic changes the hash and so retires every prior entry
+//!   without a manual bump, however the consuming binary was built, copied
+//!   or packaged. Dependencies are covered only through that lock: in a
+//!   standalone build it pins them, so bumping stng retires every entry.
+//!   When filefacts is itself a dependency, the consumer's lock picks the
+//!   versions of stng, binform and the grammars, and cargo gives a build
+//!   script no reliable way to find that lock, so updating them there does
+//!   not change the key. Such a host passes
+//!   [`crate::OpenOptions::cache_namespace`], derived from its own lock or
+//!   version, to retire entries when it updates them.
 //! * **variant** — what else the extraction depends on: for a
-//!   [`crate::ParsedFile`], the detected type, the basename and
-//!   [`crate::OpenOptions::recovery_fingerprint`] (the binform recovery
-//!   policy).
+//!   [`crate::ParsedFile`], the host's namespace, the detected type, a
+//!   content/extension mismatch, the basename and
+//!   [`crate::RECOVERY_FINGERPRINT`] (binform's recovery policy, which
+//!   `src/functions.rs` bumps with the binform commit in the lock).
 //!
 //! `CACHE_SCHEMA_VERSION` is the manual lever on top, reserved for deliberate
 //! format breaks; a sweep removes superseded version directories.
@@ -57,10 +72,11 @@
 //! Each version directory is bounded by entry count, total size and age (see
 //! the `sweep` module). A cache hit bumps an entry's mtime, so eviction is
 //! least-recently-*used*, not merely oldest-written. [`cleanup`] runs a routine
-//! sweep of the default root on a background thread, the entry point a host
-//! calls at startup, and a store that finds its shard over its share of the
-//! budget starts the same sweep at once. Everything here is best-effort: the
-//! cache is a performance optimisation, never a source of truth.
+//! sweep of the default root on a background thread, and [`cleanup_in`] one
+//! of a host's own directory: the entry points a host calls at startup. A
+//! store that finds its shard over its share of the budget starts the same
+//! sweep at once. Everything here is best-effort: the cache is a performance
+//! optimisation, never a source of truth.
 
 mod sweep;
 
@@ -97,7 +113,8 @@ fn parse_env_setting(value: &str) -> bool {
 const CACHE_SCHEMA_VERSION: u32 = 6;
 
 /// Build identity mixed into every cache key: `{crate version}+{source
-/// hash}`, where `build.rs` hashes the crate's `src/**` and `Cargo.lock`.
+/// hash}`, where `build.rs` hashes the crate's `src/**`, `Cargo.toml` and
+/// its own `Cargo.lock` (see the module docs for what that leaves out).
 ///
 /// Derived from the source rather than the running executable, so it holds
 /// where an mtime would not: an embedding host whose own binary is not
@@ -145,16 +162,6 @@ const LRU_TOUCH_INTERVAL: Duration = Duration::from_hours(24);
 /// also `tempfile`'s default) because the sweep matches on it.
 const TEMP_PREFIX: &str = ".tmp";
 
-/// Lowercase hex-encode a byte slice.
-fn hex(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push(char::from_digit(u32::from(b >> 4), 16).unwrap_or('0'));
-        out.push(char::from_digit(u32::from(b & 0x0f), 16).unwrap_or('0'));
-    }
-    out
-}
-
 /// Disk-cache key for `bytes` analysed under `variant`.
 ///
 /// Content addressing is only sound when the cached payload is a pure
@@ -164,7 +171,7 @@ fn hex(bytes: &[u8]) -> String {
 /// * the filefacts build fingerprint — extraction logic changes between
 ///   builds, so a stale entry from an older filefacts must not be reused;
 /// * the caller's `variant` — the detected file type plus
-///   [`crate::OpenOptions::recovery_fingerprint`], since the *same* bytes yield
+///   [`crate::RECOVERY_FINGERPRINT`], since the *same* bytes yield
 ///   different extraction under different path-assisted types or recovery
 ///   policies.
 fn cache_key(bytes: &[u8], variant: &str) -> String {
@@ -176,53 +183,165 @@ fn cache_key(bytes: &[u8], variant: &str) -> String {
     hasher.update(BUILD_FINGERPRINT.as_bytes());
     hasher.update([0u8]);
     hasher.update(variant.as_bytes());
-    hex(&hasher.finalize())
+    crate::formats::common::hex_encode(&hasher.finalize())
 }
 
-/// `atomdrift/filefacts` under the per-user cache directory, resolved once per
-/// process; `None` when there is none or it fails [`root_in`]'s check. Creates
-/// nothing below the OS cache directory.
+/// The directory the cache owns under its base: the host's
+/// [`crate::OpenOptions::cache_dir`], or `atomdrift` under the per-user cache
+/// directory.
+const ROOT_NAME: &str = "filefacts";
+
+/// The cache directory tag (<https://bford.info/cachedir/>) that marks a root
+/// as this cache's. Backup tools skip a tagged directory, and the cache uses,
+/// prunes and sweeps only a root that carries one.
+const TAG_NAME: &str = "CACHEDIR.TAG";
+
+/// The line a cache directory tag must begin with.
+const TAG_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
+
+/// The default root, `atomdrift/filefacts` under the per-user cache
+/// directory, resolved once per process; `None` when there is none or it
+/// fails [`root_under`]'s checks.
 fn default_root() -> Option<&'static Path> {
     static ROOT: OnceLock<Option<PathBuf>> = OnceLock::new();
     ROOT.get_or_init(|| {
-        let Some(base) = dirs::cache_dir() else {
+        let Some(base) = user_cache_dir() else {
             tracing::debug!("no per-user cache directory; disk cache off");
             return None;
         };
-        let root = root_in(&base);
+        // filefacts chose this directory's name, so it adopts one that a
+        // build predating the tag created.
+        let root = root_under(&base.join("atomdrift"), true);
         if root.is_none() {
             tracing::warn!(
                 dir = %base.display(),
-                "per-user cache directory is relative, missing or writable by another user; disk cache off"
+                "per-user cache directory is unusable (see the debug log); disk cache off"
             );
         }
-        Some(root?.join("atomdrift").join("filefacts"))
+        root
     })
     .as_deref()
 }
 
-/// `dir`, created if missing and resolved, when it is safe to cache in.
+/// The per-user cache directory, from the environment: `%LOCALAPPDATA%` on
+/// Windows, `$HOME/Library/Caches` on macOS, and elsewhere `$XDG_CACHE_HOME`
+/// or `$HOME/.cache` (XDG Base Directory). A relative or empty value counts
+/// as unset, as the XDG specification requires.
+fn user_cache_dir() -> Option<PathBuf> {
+    let absolute = |var| {
+        std::env::var_os(var)
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+    };
+    if cfg!(windows) {
+        absolute("LOCALAPPDATA")
+    } else if cfg!(target_os = "macos") {
+        absolute("HOME").map(|home| home.join("Library/Caches"))
+    } else {
+        absolute("XDG_CACHE_HOME").or_else(|| absolute("HOME").map(|home| home.join(".cache")))
+    }
+}
+
+/// The cache root for a host's `dir` ([`crate::OpenOptions::cache_dir`]),
+/// or the per-user default for `None`.
+fn resolve_root(dir: Option<&Path>) -> Option<PathBuf> {
+    match dir {
+        Some(dir) => root_under(dir, false),
+        None => default_root().map(Path::to_path_buf),
+    }
+}
+
+/// `{base}/filefacts`, created and tagged if missing, when it is safe to
+/// cache in. Logs why at debug level when it is not: a host's directory is
+/// resolved on every open.
 ///
-/// It must pass `sweep::trusted_dir`: an absolute path no other user can
+/// `base` must pass `sweep::trusted_dir`: an absolute path no other user can
 /// change. Entries read from the cache are served as analysis results and
 /// its sweep deletes by path, so a root another user could redirect or write
-/// into — a relative `HOME`, a cache under a shared directory — would let them
-/// plant verdicts or aim deletes at this user's files. Such a root leaves the
-/// cache off.
-fn root_in(dir: &Path) -> Option<PathBuf> {
+/// into — a relative `HOME`, a cache under a shared directory — would let
+/// them plant verdicts or aim deletes at this user's files.
+///
+/// The cache never works in `base` itself, which may hold the host's own
+/// files, and uses the `filefacts` directory below it only when that carries
+/// the [`TAG_NAME`] the cache wrote on creating it: a sweep deletes what
+/// looks like a superseded version or an expired entry, and nothing the cache
+/// did not create may be mistaken for one. An existing untagged directory is
+/// adopted only with `adopt`. Any failure leaves the cache off.
+fn root_under(base: &Path, adopt: bool) -> Option<PathBuf> {
     // A fresh account may not have its cache directory yet; it has to exist
     // before its ownership can be checked.
-    if dir.is_absolute() {
-        let _ = fs::create_dir_all(dir);
+    if base.is_absolute() {
+        let _ = fs::create_dir_all(base);
     }
-    let root = sweep::trusted_dir(dir);
-    if root.is_none() {
+    let Some(base) = sweep::trusted_dir(base) else {
         tracing::debug!(
-            dir = %dir.display(),
-            "cache directory is relative, missing or writable by another user; cache skipped"
+            dir = %base.display(),
+            "cache directory is relative, missing or writable by another user; disk cache off"
         );
+        return None;
+    };
+    let root = base.join(ROOT_NAME);
+    // Readable and writable by this user alone, whatever the umask.
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    let created = match builder.create(&root) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(error) => {
+            tracing::debug!(dir = %root.display(), %error, "cannot create cache root; disk cache off");
+            return None;
+        }
+    };
+    let Some(root) = sweep::trusted_dir(&root) else {
+        tracing::debug!(
+            dir = %root.display(),
+            "cache root is a symlink or writable by another user; disk cache off"
+        );
+        return None;
+    };
+    if created || adopt {
+        write_tag(&root);
     }
-    root
+    if !is_tagged(&root) {
+        tracing::debug!(
+            dir = %root.display(),
+            tag = TAG_NAME,
+            "cache root was not created by filefacts; disk cache off"
+        );
+        return None;
+    }
+    Some(root)
+}
+
+/// Tag `root` as this cache's, unless it already holds a tag. `create_new`
+/// never follows a link planted where the tag goes. Best-effort.
+fn write_tag(root: &Path) {
+    let path = root.join(TAG_NAME);
+    let written = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .and_then(|mut file| {
+            file.write_all(TAG_SIGNATURE)?;
+            file.write_all(
+                b"\n# This file is a cache directory tag created by filefacts.\n\
+                  # For information about cache directory tags, see https://bford.info/cachedir/\n",
+            )
+        });
+    match written {
+        Ok(()) => tracing::debug!(path = %path.display(), "tagged cache root"),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => tracing::debug!(path = %path.display(), %error, "cannot tag cache root"),
+    }
+}
+
+/// Whether `root` carries a cache directory tag.
+fn is_tagged(root: &Path) -> bool {
+    let mut head = [0u8; TAG_SIGNATURE.len()];
+    fs::File::open(root.join(TAG_NAME))
+        .and_then(|mut file| file.read_exact(&mut head))
+        .is_ok_and(|()| head == *TAG_SIGNATURE)
 }
 
 /// `v{CACHE_SCHEMA_VERSION}` under `root`.
@@ -358,9 +477,14 @@ fn store_at_path<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), Stor
     }
 }
 
-/// Remove version directories older than the current one under `root`.
-/// Best-effort; failures are ignored.
+/// Remove version directories older than the current one under `root`,
+/// provided `root` carries the cache's tag. Best-effort; failures are
+/// ignored.
 fn prune_old_versions(root: &Path) {
+    if !is_tagged(root) {
+        tracing::debug!(dir = %root.display(), "untagged cache root; not pruned");
+        return;
+    }
     let Ok(entries) = fs::read_dir(root) else {
         return;
     };
@@ -403,6 +527,16 @@ fn prune_old_versions(root: &Path) {
 pub fn cleanup() {
     if let Some(root) = default_root() {
         spawn_sweep(root, Gate::Interval);
+    }
+}
+
+/// [`cleanup`] for a host that keeps the cache under its own `dir`, the one
+/// it passes to [`crate::OpenOptions::cache_dir`]. Only the `filefacts`
+/// directory the cache created there is swept; nothing else in `dir` is
+/// touched.
+pub fn cleanup_in(dir: &Path) {
+    if let Some(root) = root_under(dir, false) {
+        spawn_sweep(&root, Gate::Interval);
     }
 }
 
@@ -479,11 +613,7 @@ where
     T: serde::Serialize + serde::de::DeserializeOwned,
     F: FnOnce() -> Computed<T>,
 {
-    let root = match dir {
-        Some(dir) => root_in(dir),
-        None => default_root().map(Path::to_path_buf),
-    };
-    match root {
+    match resolve_root(dir) {
         Some(root) => open_with_cache_in(&root, bytes, variant, compute),
         None => match compute() {
             Computed::Cacheable(value) | Computed::Transient(value) => value,

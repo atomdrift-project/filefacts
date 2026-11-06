@@ -6,19 +6,19 @@ use serde_json::Value as JsonValue;
 
 use super::layout::rva_to_file_offset;
 use super::{ordinal_names, ordinals};
-use crate::formats::common::bytes_at::{u16_le, u32_le, u64_le};
-use crate::formats::common::{hex_encode, put_str};
+use crate::bytes::{u16_le, u32_le};
+use crate::formats::common::{hex_encode, put_str, unnamed_ordinal};
 use crate::metric;
 use crate::output::{Metrics, Values};
 use crate::value_key;
 
+/// The import tables, from binform: the typed import view, `dependencies.count`
+/// and the imphash, and whether binform had to cut a table short.
 pub(super) fn imports(
     layout: &binform::Binary<'_>,
     image_base: u64,
     machine: u16,
-    values: &mut Values,
-    metrics: &mut Metrics,
-    symbols_out: &mut crate::Symbols,
+    ctx: &mut crate::formats::ExtractCtx<'_>,
 ) {
     // binform reads the import table and then the delay-load table, one
     // entry per slot, the DLL name as the binary spells it. The library lands
@@ -29,7 +29,11 @@ pub(super) fn imports(
     let mut libraries = std::collections::BTreeSet::new();
     let mut table = Vec::new();
     let mut delayed = 0_u64;
+    let mut name_bytes = 0_usize;
     for imp in layout.imports() {
+        name_bytes = name_bytes
+            .saturating_add(imp.name.len())
+            .saturating_add(imp.library.as_ref().map_or(0, String::len));
         if imp.delayed {
             // Descriptors may share one name table; real binaries delay-load
             // tens to hundreds of functions.
@@ -46,10 +50,10 @@ pub(super) fn imports(
         // the name the DLL exports there; `ordinal` keeps the number.
         let name = match imp.ordinal {
             Some(ordinal) => known_ordinal(&dll, ordinal, cpu)
-                .map_or_else(|| format!("ORDINAL {ordinal}"), str::to_owned),
+                .map_or_else(|| unnamed_ordinal(ordinal), str::to_owned),
             None => imp.name.clone(),
         };
-        symbols_out.push(crate::Symbol::Import {
+        ctx.symbols.push(crate::Symbol::Import {
             name,
             alias: None,
             library: Some(strip_lib_ext(&dll).to_string()),
@@ -60,12 +64,45 @@ pub(super) fn imports(
     }
     // DLL dependencies (the libraries imports are bound to) flow through the
     // cross-format `dependencies.count`; the symbol total is `imports.count`.
-    metrics.insert(metric!("dependencies.count"), libraries.len() as f64);
+    ctx.metrics
+        .insert(metric!("dependencies.count"), libraries.len() as f64);
 
     if let Some(hash) = imphash(&table) {
-        put_str(values, value_key!("pe.hashes.imphash"), hash);
+        put_str(ctx.values, value_key!("pe.hashes.imphash"), hash);
+    }
+    // binform stops reading the import tables at a count or a sum of name
+    // bytes no linker produces: descriptors sharing one long lookup table,
+    // or entries all naming one long string. A table cut short is a forged
+    // one, a fact about the sample.
+    if layout.imports().len() >= BINFORM_MAX_IMPORTS || name_bytes >= BINFORM_MAX_NAME_BYTES {
+        tracing::debug!(
+            target: "filefacts::pe",
+            format = "pe",
+            stage = "imports",
+            imports = layout.imports().len(),
+            name_bytes,
+            "import tables past binform's walk budget"
+        );
+        ctx.errors.record_malformed(
+            crate::Stage::PeParse,
+            format!(
+                "import tables cut short at {} imports and {name_bytes} name bytes",
+                layout.imports().len()
+            ),
+        );
+        ctx.metrics
+            .insert(metric!("pe.import_table_unwalkable"), 1.0);
     }
 }
+
+/// binform's bounds on its walk of one PE's import tables: the imports it
+/// reads across the import and delay-load tables, and the bytes of their
+/// DLL and symbol names. A walk that reaches either was cut short. binform
+/// spends its budget of 1 << 18 lookup-table entries on each descriptor's
+/// terminating entry too, and reads at most 1 << 12 descriptors, so a walk
+/// cut at the count yields at least this many imports; no linker comes close.
+const BINFORM_MAX_IMPORTS: usize = (1 << 18) - (1 << 12);
+const BINFORM_MAX_NAME_BYTES: usize = 32 << 20;
 
 /// The most delay-load imports counted, and taken into the symbol view,
 /// across every descriptor. Descriptors may all share one name table, so
@@ -127,11 +164,7 @@ fn pefile_ordinal(dll: &str, ordinal: u16) -> Option<&'static str> {
 /// the DLLs whose ordinals are stable across Windows releases: pefile's, and
 /// those programs import by ordinal from `ordinal_names.rs`. For naming
 /// imports; the imphash takes pefile's alone.
-pub(in crate::formats) fn known_ordinal(
-    dll: &str,
-    ordinal: u16,
-    cpu: Option<Cpu>,
-) -> Option<&'static str> {
+fn known_ordinal(dll: &str, ordinal: u16, cpu: Option<Cpu>) -> Option<&'static str> {
     // Windows CE's coredll numbers some exports differently per CPU: those
     // ordinals are named only when the CPU is known.
     let per_cpu = match (dll, cpu) {
@@ -163,7 +196,7 @@ pub(in crate::formats) fn known_ordinal(
 /// The CPU families whose DLLs number exports differently: Windows CE's
 /// coredll, built for each.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::formats) enum Cpu {
+enum Cpu {
     X86,
     Arm,
     Mips,
@@ -172,7 +205,7 @@ pub(in crate::formats) enum Cpu {
 
 impl Cpu {
     /// The family of a PE's COFF `Machine`.
-    pub(in crate::formats) fn of_machine(machine: u16) -> Option<Self> {
+    fn of_machine(machine: u16) -> Option<Self> {
         match machine {
             0x014c => Some(Self::X86),
             // ARM, Thumb (Windows CE's ARMV4I).
@@ -232,8 +265,8 @@ pub(super) fn bound_imports(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metr
     let Some(dd) = opt.data_directories.get_bound_import_table() else {
         return;
     };
-    let table_off = dd.virtual_address as usize;
-    let table_size = dd.size as usize;
+    let table_off = crate::bytes::sat_usize(dd.virtual_address);
+    let table_size = crate::bytes::sat_usize(dd.size);
     if table_size == 0 || table_off >= bytes.len() {
         return;
     }
@@ -242,6 +275,9 @@ pub(super) fn bound_imports(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metr
         return;
     };
 
+    /// Most descriptors reported, and the longest module name read.
+    const MAX_DESCRIPTORS: usize = 64;
+    const MAX_NAME_LEN: usize = 256;
     struct Desc {
         name: String,
         time_date_stamp: u32,
@@ -249,7 +285,7 @@ pub(super) fn bound_imports(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metr
     }
     let mut out: Vec<Desc> = Vec::new();
     let mut cursor = 0_usize;
-    while out.len() < 64 {
+    while out.len() < MAX_DESCRIPTORS {
         // A descriptor is 8 bytes; a short tail ends the table.
         let (Some(time_date), Some(name_off), Some(forwarder_count)) = (
             u32_le(table, cursor),
@@ -259,13 +295,12 @@ pub(super) fn bound_imports(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metr
             break;
         };
         let name_off = usize::from(name_off);
-        let forwarder_count = u32::from(forwarder_count);
 
         // All-zero descriptor terminates the list.
         if time_date == 0 && name_off == 0 && forwarder_count == 0 {
             break;
         }
-        if let Some(tail) = table.get(name_off..table.len().min(name_off + 256)) {
+        if let Some(tail) = table.get(name_off..table.len().min(name_off + MAX_NAME_LEN)) {
             let name = tail.split(|b| *b == 0).next().unwrap_or_default();
             if let Ok(name) = std::str::from_utf8(name)
                 && !name.is_empty()
@@ -273,11 +308,12 @@ pub(super) fn bound_imports(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metr
                 out.push(Desc {
                     name: name.to_string(),
                     time_date_stamp: time_date,
-                    forwarder_ref_count: forwarder_count,
+                    forwarder_ref_count: u32::from(forwarder_count),
                 });
             }
         }
-        cursor = cursor.saturating_add(8 + (forwarder_count as usize).saturating_mul(8));
+        // Each forwarder reference is another 8-byte record.
+        cursor = cursor.saturating_add(8 + usize::from(forwarder_count) * 8);
     }
     if out.is_empty() {
         return;
@@ -322,10 +358,16 @@ pub(super) fn bound_imports(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metr
 /// delay-load table so a static IAT scan misses them.
 ///
 /// Emits `pe.delay_imports[]` (one descriptor per DLL with timestamp,
-/// rva_based flag, and import count). The imports themselves reach the
-/// typed [`crate::Symbols`] view from binform's table, with the rest (see
-/// [`imports`]).
-pub(super) fn delay_imports(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metrics: &mut Metrics) {
+/// rva_based flag, and import count). The imports themselves, and so each
+/// descriptor's count, are binform's (see [`imports`]): this walk reads
+/// only the descriptors' own fields.
+pub(super) fn delay_imports(
+    pe: &PE<'_>,
+    layout: Option<&binform::Binary<'_>>,
+    bytes: &[u8],
+    values: &mut Values,
+    metrics: &mut Metrics,
+) {
     let Some(opt) = pe.header.optional_header.as_ref() else {
         return;
     };
@@ -345,13 +387,16 @@ pub(super) fn delay_imports(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metr
         );
         return;
     };
-    let is_64 = opt.standard_fields.magic == MAGIC_64;
-    let ptr_size = if is_64 { 8 } else { 4 };
+    let width = if opt.standard_fields.magic == MAGIC_64 {
+        8
+    } else {
+        4
+    };
     let image_base = opt.windows_fields.image_base;
     const DESC_SIZE: usize = 32; // IMAGE_DELAYLOAD_DESCRIPTOR is 8 DWORDs
     const MAX_DESCRIPTORS: usize = 128;
-    const MAX_FUNCTIONS_PER_DLL: usize = 4096;
 
+    let mut runs = delayed_runs(layout, width).into_iter().peekable();
     let mut entries_out: Vec<JsonValue> = Vec::new();
     let mut total_imports = 0_u64;
     let mut cursor = table_off;
@@ -376,35 +421,21 @@ pub(super) fn delay_imports(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metr
         // Attributes bit 0 (`RvaBased`) tells us whether `name`/`iat`/`int`
         // are RVAs (modern linkers) or absolute VAs (VC6-era linkers).
         let rva_based = attrs & 1 != 0;
-        let to_rva = |v: u32| delay_import_rva(v, rva_based, image_base);
-
-        let dll = rva_to_file_offset(pe, to_rva(name_va))
-            .map(|off| cstring_at(bytes, off))
+        let dll = rva_to_file_offset(pe, delay_import_rva(name_va, rva_based, image_base))
+            .map(|off| {
+                // DLL names are ASCII by spec; one that is not UTF-8 is none.
+                let name = bytes.get(off..bytes.len().min(off.saturating_add(512)));
+                let name = name.unwrap_or_default().split(|&b| b == 0).next();
+                std::str::from_utf8(name.unwrap_or_default()).unwrap_or("")
+            })
             .unwrap_or_default();
         if dll.is_empty() {
             continue;
         }
-        // Count the Import Name Table's pointer-sized entries, up to the
-        // zero that ends it.
-        let mut function_count = 0_u64;
-        if let Some(mut int_off) = rva_to_file_offset(pe, to_rva(int_va)) {
-            let budget = MAX_DELAY_IMPORTS - total_imports;
-            for _ in 0..MAX_FUNCTIONS_PER_DLL.min(crate::bytes::sat_usize(budget)) {
-                let entry = if is_64 {
-                    u64_le(bytes, int_off)
-                } else {
-                    u32_le(bytes, int_off).map(u64::from)
-                };
-                let Some(entry) = entry else {
-                    break;
-                };
-                int_off += ptr_size;
-                if entry == 0 {
-                    break;
-                }
-                function_count += 1;
-            }
-        }
+        // binform's run for this descriptor, when it read one.
+        let function_count = runs
+            .next_if(|(library, _)| *library == dll)
+            .map_or(0, |(_, count)| count);
         total_imports = total_imports.saturating_add(function_count);
 
         entries_out.push(serde_json::json!({
@@ -424,6 +455,29 @@ pub(super) fn delay_imports(pe: &PE<'_>, bytes: &[u8], values: &mut Values, metr
     }
 }
 
+/// binform's delay-load imports, the first [`MAX_DELAY_IMPORTS`] of them,
+/// as one `(library, count)` run per descriptor: a descriptor's imports are
+/// consecutive slots of its own address table, `width` bytes apart, so a
+/// new library or a slot out of step starts the next descriptor's run.
+fn delayed_runs<'l>(layout: Option<&'l binform::Binary<'_>>, width: u64) -> Vec<(&'l str, u64)> {
+    let mut runs: Vec<(&'l str, u64)> = Vec::new();
+    let mut next_slot = None;
+    let delayed = layout
+        .iter()
+        .flat_map(|layout| layout.imports())
+        .filter(|imp| imp.delayed)
+        .take(crate::bytes::sat_usize(MAX_DELAY_IMPORTS));
+    for imp in delayed {
+        let library = imp.library.as_deref().unwrap_or("");
+        match runs.last_mut() {
+            Some((last, count)) if *last == library && imp.slot == next_slot => *count += 1,
+            _ => runs.push((library, 1)),
+        }
+        next_slot = imp.slot.map(|slot| slot.wrapping_add(width));
+    }
+    runs
+}
+
 /// Resolve a delay-load descriptor field to an RVA. `RvaBased` descriptors
 /// already hold RVAs; the older ones hold VAs, which only fit the 32-bit
 /// field under a PE32 image base. Subtracting in 64 bits keeps a PE32+ base
@@ -434,17 +488,6 @@ fn delay_import_rva(value: u32, rva_based: bool, image_base: u64) -> u32 {
     }
     // The difference never exceeds `value`, so it always fits.
     u32::try_from(u64::from(value).saturating_sub(image_base)).unwrap_or(0)
-}
-
-/// The NUL-terminated string at file offset `off`, capped at 512 bytes, or
-/// empty when it is not UTF-8 (DLL and function names are ASCII by spec).
-fn cstring_at(bytes: &[u8], off: usize) -> String {
-    let cap = bytes.len().min(off.saturating_add(512));
-    let Some(tail) = bytes.get(off..cap) else {
-        return String::new();
-    };
-    let name = tail.split(|&b| b == 0).next().unwrap_or_default();
-    std::str::from_utf8(name).unwrap_or("").to_string()
 }
 
 #[cfg(test)]

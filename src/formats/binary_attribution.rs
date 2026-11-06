@@ -36,49 +36,42 @@ fn each_import_name(symbols: &Symbols) -> impl Iterator<Item = &str> {
 }
 
 fn sanitizers(symbols: &Symbols, values: &mut Values) {
-    let mut out: BTreeSet<&'static str> = BTreeSet::new();
-    for name in each_import_name(symbols) {
-        let s = name.trim_start_matches('_');
-        let tag = if s.starts_with("asan_") {
-            "asan"
-        } else if s.starts_with("tsan_") {
-            "tsan"
-        } else if s.starts_with("msan_") {
-            "msan"
-        } else if s.starts_with("ubsan_") {
-            "ubsan"
-        } else if s.starts_with("hwasan_") {
-            "hwasan"
-        } else if s.starts_with("lsan_") {
-            "lsan"
-        } else if s.starts_with("kasan_") {
-            "kasan"
-        } else if s.starts_with("llvm_profile_") {
-            "pgo"
-        } else if s.starts_with("llvm_coverage_") || s.starts_with("llvm_covmap_") {
-            "coverage"
-        } else if s.starts_with("gcov_") || s.starts_with("llvm_gcov_") {
-            "gcov"
-        } else {
-            continue;
-        };
-        out.insert(tag);
-    }
+    /// Runtime symbol prefixes (leading underscores stripped) and the
+    /// instrumentation each one names.
+    const PREFIXES: &[(&str, &str)] = &[
+        ("asan_", "asan"),
+        ("tsan_", "tsan"),
+        ("msan_", "msan"),
+        ("ubsan_", "ubsan"),
+        ("hwasan_", "hwasan"),
+        ("lsan_", "lsan"),
+        ("kasan_", "kasan"),
+        ("llvm_profile_", "pgo"),
+        ("llvm_coverage_", "coverage"),
+        ("llvm_covmap_", "coverage"),
+        ("gcov_", "gcov"),
+        ("llvm_gcov_", "gcov"),
+    ];
+    let out: BTreeSet<&str> = each_import_name(symbols)
+        .filter_map(|name| {
+            let s = name.trim_start_matches('_');
+            PREFIXES
+                .iter()
+                .find(|(prefix, _)| s.starts_with(prefix))
+                .map(|&(_, tag)| tag)
+        })
+        .collect();
     if out.is_empty() {
         return;
     }
     values.insert_key(
         value_key!("binary.sanitizers"),
-        JsonValue::Array(
-            out.into_iter()
-                .map(|s| JsonValue::String(s.into()))
-                .collect(),
-        ),
+        JsonValue::Array(out.into_iter().map(JsonValue::from).collect()),
     );
 }
 
 fn fortify(symbols: &Symbols, values: &mut Values) {
-    let mut out: BTreeSet<String> = BTreeSet::new();
+    let mut out: BTreeSet<&str> = BTreeSet::new();
     for name in each_import_name(symbols) {
         let s = name.trim_start_matches('_');
         let Some(base) = s.strip_suffix("_chk") else {
@@ -88,13 +81,13 @@ fn fortify(symbols: &Symbols, values: &mut Values) {
         if base.is_empty() || base.starts_with("asan") || base.starts_with("tsan") {
             continue;
         }
-        out.insert(base.to_string());
+        out.insert(base);
     }
     if out.is_empty() {
         return;
     }
     values.insert_key(
         value_key!("binary.fortify"),
-        JsonValue::Array(out.into_iter().map(JsonValue::String).collect()),
+        JsonValue::Array(out.into_iter().map(JsonValue::from).collect()),
     );
 }

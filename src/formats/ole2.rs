@@ -33,13 +33,13 @@
 
 use crate::metric;
 use std::collections::BTreeMap;
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Seek};
 
 use serde_json::Value as JsonValue;
 
-use crate::bytes::{self, Reader};
+use crate::bytes::{self, Reader, sat_usize};
 use crate::error::Error;
-use crate::formats::bounded::{Limits, inflate_capped};
+use crate::formats::bounded::{Limits, OnError, inflate_capped};
 use crate::formats::common::put_str;
 use crate::output::{Errors, Metrics, Stage, ValueKey, Values};
 use crate::value_key;
@@ -66,20 +66,24 @@ const MAX_PROPERTY_STREAM_BYTES: u64 = 1 << 20;
 /// stream length can make the walk hold.
 const MAX_WORKBOOK_BYTES: u64 = 32 << 20;
 
-pub(super) fn extract(
-    bytes: &[u8],
+/// Open `bytes` as a compound file, once for [`extract`] and the VBA layer.
+///
+/// # Errors
+///
+/// A file carrying the OLE2 signature that `cfb` cannot open loses the
+/// whole `office.*` view, and a malformed compound file is itself an
+/// evasion shape, so the failure is reported rather than passed as an
+/// empty document.
+pub(super) fn open(bytes: &[u8]) -> Result<cfb::CompoundFile<Cursor<&[u8]>>, Error> {
+    cfb::CompoundFile::open(Cursor::new(bytes)).map_err(|e| Error::malformed_caused_by("ole2", e))
+}
+
+pub(super) fn extract<R: Read + Seek>(
+    comp: &mut cfb::CompoundFile<R>,
     values: &mut Values,
     metrics: &mut Metrics,
     errors: &mut Errors,
-) -> Result<(), Error> {
-    let cursor = Cursor::new(bytes);
-    // A file carrying the OLE2 signature that `cfb` cannot open loses the
-    // whole `office.*` view, and a malformed compound file is itself an
-    // evasion shape, so the failure is reported rather than passed as an
-    // empty document.
-    let mut comp =
-        cfb::CompoundFile::open(cursor).map_err(|e| Error::malformed_caused_by("ole2", e))?;
-
+) {
     let mut streams: Vec<String> = Vec::new();
     let mut macro_count: u64 = 0;
     let mut features: Vec<&'static str> = Vec::new();
@@ -143,10 +147,10 @@ pub(super) fn extract(
         if lower == "/objectpool" || lower.contains("/objectpool/") {
             had_object_pool = true;
         }
-        if path == "/EncryptionInfo" || lower.contains("encryptioninfo") {
+        if lower.contains("encryptioninfo") {
             had_encryption_info = true;
         }
-        if path == "/EncryptedPackage" || lower.contains("encryptedpackage") {
+        if lower.contains("encryptedpackage") {
             had_encrypted_package = true;
         }
         if lower.contains("encryptedsummary") {
@@ -158,20 +162,14 @@ pub(super) fn extract(
 
     // Empty stream listing → almost certainly not a real OLE2 doc.
     if streams.is_empty() {
-        return Ok(());
+        return;
     }
 
     let kind = detect_kind(&streams);
     put_str(values, value_key!("office.kind"), kind);
 
-    metrics.insert(metric!("office.stream_count"), streams.len() as f64);
-    values.insert_key(
-        value_key!("office.streams"),
-        JsonValue::Array(streams.iter().cloned().map(JsonValue::String).collect()),
-    );
-
     if kind == "msg" {
-        let attachments = msg_attachments(&mut comp, &streams);
+        let attachments = msg_attachments(comp, &streams);
         metrics.insert(
             metric!("office.msg.attachment_count"),
             attachments.len() as f64,
@@ -183,9 +181,14 @@ pub(super) fn extract(
             );
         }
     }
+    metrics.insert(metric!("office.stream_count"), streams.len() as f64);
+    values.insert_key(
+        value_key!("office.streams"),
+        JsonValue::Array(streams.into_iter().map(JsonValue::String).collect()),
+    );
 
     let summary_data = read_stream_data(
-        &mut comp,
+        comp,
         "\x05SummaryInformation",
         MAX_PROPERTY_STREAM_BYTES,
         &mut limits,
@@ -194,7 +197,7 @@ pub(super) fn extract(
     let summary_security_encrypted = summary_data
         .as_deref()
         .is_some_and(summary_document_security_encrypted);
-    let word_document_encrypted = word_document_encrypted(&mut comp, errors);
+    let word_document_encrypted = word_document_encrypted(comp, errors);
 
     if macro_count > 0 {
         features.push("macros");
@@ -206,7 +209,7 @@ pub(super) fn extract(
     // so a workbook still declaring one is worth reporting on its own.
     let workbook = ["Workbook", "Book"]
         .iter()
-        .find_map(|name| read_stream_data(&mut comp, name, MAX_WORKBOOK_BYTES, &mut limits, errors))
+        .find_map(|name| read_stream_data(comp, name, MAX_WORKBOOK_BYTES, &mut limits, errors))
         .unwrap_or_default();
     let workbook = if biff_encrypted(&workbook) {
         tracing::debug!(
@@ -222,11 +225,7 @@ pub(super) fn extract(
     let names = defined_names(&workbook);
     for auto in ["auto_open", "auto_close"] {
         if names.iter().any(|n| n == auto) {
-            features.push(if auto == "auto_open" {
-                "auto_open"
-            } else {
-                "auto_close"
-            });
+            features.push(auto);
         }
     }
     if !names.is_empty() {
@@ -237,9 +236,8 @@ pub(super) fn extract(
             value_key!("office.names"),
             JsonValue::Array(
                 names
-                    .iter()
+                    .into_iter()
                     .take(MAX_NAMES)
-                    .cloned()
                     .map(JsonValue::String)
                     .collect(),
             ),
@@ -248,14 +246,18 @@ pub(super) fn extract(
     if !sheets.is_empty() {
         let xlm = sheets.iter().filter(|s| s.kind == SHEET_XLM).count();
         let hidden = sheets.iter().filter(|s| s.visibility != 0).count();
+        // Visibility 2 is "very hidden": the sheet cannot be unhidden from
+        // Excel's own UI, only from VBA. Nothing a person maintaining a
+        // workbook has a reason to set.
+        let very_hidden = sheets.iter().any(|s| s.visibility == SHEET_VERY_HIDDEN);
         metrics.insert(metric!("office.sheet_count"), sheets.len() as f64);
         values.insert_key(
             value_key!("office.sheet_names"),
             JsonValue::Array(
                 sheets
-                    .iter()
+                    .into_iter()
                     .filter(|s| !s.name.is_empty())
-                    .map(|s| JsonValue::String(s.name.clone()))
+                    .map(|s| JsonValue::String(s.name))
                     .collect(),
             ),
         );
@@ -266,10 +268,7 @@ pub(super) fn extract(
         if hidden > 0 {
             metrics.insert(metric!("office.hidden_sheet_count"), hidden as f64);
         }
-        // Visibility 2 is "very hidden": the sheet cannot be unhidden from
-        // Excel's own UI, only from VBA. Nothing a person maintaining a
-        // workbook has a reason to set.
-        if sheets.iter().any(|s| s.visibility == SHEET_VERY_HIDDEN) {
+        if very_hidden {
             features.push("veryhidden_sheets");
         }
     }
@@ -313,21 +312,21 @@ pub(super) fn extract(
     // for a control-character storage). Emit the same `office.*`
     // paths as OOXML so rules do not care which container supplied
     // the property.
-    let mut props: BTreeMap<ValueKey, JsonValue> = summary_data
+    let mut props = summary_data
         .as_deref()
-        .map(parse_summary_information)
+        .map(|data| property_set(data, summary_key))
         .unwrap_or_default();
     // DocumentSummaryInformation extends the summary set with
     // manager / company / security_flag / hyperlink_base — fields
     // OOXML carries in `docProps/app.xml`.
     if let Some(data) = read_stream_data(
-        &mut comp,
+        comp,
         "\x05DocumentSummaryInformation",
         MAX_PROPERTY_STREAM_BYTES,
         &mut limits,
         errors,
     ) {
-        for (k, v) in parse_document_summary_information(&data) {
+        for (k, v) in property_set(&data, document_summary_key) {
             props.entry(k).or_insert(v);
         }
     }
@@ -341,7 +340,7 @@ pub(super) fn extract(
     // a `.doc` file whose CompObj declares Excel is the canonical
     // CVE-2017-0199 extension-mismatch shape.
     if let Some(co) = read_stream_data(
-        &mut comp,
+        comp,
         "\x01CompObj",
         MAX_PROPERTY_STREAM_BYTES,
         &mut limits,
@@ -349,61 +348,41 @@ pub(super) fn extract(
     )
     .and_then(|data| parse_compobj(&data))
     {
-        let mut obj = serde_json::Map::new();
-        if !co.user_type.is_empty() {
-            obj.insert("user_type".into(), JsonValue::String(co.user_type));
-        }
-        if !co.clipboard_format.is_empty() {
-            obj.insert(
-                "clipboard_format".into(),
-                JsonValue::String(co.clipboard_format),
-            );
-        }
-        if !co.prog_id.is_empty() {
-            obj.insert("prog_id".into(), JsonValue::String(co.prog_id));
-        }
+        let obj: serde_json::Map<_, _> = [
+            ("user_type", co.user_type),
+            ("clipboard_format", co.clipboard_format),
+            ("prog_id", co.prog_id),
+        ]
+        .into_iter()
+        .filter(|(_, v)| !v.is_empty())
+        .map(|(k, v)| (k.to_string(), JsonValue::String(v)))
+        .collect();
         if !obj.is_empty() {
             values.insert_key(value_key!("office.compobj"), JsonValue::Object(obj));
         }
     }
     limits.emit(values, value_key!("office.limits"));
-    Ok(())
 }
 
-/// Parse the `\x05SummaryInformation` property set (MS-OLEPS) and
-/// return a map keyed by the same canonical names the OOXML
-/// extractor uses for `office.*`, so trait rules can match
-/// either legacy or modern Office uniformly.
+/// Read the first section of a property-set stream (MS-OLEPS) into a map
+/// keyed by the same canonical names the OOXML extractor uses for
+/// `office.*`, so trait rules can match either legacy or modern Office
+/// uniformly. `key` names the PIDs worth reading; the first value read for a
+/// key wins.
 ///
 /// Property layout:
 /// - 28-byte header: byte-order mark, version, OS, class GUID, section count.
 /// - Per-section header: FMTID (16 bytes) + offset (4 bytes).
 /// - Section body: size (4) + property count (4) + (PID, offset) pairs.
 /// - Each property entry: type tag (4) + value bytes (length depends on type).
-fn parse_summary_information(data: &[u8]) -> BTreeMap<ValueKey, JsonValue> {
+fn property_set(data: &[u8], key: fn(u32) -> Option<ValueKey>) -> BTreeMap<ValueKey, JsonValue> {
     let mut out = BTreeMap::new();
     let Some(section) = locate_first_section(data) else {
         return out;
     };
     for (pid, val_off) in property_entries(section) {
-        // PIDSI_* per MS-OLEPS §2.4.1. The mapping uses the same
-        // canonical names as the OOXML core-properties schema so
-        // traits don't have to special-case the format.
-        let key = match pid {
-            0x02 => value_key!("office.title"),
-            0x03 => value_key!("office.subject"),
-            0x04 => value_key!("office.creator"), // PIDSI_AUTHOR
-            0x05 => value_key!("office.keywords"),
-            0x06 => value_key!("office.description"), // PIDSI_COMMENTS
-            0x07 => value_key!("office.template"),
-            0x08 => value_key!("office.last_modified_by"), // PIDSI_LASTAUTHOR
-            0x09 => value_key!("office.revision"),         // VT_LPSTR holding a decimal string
-            0x0B => value_key!("office.last_printed"),     // VT_FILETIME
-            0x0C => value_key!("office.created"),          // VT_FILETIME
-            0x0D => value_key!("office.modified"),         // PIDSI_LASTSAVE_DTM, VT_FILETIME
-            0x12 => value_key!("office.application"),      // PIDSI_APPNAME
-            0x13 => value_key!("office.document_security"), // PIDSI_DOC_SECURITY, VT_I4 bitfield
-            _ => continue,
+        let Some(key) = key(pid) else {
+            continue;
         };
         if out.contains_key(&key) {
             continue;
@@ -417,37 +396,43 @@ fn parse_summary_information(data: &[u8]) -> BTreeMap<ValueKey, JsonValue> {
     out
 }
 
-/// Parse the `\x05DocumentSummaryInformation` property set into the
-/// subset of fields that overlap with the OOXML `office.*` shape. Its
-/// second section, the user-defined custom properties, is not read.
-fn parse_document_summary_information(data: &[u8]) -> BTreeMap<ValueKey, JsonValue> {
-    let mut out = BTreeMap::new();
-    let Some(section) = locate_first_section(data) else {
-        return out;
-    };
-    for (pid, val_off) in property_entries(section) {
-        // PIDDSI_* per MS-OLEPS §2.4.2. We only surface the fields
-        // that have a matching OOXML core / app-properties slot.
-        let key = match pid {
-            0x02 => value_key!("office.category"),
-            0x05 => value_key!("office.presentation_format"),
-            0x09 => value_key!("office.slide_count"), // VT_I4
-            0x10 => value_key!("office.manager"),     // VT_LPSTR
-            0x11 => value_key!("office.company"),     // VT_LPSTR
-            0x13 => value_key!("office.security_flag"), // VT_I4 — bitfield
-            0x1A => value_key!("office.hyperlink_base"), // VT_LPSTR
-            _ => continue,
-        };
-        if out.contains_key(&key) {
-            continue;
-        }
-        if let Some(value) =
-            read_property(section, val_off).or_else(|| read_property_i32(section, val_off))
-        {
-            out.insert(key, value);
-        }
-    }
-    out
+/// The `\x05SummaryInformation` PIDs read (PIDSI_*, MS-OLEPS §2.4.1), under
+/// the same canonical names as the OOXML core-properties schema so traits
+/// don't have to special-case the format.
+fn summary_key(pid: u32) -> Option<ValueKey> {
+    Some(match pid {
+        0x02 => value_key!("office.title"),
+        0x03 => value_key!("office.subject"),
+        0x04 => value_key!("office.creator"), // PIDSI_AUTHOR
+        0x05 => value_key!("office.keywords"),
+        0x06 => value_key!("office.description"), // PIDSI_COMMENTS
+        0x07 => value_key!("office.template"),
+        0x08 => value_key!("office.last_modified_by"), // PIDSI_LASTAUTHOR
+        0x09 => value_key!("office.revision"),         // VT_LPSTR holding a decimal string
+        0x0B => value_key!("office.last_printed"),     // VT_FILETIME
+        0x0C => value_key!("office.created"),          // VT_FILETIME
+        0x0D => value_key!("office.modified"),         // PIDSI_LASTSAVE_DTM, VT_FILETIME
+        0x12 => value_key!("office.application"),      // PIDSI_APPNAME
+        0x13 => value_key!("office.document_security"), // PIDSI_DOC_SECURITY, VT_I4 bitfield
+        _ => return None,
+    })
+}
+
+/// The `\x05DocumentSummaryInformation` PIDs read (PIDDSI_*, MS-OLEPS
+/// §2.4.2): only the fields that have a matching OOXML core /
+/// app-properties slot. Its second section, the user-defined custom
+/// properties, is not read.
+fn document_summary_key(pid: u32) -> Option<ValueKey> {
+    Some(match pid {
+        0x02 => value_key!("office.category"),
+        0x05 => value_key!("office.presentation_format"),
+        0x09 => value_key!("office.slide_count"),   // VT_I4
+        0x10 => value_key!("office.manager"),       // VT_LPSTR
+        0x11 => value_key!("office.company"),       // VT_LPSTR
+        0x13 => value_key!("office.security_flag"), // VT_I4 — bitfield
+        0x1A => value_key!("office.hyperlink_base"), // VT_LPSTR
+        _ => return None,
+    })
 }
 
 /// A worksheet declared by a BIFF `BOUNDSHEET` record.
@@ -498,7 +483,7 @@ fn defined_names(data: &[u8]) -> Vec<String> {
     let mut out = Vec::new();
     for (id, body) in biff_records(data) {
         let cch = match body.get(3) {
-            Some(&c) if body.len() > start && id == DEFINEDNAME => c as usize,
+            Some(&c) if body.len() > start && id == DEFINEDNAME => usize::from(c),
             _ => continue,
         };
         // `body.len() > start` above, so the header and the first name byte
@@ -510,10 +495,11 @@ fn defined_names(data: &[u8]) -> Vec<String> {
             let Some(&idx) = body.get(start) else {
                 continue;
             };
-            out.push(match BUILTIN_NAMES.get(idx as usize) {
-                Some(name) => (*name).to_string(),
-                None => format!("builtin_{idx}"),
-            });
+            out.push(
+                BUILTIN_NAMES
+                    .get(usize::from(idx))
+                    .map_or_else(|| format!("builtin_{idx}"), |name| (*name).to_string()),
+            );
             continue;
         }
         // Otherwise it is text: BIFF8 marks a wide string in the byte before
@@ -521,7 +507,7 @@ fn defined_names(data: &[u8]) -> Vec<String> {
         let wide = biff8 && body.get(FIXED).is_some_and(|b| b & 1 != 0);
         let step = if wide { 2 } else { 1 };
         let name: String = (0..cch)
-            .filter_map(|i| body.get(start + i * step).map(|&b| b as char))
+            .filter_map(|i| body.get(start + i * step).copied().map(char::from))
             .collect();
         if name.chars().count() == cch {
             out.push(name.to_ascii_lowercase());
@@ -537,14 +523,14 @@ fn sheet_name(rest: &[u8], biff8: bool) -> String {
     let Some(&cch) = rest.first() else {
         return String::new();
     };
-    let cch = cch as usize;
+    let cch = usize::from(cch);
     let (start, step) = match biff8 {
         true if rest.get(1).is_some_and(|f| f & 1 != 0) => (2, 2),
         true => (2, 1),
         false => (1, 1),
     };
     (0..cch)
-        .filter_map(|i| rest.get(start + i * step).map(|&b| b as char))
+        .filter_map(|i| rest.get(start + i * step).copied().map(char::from))
         .collect()
 }
 
@@ -582,7 +568,7 @@ fn biff_records(data: &[u8]) -> impl Iterator<Item = (u16, &[u8])> {
             return None;
         }
         let id = bytes::u16_le(data, pos)?;
-        let len = bytes::u16_le(data, pos + 2)? as usize;
+        let len = usize::from(bytes::u16_le(data, pos + 2)?);
         let body = data.get(pos + 4..pos + 4 + len)?;
         pos += 4 + len;
         Some((id, body))
@@ -681,10 +667,10 @@ fn msg_attachments<T: Read + std::io::Seek>(
         if let Some(cid) = read_msg_string(comp, storage, "3712") {
             obj.insert("content_id".into(), JsonValue::String(cid));
         }
-        if let Ok(entry) = comp.entry(format!("{storage}/__substg1.0_37010102")) {
-            if entry.is_stream() {
-                obj.insert("size".into(), JsonValue::from(entry.len()));
-            }
+        if let Ok(entry) = comp.entry(format!("{storage}/__substg1.0_37010102"))
+            && entry.is_stream()
+        {
+            obj.insert("size".into(), JsonValue::from(entry.len()));
         }
         let props = msg_attachment_properties(comp, storage);
         let method = props.method.or_else(|| {
@@ -827,7 +813,7 @@ fn read_stream_data<T: Read + std::io::Seek>(
 ) -> Option<Vec<u8>> {
     let stream = comp.open_stream(path).ok()?;
     let len = stream.len();
-    let prefix = match inflate_capped(stream, cap) {
+    let prefix = match inflate_capped(stream, cap, OnError::Discard) {
         Ok(prefix) => prefix,
         Err(e) => {
             record_unreadable_stream(errors, path, &e);
@@ -881,9 +867,9 @@ fn summary_document_security_encrypted(data: &[u8]) -> bool {
 /// are read, and the walk stops at the first pair that runs past the section.
 fn property_entries(section: &[u8]) -> impl Iterator<Item = (u32, usize)> {
     let count =
-        bytes::u32_le(section, 4).map_or(0, |n| (n as usize).min(MAX_PROPERTIES_PER_SECTION));
+        bytes::u32_le(section, 4).map_or(0, |n| sat_usize(n).min(MAX_PROPERTIES_PER_SECTION));
     let mut entries = Reader::at(section, 8);
-    (0..count).map_while(move |_| Some((entries.u32_le()?, entries.u32_le()? as usize)))
+    (0..count).map_while(move |_| Some((entries.u32_le()?, sat_usize(entries.u32_le()?))))
 }
 
 fn word_document_encrypted<T: Read + std::io::Seek>(
@@ -938,11 +924,9 @@ fn locate_first_section(data: &[u8]) -> Option<&[u8]> {
     if bytes::u32_le(data, 24)? == 0 {
         return None;
     }
-    let section_off = bytes::u32_le(data, 44)? as usize;
-    if section_off >= data.len() {
-        return None;
-    }
+    let section_off = sat_usize(bytes::u32_le(data, 44)?);
     data.get(section_off..)
+        .filter(|section| !section.is_empty())
 }
 
 /// Read a property value at `(section + offset)` and decode it into
@@ -968,35 +952,28 @@ fn read_property(section: &[u8], offset: usize) -> Option<JsonValue> {
 }
 
 fn read_lpstr(body: &[u8]) -> Option<JsonValue> {
-    let len = bytes::u32_le(body, 0)? as usize;
+    let mut r = Reader::new(body);
+    let len = sat_usize(r.u32_le()?);
     if len == 0 {
         return None;
     }
-    let s = String::from_utf8_lossy(body.get(4..4 + len)?)
+    let s = String::from_utf8_lossy(r.bytes(len)?)
         .trim_end_matches('\0')
         .to_string();
-    if s.is_empty() {
-        None
-    } else {
-        Some(JsonValue::String(s))
-    }
+    (!s.is_empty()).then_some(JsonValue::String(s))
 }
 
 fn read_lpwstr(body: &[u8]) -> Option<JsonValue> {
-    let chars = bytes::u32_le(body, 0)? as usize;
-    let byte_len = chars.checked_mul(2)?;
+    let mut r = Reader::new(body);
+    let chars = sat_usize(r.u32_le()?);
     if chars == 0 {
         return None;
     }
-    let units = body.get(4..byte_len.checked_add(4)?)?;
+    let units = r.bytes(chars.checked_mul(2)?)?;
     let s = bytes::utf16_lossy(units, bytes::Endian::Little)
         .trim_end_matches('\0')
         .to_string();
-    if s.is_empty() {
-        None
-    } else {
-        Some(JsonValue::String(s))
-    }
+    (!s.is_empty()).then_some(JsonValue::String(s))
 }
 
 fn read_filetime(body: &[u8]) -> Option<JsonValue> {
@@ -1004,40 +981,10 @@ fn read_filetime(body: &[u8]) -> Option<JsonValue> {
     if ticks == 0 {
         return None;
     }
-    // Windows FILETIME → Unix seconds: subtract the 1601→1970
-    // 100-ns-tick offset, then divide by 10_000_000.
-    const EPOCH_OFFSET: u64 = 11_644_473_600;
-    let unix_seconds = ticks / 10_000_000;
-    if unix_seconds < EPOCH_OFFSET {
-        // Stored value is a duration (e.g. PIDSI_EDITTIME), not an
-        // absolute timestamp — surface the raw value as seconds so
-        // the consumer can interpret it.
-        return Some(JsonValue::String(format!("PT{}S", unix_seconds)));
-    }
-    let unix = unix_seconds - EPOCH_OFFSET;
-    Some(JsonValue::String(format_iso8601_utc(unix)))
-}
-
-/// Format a Unix timestamp as ISO-8601 in UTC without pulling in a
-/// date crate: Howard Hinnant's `civil_from_days`, in its unsigned form
-/// since the input never precedes 1970.
-fn format_iso8601_utc(unix: u64) -> String {
-    let (days, secs) = (unix / 86_400, unix % 86_400);
-    let z = days + 719_468;
-    let era = z / 146_097;
-    let doe = z % 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = era * 400 + yoe + u64::from(month <= 2);
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
-        secs / 3600,
-        secs % 3600 / 60,
-        secs % 60
-    )
+    // Every property read here is an absolute time; one before 1970 is
+    // rendered as the date it names.
+    let unix = crate::time::filetime_to_unix(ticks);
+    Some(JsonValue::String(crate::time::iso8601_utc(unix)))
 }
 
 /// Parsed CompObj stream contents.
@@ -1086,11 +1033,12 @@ fn parse_compobj(data: &[u8]) -> Option<CompObjData> {
     if marker == 0 {
         pos += 4;
     } else {
-        let len = marker as usize;
+        let len = sat_usize(marker);
         let str_start = pos + 4;
         let text = data
-            .get(str_start..str_start + len)
-            .filter(|_| len > 0 && len <= 256)
+            .get(str_start..)
+            .and_then(|rest| rest.get(..len))
+            .filter(|_| len <= 256)
             .filter(|t| {
                 t.iter()
                     .all(|b| b.is_ascii_graphic() || *b == b' ' || *b == 0)
@@ -1111,11 +1059,10 @@ fn parse_compobj(data: &[u8]) -> Option<CompObjData> {
 }
 
 fn read_length_prefixed_ansi(buf: &[u8]) -> Option<(String, usize)> {
-    let len = bytes::u32_le(buf, 0)? as usize;
-    if len == 0 {
-        return Some((String::new(), 4));
-    }
-    Some((sanitize_ansi(buf.get(4..4 + len)?), 4 + len))
+    let mut r = Reader::new(buf);
+    let len = sat_usize(r.u32_le()?);
+    let text = sanitize_ansi(r.bytes(len)?);
+    Some((text, r.pos()))
 }
 
 fn sanitize_ansi(bytes: &[u8]) -> String {
@@ -1168,7 +1115,7 @@ fn detect_kind(streams: &[String]) -> &'static str {
     if has("Workbook") || has("Book") {
         return "xls";
     }
-    if has("PowerPoint Document") || has("PowerPoint") {
+    if has("PowerPoint") {
         return "ppt";
     }
     if has("__substg1.0_") || has("__nameid_version1.0") {

@@ -96,19 +96,10 @@ fn stored_text_budget_is_reported() {
     let mut bytes = b"FasdUAS 1.101.10\x0e\0\0\0\x01\xb1\0\x01\x13\0\x01\0\0".to_vec();
     bytes.extend_from_slice(&(size as u32).to_be_bytes());
     bytes.resize(bytes.len() + size, 0);
-    let mut values = Values::new();
-    let mut strings = Strings::default();
-    let mut metrics = Metrics::new();
-    let mut symbols = Symbols::new();
-    extract(
-        &bytes,
-        &mut values,
-        &mut strings,
-        &mut metrics,
-        &mut symbols,
-    )
-    .unwrap();
-    assert!(strings.literals.is_empty());
+    let mut sinks = crate::formats::Sinks::default();
+    extract(&bytes, sinks.ctx()).unwrap();
+    let values = sinks.values;
+    assert!(sinks.strings.literals.is_empty());
     assert_eq!(
         values.get("scpt.limits"),
         Some(&json!([

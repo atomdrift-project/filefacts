@@ -8,12 +8,18 @@
 //! headers, NuGet's comma-separated `authors`. The identity view reads them
 //! back through [`read`].
 
+use std::collections::HashSet;
+
 use serde_json::{Map, Value as JsonValue};
 
 use crate::output::{ValueKey, Values};
 
+/// People one list keeps. A manifest's people list is bounded only by its
+/// size; this is far past any real package's maintainers or authors.
+pub(crate) const MAX_PEOPLE: usize = 256;
+
 /// One person: any of a display name, an email address and a URL.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct Person {
     pub(crate) name: Option<String>,
     pub(crate) email: Option<String>,
@@ -86,24 +92,57 @@ impl Person {
 }
 
 /// Publish `people` under `key`, dropping empty entries and repeats; nothing
-/// is written when none remain.
-pub(crate) fn put(values: &mut Values, key: ValueKey, people: impl IntoIterator<Item = Person>) {
-    let mut kept: Vec<Person> = Vec::new();
+/// is written when none remain. At most [`MAX_PEOPLE`] are kept, and the
+/// walk stops there: the return value says whether the list was cut, for the
+/// caller to report as a limit.
+pub(crate) fn put(
+    values: &mut Values,
+    key: ValueKey,
+    people: impl IntoIterator<Item = Person>,
+) -> bool {
+    let mut seen = HashSet::new();
+    let mut kept = Vec::new();
+    let mut capped = false;
     for person in people {
-        if !person.is_empty() && !kept.contains(&person) {
-            kept.push(person);
+        if person.is_empty() || seen.contains(&person) {
+            continue;
         }
+        if kept.len() == MAX_PEOPLE {
+            capped = true;
+            break;
+        }
+        seen.insert(person.clone());
+        kept.push(person);
+    }
+    if capped {
+        tracing::debug!(target: "filefacts::people", key = %key, cap = MAX_PEOPLE, "people list capped");
     }
     if !kept.is_empty() {
         let list = kept.into_iter().map(Person::into_json).collect();
         values.insert_key(key, JsonValue::Array(list));
+    }
+    capped
+}
+
+/// [`put`] for a list a manifest can make arbitrarily long: a cut list is
+/// recorded under the format's `limits` key.
+pub(super) fn put_list(
+    values: &mut Values,
+    key: ValueKey,
+    people: impl IntoIterator<Item = Person>,
+    limits: ValueKey,
+) {
+    if put(values, key, people) {
+        let mut cut = super::bounded::Limits::default();
+        cut.push("people", format!("{key} cut at {MAX_PEOPLE} entries"));
+        cut.emit(values, limits);
     }
 }
 
 /// The people published under `key`.
 pub(crate) fn read(values: &Values, key: ValueKey) -> impl Iterator<Item = Person> + '_ {
     values
-        .get_key(key)
+        .lookup(key)
         .and_then(JsonValue::as_array)
         .into_iter()
         .flatten()

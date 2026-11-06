@@ -27,13 +27,13 @@ use serde_json::Value as JsonValue;
 use std::io::{Read, Seek};
 
 use super::bounded::Limits;
-use crate::output::{Errors, Metrics, Values};
+use super::zip::JarSigning;
+use crate::output::{Errors, Values};
 use crate::value_key;
 
 pub(super) fn extract_from_archive<R: Read + Seek>(
     zip: &mut ::zip::ZipArchive<R>,
     values: &mut Values,
-    _metrics: &mut Metrics,
     errors: &mut Errors,
 ) {
     let mut has_manifest_json = false;
@@ -49,11 +49,21 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
             "manifest.json" => has_manifest_json = true,
             "install.rdf" => has_install_rdf = true,
             "chrome.manifest" => has_chrome_manifest = true,
-            "META-INF/mozilla.sf" => has_mozilla_sf = true,
-            "META-INF/mozilla.rsa" => has_mozilla_rsa = true,
-            "META-INF/cose.manifest" => has_cose_manifest = true,
-            "META-INF/cose.sig" => has_cose_sig = true,
-            _ => {}
+            name => match super::zip::jar_signing(name) {
+                // PKCS #7 signing is JAR signing under the base `mozilla`.
+                Some((role, base)) if base.eq_ignore_ascii_case("mozilla") => match role {
+                    JarSigning::SignatureFile => has_mozilla_sf = true,
+                    JarSigning::SignatureBlock => has_mozilla_rsa = true,
+                },
+                _ => {
+                    // COSE signing keeps its own two files beside it.
+                    if name.eq_ignore_ascii_case("META-INF/cose.manifest") {
+                        has_cose_manifest = true;
+                    } else if name.eq_ignore_ascii_case("META-INF/cose.sig") {
+                        has_cose_sig = true;
+                    }
+                }
+            },
         }
     }
 

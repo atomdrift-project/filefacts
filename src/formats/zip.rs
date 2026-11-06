@@ -30,8 +30,8 @@ use zip::result::ZipError;
 use zip::{CompressionMethod, ZipArchive};
 
 use super::archive_stats::{Agg, ArchiveStats, Dominance, Reading, Scope, member_value};
-use super::bounded::{Limits, MAX_ARCHIVE_MEMBERS, MemberPrefix, inflate_capped};
-use super::common::{bytes_at, ends_with_ci};
+use super::bounded::{Limits, MAX_ARCHIVE_MEMBERS, MemberPrefix, OnError, inflate_capped};
+use crate::bytes::ends_with_ci;
 use crate::error::Error;
 use crate::output::{
     ArchiveCompression, ArchiveMember, ArchiveOffsets, ArchiveOwnership, EntryType, Errors,
@@ -313,17 +313,6 @@ pub(super) fn open_and_walk<'a>(
     }
 }
 
-/// Emit the ZIP member listing and archive facts for `bytes`.
-pub(super) fn extract(
-    bytes: &[u8],
-    values: &mut Values,
-    metrics: &mut Metrics,
-    archive_members: &mut Vec<ArchiveMember>,
-    errors: &mut Errors,
-) -> Result<(), Error> {
-    open_and_walk(bytes, values, metrics, archive_members, errors).map(drop)
-}
-
 /// One walked member, with the per-entry facts the walk aggregates.
 struct EntryFacts {
     member: ArchiveMember,
@@ -399,7 +388,7 @@ fn walk_archive<R: Read + Seek>(
             // purpose.
             mtime_unix: entry
                 .last_modified()
-                .and_then(crate::scan::zip_datetime_to_unix),
+                .and_then(|dt| crate::time::dos_datetime_to_unix(dt.datepart(), dt.timepart())),
             crc32: Some(entry.crc32()),
             encrypted: entry.encrypted(),
             compression: ArchiveCompression::new(
@@ -743,7 +732,12 @@ fn emit_walk(
     // Container-level structural facts derived from the raw byte stream:
     // prefix bytes before the first LFH (self-extracting stubs / polyglots)
     // and trailing bytes after the EOCD record (appended payloads).
-    let prefix = scan_prefix_bytes(bytes);
+    // The offset of the first local-file header: past zero, the archive
+    // carries a prefix (a self-extracting stub, a polyglot, a front-appended
+    // payload). The `zip` crate reads such archives, as EOCD offsets are
+    // relative to the stream, but the prefix is container-level data
+    // outside any signed-content scheme.
+    let prefix = memchr::memmem::find(bytes, b"PK\x03\x04").unwrap_or(0);
     if prefix > 0 {
         metrics.insert(metric!("archive.leading_bytes"), prefix as f64);
     }
@@ -779,6 +773,39 @@ impl std::error::Error for MemberError {
             Self::Zip(e) => Some(e),
         }
     }
+}
+
+/// The part a member plays in JAR signing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum JarSigning {
+    /// `<base>.SF`: the signature file, listing digests of the manifest.
+    SignatureFile,
+    /// `<base>.RSA`, `.DSA` or `.EC`: the PKCS #7 block signing the
+    /// signature file of the same base.
+    SignatureBlock,
+}
+
+/// `name`'s part in JAR signing, with the base name the signature file and
+/// its block pair on (the path after `META-INF/`, without the extension).
+/// Names are compared as the JDK compares them, without regard to case, so
+/// `meta-inf/cert.sf` signs a JAR exactly as `META-INF/CERT.SF` does. JAR,
+/// APK v1 and XPI signing all use this layout.
+pub(super) fn jar_signing(name: &str) -> Option<(JarSigning, &str)> {
+    if !super::common::starts_with_ci(name, "META-INF/") {
+        return None;
+    }
+    let (base, ext) = name.get("META-INF/".len()..)?.rsplit_once('.')?;
+    let role = if ext.eq_ignore_ascii_case("SF") {
+        JarSigning::SignatureFile
+    } else if ["RSA", "DSA", "EC"]
+        .iter()
+        .any(|block| ext.eq_ignore_ascii_case(block))
+    {
+        JarSigning::SignatureBlock
+    } else {
+        return None;
+    };
+    Some((role, base))
 }
 
 /// Read member `name`, refusing it when it inflates past `max` bytes.
@@ -821,6 +848,10 @@ pub(super) fn read_manifest_member<R: Read + Seek>(
     }
 }
 
+/// Plaintext a member with a false encryption bit may inflate to: the whole
+/// member is read to check its CRC before any prefix of it is used.
+const MAX_VERIFIED_PLAINTEXT: u64 = 16 << 20;
+
 /// The first `max` bytes of member `name`, and whether more followed, for a
 /// caller that can use a prefix (a header block). `Ok(None)` when no member
 /// has that name.
@@ -837,12 +868,18 @@ pub(super) fn read_member_prefix<R: Read + Seek>(
         if raw.encrypted() {
             let size = raw.size();
             let crc = raw.crc32();
-            let method = raw.compression();
-            let prefix = match method {
-                CompressionMethod::Stored => inflate_capped(raw, max),
-                CompressionMethod::Deflated => {
-                    inflate_capped(flate2::read::DeflateDecoder::new(raw), max)
-                }
+            if size > MAX_VERIFIED_PLAINTEXT {
+                return Err(MemberError::TooLarge {
+                    max: MAX_VERIFIED_PLAINTEXT,
+                });
+            }
+            let whole = match raw.compression() {
+                CompressionMethod::Stored => inflate_capped(raw, size, OnError::Discard),
+                CompressionMethod::Deflated => inflate_capped(
+                    flate2::read::DeflateDecoder::new(raw),
+                    size,
+                    OnError::Discard,
+                ),
                 _ => {
                     return Err(MemberError::Zip(ZipError::UnsupportedArchive(
                         "encrypted member cannot be read as bounded plaintext",
@@ -850,16 +887,19 @@ pub(super) fn read_member_prefix<R: Read + Seek>(
                 }
             }
             .map_err(|e| MemberError::Zip(ZipError::Io(e)))?;
-            if prefix.truncated {
-                return Err(MemberError::TooLarge { max });
-            }
-            if prefix.bytes.len() as u64 != size || crc32fast::hash(&prefix.bytes) != crc {
+            if whole.truncated
+                || whole.bytes.len() as u64 != size
+                || crc32fast::hash(&whole.bytes) != crc
+            {
                 return Err(MemberError::Zip(ZipError::Io(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "encrypted member is not verified plaintext",
                 ))));
             }
-            return Ok(Some(prefix));
+            let mut bytes = whole.bytes;
+            let truncated = bytes.len() as u64 > max;
+            bytes.truncate(usize::try_from(max).unwrap_or(usize::MAX));
+            return Ok(Some(MemberPrefix { bytes, truncated }));
         }
     }
     let entry = match zip.by_name(name) {
@@ -867,7 +907,7 @@ pub(super) fn read_member_prefix<R: Read + Seek>(
         Err(ZipError::FileNotFound) => return Ok(None),
         Err(e) => return Err(MemberError::Zip(e)),
     };
-    inflate_capped(entry, max)
+    inflate_capped(entry, max, OnError::Discard)
         .map(Some)
         .map_err(|e| MemberError::Zip(ZipError::Io(e)))
 }
@@ -927,8 +967,8 @@ fn scan_central_directory(bytes: &[u8], cd_start: usize) -> Vec<RawCdhEntry> {
             break;
         }
         // Every field sits inside the fixed header just read.
-        let u16_at = |off| bytes_at::u16_le(header, off).unwrap_or(0);
-        let u32_at = |off| bytes_at::u32_le(header, off).unwrap_or(0);
+        let u16_at = |off| crate::bytes::u16_le(header, off).unwrap_or(0);
+        let u32_at = |off| crate::bytes::u32_le(header, off).unwrap_or(0);
         let name_len = usize::from(u16_at(28));
         let extra_len = usize::from(u16_at(30));
         let comment_len = usize::from(u16_at(32));
@@ -937,9 +977,7 @@ fn scan_central_directory(bytes: &[u8], cd_start: usize) -> Vec<RawCdhEntry> {
         let Some(name) = bytes.get(name_start..name_end) else {
             break;
         };
-        let parsed_mtime = ::zip::DateTime::try_from_msdos(u16_at(14), u16_at(12))
-            .ok()
-            .and_then(crate::scan::zip_datetime_to_unix);
+        let parsed_mtime = crate::time::dos_datetime_to_unix(u16_at(14), u16_at(12));
         out.push(RawCdhEntry {
             name: String::from_utf8_lossy(name).into_owned(),
             crc32: u32_at(16),
@@ -972,8 +1010,15 @@ struct RawDirectory {
 }
 
 impl RawDirectory {
+    /// Absolute offset of the local header `entry` points at.
+    fn local_header(&self, entry: &RawCdhEntry) -> Option<usize> {
+        usize::try_from(entry.header_offset)
+            .ok()?
+            .checked_add(self.archive_offset)
+    }
+
     fn comment<'b>(&self, bytes: &'b [u8]) -> &'b [u8] {
-        let len = bytes_at::u16_le(bytes, self.eocd + 20).map_or(0, usize::from);
+        let len = crate::bytes::u16_le(bytes, self.eocd + 20).map_or(0, usize::from);
         let start = self.eocd + 22;
         bytes
             .get(start..start.saturating_add(len))
@@ -986,8 +1031,8 @@ impl RawDirectory {
 /// not follow, or no record parses where it points.
 fn read_raw_directory(bytes: &[u8]) -> Option<RawDirectory> {
     let eocd = find_eocd(bytes)?;
-    let cd_size = bytes_at::u32_le(bytes, eocd + 12)?;
-    let cd_offset = bytes_at::u32_le(bytes, eocd + 16)?;
+    let cd_size = crate::bytes::u32_le(bytes, eocd + 12)?;
+    let cd_offset = crate::bytes::u32_le(bytes, eocd + 16)?;
     if cd_size == u32::MAX || cd_offset == u32::MAX {
         return None;
     }
@@ -1010,9 +1055,8 @@ fn read_raw_directory(bytes: &[u8]) -> Option<RawDirectory> {
 
 /// Whether the local header `entry` points at starts with its signature.
 fn local_header_intact(bytes: &[u8], directory: &RawDirectory, entry: &RawCdhEntry) -> bool {
-    usize::try_from(entry.header_offset)
-        .ok()
-        .and_then(|off| off.checked_add(directory.archive_offset))
+    directory
+        .local_header(entry)
         .and_then(|at| bytes.get(at..))
         .is_some_and(|rest| rest.starts_with(b"PK\x03\x04"))
 }
@@ -1027,14 +1071,10 @@ fn repair_local_headers(bytes: &[u8], directory: &RawDirectory) -> Option<(Vec<u
         if local_header_intact(bytes, directory, entry) {
             continue;
         }
-        let Some(at) = usize::try_from(entry.header_offset)
-            .ok()
-            .and_then(|off| off.checked_add(directory.archive_offset))
-            .filter(|at| {
-                at.checked_add(LFH_FIXED_LEN)
-                    .is_some_and(|end| end <= bytes.len())
-            })
-        else {
+        let Some(at) = directory.local_header(entry).filter(|at| {
+            at.checked_add(LFH_FIXED_LEN)
+                .is_some_and(|end| end <= bytes.len())
+        }) else {
             continue;
         };
         let copy = repaired.get_or_insert_with(|| bytes.to_vec());
@@ -1066,23 +1106,13 @@ pub(super) fn enumerate_extra_tags(extra: &[u8]) -> BTreeSet<u16> {
     tags
 }
 
-/// Offset of the first ZIP local-file-header signature `PK\x03\x04`.
-/// Returning >0 means the archive carries a prefix (self-extracting
-/// stub, polyglot, or appended-front payload). The `zip` crate parses
-/// such archives correctly because EOCD offsets are relative to the
-/// start of stream, but the prefix is still container-level data
-/// outside any signed-content scheme.
-fn scan_prefix_bytes(bytes: &[u8]) -> usize {
-    memchr::memmem::find(bytes, b"PK\x03\x04").unwrap_or(0)
-}
-
 /// Bytes appended after the End-of-Central-Directory record at `eocd`
 /// (its offset + 22 + comment length). A non-zero value means an attacker
 /// (or an aggressive concatenator) stuck data on the end of the archive
 /// that the canonical EOCD doesn't account for.
 fn trailing_bytes(bytes: &[u8], eocd: usize) -> usize {
     // The comment length is the record's last fixed field, at +20.
-    let Some(comment_len) = bytes_at::u16_le(bytes, eocd + 20) else {
+    let Some(comment_len) = crate::bytes::u16_le(bytes, eocd + 20) else {
         return 0;
     };
     let end = eocd + 22 + usize::from(comment_len);

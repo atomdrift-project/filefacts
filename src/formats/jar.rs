@@ -22,7 +22,7 @@
 //!   `META-INF/maven/<g>/<a>/pom.properties` we find.
 //!   Embedded `pom.xml` files additionally supply direct dependency rows and
 //!   explicit effective-model coverage gaps. XML parsing is bounded and offline.
-//! - `jar.features[]` — Pike-style flag array (`signed`,
+//! - `jar.features[]` — presence flags (`signed`,
 //!   `multi_release`, `native_libs`, `embedded_jars`, `services`,
 //!   `java_agents`, `osgi_activator`).
 //! - `jar.class_count`, `jar.entry_count`, `jar.embedded_jar_count`,
@@ -34,7 +34,8 @@
 //! `archive.compression.*`) runs on the same ZIP handle before this
 //! extractor layers JAR-specific facts on top.
 
-use crate::formats::common::{ends_with_ci, starts_with_ci};
+use super::zip::JarSigning;
+use crate::formats::bounded::MAX_MANIFEST_BYTES;
 use crate::metric;
 use serde_json::{Value as JsonValue, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -43,16 +44,14 @@ use std::io::{Read, Seek};
 use crate::output::{Errors, Metrics, Stage, Values};
 use crate::value_key;
 
-/// Cap on a single text entry we'll decompress for parsing
-/// (MANIFEST.MF / pom.properties / pom.xml). 1 MiB is generous; anything
-/// larger is hostile zip-bomb input.
-const MAX_TEXT_BYTES: u64 = 1024 * 1024;
-
 /// `pom.properties` members read while looking for one with a `groupId`.
 /// A jar shades a handful of Maven modules at most; each read costs up to
-/// [`MAX_TEXT_BYTES`] of inflation, and a hostile jar can list any number
+/// [`MAX_MANIFEST_BYTES`] of inflation, and a hostile jar can list any number
 /// of them that never name a group.
 const MAX_POM_READS: usize = 16;
+
+/// Where a JAR keeps its manifest.
+const MANIFEST: &str = "META-INF/MANIFEST.MF";
 
 const TRACKED_HEADERS: &[(&str, &str)] = &[
     ("Manifest-Version", "manifest_version"),
@@ -165,6 +164,13 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         .filter_map(Result::ok)
         .map(std::borrow::Cow::into_owned)
         .collect();
+    // The member the JVM reads as the manifest: the exact name, else the
+    // first `META-INF/` member that upper-cases to it, as `JarFile` looks.
+    let manifest_name = names
+        .iter()
+        .find(|n| *n == MANIFEST)
+        .or_else(|| names.iter().find(|n| is_manifest_alias(n)))
+        .cloned();
 
     for name in &names {
         if name.ends_with('/') {
@@ -184,19 +190,10 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
             }
             _ => {}
         }
-        // The JDK upper-cases entry names before looking for signature files,
-        // so `meta-inf/cert.sf` signs a JAR exactly as `META-INF/CERT.SF` does.
-        if starts_with_ci(name, "META-INF/") && ends_with_ci(name, ".SF") {
-            signature_count += 1;
-        }
-        if starts_with_ci(name, "META-INF/")
-            && name.rsplit('.').next().is_some_and(|ext| {
-                ["RSA", "DSA", "EC", "SIG"]
-                    .iter()
-                    .any(|sig| ext.eq_ignore_ascii_case(sig))
-            })
-        {
-            signature_block_count += 1;
+        match super::zip::jar_signing(name) {
+            Some((JarSigning::SignatureFile, _)) => signature_count += 1,
+            Some((JarSigning::SignatureBlock, _)) => signature_block_count += 1,
+            None => {}
         }
         if name.starts_with("META-INF/versions/") {
             multi_release = true;
@@ -213,7 +210,7 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         if name == "META-INF/INDEX.LIST" {
             index_count += 1;
         }
-        if name == "META-INF/MANIFEST.MF" {
+        if manifest_name.as_ref() == Some(name) {
             if !manifest_read {
                 manifest_read = true;
                 if let Some(text) = read_text(zip, name, errors) {
@@ -264,16 +261,15 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         return;
     }
 
-    let class_path_count = manifest
-        .as_ref()
-        .and_then(|m| m.headers.get("class_path"))
-        .map(|v| crate::bytes::sat_u32(v.split_whitespace().count()))
-        .unwrap_or(0);
-    let boot_class_path_count = manifest
-        .as_ref()
-        .and_then(|m| m.headers.get("boot_class_path"))
-        .map(|v| crate::bytes::sat_u32(v.split_whitespace().count()))
-        .unwrap_or(0);
+    // The space-separated entries of a path header.
+    let path_count = |header: &str| {
+        manifest
+            .as_ref()
+            .and_then(|m| m.headers.get(header))
+            .map_or(0, |v| crate::bytes::sat_u32(v.split_whitespace().count()))
+    };
+    let class_path_count = path_count("class_path");
+    let boot_class_path_count = path_count("boot_class_path");
     let has_java_agents = manifest_has_agent(manifest.as_ref());
     let has_osgi_activator = manifest
         .as_ref()
@@ -281,8 +277,8 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
 
     if let Some(manifest) = manifest.as_ref() {
         let mut obj = serde_json::Map::new();
-        for (k, v) in &manifest.headers {
-            obj.insert(k.clone(), JsonValue::String(v.clone()));
+        for (&k, v) in &manifest.headers {
+            obj.insert(k.into(), JsonValue::String(v.clone()));
         }
         if manifest.section_count > 0 {
             obj.insert("section_count".into(), json!(manifest.section_count));
@@ -343,71 +339,43 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         values.insert_key(value_key!("jar.pom"), JsonValue::Object(pom));
     }
 
-    let mut features: Vec<&'static str> = Vec::new();
-    if signature_count > 0 {
-        features.push("signed");
-    }
-    if multi_release {
-        features.push("multi_release");
-    }
-    if native_lib_count > 0 {
-        features.push("native_libs");
-    }
-    if embedded_jar_count > 0 {
-        features.push("embedded_jars");
-    }
-    if service_count > 0 {
-        features.push("services");
-    }
-    if has_java_agents {
-        features.push("java_agents");
-    }
-    if has_osgi_activator {
-        features.push("osgi_activator");
-    }
+    let features: Vec<JsonValue> = [
+        (signature_count > 0, "signed"),
+        (multi_release, "multi_release"),
+        (native_lib_count > 0, "native_libs"),
+        (embedded_jar_count > 0, "embedded_jars"),
+        (service_count > 0, "services"),
+        (has_java_agents, "java_agents"),
+        (has_osgi_activator, "osgi_activator"),
+    ]
+    .into_iter()
+    .filter(|&(present, _)| present)
+    .map(|(_, feature)| JsonValue::from(feature))
+    .collect();
     if !features.is_empty() {
-        values.insert_key(
-            value_key!("jar.features"),
-            JsonValue::Array(
-                features
-                    .into_iter()
-                    .map(|s| JsonValue::String(s.into()))
-                    .collect(),
-            ),
-        );
+        values.insert_key(value_key!("jar.features"), JsonValue::Array(features));
     }
 
     values.insert_key(value_key!("jar.entry_count"), json!(entry_count));
     values.insert_key(value_key!("jar.class_count"), json!(class_count));
-    if embedded_jar_count > 0 {
-        values.insert_key(
-            value_key!("jar.embedded_jar_count"),
-            json!(embedded_jar_count),
-        );
-    }
-    if signature_count > 0 {
-        values.insert_key(value_key!("jar.signature_count"), json!(signature_count));
-    }
-    if signature_block_count > 0 {
-        values.insert_key(
+    for (key, count) in [
+        (value_key!("jar.embedded_jar_count"), embedded_jar_count),
+        (value_key!("jar.signature_count"), signature_count),
+        (
             value_key!("jar.signature_block_count"),
-            json!(signature_block_count),
-        );
-    }
-    if native_lib_count > 0 {
-        values.insert_key(value_key!("jar.native_lib_count"), json!(native_lib_count));
-    }
-    if service_count > 0 {
-        values.insert_key(value_key!("jar.service_count"), json!(service_count));
-    }
-    if versioned_class_count > 0 {
-        values.insert_key(
+            signature_block_count,
+        ),
+        (value_key!("jar.native_lib_count"), native_lib_count),
+        (value_key!("jar.service_count"), service_count),
+        (
             value_key!("jar.versioned_class_count"),
-            json!(versioned_class_count),
-        );
-    }
-    if index_count > 0 {
-        values.insert_key(value_key!("jar.index_count"), json!(index_count));
+            versioned_class_count,
+        ),
+        (value_key!("jar.index_count"), index_count),
+    ] {
+        if count > 0 {
+            values.insert_key(key, json!(count));
+        }
     }
     metrics.insert(metric!("jar.entry_count"), f64::from(entry_count));
     metrics.insert(metric!("jar.class_count"), f64::from(class_count));
@@ -455,7 +423,7 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     }
 }
 
-/// Decompress an entry into a `String`, capped at `MAX_TEXT_BYTES`
+/// Decompress an entry into a `String`, capped at `MAX_MANIFEST_BYTES`
 /// of actual decompressed output. Trusting `entry.size()` alone is
 /// unsafe — that value comes from the central-directory header and
 /// can be spoofed by a zip bomb that claims a small uncompressed
@@ -468,7 +436,7 @@ fn read_text<R: std::io::Read + std::io::Seek>(
 ) -> Option<String> {
     // Absent is normal; anything else stopped a member the JAR lists from
     // being read, and is worth stating.
-    let buf = match super::zip::read_member(zip, name, MAX_TEXT_BYTES) {
+    let buf = match super::zip::read_member(zip, name, MAX_MANIFEST_BYTES) {
         Ok(buf) => buf?,
         Err(e) => {
             errors.record_malformed(Stage::ZipParse, format!("{name}: {e}"));
@@ -482,12 +450,23 @@ fn read_text<R: std::io::Read + std::io::Seek>(
         .ok()
 }
 
+/// Whether `name`, not spelled exactly as [`MANIFEST`], is still the
+/// manifest to `JarFile`: a `META-INF/` member (ASCII case-insensitively)
+/// whose name upper-cases to it. The JVM runs the `Main-Class` such a
+/// member names, so it is the manifest here too.
+fn is_manifest_alias(name: &str) -> bool {
+    name.get(..9)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("META-INF/"))
+        && name.to_uppercase() == MANIFEST
+}
+
 /// Facts parsed from a `MANIFEST.MF` text body. The JAR manifest format wraps
 /// long values onto continuation lines that start with a single space —
 /// handled here so `Implementation-Title: A very long…` values survive intact.
 #[derive(Debug, Default)]
 struct ManifestFacts {
-    headers: BTreeMap<String, String>,
+    /// Tracked header values by snake-case name.
+    headers: BTreeMap<&'static str, String>,
     section_count: u32,
     entry_count: u32,
     attribute_count: u32,
@@ -526,21 +505,28 @@ fn manifest_has_agent(manifest: Option<&ManifestFacts>) -> bool {
 /// attributes are counted and their algorithm names are retained, but
 /// attacker-controlled entry names are deliberately not copied into values;
 /// the generic archive member table already carries those names.
+///
+/// Lines end at CR, LF or CRLF, as `java.util.jar.Manifest` reads them. A
+/// tracked header is taken from the main section, the one the JVM reads
+/// `Main-Class`, `Premain-Class` and the rest from; an entry section only
+/// supplies a header the main section lacks (a package's
+/// `Implementation-Title`), and never overrides one.
 fn parse_manifest(text: &str) -> Option<ManifestFacts> {
     let mut sections: Vec<Vec<String>> = Vec::new();
     let mut section: Vec<String> = Vec::new();
-    for line in text.lines() {
+    let text = text.replace("\r\n", "\n");
+    for line in text.split(['\r', '\n']) {
         if line.is_empty() {
             if !section.is_empty() {
                 sections.push(std::mem::take(&mut section));
             }
             continue;
         }
-        if let Some(stripped) = line.strip_prefix(' ') {
-            if let Some(last) = section.last_mut() {
-                last.push_str(stripped);
-                continue;
-            }
+        if let Some(stripped) = line.strip_prefix(' ')
+            && let Some(last) = section.last_mut()
+        {
+            last.push_str(stripped);
+            continue;
         }
         section.push(line.to_string());
     }
@@ -553,6 +539,8 @@ fn parse_manifest(text: &str) -> Option<ManifestFacts> {
     }
 
     let mut facts = ManifestFacts::default();
+    // Tracked headers the main section set, which entry sections keep.
+    let mut main_headers: BTreeSet<&'static str> = BTreeSet::new();
     facts.section_count = crate::bytes::sat_u32(sections.len().saturating_sub(1));
     for (section_index, section) in sections.into_iter().enumerate() {
         let mut named = false;
@@ -583,13 +571,15 @@ fn parse_manifest(text: &str) -> Option<ManifestFacts> {
                     .digest_algorithms
                     .insert(algorithm.to_ascii_lowercase());
             }
-            if let Some((_, snake)) = TRACKED_HEADERS
+            if let Some(&(_, snake)) = TRACKED_HEADERS
                 .iter()
                 .find(|(k, _)| k.eq_ignore_ascii_case(key))
+                && (section_index == 0 || !main_headers.contains(snake))
             {
-                facts
-                    .headers
-                    .insert((*snake).to_string(), value.to_string());
+                facts.headers.insert(snake, value.to_string());
+                if section_index == 0 {
+                    main_headers.insert(snake);
+                }
             }
         }
         if section_index > 0 && named {

@@ -70,7 +70,7 @@ pub enum RefKind {
 
 /// How a declared dependency settled against the rest of its artifact (the
 /// module's workspace, replacements, checksums and vendor directory). Set by
-/// [`crate::go_dependency_context`]; `None` on references nothing reconciled.
+/// [`crate::package_context::go_dependency_context()`]; `None` on references nothing reconciled.
 /// Serialized as its kebab-case name; an unresolved one as
 /// `{"unresolved": "<reason>"}`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -223,6 +223,32 @@ pub struct Reference {
     /// How the reference settled against the rest of its artifact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolution: Option<Resolution>,
+    /// For a replacement directive (a Go `replace`), what it replaces; the
+    /// replacement is [`Self::locator`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaces: Option<Replaced>,
+}
+
+/// The module a replacement directive replaces.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct Replaced {
+    /// The replaced module path.
+    pub module: String,
+    /// The one version replaced, or `None` for every version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+impl Replaced {
+    /// `module`, at `version` only when one is given.
+    #[must_use]
+    pub fn new(module: impl Into<String>, version: Option<String>) -> Self {
+        Self {
+            module: module.into(),
+            version,
+        }
+    }
 }
 
 impl Reference {
@@ -244,6 +270,7 @@ impl Reference {
             content_sha256: None,
             context: None,
             resolution: None,
+            replaces: None,
         }
     }
 

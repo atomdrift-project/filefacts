@@ -182,3 +182,19 @@ fn walks_partition_relative_udf_file_extents() {
         assert!(!walk.truncated);
     }
 }
+
+/// The partition start, block number and block size all come from the
+/// image; their product can pass `u64`, and must not wrap to some other
+/// offset.
+#[test]
+fn block_addresses_past_u64_are_absent_not_wrapped() {
+    let bytes = vec![0u8; 4096];
+    let vol = Volume {
+        bytes: &bytes,
+        partition_start: u32::MAX,
+        block_size: u32::MAX,
+    };
+    assert_eq!(vol.byte_offset(u32::MAX), None);
+    assert!(vol.block(u32::MAX).is_none());
+    assert!(vol.range(u32::MAX, 16).is_none());
+}

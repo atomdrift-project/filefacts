@@ -1,5 +1,20 @@
-//! Byte-level text tests shared by every stage of identification: whether a
-//! window reads as text or as object code, and ASCII case-insensitive search.
+//! Byte-level text tests shared by every stage of identification: whether
+//! bytes read as text or as object code, which UTF-16 they are, and ASCII
+//! case-insensitive search.
+//!
+//! One measure decides text against binary: the control bytes a window
+//! carries beyond the ones its kind of text may ([`control_bytes`]). Every
+//! classifier here is that measure over a stated window:
+//!
+//! - [`is_binary`]: a share of 3% across any window the caller reads;
+//! - [`is_object_code`]: [`is_binary`] over the scorer's head window, where
+//!   UTF-16 text (a lane of NULs) is still text;
+//! - [`head_is_text`]: none at all in the first 64 bytes, and UTF-8. A short
+//!   signature followed by such a head is a script that happens to open with
+//!   the same letters, so one stray byte is enough to doubt it.
+
+use super::heuristics::SCAN_LIMIT;
+use crate::bytes::Endian;
 
 /// The UTF-8 byte-order mark. Windows editors write it ahead of scripts and
 /// markup alike, so content checks read past it.
@@ -71,6 +86,69 @@ pub(super) fn is_binary(window: &[u8], allowed: Controls) -> bool {
     let control = control_bytes(window, allowed);
     control * 100 > window.len() * MAX_CONTROL_PERCENT
         && (window.len() >= 64 || control >= MIN_CONTROL_SHORT)
+}
+
+/// How much of a file [`head_is_text`] reads. Binary headers put a NUL or a
+/// control byte well inside it: a PE's `e_lfanew`, a font's table count, a
+/// RIFF or ISO-BMFF box size.
+const TEXT_PROBE: usize = 64;
+
+/// Whether the head of `data` reads as plain text: UTF-8 with no control
+/// bytes beyond what any text carries. A character cut off by the end of the
+/// probe still counts.
+pub(super) fn head_is_text(data: &[u8]) -> bool {
+    let head = data.get(..TEXT_PROBE).unwrap_or(data);
+    if control_bytes(head, Controls::Text) > 0 {
+        return false;
+    }
+    match std::str::from_utf8(head) {
+        Ok(_) => true,
+        Err(e) => e.error_len().is_none(),
+    }
+}
+
+/// Object code, not text in any encoding: [`is_binary`] over the scorer's
+/// head window past a UTF-8 byte-order mark. UTF-16 text is mostly NULs and
+/// would otherwise look the same; a BOM or a lane of NULs keeps that as text.
+pub(super) fn is_object_code(data: &[u8]) -> bool {
+    let body = strip_utf8_bom(data);
+    let head = body.get(..SCAN_LIMIT).unwrap_or(body);
+    is_binary(head, Controls::Text) && !looks_like_utf16_text(head)
+}
+
+/// UTF-16 text, which the byte-oriented scorer cannot read. Content cannot
+/// judge it, so the extension stays the word on it.
+pub(super) fn is_utf16_text(data: &[u8]) -> bool {
+    looks_like_utf16_text(data.get(..SCAN_LIMIT).unwrap_or(data))
+}
+
+fn looks_like_utf16_text(head: &[u8]) -> bool {
+    head.starts_with(&[0xFF, 0xFE])
+        || head.starts_with(&[0xFE, 0xFF])
+        || utf16_lanes(head).is_some()
+}
+
+/// The byte order of UTF-16 text without a byte-order mark. Little-endian
+/// ASCII leaves the odd bytes NUL, big-endian the even ones.
+pub(super) fn utf16_lanes(head: &[u8]) -> Option<Endian> {
+    if head.len() < 64 {
+        return None;
+    }
+    let pairs = head.len() / 2;
+    let nul_even = head.iter().step_by(2).filter(|&&b| b == 0).count();
+    let nul_odd = head.iter().skip(1).step_by(2).filter(|&&b| b == 0).count();
+    // One lane of NULs beside a lane of characters. A zero-filled header
+    // (an Access database, a boot sector's padding) is NUL in both lanes and
+    // is not text.
+    let mostly = |n: usize| n * 5 > pairs * 4;
+    let sparse = |n: usize| n * 5 < pairs;
+    if mostly(nul_odd) && sparse(nul_even) {
+        Some(Endian::Little)
+    } else if mostly(nul_even) && sparse(nul_odd) {
+        Some(Endian::Big)
+    } else {
+        None
+    }
 }
 
 /// Offset of `needle` in `hay`, ignoring ASCII case. Every line of a file

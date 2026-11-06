@@ -1,8 +1,8 @@
 //! Shared driver for the filefacts fuzz targets.
 //!
-//! Every target runs its input on a 2 MiB thread, the stack a rayon worker
-//! gets. libFuzzer calls targets on the main thread, whose 8 MiB stack hides
-//! recursion that overflows in a real scan.
+//! Every target runs its input on a 2 MiB thread, the stack of a host worker
+//! thread. libFuzzer calls targets on the main thread, whose 8 MiB stack
+//! hides recursion that overflows in a real scan.
 
 use std::cell::Cell;
 use std::hint::black_box;
@@ -11,7 +11,7 @@ use std::sync::{Mutex, Once};
 
 use filefacts::{DiagnosticKind, FileId, FileType, OpenOptions, ParsedFile};
 
-/// The stack a rayon worker thread gets by default.
+/// The stack of a host worker thread.
 const WORKER_STACK: usize = 2 << 20;
 
 /// Options for a hermetic open: no disk cache.
@@ -132,4 +132,41 @@ pub fn forced(file_type: FileType, basename: &str, data: &[u8]) {
             .open(data);
         touch_all(&parsed);
     });
+}
+
+/// Drive the public Ren'Py index reader, which a host calls outside the
+/// extraction pipeline's panic guard. `data` is tried as a whole archive,
+/// then as the index pickle wrapped in a valid RPA-2.0 header and a stored
+/// zlib stream, so mutations reach the pickle interpreter directly.
+pub fn rpa(data: &[u8]) {
+    on_worker_stack(|| {
+        black_box(filefacts::recover::rpa::members(data).ok());
+        black_box(filefacts::recover::rpa::members(&rpa_archive(data)).ok());
+    });
+}
+
+/// An RPA-2.0 archive whose index is `pickle`, zlib-compressed with stored
+/// deflate blocks, after a one-byte payload region.
+fn rpa_archive(pickle: &[u8]) -> Vec<u8> {
+    let mut out = format!("RPA-2.0 {:016x}\n", 26).into_bytes();
+    out.push(0);
+    out.extend_from_slice(&[0x78, 0x01]);
+    let mut blocks = pickle.chunks(usize::from(u16::MAX)).peekable();
+    if blocks.peek().is_none() {
+        out.extend_from_slice(&[1, 0, 0, 0xff, 0xff]);
+    }
+    while let Some(block) = blocks.next() {
+        let len = u16::try_from(block.len()).unwrap_or(u16::MAX);
+        out.push(u8::from(blocks.peek().is_none()));
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&(!len).to_le_bytes());
+        out.extend_from_slice(block);
+    }
+    let (mut a, mut b) = (1u32, 0u32);
+    for &byte in pickle {
+        a = (a + u32::from(byte)) % 65_521;
+        b = (b + a) % 65_521;
+    }
+    out.extend_from_slice(&((b << 16) | a).to_be_bytes());
+    out
 }

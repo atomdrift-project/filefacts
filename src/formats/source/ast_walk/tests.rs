@@ -89,3 +89,36 @@ fn long_chains_resolve_in_linear_work() {
     assert_eq!(metrics.get("ast.depth_capped"), Some(1.0));
     assert_eq!(metrics.get("ast.max_member_depth"), Some(451.0));
 }
+
+/// Every prefix of a member chain is a member of its own, so one chain of
+/// hundreds of long links would record hundreds of copies of itself. The
+/// recorded paths stay within a small multiple of the source.
+#[test]
+fn member_prefixes_are_bounded_by_the_source() {
+    let name = "b".repeat(200);
+    let src = format!("x = a{};\n", format!(".{name}").repeat(900));
+    let parsed = crate::OpenOptions::new()
+        .path(std::path::Path::new("deep.js"))
+        .open(src.as_bytes());
+    let bytes: usize = parsed
+        .symbols()
+        .iter()
+        .filter_map(|symbol| match symbol {
+            Symbol::Member { path, .. } => Some(path.len()),
+            _ => None,
+        })
+        .sum();
+    assert!(
+        bytes <= member_byte_budget(src.len()),
+        "{bytes} member bytes"
+    );
+    assert_eq!(parsed.metrics().get("ast.members_capped"), Some(1.0));
+
+    // An ordinary chain records every prefix.
+    let state = walk_state("a.js", "x = a.b.c.d;\n");
+    assert_eq!(
+        state.members.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["a.b", "a.b.c", "a.b.c.d"]
+    );
+    assert!(!state.members_capped);
+}

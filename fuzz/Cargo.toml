@@ -104,3 +104,10 @@ path = "fuzz_targets/source_python.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "rpa"
+path = "fuzz_targets/rpa.rs"
+test = false
+doc = false
+bench = false

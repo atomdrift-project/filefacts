@@ -78,6 +78,9 @@ fn identifier(bytes: &[u8], mut at: usize, end: usize) -> usize {
     }
     at
 }
+/// Deepest bracket or block nesting a script statement is read through.
+const MAX_NESTING: usize = 32;
+
 fn parentheses(bytes: &[u8], mut at: usize, end: usize) -> Option<usize> {
     let text = bytes.get(..end).unwrap_or(bytes);
     let mut depth = 0usize;
@@ -91,7 +94,7 @@ fn parentheses(bytes: &[u8], mut at: usize, end: usize) -> Option<usize> {
             }
             b'(' => {
                 depth += 1;
-                if depth > 32 {
+                if depth > MAX_NESTING {
                     return None;
                 }
             }
@@ -139,14 +142,16 @@ pub(super) fn calls(bytes: &[u8], range: Range<usize>) -> (Vec<Range<usize>>, bo
             at += 1;
             continue;
         }
-        let name = String::from_utf8_lossy(bytes.get(start..name_end).unwrap_or_default())
-            .to_ascii_lowercase();
+        let name = bytes.get(start..name_end).unwrap_or_default();
         at = name_end;
-        if name == "function" {
+        if name.eq_ignore_ascii_case(b"function") {
             declaration = true;
             continue;
         }
-        if matches!(name.as_str(), "if" | "for" | "while" | "switch" | "catch") {
+        if [b"if".as_slice(), b"for", b"while", b"switch", b"catch"]
+            .iter()
+            .any(|keyword| name.eq_ignore_ascii_case(keyword))
+        {
             continue;
         }
         let end = if at < chain_end {
@@ -272,7 +277,7 @@ pub(super) fn statements(bytes: &[u8], range: Range<usize>) -> (Vec<Event>, bool
                 continue;
             }
             b'(' | b'[' => {
-                if delimiters.len() == 32 {
+                if delimiters.len() == MAX_NESTING {
                     return (out, true);
                 }
                 delimiters.push(byte);
@@ -289,7 +294,8 @@ pub(super) fn statements(bytes: &[u8], range: Range<usize>) -> (Vec<Event>, bool
                     out.push(Event::Statement(start..at, allowed));
                 }
                 if byte == b'{' {
-                    if blocks.len() == 33 {
+                    // The outermost entry is the script itself, not a block.
+                    if blocks.len() == MAX_NESTING + 1 {
                         return (out, true);
                     }
                     blocks.push(allowed && block_header(bytes, start..at));

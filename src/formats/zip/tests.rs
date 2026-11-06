@@ -17,7 +17,7 @@ fn run(bytes: &[u8]) -> (Values, Metrics) {
     let mut m = Metrics::new();
     let mut archive_members = Vec::new();
     let mut errors = Errors::new();
-    let _ = extract(bytes, &mut v, &mut m, &mut archive_members, &mut errors);
+    let _ = open_and_walk(bytes, &mut v, &mut m, &mut archive_members, &mut errors);
     (v, m)
 }
 
@@ -970,7 +970,7 @@ fn entry_pointing_at_no_local_header_is_reported() {
         ("b.txt", b"b", CompressionMethod::Stored),
     ]);
     let eocd = find_eocd(&z).unwrap();
-    let cd_size = bytes_at::u32_le(&z, eocd + 12).unwrap() as usize;
+    let cd_size = crate::bytes::u32_le(&z, eocd + 12).unwrap() as usize;
     let cd_start = eocd - cd_size;
     z[cd_start + 42..cd_start + 46].copy_from_slice(&(cd_start as u32).to_le_bytes());
 
@@ -1070,4 +1070,46 @@ fn read_false_encryption_flags_requires_complete_crc_checked_plaintext() {
         let mut archive = ZipArchive::new(Cursor::new(&bytes)).unwrap();
         assert!(read_member(&mut archive, "AndroidManifest.xml", 100).is_err());
     }
+}
+
+/// A false encryption bit gives a prefix reader the same truncated prefix a
+/// plain member does, once the whole member is CRC-checked.
+#[test]
+fn false_encryption_flag_prefix_is_truncated_not_refused() {
+    for method in [CompressionMethod::Stored, CompressionMethod::Deflated] {
+        let mut bytes = build_zip(&[("METADATA", b"Name: demo\nVersion: 1\n", method)]);
+        for (signature, delta) in [(b"PK\x03\x04", 6usize), (b"PK\x01\x02", 8usize)] {
+            let offset = bytes.windows(4).position(|w| w == signature).unwrap();
+            bytes[offset + delta] |= 1;
+        }
+        let mut archive = ZipArchive::new(Cursor::new(&bytes)).unwrap();
+        let prefix = read_member_prefix(&mut archive, "METADATA", 4)
+            .unwrap()
+            .unwrap();
+        assert_eq!(prefix.bytes, b"Name");
+        assert!(prefix.truncated);
+        let cd = bytes.windows(4).position(|w| w == b"PK\x01\x02").unwrap();
+        bytes[cd + 16] ^= 1;
+        let mut archive = ZipArchive::new(Cursor::new(&bytes)).unwrap();
+        assert!(read_member_prefix(&mut archive, "METADATA", 4).is_err());
+    }
+}
+
+#[test]
+fn jar_signing_files_are_classified_without_regard_to_case() {
+    assert_eq!(
+        jar_signing("META-INF/CERT.SF"),
+        Some((JarSigning::SignatureFile, "CERT"))
+    );
+    assert_eq!(
+        jar_signing("meta-inf/mozilla.rsa"),
+        Some((JarSigning::SignatureBlock, "mozilla"))
+    );
+    assert_eq!(
+        jar_signing("Meta-Inf/a.b.Ec"),
+        Some((JarSigning::SignatureBlock, "a.b"))
+    );
+    assert_eq!(jar_signing("META-INF/MANIFEST.MF"), None);
+    assert_eq!(jar_signing("META-INF/cose.sig"), None);
+    assert_eq!(jar_signing("lib/CERT.SF"), None);
 }

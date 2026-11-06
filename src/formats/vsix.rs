@@ -90,22 +90,20 @@ pub(super) fn extract(
 
     // <Identity Id="…" Publisher="…" Version="…" />
     if let Some(node) = doc.descendants().find(|n| n.has_tag_name("Identity")) {
-        let mut identity = serde_json::Map::new();
-        for (attr, key) in [
-            ("Id", "id"),
-            ("Publisher", "publisher"),
-            ("Version", "version"),
-            ("Language", "language"),
-        ] {
-            if let Some(v) = node.attribute(attr) {
-                identity.insert(key.into(), JsonValue::String(v.to_string()));
-            }
-        }
         if let Some(v) = node.attribute("TargetPlatform") {
             put_str(values, value_key!("vsix.target_platform"), v.to_string());
         }
-        if !identity.is_empty() {
-            values.insert_key(value_key!("vsix.identity"), JsonValue::Object(identity));
+        let identity = attributes(
+            node,
+            &[
+                ("Id", "id"),
+                ("Publisher", "publisher"),
+                ("Version", "version"),
+                ("Language", "language"),
+            ],
+        );
+        if let Some(identity) = identity {
+            values.insert_key(value_key!("vsix.identity"), identity);
         }
     }
 
@@ -114,13 +112,14 @@ pub(super) fn extract(
         ("DisplayName", value_key!("vsix.display_name")),
         ("Description", value_key!("vsix.description")),
     ] {
-        if let Some(node) = doc.descendants().find(|n| n.has_tag_name(tag)) {
-            if let Some(text) = node.text() {
-                let trimmed = text.trim();
-                if !trimmed.is_empty() {
-                    put_str(values, key, trimmed.to_string());
-                }
-            }
+        if let Some(text) = doc
+            .descendants()
+            .find(|n| n.has_tag_name(tag))
+            .and_then(|n| n.text())
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
+            put_str(values, key, text.to_string());
         }
     }
 
@@ -129,18 +128,21 @@ pub(super) fn extract(
         ("Tags", value_key!("vsix.tags")),
         ("Categories", value_key!("vsix.categories")),
     ] {
-        if let Some(node) = doc.descendants().find(|n| n.has_tag_name(tag)) {
-            if let Some(text) = node.text() {
-                let items: Vec<JsonValue> = text
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(|s| JsonValue::String(s.to_string()))
-                    .collect();
-                if !items.is_empty() {
-                    values.insert_key(key, JsonValue::Array(items));
-                }
-            }
+        let Some(text) = doc
+            .descendants()
+            .find(|n| n.has_tag_name(tag))
+            .and_then(|n| n.text())
+        else {
+            continue;
+        };
+        let items: Vec<JsonValue> = text
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| JsonValue::String(s.to_string()))
+            .collect();
+        if !items.is_empty() {
+            values.insert_key(key, JsonValue::Array(items));
         }
     }
 
@@ -168,17 +170,7 @@ pub(super) fn extract(
     let deps: Vec<JsonValue> = doc
         .descendants()
         .filter(|n| n.has_tag_name("Dependency"))
-        .map(|n| {
-            let mut obj = serde_json::Map::new();
-            if let Some(id) = n.attribute("Id") {
-                obj.insert("id".into(), JsonValue::String(id.to_string()));
-            }
-            if let Some(v) = n.attribute("Version") {
-                obj.insert("version".into(), JsonValue::String(v.to_string()));
-            }
-            JsonValue::Object(obj)
-        })
-        .filter(|v| v.as_object().is_some_and(|o| !o.is_empty()))
+        .filter_map(|n| attributes(n, &[("Id", "id"), ("Version", "version")]))
         .collect();
     if !deps.is_empty() {
         values.insert_key(value_key!("vsix.dependencies"), JsonValue::Array(deps));
@@ -190,25 +182,22 @@ pub(super) fn extract(
     let assets: Vec<JsonValue> = doc
         .descendants()
         .filter(|n| n.has_tag_name("Asset"))
-        .filter_map(|n| {
-            let mut obj = serde_json::Map::new();
-            if let Some(t) = n.attribute("Type") {
-                obj.insert("type".into(), JsonValue::String(t.to_string()));
-            }
-            if let Some(p) = n.attribute("Path") {
-                obj.insert("path".into(), JsonValue::String(p.to_string()));
-            }
-            if obj.is_empty() {
-                None
-            } else {
-                Some(JsonValue::Object(obj))
-            }
-        })
+        .filter_map(|n| attributes(n, &[("Type", "type"), ("Path", "path")]))
         .collect();
     if !assets.is_empty() {
         metrics.insert(metric!("vsix.asset_count"), assets.len() as f64);
         values.insert_key(value_key!("vsix.assets"), JsonValue::Array(assets));
     }
+}
+
+/// The `(attribute, key)` attributes `node` carries, as an object under
+/// their keys; `None` when it carries none of them.
+fn attributes(node: roxmltree::Node<'_, '_>, attrs: &[(&str, &str)]) -> Option<JsonValue> {
+    let obj: serde_json::Map<String, JsonValue> = attrs
+        .iter()
+        .filter_map(|&(attr, key)| Some((key.to_string(), node.attribute(attr)?.into())))
+        .collect();
+    (!obj.is_empty()).then_some(JsonValue::Object(obj))
 }
 
 /// Shorten the verbose `Microsoft.VisualStudio.<area>.<name>` property

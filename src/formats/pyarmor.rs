@@ -1,7 +1,7 @@
 //! Static recovery of the reviewed PyArmor 8/9 container and code-object layouts.
 //! No Python objects, native runtime or specimen code is executed. GCM's
 //! counter stream is decoded and checked structurally; this is not tag authentication.
-use crate::bytes::{u16_le, u32_le};
+use crate::bytes::{sat_usize, u16_le, u32_le};
 use aes::cipher::{BlockCipherEncrypt, KeyInit};
 use md5::{Digest, Md5};
 
@@ -29,8 +29,21 @@ pub struct RecoveredPyc {
     pub limitations: Vec<&'static str>,
 }
 
-#[path = "pyarmor/marshal.rs"]
 mod marshal;
+
+/// Bytes of runtime data hashed into a key candidate.
+const SALT_LEN: usize = 270;
+
+/// Largest companion runtime searched for key material.
+const MAX_RUNTIME_BYTES: usize = 8 << 20;
+/// Largest protected input: a `.pyc`, a container, or the Python source a
+/// container is recovered from; also the most container bytes one source
+/// yields in all.
+const MAX_PROTECTED_BYTES: usize = 16 << 20;
+/// Most containers recovered from one Python source.
+const MAX_CONTAINERS: usize = 128;
+/// Syntax-tree nodes visited looking for containers in one Python source.
+const MAX_WALK_NODES: usize = 100_000;
 
 impl Recovery {
     /// Normalize PyArmor's extra marshal fields and recover nested instruction
@@ -39,21 +52,19 @@ impl Recovery {
     /// not a runnable or authenticated reconstruction of the original program.
     ///
     /// # Errors
-    /// Returns an error for unsupported versions, malformed marshal data,
-    /// or exhausted parsing budgets.
-    pub fn pyc(&self) -> Result<RecoveredPyc, &'static str> {
+    /// [`crate::Error::Malformed`] for unsupported versions, malformed
+    /// marshal data, or exhausted parsing budgets.
+    pub fn pyc(&self) -> Result<RecoveredPyc, crate::Error> {
+        self.normalize()
+            .map_err(|detail| crate::Error::malformed("pyarmor", detail))
+    }
+
+    fn normalize(&self) -> Result<RecoveredPyc, &'static str> {
         let magic = self.python_magic.ok_or("missing CPython magic")?;
         let word = u16::from_le_bytes([magic[0], magic[1]]);
-        let minor = match word {
-            3400..=3413 => 8,
-            3420..=3425 => 9,
-            3430..=3439 => 10,
-            3450..=3495 => 11,
-            3500..=3531 => 12,
-            3550..=3571 => 13,
-            3627 => 14,
-            _ => return Err("unsupported CPython marshal version"),
-        };
+        let minor = super::pyc::python3_minor_for_magic(word)
+            .filter(|&minor| minor >= 8)
+            .ok_or("unsupported CPython marshal version")?;
         let body = self.container.get(32..).ok_or("truncated outer header")?;
         let mut recovered = marshal::normalize(body, minor, &self.key)?;
         let mut data = Vec::with_capacity(16 + recovered.data.len());
@@ -102,15 +113,15 @@ fn header_valid(plain: &[u8], n: usize, flags: u32) -> bool {
 /// names, platform and default license serial do not gate recovery. Layouts
 /// with a nonce-XOR procedure remain unsupported and return `None`.
 pub fn recover(runtime: &[u8], pyc: &[u8]) -> Option<Recovery> {
-    if runtime.len() > 8 * 1024 * 1024 || pyc.len() > 16 * 1024 * 1024 {
+    if runtime.len() > MAX_RUNTIME_BYTES || pyc.len() > MAX_PROTECTED_BYTES {
         return None;
     }
     let at = pyc.windows(8).position(is_container)?;
     let blob = pyc.get(at..)?;
-    let offset = u32_le(blob, 0x1c)? as usize;
-    let n = u32_le(blob, 0x20)? as usize;
+    let offset = sat_usize(u32_le(blob, 0x1c)?);
+    let n = sat_usize(u32_le(blob, 0x20)?);
     let flags = u32_le(blob, 0x24)?;
-    if !(32..=16 * 1024 * 1024).contains(&n) || offset != 64 || flags & 0x700 == 0 {
+    if !(32..=MAX_PROTECTED_BYTES).contains(&n) || offset != 64 || flags & 0x700 == 0 {
         return None;
     }
     let cipher = span(blob, offset, n)?;
@@ -123,10 +134,10 @@ pub fn recover(runtime: &[u8], pyc: &[u8]) -> Option<Recovery> {
         return None;
     }
     let start = id.checked_add(0x34)?;
-    let public_at = start.checked_add(u32_le(runtime, id + 0x24)? as usize)?;
-    let public_len = u32_le(runtime, id + 0x28)? as usize;
-    let license = start.checked_add(u32_le(runtime, id + 0x2c)? as usize)?;
-    let extra_len = u32_le(runtime, license + 4)? as usize;
+    let public_at = start.checked_add(sat_usize(u32_le(runtime, id + 0x24)?))?;
+    let public_len = sat_usize(u32_le(runtime, id + 0x28)?);
+    let license = start.checked_add(sat_usize(u32_le(runtime, id + 0x2c)?))?;
+    let extra_len = sat_usize(u32_le(runtime, license.checked_add(4)?)?);
     if public_len > 8192 || extra_len > 8192 {
         return None;
     }
@@ -149,11 +160,15 @@ pub fn recover(runtime: &[u8], pyc: &[u8]) -> Option<Recovery> {
             if candidates > 128 {
                 return None;
             }
-            let Some(salt) = span(runtime, at, 270) else {
+            let Some(salt) = span(runtime, at, SALT_LEN) else {
                 continue;
             };
+            let mut masked = [0u8; SALT_LEN];
+            for (out, b) in masked.iter_mut().zip(salt) {
+                *out = b ^ mask;
+            }
             let mut hash = prefix.clone();
-            hash.update(salt.iter().map(|b| b ^ mask).collect::<Vec<_>>());
+            hash.update(masked);
             let key: [u8; 16] = hash.finalize().into();
             if header_valid(&ctr(cipher.get(..32)?, &key, &nonce)?, n, flags) {
                 return Some(Recovery {
@@ -170,7 +185,7 @@ pub fn recover(runtime: &[u8], pyc: &[u8]) -> Option<Recovery> {
     if runtime.get(..2)? != b"MZ" {
         return None;
     }
-    let pe = u32_le(runtime, 60)? as usize;
+    let pe = sat_usize(u32_le(runtime, 60)?);
     if span(runtime, pe, 4)? != b"PE\0\0" {
         return None;
     }
@@ -187,17 +202,20 @@ pub fn recover(runtime: &[u8], pyc: &[u8]) -> Option<Recovery> {
         if u32_le(runtime, sh + 36)? & 0x80000000 == 0 {
             continue;
         }
-        let off = u32_le(runtime, sh + 20)? as usize;
-        let size = u32_le(runtime, sh + 16)? as usize;
+        let off = sat_usize(u32_le(runtime, sh + 20)?);
+        let size = sat_usize(u32_le(runtime, sh + 16)?);
         let data = span(runtime, off, size)?;
-        for salt in data.windows(270) {
+        for salt in data.windows(SALT_LEN) {
             attempts += 1;
             if attempts > 65536 {
                 return None;
             }
+            let mut masked = [0u8; SALT_LEN];
+            for (out, v) in masked.iter_mut().zip(salt) {
+                *out = v ^ 0xf1;
+            }
             let mut hash = prefix.clone();
-            let salt: Vec<u8> = salt.iter().map(|v| v ^ 0xf1).collect();
-            hash.update(&salt);
+            hash.update(masked);
             let key = hash.finalize();
             let probe = ctr(cipher.get(..32)?, &key, &nonce)?;
             if header_valid(&probe, n, flags) {
@@ -216,62 +234,30 @@ pub fn recover(runtime: &[u8], pyc: &[u8]) -> Option<Recovery> {
     None
 }
 
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod tests {
-    use super::*;
-    #[test]
-    fn independent_openssl_fixture_and_negative_controls() {
-        let runtime = include_bytes!("../../testdata/pyarmor/runtime-data.bin");
-        let container = include_bytes!("../../testdata/pyarmor/container.bin");
-        let expected = include_bytes!("../../testdata/pyarmor/plain.bin");
-        assert_eq!(
-            recover(runtime, container)
-                .as_ref()
-                .map(|r| r.container.as_slice()),
-            Some(expected.as_slice())
-        );
-        let mut wrong_salt = *runtime;
-        wrong_salt[0x300] ^= 1;
-        assert!(recover(&wrong_salt, container).is_none());
-        let mut wrong_nonce = *container;
-        wrong_nonce[0x2c] ^= 1;
-        assert!(recover(runtime, &wrong_nonce).is_none());
-        assert!(recover(runtime, &container[..100]).is_none());
-    }
-    #[test]
-    fn ctr_roundtrip_and_structural_near_misses() {
-        let mut header = vec![0u8; 80];
-        for (at, v) in [(0, 32u32), (8, 48), (12, 0x40912), (16, 8)] {
-            header[at..at + 4].copy_from_slice(&v.to_le_bytes());
-        }
-        let decrypted = ctr(&header, &[0x7a; 16], &[0x19; 12])
-            .and_then(|enc| ctr(&enc, &[0x7a; 16], &[0x19; 12]));
-        assert_eq!(decrypted, Some(header.clone()));
-        assert!(header_valid(&header, 80, 0x40912));
-        assert!(!header_valid(&header, 81, 0x40912));
-        header[16] = 9;
-        assert!(!header_valid(&header, 80, 0x40912));
-        assert!(recover(b"MZ", b"PY000000").is_none());
-    }
-}
 /// Recover protected byte containers from the third argument of parsed Python
 /// calls. Only byte literals are admitted; no expressions or Python code run.
 /// Input, parser walk, count and decoded-byte budgets bound the work.
 pub fn python_containers(source: &[u8]) -> Vec<Vec<u8>> {
-    if source.len() > 16 * 1024 * 1024 {
+    if source.len() > MAX_PROTECTED_BYTES {
         return Vec::new();
     }
-    let parsed = crate::OpenOptions::new()
-        .file_type(crate::FileType::Python)
-        .open(source);
-    let Some(ast) = parsed.source_ast() else {
+    // A host calls this outside the extraction pipeline, so the parse gets
+    // the pipeline's panic guard here.
+    let parsed = crate::panic_guard::catch_infallible(|| {
+        super::source::TreeCache::parse(source, crate::FileType::Python, None)
+    });
+    let Some(ast) = parsed
+        .as_ref()
+        .ok()
+        .and_then(super::source::TreeParse::cache)
+    else {
         return Vec::new();
     };
-    let mut cursor = ast.tree.root_node().walk();
+    let text = ast.source();
+    let mut cursor = ast.tree().root_node().walk();
     let mut out = Vec::new();
     let mut total = 0usize;
-    for _ in 0..100_000 {
+    for _ in 0..MAX_WALK_NODES {
         let node = cursor.node();
         if node.kind() == "call"
             && let Some(args) = node.child_by_field_name("arguments")
@@ -282,12 +268,12 @@ pub fn python_containers(source: &[u8]) -> Vec<Vec<u8>> {
                 .filter(|n| n.kind() != "comment")
                 .nth(2);
             if let Some(arg) = arg.filter(|n| n.kind() == "string")
-                && let Some(literal) = ast.source.as_bytes().get(arg.byte_range())
+                && let Some(literal) = text.as_bytes().get(arg.byte_range())
                 && let Some(blob) = python_bytes(literal)
                 && is_container(&blob)
             {
                 total = total.saturating_add(blob.len());
-                if total > 16 * 1024 * 1024 || out.len() == 128 {
+                if total > MAX_PROTECTED_BYTES || out.len() == MAX_CONTAINERS {
                     break;
                 }
                 out.push(blob);
@@ -375,172 +361,4 @@ fn python_bytes(literal: &[u8]) -> Option<Vec<u8>> {
 }
 
 #[cfg(test)]
-mod wrapper_tests {
-    #![allow(clippy::unwrap_used)]
-    use super::*;
-    #[test]
-    fn parsed_wrapper_to_standard_pyc_preserves_constants_and_names() {
-        let source = include_bytes!("../../testdata/pyarmor/wrapper.py");
-        let containers = python_containers(source);
-        assert_eq!(containers.len(), 1);
-        assert_eq!(
-            containers[0],
-            include_bytes!("../../testdata/pyarmor/marshal-container.bin")
-        );
-        let decoded = recover(
-            include_bytes!("../../testdata/pyarmor/runtime-data.bin"),
-            &containers[0],
-        )
-        .unwrap();
-        assert_eq!(
-            decoded.container,
-            include_bytes!("../../testdata/pyarmor/marshal-plain.bin")
-        );
-        let pyc = decoded.pyc().unwrap().data;
-        let parsed = crate::OpenOptions::new()
-            .file_type(crate::FileType::PythonBytecode)
-            .open(&pyc);
-        assert!(parsed.errors().is_empty(), "{:?}", parsed.errors());
-        assert!(parsed.symbols().iter().any(|s| s.name() == Some("message")));
-    }
-    #[test]
-    fn literal_reader_does_not_execute_expressions_or_decode_documentation() {
-        for source in [
-            b"data = b'PY000000'".as_slice(),
-            b"# loader(a, b, b'PY000000')".as_slice(),
-            b"doc = \"loader(a, b, b'PY000000')\"".as_slice(),
-            b"loader(a, b, build_payload())".as_slice(),
-            b"loader(a, b, 'PY000000')".as_slice(),
-        ] {
-            assert!(python_containers(source).is_empty());
-        }
-        assert_eq!(
-            python_bytes(br#"b'PY000000\x00\377\n\\'"#).unwrap(),
-            b"PY000000\x00\xff\n\\"
-        );
-        assert_eq!(
-            python_bytes(br#"br'PY000000\x00'"#).unwrap(),
-            br"PY000000\x00"
-        );
-        assert!(python_bytes(br#"b'PY000000\xQQ'"#).is_none());
-        assert!(python_bytes(b"b'bad\\'").is_none());
-    }
-    #[test]
-    fn malformed_inputs_and_non_code_containers_do_not_become_pyc() {
-        let runtime = include_bytes!("../../testdata/pyarmor/runtime-data.bin");
-        let container = include_bytes!("../../testdata/pyarmor/marshal-container.bin");
-        for end in 0..container.len() {
-            assert!(recover(runtime, &container[..end]).is_none());
-        }
-        assert!(
-            recover(
-                runtime,
-                include_bytes!("../../testdata/pyarmor/container.bin")
-            )
-            .unwrap()
-            .pyc()
-            .is_err()
-        );
-        let mut corrupt = container.to_vec();
-        corrupt[12..16].fill(0);
-        assert!(recover(runtime, &corrupt).unwrap().pyc().is_err());
-    }
-}
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod instruction_tests {
-    use super::*;
-    #[test]
-    fn independent_nested_instruction_fixture() {
-        let runtime = include_bytes!("../../testdata/pyarmor/runtime-data.bin");
-        let container = include_bytes!("../../testdata/pyarmor/nested-container.bin");
-        let recovered = recover(runtime, container).unwrap().pyc().unwrap();
-        assert_eq!(
-            recovered.data,
-            include_bytes!("../../testdata/pyarmor/nested-normalized.pyc")
-        );
-        assert_eq!(recovered.code_objects, 2);
-        assert_eq!(recovered.decrypted_regions, 2);
-        assert!(recovered.limitations.is_empty());
-        for end in 0..recovered.data.len().saturating_sub(16) {
-            let body = &recovered.data[16..16 + end];
-            assert!(marshal::normalize(body, 11, &[0; 16]).is_err());
-        }
-        let mut recovery = recover(runtime, container).unwrap();
-        // Both short metadata and an invalid descriptor index must fail closed.
-        *recovery.container.last_mut().unwrap() = 255;
-        assert!(recovery.pyc().is_err());
-    }
-    #[test]
-    fn recognizes_nondefault_serials() {
-        assert!(is_container(b"PY123456"));
-        assert!(!is_container(b"PYabc123"));
-        let runtime = include_bytes!("../../testdata/pyarmor/runtime-data.bin");
-        let mut blob = include_bytes!("../../testdata/pyarmor/nested-container.bin").to_vec();
-        blob[2..8].copy_from_slice(b"123456");
-        assert_eq!(
-            recover(runtime, &blob).unwrap().pyc().unwrap().code_objects,
-            2
-        );
-    }
-    #[test]
-    fn der_key_recovery_is_independent_of_native_file_format() {
-        let runtime = include_bytes!("../../testdata/pyarmor/der-runtime.bin");
-        let blob = include_bytes!("../../testdata/pyarmor/der-container.bin");
-        for signature in [
-            b"\x7fELF",
-            b"MZ\0\0",
-            b"\xcf\xfa\xed\xfe",
-            b"\xca\xfe\xba\xbe",
-        ] {
-            let mut runtime = runtime.to_vec();
-            runtime[..4].copy_from_slice(signature);
-            assert!(recover(&runtime, blob).unwrap().pyc().is_ok());
-        }
-        let mut wrong = *runtime;
-        wrong[768 + 20] ^= 1;
-        assert!(recover(&wrong, blob).is_none());
-    }
-    #[test]
-    fn unknown_instruction_nonce_protection_is_explicit() {
-        let runtime = include_bytes!("../../testdata/pyarmor/runtime-data.bin");
-        let container = include_bytes!("../../testdata/pyarmor/nested-container.bin");
-        let mut recovery = recover(runtime, container).unwrap();
-        let mut descriptor = vec![0; 12];
-        descriptor.extend_from_slice(&6u32.to_le_bytes());
-        descriptor.extend_from_slice(&1u32.to_le_bytes());
-        let at = recovery
-            .container
-            .windows(20)
-            .position(|v| v == descriptor)
-            .unwrap();
-        recovery.container[at + 8] = 4;
-        let result = recovery.pyc().unwrap();
-        assert_eq!(result.decrypted_regions, 1);
-        assert!(
-            result
-                .limitations
-                .contains(&"instruction nonce-XOR protection remains encrypted")
-        );
-    }
-    #[test]
-    fn relocated_prologues_and_short_nonce_descriptors() {
-        let runtime = include_bytes!("../../testdata/pyarmor/runtime-data.bin");
-        for (blob, expected) in [
-            (
-                include_bytes!("../../testdata/pyarmor/prologue-8-container.bin").as_slice(),
-                include_bytes!("../../testdata/pyarmor/prologue-8-normalized.pyc").as_slice(),
-            ),
-            (
-                include_bytes!("../../testdata/pyarmor/prologue-10-container.bin").as_slice(),
-                include_bytes!("../../testdata/pyarmor/prologue-10-normalized.pyc").as_slice(),
-            ),
-        ] {
-            let result = recover(runtime, blob).unwrap().pyc().unwrap();
-            assert_eq!(result.data, expected);
-            assert_eq!(result.decrypted_regions, 1);
-            assert!(result.limitations.is_empty());
-        }
-    }
-}
+mod tests;

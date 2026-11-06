@@ -1764,3 +1764,26 @@ fn synthetic_guarded_unscoped_argument_has_form_origin() {
     let call = first_call(&p, "cfexecute");
     assert!(origin_targets(&p, call.inputs[0], Some("arguments")).contains("form.cmd"));
 }
+
+/// The folding budget holds whatever was spent before: a spent budget
+/// records the gap instead of underflowing.
+#[test]
+fn constant_folding_budget_cannot_underflow() {
+    let mut b = Builder::new(b"");
+    let literal = |b: &mut Builder<'_>, text: &str| {
+        let id = b.add(FlowKind::Literal, 0, Vec::new());
+        b.result.flow.values[id].literal = Some(Arg::String { value: text.into() });
+        id
+    };
+    let (x, y) = (literal(&mut b, "a"), literal(&mut b, "b"));
+    b.folded_bytes = super::super::MAX_BYTES + 1;
+    let id = b.concat(0, vec![x, y]);
+    assert_ne!(id, 0);
+    assert_eq!(b.result.flow.values[id].literal, None);
+    assert!(
+        b.result
+            .flow
+            .limitations
+            .contains(&Limitation::ConstantStringBudget)
+    );
+}

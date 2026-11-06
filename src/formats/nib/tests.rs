@@ -135,9 +135,9 @@ fn locate_matches_whole_binary_plist_strings() {
 fn varint_spans_bytes() {
     // 300 = 0b10_0101100: low seven bits first, high bit marks the end.
     let mut cursor = Reader::new(&[0x2c, 0x82, 0x81]);
-    assert_eq!(cursor.varint(), Some(300));
-    assert_eq!(cursor.varint(), Some(1));
-    assert_eq!(cursor.varint(), None);
+    assert_eq!(varint(&mut cursor), Some(300));
+    assert_eq!(varint(&mut cursor), Some(1));
+    assert_eq!(varint(&mut cursor), None);
 }
 
 #[test]

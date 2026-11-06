@@ -124,7 +124,7 @@ fn bad_header_is_malformed() {
 #[test]
 fn public_members_name_each_run() {
     let bytes = archive(&zlib(&index_pickle("a.txt", 34, 5)));
-    let members = crate::rpa::members(&bytes).expect("well-formed archive");
+    let members = crate::recover::rpa::members(&bytes).expect("well-formed archive");
     assert_eq!(
         members,
         [Member {
@@ -137,5 +137,49 @@ fn public_members_name_each_run() {
             size: 5,
         }]
     );
-    assert!(crate::rpa::members(b"not an archive").is_err());
+    assert!(crate::recover::rpa::members(b"not an archive").is_err());
+}
+
+#[test]
+fn tuple_opcode_over_marks_is_malformed_not_a_panic() {
+    // TUPLE2 over two MARKs, then TUPLE: in Python the MARKs open new
+    // stacks, so TUPLE2 underflows. Each pickle must fail cleanly.
+    for pickle in [&b"((\x86t"[..], b"(\x85t.", b"(K\x01\x86t.", b"((\x87"] {
+        let bytes = archive(&zlib(pickle));
+        assert!(members(&bytes).is_err(), "{pickle:?}");
+    }
+}
+
+/// One memoized chunk tuple can be referenced by every chunk of the index,
+/// two pickle bytes each, and each reference used to copy its prefix: a
+/// small index that names one large prefix many times expanded into
+/// gigabytes. The prefixes the chunks carry are bounded by the index that
+/// stores them.
+#[test]
+fn shared_chunk_prefixes_cannot_expand_past_the_index() {
+    let prefix = vec![0x5a; 64 << 10];
+    let references = 4096;
+    let mut p = vec![0x80, 2, b'}', b'(', b'X', 5, 0, 0, 0];
+    p.extend_from_slice(b"a.txt");
+    p.extend_from_slice(b"](");
+    let (offset, length) = (34u32, 5u32);
+    for field in [offset ^ KEY, length ^ KEY] {
+        p.push(b'J');
+        p.extend_from_slice(&field.to_le_bytes());
+    }
+    p.push(b'T');
+    p.extend_from_slice(&u32::try_from(prefix.len()).unwrap().to_le_bytes());
+    p.extend_from_slice(&prefix);
+    p.extend_from_slice(&[0x87, b'q', 0]);
+    for _ in 1..references {
+        p.extend_from_slice(&[b'h', 0]);
+    }
+    p.extend_from_slice(b"eu.");
+    let bytes = archive(&zlib(&p));
+    let Err(err) = members(&bytes) else {
+        panic!("expanded prefixes must be refused");
+    };
+    assert!(err.to_string().contains("prefix"), "{err}");
+    let (result, ..) = run(&bytes);
+    assert!(result.is_err());
 }

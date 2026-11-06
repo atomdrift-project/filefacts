@@ -6,7 +6,7 @@ fn run(bytes: &[u8]) -> (Values, Errors) {
     let mut zip = ::zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
     let mut v = Values::new();
     let mut e = Errors::new();
-    extract_from_archive(&mut zip, &mut v, &mut Metrics::new(), &mut e);
+    extract_from_archive(&mut zip, &mut v, &mut e);
     (v, e)
 }
 
@@ -37,7 +37,7 @@ fn well_formed_or_absent_nuspec_records_nothing() {
 
 #[test]
 fn oversized_nuspec_is_a_limit_not_an_error() {
-    let big = vec![b' '; MAX_NUSPEC as usize + 1];
+    let big = vec![b' '; MAX_MANIFEST_BYTES as usize + 1];
     let (v, e) = run(&stored_zip(&[("Acme.nuspec", &big)]));
     assert!(e.is_empty(), "{e:?}");
     let limits = v.get("nupkg.limits").and_then(|x| x.as_array()).unwrap();

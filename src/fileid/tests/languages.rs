@@ -683,7 +683,7 @@ fn headerless_shellcode_is_shellcode() {
     }
     assert_eq!(FileId::from_bytes(&sc).file_type(), FileType::Shellcode);
     assert_eq!(FileType::from_label("shellcode"), Some(FileType::Shellcode));
-    assert!(FileType::Shellcode.is_binary());
+    assert!(FileType::Shellcode.is_executable_code());
 }
 
 #[test]

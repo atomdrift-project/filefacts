@@ -5,13 +5,14 @@
 //! Random-looking pixels alone are never treated as a recovered payload.
 
 use std::collections::BTreeSet;
-use std::io::Read;
 use std::sync::LazyLock;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
 use flate2::{Decompress, FlushDecompress, Status};
 use regex::Regex;
+
+use super::bounded::{OnError, inflate_capped};
 use serde_json::{Value, json};
 
 use crate::formats::bounded::Limits;
@@ -90,7 +91,11 @@ impl Probe {
         let mut at = 0;
         // At most two encoding layers and eight candidate buffers per probe.
         while at < candidates.len() && at < 8 {
-            let (data, encoding, depth) = candidates.get(at).cloned().unwrap_or_default();
+            // Each candidate is visited once, so it is moved out, not copied.
+            let (data, encoding, depth) = candidates
+                .get_mut(at)
+                .map(std::mem::take)
+                .unwrap_or_default();
             at += 1;
             if let Some((kind, preview)) = content(&data)
                 && self.seen.insert((kind.to_string(), preview.clone()))
@@ -220,12 +225,13 @@ impl Probe {
 
 fn decompress(data: &[u8]) -> Option<Vec<u8>> {
     if data.starts_with(&[0x1f, 0x8b, 8]) {
-        let mut output = Vec::new();
-        flate2::read::GzDecoder::new(data)
-            .take((MAX_DECODED + 1) as u64)
-            .read_to_end(&mut output)
-            .ok()?;
-        return (output.len() <= MAX_DECODED && output.len() >= 32).then_some(output);
+        let output = inflate_capped(
+            flate2::read::GzDecoder::new(data),
+            MAX_DECODED as u64,
+            OnError::Discard,
+        )
+        .ok()?;
+        return (!output.truncated && output.bytes.len() >= 32).then_some(output.bytes);
     }
     let header = data.first_chunk::<2>()?;
     if header[0] != 0x78 || u16::from_be_bytes(*header) % 31 != 0 {
@@ -245,7 +251,9 @@ fn framed_body(bytes: &[u8]) -> Option<&[u8]> {
         return None;
     }
     let len: usize = std::str::from_utf8(digits).ok()?.parse().ok()?;
-    (len >= 32).then_some(())?;
+    if len < 32 {
+        return None;
+    }
     bytes.get(colon + 1..colon.checked_add(1)?.checked_add(len)?)
 }
 
@@ -408,15 +416,11 @@ fn valid_zip(bytes: &[u8]) -> bool {
     let Some(eocd) = bytes.windows(4).rposition(|w| w == b"PK\x05\x06") else {
         return false;
     };
-    let Some(count) = bytes
-        .get(eocd + 10..eocd + 12)
-        .and_then(|p| p.first_chunk::<2>())
-    else {
+    let Some(count) = crate::bytes::u16_le(bytes, eocd + 10) else {
         return false;
     };
     // A tiny recovered ZIP need not allocate a directory for thousands of
     // forged entries; complete ordinary archives still use the regular parser.
-    let count = u16::from_le_bytes(*count);
     count > 0
         && count <= 256
         && zip::ZipArchive::new(std::io::Cursor::new(bytes)).is_ok_and(|a| !a.is_empty())
@@ -724,7 +728,6 @@ pub(super) fn extract(
                 found.push(payload);
             }
         }
-        metrics.insert(metric!("png.pixel_payload_count"), found.len() as f64);
         values.insert_key(value_key!("png.pixel_payloads"), Value::Array(found));
     }
     metrics.insert(

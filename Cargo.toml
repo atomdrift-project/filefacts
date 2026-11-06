@@ -1,6 +1,6 @@
 [package]
 name = "filefacts"
-version = "2.0.1"
+version = "3.0.0-beta.1"
 edition = "2024"
 rust-version = "1.97"
 authors = ["The Atomdrift Project"]
@@ -10,6 +10,19 @@ repository = "https://github.com/atomdrift-project/filefacts"
 keywords = ["forensics", "binary-analysis", "metadata", "pe", "elf"]
 categories = ["parsing", "command-line-utilities"]
 readme = "README.md"
+# What `cargo package` ships: the library, CLI and build script, without
+# the test suite's fixtures (real malware specimens among them).
+include = [
+    "/build.rs",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/CHANGELOG.md",
+    "/LICENSE",
+    "/NOTICE",
+    "/README.md",
+    "/src/**",
+    "!/src/**/testdata/**",
+]
 
 # The fuzz crate shares this lock file and the [patch.crates-io] forks below;
 # plain `cargo build`/`test`/`clippy` touch only the library and CLI. The
@@ -48,7 +61,8 @@ thiserror = "2"
 # Fast byte scanning, used by string extractors and the magic-byte matcher.
 memchr = "2"
 aho-corasick = "1"
-# CRC-32 — used as a non-crypto fingerprint over PE bound-import tables.
+# CRC-32: verifies ZIP, RAR and PNG checksums and fingerprints PE
+# bound-import tables.
 crc32fast = "1"
 # x86/x86-64 instruction decoder — first-instruction decode at each PE
 # export RVA powers stub/thunk alias detection.
@@ -60,9 +74,13 @@ rsa = "0.9"
 p256 = { version = "0.13", features = ["ecdsa"] }
 p384 = { version = "0.13", features = ["ecdsa"] }
 
-# Binary formats. `goblin` is a single crate that handles PE, ELF, and Mach-O
-# behind one parse entry point; we use it for all three.
-goblin = { version = "0.10", default-features = false, features = ["std", "pe32", "pe64", "elf32", "elf64", "endian_fd", "mach32", "mach64", "archive"] }
+# Binary formats. goblin parses the format-specific metadata of PE, ELF and
+# Mach-O images (headers, load commands, resources, debug and TLS
+# directories, notes, dynamic tables); binform reads their layout, sections,
+# imports, exports and functions. stng depends on goblin with its default
+# features, so the build carries those whatever this list leaves out; the
+# list names what filefacts itself uses.
+goblin = { version = "0.10", default-features = false, features = ["std", "pe32", "pe64", "elf32", "elf64", "endian_fd", "mach32", "mach64"] }
 
 # DWARF debug-info reader — surfaces DW_AT_producer (full compile
 # command line per CU) and DW_AT_comp_dir from unstripped ELF
@@ -81,8 +99,9 @@ gimli = { version = "0.32", default-features = false, features = ["read", "std"]
 stng = { git = "https://github.com/atomdrift-project/stng.git", default-features = false }
 
 # Function recovery from machine code: boundaries, basic blocks, complexity
-# and calls, in-process; also the sections, imports and exports of a PE
-# goblin cannot read (see `src/functions.rs`). Bump `POLICY` in
+# and calls, in-process; also the layout of every PE, ELF and Mach-O image,
+# its sections, imports and exports, read leniently enough to stand when
+# goblin cannot parse the image (see `src/functions.rs`). Bump `POLICY` in
 # `src/functions.rs` whenever the commit in Cargo.lock changes: the disk
 # cache keys on it.
 binform = { git = "https://github.com/atomdrift-project/binform.git", default-features = false }
@@ -102,7 +121,7 @@ roxmltree = "0.21"
 # reaching through `zip`'s public re-exports.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 # Bounded Base64 transforms in reconstructed image-pixel payloads.
-base64 = "0.22"
+base64 = "0.23"
 # Pure-Rust LZMA and xz decoders: 7z encoded headers and `.tar.xz` package
 # members (dpkg's default control compression). Its `xz` feature verifies
 # SHA-256 stream checksums with `sha2` 0.11, so the tree carries `sha2` 0.11
@@ -128,8 +147,9 @@ plist = "1"
 # layout for legacy Office documents (.doc / .xls / .ppt) and MSI / MSG.
 cfb = "0.14"
 
-# Regex engine for the VBA symbol extractor. No PCRE features used —
-# the standard `regex` crate is enough.
+# Regex engine for the VBA symbol extractor, reference URLs, PNG payload
+# text and the Perl shell-shim detector. No PCRE features used; the standard
+# `regex` crate is enough.
 regex = "1"
 
 # Source-code extraction. Each language is its own crate; the base
@@ -150,7 +170,7 @@ tree-sitter-ruby = "0.23"
 tree-sitter-lua = "0.5"
 tree-sitter-c-sharp = "0.23"
 tree-sitter-c = "0.24"
-tree-sitter-cpp = "=0.23.4"
+tree-sitter-cpp = "0.23"
 tree-sitter-scala = "0.26"
 tree-sitter-objc = "3"
 tree-sitter-kotlin-ng = "1"
@@ -194,11 +214,6 @@ tracing-subscriber = { version = "0.3", optional = true, default-features = fals
 # cached payload carries; zstd keeps the on-disk size competitive.
 zstd = "0.14.3"
 
-# OS cache directory lookup — `~/.cache/atomdrift/filefacts` (Linux) /
-# `Library/Caches/atomdrift/filefacts` (macOS) / `%LOCALAPPDATA%\atomdrift\filefacts`
-# (Windows).
-dirs = "6"
-
 # Temp file handling for atomic disk-cache writes. `tempfile` cleans up properly on Drop and avoids races.
 tempfile = "3"
 
@@ -208,12 +223,10 @@ uuid = "1"
 # Test fixtures for the LZMA/xz readers are compressed on the fly.
 lzma-rust2 = { version = "0.24", default-features = false, features = ["std", "xz", "encoder"] }
 
-# The cache sweep's ownership check (geteuid/getegid) and non-blocking
-# opens (O_NONBLOCK). Unix only.
+# The cache sweep's ownership check (geteuid), and the O_NOFOLLOW and
+# O_NONBLOCK open flags. Unix only.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-# The CLI's SIGINT/SIGTERM cleanup thread (binary only, `cli`).
-signal-hook = { version = "0.3", optional = true }
 
 # Use jemalloc on unix systems where it isn't the OS default.
 # FreeBSD/DragonFlyBSD/NetBSD ship jemalloc as the default (NetBSD's libc malloc
@@ -227,11 +240,11 @@ tikv-jemallocator = { version = "0.7", optional = true }
 
 [features]
 # Both features serve only the `filefacts` binary. A crate depending on the
-# library sets `default-features = false` to skip compiling jemalloc, the
-# signal handler and the log subscriber.
+# library sets `default-features = false` to skip compiling jemalloc and the
+# log subscriber.
 default = ["cli", "jemalloc"]
-# The `filefacts` binary and its signal/log plumbing.
-cli = ["dep:signal-hook", "dep:tracing-subscriber"]
+# The `filefacts` binary and its log subscriber.
+cli = ["dep:tracing-subscriber"]
 # jemalloc as the binary's global allocator, where it is not the OS default.
 jemalloc = ["dep:tikv-jemallocator"]
 # Enables jemalloc heap profiling. Build with:
@@ -242,11 +255,12 @@ jemalloc = ["dep:tikv-jemallocator"]
 jemalloc-prof = ["jemalloc", "tikv-jemallocator?/profiling"]
 
 [lints.rust]
-# The cache sweep's ownership check (libc::geteuid/getegid) requires
-# `unsafe`. It is tightly scoped to the cache_sweep module, and wrapped in
-# per-block `#[allow(unsafe_code)]`. Setting "deny" here means
-# any new unsafe outside that scope becomes a hard error rather than a
-# warning that can drift past review.
+# Two places need `unsafe`: the cache sweep's ownership check
+# (`libc::geteuid`) and the CLI's jemalloc configuration symbol
+# (`#[unsafe(export_name)]` in src/bin/filefacts/main.rs). Each carries a
+# scoped `#[allow(unsafe_code)]` and a `// SAFETY:` comment. Setting "deny"
+# here makes any new unsafe a hard error rather than a warning that can
+# drift past review.
 unsafe_code = "deny"
 missing_docs = "warn"
 unreachable_pub = "warn"

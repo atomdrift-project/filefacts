@@ -57,16 +57,17 @@ impl SpanBuilder {
     }
 
     /// Add a `[offset, offset+len)` span. Zero-length spans are ignored.
-    /// Adjacent to the previous run → extends it; otherwise a new run (subject
-    /// to the cap).
+    /// Adjacent to the previous run → extends it, its length saturating;
+    /// otherwise a new run (subject to the cap). A run whose end is past
+    /// `u64::MAX` has nothing adjacent to it.
     pub(crate) fn push(&mut self, offset: u64, len: u64) {
         if len == 0 {
             return;
         }
         if let Some(last) = self.spans.last_mut()
-            && last.offset + last.len == offset
+            && last.offset.checked_add(last.len) == Some(offset)
         {
-            last.len += len;
+            last.len = last.len.saturating_add(len);
             return;
         }
         if self.spans.len() < self.cap {

@@ -77,24 +77,15 @@ fn dylib_hash(macho: &MachO<'_>) -> Option<String> {
 /// Anomali / YARA-X implementations preserve case — lowercasing here
 /// would diverge from those reference outputs.
 fn symhash(macho: &MachO<'_>, bytes: &[u8]) -> Option<String> {
-    const N_EXT: u8 = 0x01;
-    const N_TYPE_MASK: u8 = 0x0e;
-    const N_UNDF: u8 = 0x00;
-    let mut names = Vec::new();
-    for sym in super::symbols::symtab_symbols(macho, bytes) {
-        let Ok((name, nlist)) = sym else { continue };
-        if nlist.n_type & N_EXT == 0 {
-            continue;
-        }
-        if nlist.n_type & N_TYPE_MASK != N_UNDF {
-            continue;
-        }
-        if name.is_empty() {
-            continue;
-        }
-        names.push(name.to_string());
-    }
-    md5_of_set(names)
+    md5_of_set(
+        super::symbols::symtab_symbols(macho, bytes)
+            .filter_map(Result::ok)
+            .filter(|(name, nlist)| {
+                super::symbols::is_undefined_external(nlist.n_type) && !name.is_empty()
+            })
+            .map(|(name, _)| name.to_owned())
+            .collect(),
+    )
 }
 
 /// MD5 of the sorted, lowercased entitlement keys plus any string
@@ -102,7 +93,7 @@ fn symhash(macho: &MachO<'_>, bytes: &[u8]) -> Option<String> {
 /// inside `com.apple.security.application-groups`). Mirrors the
 /// construction from Greg Lesnewich + Jacob Latonis's OBTS v7 talk.
 fn entitlement_hash(values: &Values) -> Option<String> {
-    let entitlements = values.get_key(value_key!("macho.code_signature.entitlements"))?;
+    let entitlements = values.lookup(value_key!("macho.code_signature.entitlements"))?;
     let JsonValue::Object(map) = entitlements else {
         return None;
     };

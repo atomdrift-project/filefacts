@@ -234,3 +234,17 @@ fn platform_tags_follow_go_build_match_tag() {
         assert!(KNOWN_ARCH.contains(&platform.goarch), "{platform:?}");
     }
 }
+
+/// The deepest `//go:build` expression the size cap admits parses,
+/// evaluates and drops on a test thread's stack.
+#[test]
+fn deepest_admitted_go_build_expression_fits_the_stack() {
+    let depth = MAX_EXPR_SIZE - 1;
+    let deep = format!(
+        "//go:build {}a{}\npackage p\n",
+        "!(".repeat(depth),
+        ")".repeat(depth)
+    );
+    let expr = file_constraint(&deep).unwrap().unwrap();
+    assert!(!expr.eval(&|tag: &str| tag == "a"));
+}

@@ -1,5 +1,9 @@
 //! Freedesktop Desktop Entry fields, and the shell flows their `Exec` lines
 //! carry.
+use super::systemd::{
+    append_string_items, append_string_occurrence, append_systemd_raw, ensure_json_object,
+    literal_shell_flows, normalize_systemd_key,
+};
 use crate::output::{Errors, Values};
 use serde_json::Value;
 
@@ -7,23 +11,23 @@ pub(crate) fn extract(bytes: &[u8], values: &mut Values, errors: &mut Errors) {
     if bytes.len() > 16 * 1024 * 1024 {
         return;
     }
-    if let Some(root) = parse_desktop_entry(bytes) {
-        super::structured::merge_document(root, values, errors);
-        let command = values.get("desktop_entry.exec").cloned();
-        let commands: Vec<&str> = match command.as_ref() {
-            Some(Value::String(s)) => vec![s],
-            Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).collect(),
-            _ => Vec::new(),
-        };
-        let flows: Vec<Value> = commands
+    let Some(root) = parse_desktop_entry(bytes) else {
+        return;
+    };
+    super::structured::merge_document(root, values, errors);
+    let flows = match values.get("desktop_entry.exec") {
+        Some(Value::String(s)) => literal_shell_flows(s),
+        Some(Value::Array(a)) => a
             .iter()
-            .flat_map(|s| super::systemd::literal_shell_flows(s))
-            .collect();
-        values.insert_key(
-            crate::value_key!("shell.literal_command_flows"),
-            Value::Array(flows),
-        );
-    }
+            .filter_map(Value::as_str)
+            .flat_map(literal_shell_flows)
+            .collect(),
+        _ => Vec::new(),
+    };
+    values.insert_key(
+        crate::value_key!("shell.literal_command_flows"),
+        Value::Array(flows),
+    );
 }
 
 fn parse_desktop_entry(content: &[u8]) -> Option<Value> {
@@ -40,19 +44,23 @@ fn parse_desktop_entry(content: &[u8]) -> Option<Value> {
             continue;
         }
 
-        if let Some(section) = parse_desktop_section_header(trimmed) {
-            current_section = Some(section);
+        // A `[Group Name]` header; one whose name normalizes to nothing
+        // opens no section.
+        if let Some(inner) = trimmed.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            let section = normalize_systemd_key(inner);
+            if !section.is_empty() {
+                current_section = Some(section);
+            }
             continue;
         }
 
         let Some(section_name) = current_section.as_deref() else {
             continue;
         };
-        let Some(eq_pos) = line.find('=') else {
+        let Some((raw_key, raw_value)) = line.split_once('=') else {
             continue;
         };
-
-        let raw_key = line[..eq_pos].trim();
+        let raw_key = raw_key.trim();
         if raw_key.is_empty() {
             continue;
         }
@@ -69,7 +77,7 @@ fn parse_desktop_entry(content: &[u8]) -> Option<Value> {
             continue;
         }
 
-        let raw_value = line[eq_pos + 1..].trim().to_string();
+        let raw_value = raw_value.trim().to_string();
         let Some(section_obj) = ensure_json_object(&mut root, section_name) else {
             continue;
         };
@@ -88,25 +96,7 @@ fn parse_desktop_entry(content: &[u8]) -> Option<Value> {
         append_string_occurrence(section_obj, &key, raw_value);
     }
 
-    if root.is_empty() {
-        None
-    } else {
-        Some(Value::Object(root))
-    }
-}
-
-fn parse_desktop_section_header(line: &str) -> Option<String> {
-    if line.starts_with('[') && line.ends_with(']') && line.len() >= 3 {
-        let inner = &line[1..line.len() - 1];
-        let normalized = normalize_systemd_key(inner);
-        if normalized.is_empty() {
-            None
-        } else {
-            Some(normalized)
-        }
-    } else {
-        None
-    }
+    (!root.is_empty()).then_some(Value::Object(root))
 }
 
 fn is_desktop_list_key(key: &str) -> bool {
@@ -125,7 +115,7 @@ fn is_desktop_list_key(key: &str) -> bool {
 fn split_desktop_list(input: &str) -> Vec<String> {
     let mut items = Vec::new();
     let mut current = String::new();
-    let mut chars = input.chars().peekable();
+    let mut chars = input.chars();
 
     while let Some(ch) = chars.next() {
         if ch == '\\' {
@@ -155,75 +145,4 @@ fn split_desktop_list(input: &str) -> Vec<String> {
     }
 
     items
-}
-
-fn normalize_systemd_key(raw: &str) -> String {
-    let chars: Vec<char> = raw.chars().collect();
-    let mut out = String::new();
-
-    for (idx, ch) in chars.iter().enumerate() {
-        if ch.is_ascii_alphanumeric() {
-            let is_upper = ch.is_ascii_uppercase();
-            let prev = idx.checked_sub(1).and_then(|i| chars.get(i));
-            let next = chars.get(idx + 1);
-            let prev_is_lower_or_digit =
-                prev.is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
-            let prev_is_upper = prev.is_some_and(char::is_ascii_uppercase);
-            let next_is_lower = next.is_some_and(char::is_ascii_lowercase);
-
-            if is_upper
-                && !out.is_empty()
-                && (prev_is_lower_or_digit || (prev_is_upper && next_is_lower))
-            {
-                out.push('_');
-            }
-            out.push(ch.to_ascii_lowercase());
-        } else if (*ch == '-' || *ch == ' ' || *ch == '.' || *ch == '/')
-            && !out.ends_with('_')
-            && !out.is_empty()
-        {
-            out.push('_');
-        }
-    }
-
-    out.trim_matches('_').to_string()
-}
-
-fn ensure_json_object<'a>(
-    map: &'a mut serde_json::Map<String, Value>,
-    key: &str,
-) -> Option<&'a mut serde_json::Map<String, Value>> {
-    if !map.contains_key(key) {
-        map.insert(key.to_string(), Value::Object(serde_json::Map::new()));
-    }
-    map.get_mut(key)?.as_object_mut()
-}
-
-fn append_systemd_raw(section_obj: &mut serde_json::Map<String, Value>, key: &str, value: String) {
-    if let Some(raw_obj) = ensure_json_object(section_obj, "_raw") {
-        append_string_occurrence(raw_obj, key, value);
-    }
-}
-
-fn append_string_occurrence(map: &mut serde_json::Map<String, Value>, key: &str, value: String) {
-    let new_value = Value::String(value);
-    match map.get_mut(key) {
-        None => {
-            map.insert(key.to_string(), new_value);
-        }
-        Some(Value::Array(arr)) => arr.push(new_value),
-        Some(existing) => {
-            let old = std::mem::replace(existing, Value::Null);
-            *existing = Value::Array(vec![old, new_value]);
-        }
-    }
-}
-
-fn append_string_items<I>(map: &mut serde_json::Map<String, Value>, key: &str, items: I)
-where
-    I: IntoIterator<Item = String>,
-{
-    for item in items {
-        append_string_occurrence(map, key, item);
-    }
 }

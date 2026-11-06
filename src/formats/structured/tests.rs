@@ -356,12 +356,12 @@ fn plist_nesting_depth_is_bounded() {
         let mut values = Values::new();
         let deep = extract_plist(&nested_xml_plist(20_000), &mut values, &mut Errors::new());
         let at_cap = extract_plist(
-            &nested_xml_plist(PLIST_MAX_DEPTH),
+            &nested_xml_plist(crate::formats::plist_guard::MAX_DEPTH),
             &mut values,
             &mut Errors::new(),
         );
         let past_cap = extract_plist(
-            &nested_xml_plist(PLIST_MAX_DEPTH + 1),
+            &nested_xml_plist(crate::formats::plist_guard::MAX_DEPTH + 1),
             &mut values,
             &mut Errors::new(),
         );

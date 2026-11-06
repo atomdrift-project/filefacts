@@ -352,3 +352,192 @@ fn header_only_fallback_judges_signatures_unverifiable() {
         Some("unverifiable")
     );
 }
+
+/// `test.exe` with Go 1.13–1.17 build info in `.data`: the header's two
+/// pointers lead, through Go string headers, to the version and modinfo,
+/// so reading it takes the image's own VA resolver.
+fn with_pointer_build_info() -> Vec<u8> {
+    const DATA: usize = 0x2200;
+    const DATA_VA: u64 = 0x1_4000_3000;
+    let mut bytes = read_fixture("test.exe");
+    let mut put = |at: usize, value: &[u8]| {
+        bytes[DATA + at..DATA + at + value.len()].copy_from_slice(value);
+    };
+    put(0, b"\xff Go buildinf:\x08\x00");
+    put(16, &(DATA_VA + 0x40).to_le_bytes());
+    put(24, &(DATA_VA + 0x50).to_le_bytes());
+    for (header, text, value) in [
+        (0x40, 0x80, &b"go1.16.15"[..]),
+        (0x50, 0xa0, &b"0w\xaf\x0c\x92t\x08\x02A\xe1\xc1\x07\xe6\xd6\x18\xe6path\tex/ample\n\xf92C1\x82B\x10A\x16\xd8\xf2"[..]),
+    ] {
+        put(header, &(DATA_VA + text).to_le_bytes());
+        put(header + 8, &(value.len() as u64).to_le_bytes());
+        put(text as usize, value);
+    }
+    bytes
+}
+
+#[test]
+fn pre_118_go_build_info_resolves_through_the_image() {
+    let (values, _, _) = run(&with_pointer_build_info());
+    let go = values.get("pe.go").expect("pe.go");
+    assert_eq!(go.get("version"), Some(&JsonValue::from("go1.16.15")));
+    assert_eq!(go.get("path"), Some(&JsonValue::from("ex/ample")));
+}
+
+/// Run [`extract`] and keep every view it wrote, with its result.
+fn sinks(bytes: &[u8]) -> (crate::formats::Sinks, Result<(), Error>) {
+    let mut out = crate::formats::Sinks::default();
+    let result = extract(bytes, out.ctx());
+    (out, result)
+}
+
+/// binform reads a PE whose headers goblin rejects outright (a data
+/// directory count past 16), and its views stand.
+#[test]
+fn binform_views_survive_a_header_goblin_rejects() {
+    let mut bytes = read_fixture("test.exe");
+    let pe_offset = u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()) as usize;
+    // PE32+ `NumberOfRvaAndSizes`.
+    bytes[pe_offset + 24 + 108] = 17;
+    let (out, result) = sinks(&bytes);
+    assert!(result.is_err());
+    assert!(!out.sections.is_empty());
+    assert!(
+        out.symbols
+            .iter_kind(crate::SymbolKind::Import)
+            .next()
+            .is_some()
+    );
+}
+
+/// An import table cut short by binform's walk budget is reported as one,
+/// from binform's own reading: goblin no longer walks it.
+#[test]
+fn an_import_table_past_binforms_budget_is_reported() {
+    // 64 descriptors sharing one table of 4096 ordinal entries: a quarter
+    // million imports from a few kilobytes.
+    let forged = crate::formats::goblin_safe::tests::pe_with_shared_ordinal_lookup_table(64, 4096);
+    let (out, _) = sinks(&forged);
+    assert_eq!(out.metrics.get("pe.import_table_unwalkable"), Some(1.0));
+    assert!(
+        out.errors
+            .iter()
+            .any(|e| e.message.starts_with("import tables cut short"))
+    );
+    let (out, _) = sinks(&read_fixture("test.exe"));
+    assert_eq!(out.metrics.get("pe.import_table_unwalkable"), None);
+}
+
+/// A PE32 image of `len` bytes whose `count` section headers all claim the
+/// whole file as their raw data.
+pub(super) fn pe_with_overlapping_sections(count: u16, len: usize) -> Vec<u8> {
+    let mut bytes = vec![0u8; len];
+    bytes[..2].copy_from_slice(b"MZ");
+    bytes[0x3c] = 0x40;
+    bytes[0x40..0x44].copy_from_slice(b"PE\0\0");
+    bytes[0x44..0x46].copy_from_slice(&0x014c_u16.to_le_bytes()); // i386
+    bytes[0x46..0x48].copy_from_slice(&count.to_le_bytes());
+    bytes[0x54..0x56].copy_from_slice(&0xe0_u16.to_le_bytes()); // optional header size
+    let optional = 0x58;
+    bytes[optional..optional + 2].copy_from_slice(&0x10b_u16.to_le_bytes());
+    bytes[optional + 36..optional + 40].copy_from_slice(&0x200_u32.to_le_bytes());
+    let table = optional + 0xe0;
+    for i in 0..usize::from(count) {
+        let at = table + 40 * i;
+        bytes[at..at + 5].copy_from_slice(b".data");
+        bytes[at + 8..at + 12].copy_from_slice(&(len as u32).to_le_bytes()); // VirtualSize
+        bytes[at + 12..at + 16].copy_from_slice(&0x1000_u32.to_le_bytes()); // VirtualAddress
+        bytes[at + 16..at + 20].copy_from_slice(&(len as u32).to_le_bytes()); // SizeOfRawData
+    }
+    bytes
+}
+
+/// binform's reading of a PE costs a pass over every section's bytes, and
+/// nothing makes the raw extents disjoint: thousands of headers claiming the
+/// whole file cost sections × file size. binform reads no more sections than
+/// goblin accepts, and the cut is reported.
+#[test]
+fn a_forged_section_count_is_cut_for_binform() {
+    let bytes = pe_with_overlapping_sections(2000, 256 * 1024);
+    let (out, _) = sinks(&bytes);
+    assert_eq!(out.sections.len(), crate::formats::pe::layout::MAX_SECTIONS);
+    assert!(
+        out.errors
+            .iter()
+            .any(|e| e.message.starts_with("section table cut to"))
+    );
+    let (out, _) = sinks(&read_fixture("test.exe"));
+    assert!(
+        !out.errors
+            .iter()
+            .any(|e| e.message.starts_with("section table cut to"))
+    );
+}
+
+/// The test fixture with its last section rebuilt to hold the import table
+/// at a raw pointer that is not a multiple of 512. The loader reads a
+/// section from its pointer rounded down to 512, where this puts a table
+/// importing `real.dll!RealFunc`; the unrounded pointer holds a decoy
+/// table importing `decoy.dll!DecoyFunc`.
+fn pe_with_unaligned_import_section() -> Vec<u8> {
+    let mut bytes = read_fixture("test.exe");
+    let pe_offset = u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()) as usize;
+    let coff = pe_offset + 4;
+    let count = u16::from_le_bytes(bytes[coff + 2..coff + 4].try_into().unwrap()) as usize;
+    let optional_size = u16::from_le_bytes(bytes[coff + 16..coff + 18].try_into().unwrap());
+    let optional = coff + 20;
+    let last = optional + optional_size as usize + 40 * (count - 1);
+    let put = |bytes: &mut Vec<u8>, at: usize, value: &[u8]| {
+        bytes[at..at + value.len()].copy_from_slice(value);
+    };
+    let va = u32::from_le_bytes(bytes[last + 12..last + 16].try_into().unwrap());
+    let rounded = u32::from_le_bytes(bytes[last + 20..last + 24].try_into().unwrap()) as usize;
+    assert_eq!(rounded % 0x200, 0);
+    let pointer = rounded + 0x100;
+    put(&mut bytes, last, b".idata\0\0");
+    put(&mut bytes, last + 8, &0x400_u32.to_le_bytes()); // VirtualSize
+    put(&mut bytes, last + 16, &0x400_u32.to_le_bytes()); // SizeOfRawData
+    put(&mut bytes, last + 20, &(pointer as u32).to_le_bytes());
+    bytes.resize(rounded + 0x600, 0);
+    bytes[rounded..].fill(0);
+    // One import table, laid out from `base` as if `base` were at `va`.
+    let table = |bytes: &mut Vec<u8>, base: usize, library: &[u8], function: &[u8]| {
+        let lookup = va + 0x40;
+        put(bytes, base, &lookup.to_le_bytes()); // OriginalFirstThunk
+        put(bytes, base + 12, &(va + 0x60).to_le_bytes()); // Name
+        put(bytes, base + 16, &lookup.to_le_bytes()); // FirstThunk
+        put(bytes, base + 0x40, &u64::from(va + 0x80).to_le_bytes());
+        put(bytes, base + 0x60, library);
+        put(bytes, base + 0x82, function);
+    };
+    table(&mut bytes, rounded, b"real.dll\0", b"RealFunc\0");
+    table(&mut bytes, pointer, b"decoy.dll\0", b"DecoyFunc\0");
+    // PE32+ data directories: the import table here, no relocations.
+    let directory = |index: usize| optional + 112 + 8 * index;
+    put(&mut bytes, directory(1), &va.to_le_bytes());
+    put(&mut bytes, directory(1) + 4, &40_u32.to_le_bytes());
+    put(&mut bytes, directory(5), &[0; 8]);
+    bytes
+}
+
+/// binform is handed the section pointers the loader uses, so the imports
+/// are the ones Windows binds, not a decoy at the unrounded offset.
+#[test]
+fn imports_are_read_where_the_loader_reads_them() {
+    let (out, _) = sinks(&pe_with_unaligned_import_section());
+    let names: Vec<&str> = out
+        .symbols
+        .iter_kind(crate::SymbolKind::Import)
+        .filter_map(crate::Symbol::name)
+        .collect();
+    assert!(names.contains(&"RealFunc"), "{names:?}");
+    assert!(!names.contains(&"DecoyFunc"), "{names:?}");
+    assert!(
+        out.errors
+            .iter()
+            .any(|e| e.message.contains("not a multiple of 512")),
+        "{:?}",
+        out.errors
+    );
+}

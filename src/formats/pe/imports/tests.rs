@@ -64,22 +64,26 @@ fn delay_imports_are_capped_across_descriptors() {
         let prepared = goblin_safe::prepare_pe(bytes);
         let pe = goblin_safe::parse_pe(&prepared).ok().expect("parses");
         let layout = binform::parse(bytes).expect("binform reads it");
-        let (mut values, mut metrics, mut symbols) =
-            (Values::new(), Metrics::new(), crate::Symbols::new());
-        delay_imports(&pe, bytes, &mut values, &mut metrics);
+        let mut sinks = crate::formats::Sinks::default();
+        delay_imports(
+            &pe,
+            Some(&layout),
+            bytes,
+            &mut sinks.values,
+            &mut sinks.metrics,
+        );
         imports(
             &layout,
             pe.image_base,
             pe.header.coff_header.machine,
-            &mut values,
-            &mut metrics,
-            &mut symbols,
+            &mut sinks.ctx(),
         );
-        let delayed = symbols
+        let delayed = sinks
+            .symbols
             .iter()
             .filter(|s| matches!(s, crate::Symbol::Import { library: Some(l), .. } if l == "a"))
             .count();
-        (delayed, metrics.get("pe.delay_import_count"))
+        (delayed, sinks.metrics.get("pe.delay_import_count"))
     };
     assert_eq!(views(&pe_with_shared_delay_imports(3, 5)), (15, Some(15.0)));
     // 128 descriptors x 4096 entries would be half a million symbols.
@@ -223,4 +227,28 @@ fn windows_ce_ordinals_follow_the_cpu() {
         Some("Int_HeapAlloc")
     );
     assert_eq!(Cpu::of_machine(0x8664), None);
+}
+
+/// Each delay-load descriptor counts binform's imports for it, by its own
+/// run of address-table slots, even where descriptors share a DLL name.
+#[test]
+fn delay_descriptors_count_binforms_imports() {
+    let bytes = pe_with_shared_delay_imports(3, 5);
+    let prepared = goblin_safe::prepare_pe(&bytes);
+    let pe = goblin_safe::parse_pe(&prepared).ok().expect("parses");
+    let layout = binform::parse(&bytes).expect("binform reads it");
+    let (mut values, mut metrics) = (Values::new(), Metrics::new());
+    delay_imports(&pe, Some(&layout), &bytes, &mut values, &mut metrics);
+    let counts: Vec<u64> = values
+        .get("pe.delay_imports")
+        .and_then(JsonValue::as_array)
+        .expect("descriptors")
+        .iter()
+        .filter_map(|d| d.get("import_count")?.as_u64())
+        .collect();
+    assert_eq!(counts, [5, 5, 5]);
+    // Without binform's reading the descriptors stand, counting nothing.
+    let (mut values, mut metrics) = (Values::new(), Metrics::new());
+    delay_imports(&pe, None, &bytes, &mut values, &mut metrics);
+    assert_eq!(metrics.get("pe.delay_import_count"), Some(0.0));
 }

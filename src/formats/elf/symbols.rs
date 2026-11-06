@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 
 use goblin::elf::Elf;
+use goblin::elf::sym::{STB_LOCAL, STV_HIDDEN};
 use serde_json::Value as JsonValue;
 
 use super::{NameBudget, load_segment_va_to_offset, section_header};
@@ -23,11 +24,8 @@ use crate::value_key;
 /// symbol rule looks for. Functions `.dynsym` already exports stay exports
 /// only, so a dynamic object reports each name once, in the same view it did.
 pub(super) fn static_function_fallback(elf: &Elf<'_>, file_len: usize, out: &mut crate::Symbols) {
-    use crate::output::{Symbol, SymbolKind};
-    if out
-        .iter()
-        .any(|symbol| symbol.kind() == SymbolKind::Function)
-    {
+    use crate::output::Symbol;
+    if crate::formats::common::has_functions(out) {
         return;
     }
     let exported: std::collections::HashSet<&str> = elf
@@ -48,8 +46,7 @@ pub(super) fn static_function_fallback(elf: &Elf<'_>, file_len: usize, out: &mut
             continue;
         }
         let Some(name) = elf.strtab.get_at(sym.st_name).filter(|name| {
-            !name.is_empty()
-                && (sym.st_bind() == goblin::elf::sym::STB_LOCAL || !exported.contains(name))
+            !name.is_empty() && (sym.st_bind() == STB_LOCAL || !exported.contains(name))
         }) else {
             continue;
         };
@@ -94,9 +91,8 @@ pub(super) fn emit(
     let mut sym_bind_counts: [u64; 4] = [0; 4];
     let mut sym_vis_counts: [u64; 4] = [0; 4];
     // Static `.symtab` — hidden visibility + stack-canary symbols.
-    // `STB_LOCAL = 0`, `STV_HIDDEN = 2`.
     for sym in elf.syms.iter() {
-        if sym.st_bind() == 0 && sym.st_visibility() == 2 {
+        if sym.st_bind() == STB_LOCAL && sym.st_visibility() == STV_HIDDEN {
             hidden_count += 1;
         }
         tally_symbol_kinds(
@@ -105,10 +101,10 @@ pub(super) fn emit(
             &mut sym_bind_counts,
             &mut sym_vis_counts,
         );
-        if let Some(name) = elf.strtab.get_at(sym.st_name) {
-            if name == "__stack_chk_fail" || name == "__stack_chk_guard" {
-                stack_canary = true;
-            }
+        if let Some(name) = elf.strtab.get_at(sym.st_name)
+            && (name == "__stack_chk_fail" || name == "__stack_chk_guard")
+        {
+            stack_canary = true;
         }
     }
     // File offset of the `.dynstr` table, so each dynamic symbol's name can be
@@ -127,7 +123,7 @@ pub(super) fn emit(
         .or_else(|| load_segment_va_to_offset(elf, elf.dynamic.as_ref()?.info.strtab as u64));
     for sym in &elf.dynsyms {
         // Hidden + canary on dynsym too.
-        if sym.st_bind() == 0 && sym.st_visibility() == 2 {
+        if sym.st_bind() == STB_LOCAL && sym.st_visibility() == STV_HIDDEN {
             hidden_count += 1;
         }
         tally_symbol_kinds(
@@ -172,7 +168,10 @@ pub(super) fn emit(
         elf.section_headers
             .iter()
             .find(|sh| sh.sh_type == goblin::elf::section_header::SHT_SYMTAB)
-            .and_then(|symtab| elf.section_headers.get(symtab.sh_link as usize))
+            .and_then(|symtab| {
+                elf.section_headers
+                    .get(crate::bytes::sat_usize(symtab.sh_link))
+            })
             .map(|sh| sh.sh_offset)
     } else {
         None
@@ -263,15 +262,15 @@ fn tally_symbol_kinds(
     bindings: &mut [u64; 4],
     visibility: &mut [u64; 4],
 ) {
-    let stt = (sym.st_info & 0xf) as usize;
+    let stt = usize::from(sym.st_info & 0xf);
     if let Some(count) = types.get_mut(stt) {
         *count += 1;
     }
-    let stb = ((sym.st_info >> 4) & 0xf) as usize;
+    let stb = usize::from((sym.st_info >> 4) & 0xf);
     if let Some(count) = bindings.get_mut(stb.min(3)) {
         *count += 1;
     }
-    let vis = (sym.st_other & 0x3) as usize;
+    let vis = usize::from(sym.st_other & 0x3);
     if let Some(count) = visibility.get_mut(vis) {
         *count += 1;
     }
@@ -308,41 +307,32 @@ fn emit_symbol_kind_histograms(
     const BIND_NAMES: [&str; 4] = ["local", "global", "weak", "other"];
     const VIS_NAMES: [&str; 4] = ["default", "internal", "hidden", "protected"];
 
-    let mut by_type = serde_json::Map::new();
-    for (name, count) in TYPE_NAMES.iter().zip(types) {
-        if *count > 0 {
-            by_type.insert((*name).to_string(), JsonValue::Number((*count).into()));
-        }
-    }
-    if !by_type.is_empty() {
-        values.insert_key(
+    for (key, names, counts) in [
+        (
             value_key!("elf.symbol_kinds.types"),
-            JsonValue::Object(by_type),
-        );
-    }
-    let mut by_bind = serde_json::Map::new();
-    for (name, count) in BIND_NAMES.iter().zip(bindings) {
-        if *count > 0 {
-            by_bind.insert((*name).to_string(), JsonValue::Number((*count).into()));
-        }
-    }
-    if !by_bind.is_empty() {
-        values.insert_key(
+            &TYPE_NAMES[..],
+            &types[..],
+        ),
+        (
             value_key!("elf.symbol_kinds.bindings"),
-            JsonValue::Object(by_bind),
-        );
-    }
-    let mut by_vis = serde_json::Map::new();
-    for (name, count) in VIS_NAMES.iter().zip(visibility) {
-        if *count > 0 {
-            by_vis.insert((*name).to_string(), JsonValue::Number((*count).into()));
-        }
-    }
-    if !by_vis.is_empty() {
-        values.insert_key(
+            &BIND_NAMES,
+            bindings,
+        ),
+        (
             value_key!("elf.symbol_kinds.visibility"),
-            JsonValue::Object(by_vis),
-        );
+            &VIS_NAMES,
+            visibility,
+        ),
+    ] {
+        let histogram: serde_json::Map<String, JsonValue> = names
+            .iter()
+            .zip(counts)
+            .filter(|&(_, &count)| count > 0)
+            .map(|(&name, &count)| (name.to_string(), JsonValue::from(count)))
+            .collect();
+        if !histogram.is_empty() {
+            values.insert_key(key, JsonValue::Object(histogram));
+        }
     }
 }
 

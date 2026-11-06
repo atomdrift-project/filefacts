@@ -11,19 +11,8 @@ fn no_rich_header_is_silent() {
     assert!(v.is_empty());
 }
 
-#[test]
-fn rich_md5_is_deterministic() {
-    let bytes = b"hello world here is some data";
-    let h1 = rich_md5(bytes, 0xdead_beef);
-    let h2 = rich_md5(bytes, 0xdead_beef);
-    assert_eq!(h1, h2);
-    // Different key changes the digest.
-    let h3 = rich_md5(bytes, 0xcafe_babe);
-    assert_ne!(h1, h3);
-}
-
-/// `locate` is the one Rich scan: `extract` decodes a located table and
-/// `goblin_safe` neutralises a marker that has none.
+/// `extract` decodes the table `locate` finds; a marker with none is one
+/// goblin rejects, so `goblin_safe` clears it.
 #[test]
 fn locate_drives_extract_and_the_goblin_neutraliser() {
     let bytes = std::fs::read("tests/fixtures/test.exe").expect("test.exe fixture");
@@ -52,11 +41,13 @@ fn locate_drives_extract_and_the_goblin_neutraliser() {
 }
 
 #[test]
-fn find_rich_marker_locates_last_occurrence() {
-    let mut buf = vec![0u8; 64];
+fn locate_takes_the_last_marker_in_the_stub() {
+    let mut buf = vec![0u8; 0x80];
+    buf[0x3c] = 0x60;
     buf[20..24].copy_from_slice(b"Rich");
     buf[40..44].copy_from_slice(b"Rich");
-    assert_eq!(find_rich_marker(&buf), Some(40));
+    buf[0x60..0x64].copy_from_slice(b"Rich");
+    assert_eq!(locate(&buf).map(|rich| rich.rich_pos), Some(40));
 }
 
 /// End-to-end Rich header decode for the canonical `test.exe`
@@ -91,4 +82,46 @@ fn rich_header_decodes_test_exe_to_known_values() {
     );
     assert_eq!(first.get("build_id").and_then(|x| x.as_u64()), Some(147));
     assert_eq!(first.get("use_count").and_then(|x| x.as_u64()), Some(10));
+}
+
+/// A DOS stub of `pairs` Rich entries under key 0x01020304, `e_lfanew`
+/// just past the key.
+fn stub_with_rich_entries(pairs: usize) -> Vec<u8> {
+    let key = 0x0102_0304_u32;
+    let mut buf = vec![0u8; 0x80];
+    let word = |w: u32| (w ^ key).to_le_bytes();
+    buf.extend_from_slice(&word(DANS_MARKER));
+    for _ in 0..3 {
+        buf.extend_from_slice(&word(0));
+    }
+    for i in 0..pairs {
+        buf.extend_from_slice(&word(0x0001_0000 | i as u32));
+        buf.extend_from_slice(&word(1));
+    }
+    buf.extend_from_slice(b"Rich");
+    buf.extend_from_slice(&key.to_le_bytes());
+    let end = buf.len() as u32;
+    buf[0x3c..0x40].copy_from_slice(&end.to_le_bytes());
+    buf
+}
+
+/// Every eight bytes of a table become a JSON object some thirty times
+/// their size, and the stub runs as far as `e_lfanew` says. The entry list
+/// is capped; the hash still covers the whole table.
+#[test]
+fn rich_entries_are_capped() {
+    let entries = |v: &Values| {
+        v.get("pe.rich.entries")
+            .and_then(JsonValue::as_array)
+            .map(Vec::len)
+    };
+    let mut v = Values::new();
+    extract(&stub_with_rich_entries(3), &mut v);
+    assert_eq!(entries(&v), Some(3));
+
+    let big = stub_with_rich_entries(MAX_RICH_ENTRIES * 4);
+    let mut v = Values::new();
+    extract(&big, &mut v);
+    assert_eq!(entries(&v), Some(MAX_RICH_ENTRIES));
+    assert!(v.get("pe.rich.hash").is_some());
 }

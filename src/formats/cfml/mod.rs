@@ -67,30 +67,36 @@ fn script_end(bytes: &[u8], mut at: usize) -> Result<usize, Limit> {
             }
             at += 2;
         } else if starts(bytes, at, b"<!---") {
-            at += 5;
-            let mut depth = 1;
-            while depth > 0 {
-                if at == bytes.len() {
-                    return Err(Limit::Truncated);
-                }
-                if starts(bytes, at, b"<!---") {
-                    depth += 1;
-                    if depth > MAX_COMMENT_DEPTH {
-                        return Err(Limit::CommentDepth);
-                    }
-                    at += 5;
-                } else if starts(bytes, at, b"--->") {
-                    depth -= 1;
-                    at += 4;
-                } else {
-                    at += 1;
-                }
-            }
+            skip_comment(bytes, &mut at)?;
         } else {
             at += 1;
         }
     }
     Err(Limit::Truncated)
+}
+
+/// Move `*at` past the nested `<!--- … --->` comment that starts there.
+fn skip_comment(bytes: &[u8], at: &mut usize) -> Result<(), Limit> {
+    *at += 5;
+    let mut depth = 1;
+    while depth > 0 {
+        if *at == bytes.len() {
+            return Err(Limit::Truncated);
+        }
+        if starts(bytes, *at, b"<!---") {
+            depth += 1;
+            if depth > MAX_COMMENT_DEPTH {
+                return Err(Limit::CommentDepth);
+            }
+            *at += 5;
+        } else if starts(bytes, *at, b"--->") {
+            depth -= 1;
+            *at += 4;
+        } else {
+            *at += 1;
+        }
+    }
+    Ok(())
 }
 
 fn starts(bytes: &[u8], at: usize, value: &[u8]) -> bool {
@@ -174,26 +180,9 @@ pub(super) fn scan(bytes: &[u8]) -> Syntax {
     let mut markup = markup::Markup::default();
     while let Some(&byte) = bytes.get(at) {
         if starts(bytes, at, b"<!---") {
-            at += 5;
-            let mut depth = 1;
-            while depth > 0 {
-                if at == bytes.len() {
-                    out.limitation = Some(Limit::Truncated);
-                    return out;
-                }
-                if starts(bytes, at, b"<!---") {
-                    depth += 1;
-                    if depth > MAX_COMMENT_DEPTH {
-                        out.limitation = Some(Limit::CommentDepth);
-                        return out;
-                    }
-                    at += 5;
-                } else if starts(bytes, at, b"--->") {
-                    depth -= 1;
-                    at += 4;
-                } else {
-                    at += 1;
-                }
+            if let Err(limit) = skip_comment(bytes, &mut at) {
+                out.limitation = Some(limit);
+                return out;
             }
             continue;
         }

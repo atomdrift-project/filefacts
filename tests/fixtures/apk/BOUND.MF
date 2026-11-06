@@ -1,0 +1,9 @@
+Manifest-Version: 1.0
+Created-By: filefacts fixture
+
+Name: AndroidManifest.xml
+SHA-256-Digest: liyyGtvp8du/XenGfZP2Bk0tLkOb4KEdUqTKtsk3rOM=
+
+Name: classes.dex
+SHA-256-Digest: LFSkxRGSYBZ0Yj0kfoJ/+PzuchLtp/7WurWk6Vms5Y4=
+

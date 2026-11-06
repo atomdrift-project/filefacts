@@ -3,7 +3,7 @@
 use goblin::pe::PE;
 
 use super::layout::{rva_to_file_offset, section_containing};
-use crate::formats::common::bytes_at::{u16_le, u32_le};
+use crate::bytes::{sat_usize, u32_le};
 use crate::metric;
 use crate::output::{Metrics, Values};
 use crate::value_key;
@@ -33,7 +33,7 @@ pub(super) fn base_relocations(
     let Some(start) = rva_to_file_offset(pe, dd.virtual_address) else {
         return;
     };
-    let end = start.saturating_add(dd.size as usize).min(bytes.len());
+    let end = start.saturating_add(sat_usize(dd.size)).min(bytes.len());
     let mut cursor = start;
     let mut block_count = 0_u64;
     let mut entry_count = 0_u64;
@@ -41,24 +41,19 @@ pub(super) fn base_relocations(
     while cursor + 8 <= end {
         // The block header is `{ page_rva: u32, block_size: u32 }`; only the
         // size matters here.
-        let Some(block_size) = u32_le(bytes, cursor + 4).map(|v| v as usize) else {
+        let Some(block_size) = u32_le(bytes, cursor + 4).map(sat_usize) else {
             break;
         };
         if block_size < 8 || cursor + block_size > end {
             break;
         }
+        let Some(block) = bytes.get(cursor + 8..cursor + block_size) else {
+            break;
+        };
         block_count += 1;
-        let entries = (block_size - 8) / 2;
-        for i in 0..entries {
-            let off = cursor + 8 + i * 2;
-            if off + 2 > end {
-                break;
-            }
-            let Some(word) = u16_le(bytes, off) else {
-                break;
-            };
-            let kind = word >> 12;
-            if kind == 0 {
+        // Each entry is a 4-bit type over a 12-bit page offset.
+        for entry in block.as_chunks::<2>().0 {
+            if u16::from_le_bytes(*entry) >> 12 == 0 {
                 absolute_count += 1;
             } else {
                 entry_count += 1;

@@ -1,4 +1,8 @@
 use super::*;
+
+fn analyze(source: &str) -> Stats {
+    super::analyze(&Lines::new(source))
+}
 const LOOP: &str = ":1\nset alias=cache\necho 0000>>data\ncopy /b data %alias%\ncopy /b data+%alias%+%alias%\ncopy /b data+data+data\ngoto 1\n";
 #[test]
 fn snapshot_source_and_backedge_are_bound() {
@@ -121,4 +125,21 @@ fn closing_parenthesis_inside_argument_does_not_stop_fallthrough() {
     assert_eq!(analyze(&source).seeded, 1);
     assert_eq!(analyze(&format!("echo )\n{LOOP}")).loops, 0);
     assert_eq!(analyze(&format!("( exit /b )\n{LOOP}")).loops, 0);
+}
+
+/// cmd.exe refuses a command line longer than 8191 characters after
+/// expansion, so a line that expands past it runs nothing; expanding it in
+/// full would also let a few KB of `%a%` references to a long variable
+/// allocate gigabytes.
+#[test]
+fn expansion_stops_at_the_command_line_limit() {
+    let long = "c".repeat(MAX_COMMAND_LINE);
+    assert_eq!(analyze(&LOOP.replace("cache", &long)).loops, 0);
+
+    let env = HashMap::from([("a".to_string(), "A".repeat(30_000))]);
+    assert_eq!(expand(&"%a%".repeat(10_000), &env), None);
+    assert_eq!(
+        expand("%a%%a%", &HashMap::from([("a".into(), "AB".into())])).as_deref(),
+        Some("ABAB")
+    );
 }

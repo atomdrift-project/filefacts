@@ -49,35 +49,26 @@ const MAX_VERSION_RECORDS: usize = 4096;
 /// length never truncates one. Once a name does not fit, the view is spent:
 /// every later name is refused too.
 struct NameBudget {
-    left: usize,
-    refused: bool,
+    /// Bytes still to spend; `None` once a name has been refused.
+    left: Option<usize>,
 }
 
 impl NameBudget {
     fn new(file_len: usize) -> Self {
         Self {
-            left: file_len.saturating_mul(2),
-            refused: false,
+            left: Some(file_len.saturating_mul(2)),
         }
     }
 
     /// Charge `len` bytes of name text; `false` once the view is spent.
     fn take(&mut self, len: usize) -> bool {
-        match self.left.checked_sub(len) {
-            Some(left) if !self.refused => {
-                self.left = left;
-                true
-            }
-            _ => {
-                self.refused = true;
-                false
-            }
-        }
+        self.left = self.left.and_then(|left| left.checked_sub(len));
+        self.left.is_some()
     }
 
     /// Whether any name was refused.
     fn refused(&self) -> bool {
-        self.refused
+        self.left.is_none()
     }
 }
 
@@ -222,8 +213,9 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
     let object = goblin::Object::Elf(elf);
     let shared: Vec<stng::Layout<'_, '_>> = layout.iter().map(|layout| (0, *layout)).collect();
     extract_binary_strings_from_object(&object, &shared, bytes, strings, XorScan::Yes);
+    // Constructed as `Object::Elf` above.
     let goblin::Object::Elf(elf) = object else {
-        unreachable!("constructed as Object::Elf")
+        return;
     };
     // Every PT_NOTE reader below shares one guarded walk.
     let segment_notes = notes::drain(elf.iter_note_headers(bytes), &mut bytes.len(), errors_out);
@@ -279,8 +271,8 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
             .filter(|sh| sh.sh_flags & u64::from(goblin::elf::section_header::SHF_EXECINSTR) != 0)
             .map(|sh| (sh.sh_addr, sh.sh_size)),
     );
-    let pclntab = read_section(&elf, bytes, ".gopclntab")
-        .filter(|table| super::go_buildinfo::has_pclntab_magic(table));
+    let pclntab =
+        read_section(&elf, bytes, ".gopclntab").filter(|table| super::go_pclntab::has_magic(table));
     let text = section_header(&elf, ".text").map(|sh| sh.sh_addr);
     if let Some(go) = pclntab
         .zip(code)
@@ -307,11 +299,8 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
             .iter()
             .any(|sym| sym.st_shndx == 0 && elf.dynstrtab.get_at(sym.st_name) == Some("syscall"));
         syscalls::emit(&native.syscalls, native.arch, indirect, values, metrics);
-        let has_function = symbols_out
-            .iter()
-            .any(|symbol| symbol.kind() == crate::SymbolKind::Function);
-        if !has_function {
-            super::common::apply_native(&native, symbols_out, metrics);
+        if !super::common::has_functions(symbols_out) {
+            native.functions.apply(symbols_out, metrics);
         }
     }
     // Symbol-table names when nothing above produced a function inventory:
@@ -381,7 +370,7 @@ fn linker_family(elf: &Elf<'_>, values: &mut Values) {
     // `.comment` fallback — covers GNU ld (no dedicated note) and
     // toolchains that append `ld.lld` / `mold` strings inline.
     let family = values
-        .get_key(value_key!("elf.comment"))
+        .lookup(value_key!("elf.comment"))
         .and_then(serde_json::Value::as_array)
         .into_iter()
         .flatten()
@@ -415,7 +404,7 @@ fn linker_family(elf: &Elf<'_>, values: &mut Values) {
 /// the raw `elf.comment[]` entries; these are the common cases.
 fn comment_fingerprint(values: &mut Values) {
     let joined: String = values
-        .get_key(value_key!("elf.comment"))
+        .lookup(value_key!("elf.comment"))
         .and_then(serde_json::Value::as_array)
         .into_iter()
         .flatten()
@@ -467,14 +456,18 @@ fn comment_fingerprint(values: &mut Values) {
         put_str(values, value_key!("elf.distro"), d);
     }
 
+    // The token after the first `marker`, up to a space or parenthesis.
+    let token_after = |marker: &str| {
+        let (_, rest) = joined.split_once(marker)?;
+        rest.split([' ', '(', ')'])
+            .next()
+            .map(|t| t.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
     let (family, version) = if joined.starts_with("GCC:") || joined.contains("; GCC:") {
-        let version = joined.find("GCC:").and_then(|start| {
-            let rest = &joined[start + "GCC:".len()..];
+        let version = joined.split_once("GCC:").and_then(|(_, rest)| {
             // Skip the parenthesized distro tag.
-            let after_paren = match rest.find(')') {
-                Some(p) => &rest[p + 1..],
-                None => rest,
-            };
+            let after_paren = rest.split_once(')').map_or(rest, |(_, after)| after);
             after_paren
                 .split([';', ',', ' '])
                 .find(|t| t.chars().next().is_some_and(|c| c.is_ascii_digit()))
@@ -483,23 +476,9 @@ fn comment_fingerprint(values: &mut Values) {
         });
         (Some("gcc"), version)
     } else if joined.contains("Apple LLVM") || joined.contains("Apple clang") {
-        let version = joined.find("version ").and_then(|pos| {
-            let rest = &joined[pos + "version ".len()..];
-            rest.split([' ', '(', ')'])
-                .next()
-                .map(|t| t.trim().to_string())
-                .filter(|s| !s.is_empty())
-        });
-        (Some("apple_clang"), version)
+        (Some("apple_clang"), token_after("version "))
     } else if joined.contains("clang version") {
-        let version = joined.find("clang version ").and_then(|pos| {
-            let rest = &joined[pos + "clang version ".len()..];
-            rest.split([' ', '(', ')'])
-                .next()
-                .map(|t| t.trim().to_string())
-                .filter(|s| !s.is_empty())
-        });
-        (Some("clang"), version)
+        (Some("clang"), token_after("clang version "))
     } else {
         (None, None)
     };
@@ -555,7 +534,7 @@ fn gcc_command_line(elf: &Elf<'_>, bytes: &[u8], values: &mut Values) {
     };
     let rendered: String = data
         .iter()
-        .map(|&b| if b == 0 { ' ' } else { b as char })
+        .map(|&b| if b == 0 { ' ' } else { char::from(b) })
         .collect();
     let trimmed = rendered.trim();
     if trimmed.is_empty() {
@@ -574,10 +553,14 @@ fn gcc_command_line(elf: &Elf<'_>, bytes: &[u8], values: &mut Values) {
 /// distinct headers may name every suffix of that run. Cutting by chars always
 /// lands on a boundary; real names are a handful of bytes.
 fn section_name<'a>(elf: &Elf<'a>, sh: &SectionHeader) -> &'a str {
-    let full = elf.shdr_strtab.get_at(sh.sh_name).unwrap_or("");
-    match full.char_indices().nth(MAX_SECTION_NAME) {
-        Some((end, _)) => full.get(..end).unwrap_or(full),
-        None => full,
+    truncated_name(elf.shdr_strtab.get_at(sh.sh_name).unwrap_or(""))
+}
+
+/// `name` cut to [`MAX_SECTION_NAME`] chars, on a char boundary.
+fn truncated_name(name: &str) -> &str {
+    match name.char_indices().nth(MAX_SECTION_NAME) {
+        Some((end, _)) => name.get(..end).unwrap_or(name),
+        None => name,
     }
 }
 
@@ -896,12 +879,7 @@ fn e_flags(elf: &Elf<'_>, values: &mut Values) {
     if !flags.is_empty() {
         values.insert_key(
             value_key!("elf.e_flags"),
-            JsonValue::Array(
-                flags
-                    .into_iter()
-                    .map(|s| JsonValue::String(s.to_string()))
-                    .collect(),
-            ),
+            JsonValue::Array(flags.into_iter().map(JsonValue::from).collect()),
         );
     }
 }
@@ -1006,15 +984,10 @@ fn sections(layout: Option<&binform::Binary<'_>>, bytes: &[u8], sections_out: &m
     // need and this never bites a real binary.
     let mut entropy_budget = bytes.len() as u64;
     for section in layout.sections() {
-        // The name is cut as `section_name` cuts it: names are
-        // attacker-controlled string-table runs, and distinct headers naming
-        // every suffix of one run to EOF would otherwise turn a few MB of
-        // input into hundreds of MB of JSON. Real names are a handful of
-        // bytes.
-        let name = match section.name.char_indices().nth(MAX_SECTION_NAME) {
-            Some((end, _)) => section.name.get(..end).unwrap_or_default().to_owned(),
-            None => section.name.clone(),
-        };
+        // Names are attacker-controlled string-table runs, and distinct
+        // headers naming every suffix of one run to EOF would otherwise turn
+        // a few MB of input into hundreds of MB of JSON.
+        let name = truncated_name(&section.name).to_owned();
         // SHT_NOBITS sections have no file bytes. Other types
         // occupy `sh_offset..sh_offset + sh_size` in the file.
         let (file_offset, file_size) = (section.offset, section.file_size);

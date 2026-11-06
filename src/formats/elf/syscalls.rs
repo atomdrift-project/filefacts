@@ -2,8 +2,8 @@
 //!
 //! binform walks each recovered function tracking register and stack values,
 //! so a raw `syscall`/`svc` instruction yields its number and arguments even
-//! when the number is built across several instructions or an earlier block —
-//! which rizin's `/as` and the old fixed-window scan both miss. A libc
+//! when the number is built across several instructions or an earlier block,
+//! where a scan of a fixed window before the instruction finds none. A libc
 //! `syscall(number, …)` call with a constant number comes through as a site
 //! with `via = "syscall"`.
 //!
@@ -113,7 +113,18 @@ fn arch_label(arch: binform::Arch) -> Option<&'static str> {
 /// index `args` positionally (arg 0 = the first syscall argument), read
 /// `number` against `elf.syscalls_arch`, and treat `offset` as a file offset.
 fn site_json(fact: &SyscallFact) -> JsonValue {
-    let ints: Vec<Option<u64>> = fact.args.iter().map(arg_int).collect();
+    // Each argument's integer: a constant, or the fixed address a pointer
+    // holds (its bytes ride in `decoded`). A stack pointer has no address,
+    // so it is null.
+    let ints: Vec<Option<u64>> = fact
+        .args
+        .iter()
+        .map(|value| match value {
+            binform::Value::Int(n) => Some(*n),
+            binform::Value::Mem { addr, .. } => *addr,
+            _ => None,
+        })
+        .collect();
     let end = ints.iter().rposition(Option::is_some).map_or(0, |i| i + 1);
     let args: Vec<JsonValue> = ints
         .iter()
@@ -142,17 +153,6 @@ fn site_json(fact: &SyscallFact) -> JsonValue {
         object.insert("decoded".into(), JsonValue::Array(decoded));
     }
     record
-}
-
-/// A value's integer, for positional `args`: a constant, or the fixed address
-/// a pointer holds (its bytes ride in `decoded`). A stack pointer has no
-/// address, so it is null.
-fn arg_int(value: &binform::Value) -> Option<u64> {
-    match value {
-        binform::Value::Int(n) => Some(*n),
-        binform::Value::Mem { addr, .. } => *addr,
-        _ => None,
-    }
 }
 
 /// Decode a `sockaddr_in` or `sockaddr_in6` behind a pointer argument into

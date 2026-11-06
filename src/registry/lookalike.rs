@@ -328,20 +328,24 @@ const TERRAFORM_POPULAR: &[&str] = &[
 
 /// `Some(1.0)` when `name` is one edit from a popular package's name in its
 /// ecosystem without being one, `Some(0.0)` when it was checked and is not,
-/// `None` when the ecosystem has no list.
+/// `None` when the ecosystem has no list. The ecosystem is matched by its
+/// label, so an [`Ecosystem::Other`] spelling a listed registry is checked
+/// too. A name without a namespace imitates no provider and is `Some(0.0)`.
 pub(super) fn name_lookalike(ecosystem: &Ecosystem, name: &str) -> Option<f64> {
-    if *ecosystem != Ecosystem::Terraform {
+    if !ecosystem
+        .as_str()
+        .eq_ignore_ascii_case(Ecosystem::Terraform.as_str())
+    {
         return None;
     }
     let name = name.trim().to_ascii_lowercase();
-    if TERRAFORM_POPULAR.binary_search(&name.as_str()).is_ok() {
-        return Some(0.0);
-    }
-    let (ns, typ) = name.split_once('/')?;
-    let hit = TERRAFORM_POPULAR.iter().any(|p| {
-        p.split_once('/')
-            .is_some_and(|(pns, ptyp)| ptyp == typ && one_edit(ns, pns))
-    });
+    let hit = TERRAFORM_POPULAR.binary_search(&name.as_str()).is_err()
+        && name.split_once('/').is_some_and(|(ns, typ)| {
+            TERRAFORM_POPULAR.iter().any(|p| {
+                p.split_once('/')
+                    .is_some_and(|(pns, ptyp)| ptyp == typ && one_edit(ns, pns))
+            })
+        });
     Some(f64::from(u8::from(hit)))
 }
 

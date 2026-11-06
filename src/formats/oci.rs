@@ -13,8 +13,8 @@
 //!
 //! The image refs and the config/manifest digests are the strongest
 //! cross-image identifiers, so they are surfaced as `oci.*` for the identity
-//! normalizer. The tarball is uncompressed, so reading one small JSON member
-//! is cheap.
+//! normalizer. The tarball is uncompressed, so walking it for one small
+//! JSON member is cheap.
 
 use crate::metric;
 use std::collections::BTreeSet;
@@ -22,13 +22,9 @@ use std::io::Cursor;
 
 use serde_json::Value as JsonValue;
 
-use super::bounded::{Limits, MemberPrefix, inflate_capped};
+use super::bounded::{Limits, MAX_MANIFEST_BYTES, MemberPrefix, OnError, inflate_capped};
 use crate::output::{Errors, Metrics, Stage, ValueKey, Values};
 use crate::value_key;
-
-/// Manifests larger than this are not the small index/manifest JSON we want;
-/// stop reading rather than buffer them.
-const MAX_MANIFEST: u64 = 1 << 20;
 
 pub(super) fn extract(
     bytes: &[u8],
@@ -69,7 +65,7 @@ fn manifest(
     if raw.truncated {
         limits.push(
             "manifest",
-            format!("{name} over the {MAX_MANIFEST}-byte cap; not parsed"),
+            format!("{name} over the {MAX_MANIFEST_BYTES}-byte cap; not parsed"),
         );
         return None;
     }
@@ -80,8 +76,11 @@ fn manifest(
 
 /// Read a top-level tar member by name (tolerating a `./` prefix) through
 /// the manifest cap. `Ok(None)` when the bundle holds no such member.
+/// `docker load` and tar extraction keep the last of two members with one
+/// name, so the whole archive is walked and the last one read.
 fn member(bytes: &[u8], name: &str) -> std::io::Result<Option<MemberPrefix>> {
     let mut archive = tar::Archive::new(Cursor::new(bytes));
+    let mut found = None;
     for entry in archive.entries()? {
         let entry = entry?;
         let matches = entry
@@ -90,16 +89,20 @@ fn member(bytes: &[u8], name: &str) -> std::io::Result<Option<MemberPrefix>> {
         if !matches {
             continue;
         }
-        return inflate_capped(entry, MAX_MANIFEST).map(Some);
+        if found.is_some() {
+            tracing::debug!(target: "filefacts::oci", stage = "manifest", member = name, "member repeated; the later one replaces the earlier");
+        }
+        found = Some(inflate_capped(entry, MAX_MANIFEST_BYTES, OnError::Discard)?);
     }
-    Ok(None)
+    Ok(found)
 }
 
 /// Emit `oci.*` facts from an OCI image index.
 fn emit_oci_index(index: &JsonValue, values: &mut Values, metrics: &mut Metrics) {
     values.insert_key(value_key!("oci.kind"), JsonValue::String("oci".into()));
-    let manifests = index.get("manifests").and_then(JsonValue::as_array);
-    let Some(manifests) = manifests else { return };
+    let Some(manifests) = index.get("manifests").and_then(JsonValue::as_array) else {
+        return;
+    };
     metrics.insert(metric!("oci.manifest_count"), manifests.len() as f64);
 
     let mut digests = BTreeSet::new();
@@ -123,8 +126,9 @@ fn emit_oci_index(index: &JsonValue, values: &mut Values, metrics: &mut Metrics)
 /// Emit `oci.*` facts from a `docker save` `manifest.json` array.
 fn emit_docker_manifest(manifest: &JsonValue, values: &mut Values, metrics: &mut Metrics) {
     values.insert_key(value_key!("oci.kind"), JsonValue::String("docker".into()));
-    let images = manifest.as_array();
-    let Some(images) = images else { return };
+    let Some(images) = manifest.as_array() else {
+        return;
+    };
     metrics.insert(metric!("oci.image_count"), images.len() as f64);
 
     let mut refs = BTreeSet::new();
@@ -157,12 +161,8 @@ fn emit_docker_manifest(manifest: &JsonValue, values: &mut Values, metrics: &mut
 /// Classic bundles name it `<hex>.json`; containerd-era bundles already use
 /// `blobs/sha256/<hex>`. Anything else is passed through unchanged.
 fn normalize_digest(config: &str) -> String {
-    let stem = config
-        .rsplit('/')
-        .next()
-        .unwrap_or(config)
-        .strip_suffix(".json")
-        .unwrap_or_else(|| config.rsplit('/').next().unwrap_or(config));
+    let base = config.rsplit('/').next().unwrap_or(config);
+    let stem = base.strip_suffix(".json").unwrap_or(base);
     if stem.len() == 64 && stem.bytes().all(|b| b.is_ascii_hexdigit()) {
         format!("sha256:{stem}")
     } else {

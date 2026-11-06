@@ -41,8 +41,7 @@ fn source_with_prose_comments_still_detects() {
 /// either must not pass as "no language here".
 #[test]
 fn pattern_automata_build() {
-    assert_eq!(SCANNER.ac.patterns_len(), PATTERNS.len());
-    assert_eq!(SCANNER.entries.len(), PATTERNS.len());
+    assert_eq!(SCANNER.patterns_len(), PATTERNS.len());
     assert!(HTML_AC.is_match(b"<HTML>"));
 }
 
@@ -68,28 +67,10 @@ fn saturated_scores_are_compared_without_overflow() {
 }
 
 #[test]
-fn binary_judgement_reads_past_a_utf8_bom() {
-    let mut data = b"\xEF\xBB\xBF".to_vec();
-    data.extend_from_slice(b"\x01\x02\x03\x04\x05\x06\x07\x08 mostly text\n");
-    assert!(binary_not_source(&data));
-    assert!(!binary_not_source(
-        b"\xEF\xBB\xBF#import <Foundation/Foundation.h>\n"
-    ));
-}
-
-#[test]
 fn prose_guard_skips_tiny_inputs() {
     let tiny = b"var x = require('foo');\nmodule.exports = x;\n";
     assert!(tiny.len() < PROSE_GUARD_MIN_BYTES);
     assert_eq!(detect_from_content(tiny), Some(FileType::JavaScript));
-}
-
-/// The bitmask is exactly [`CODE_PUNCT`], over every byte value.
-#[test]
-fn code_punct_mask_matches_list() {
-    for b in 0..=u8::MAX {
-        assert_eq!(is_code_punct(b), CODE_PUNCT.contains(&b), "byte {b:#04x}");
-    }
 }
 
 #[test]
@@ -935,4 +916,27 @@ fn lua_elseif_requires_its_then_keyword() {
     let source =
         b"if first then return 1\nelseif second then return 2\nelseif third then return 3\nend\n";
     assert_eq!(detect_from_content(source), Some(FileType::Lua));
+}
+
+/// The JavaScript and PHP gates read the same window the scorer read: the
+/// body past its leading whitespace. Padding the left margin must not move
+/// the gate's window away from the tokens that were scored.
+#[test]
+fn language_gates_read_the_scored_window_past_leading_padding() {
+    let mut js = vec![b' '; 3000];
+    for _ in 0..45 {
+        js.extend_from_slice(b"console.log('hello world')\n");
+    }
+    js.extend_from_slice(b"module.exports = { run: main }\n");
+    assert_eq!(detect_from_content(&js), Some(FileType::JavaScript));
+
+    let mut php = vec![b' '; 7000];
+    for _ in 0..40 {
+        php.extend_from_slice(b"echo $_POST['cmd'] . $_GET['x']\n");
+    }
+    php.extend_from_slice(b"<?php eval($_POST['z']) ?>\n");
+    for _ in 0..80 {
+        php.extend_from_slice(b"echo $_SERVER['HTTP_HOST']\n");
+    }
+    assert_eq!(detect_from_content(&php), Some(FileType::Php));
 }

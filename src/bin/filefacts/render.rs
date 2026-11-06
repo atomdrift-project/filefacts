@@ -5,8 +5,12 @@
 //! [`Style::pill`], which escape control characters: names, strings and paths
 //! come from the analysed file, and a raw ESC in one would let the file drive
 //! the user's terminal.
+//!
+//! Output is built up in a `String` with `write!`, which cannot fail on one,
+//! so its `fmt::Result` is discarded.
 
 use std::borrow::Cow;
+use std::fmt::Write as _;
 use std::path::Path;
 
 use filefacts::{
@@ -130,7 +134,7 @@ pub(crate) fn format_terminal(
     out.push('\n');
     match view {
         None => {
-            for view in View::ALL.into_iter().filter(|v| v.bundled()) {
+            for view in View::ALL.iter().copied().filter(|v| v.bundled()) {
                 render_section(st, &mut out, view, &render_view(st, parsed, view)?);
             }
         }
@@ -146,7 +150,8 @@ pub(crate) fn format_terminal(
             }
         }
     }
-    Ok(out.trim_end().to_string())
+    out.truncate(out.trim_end().len());
+    Ok(out)
 }
 
 /// One view rendered for the terminal.
@@ -222,7 +227,7 @@ fn render_view(st: Style, parsed: &ParsedFile<'_>, view: View) -> serde_json::Re
             let mut body = render_values_tree(st, &Value::Array(shown));
             if total > ARRAY_PREVIEW_LIMIT {
                 let more = format!("... {} more", total - ARRAY_PREVIEW_LIMIT);
-                body.push_str(&format!("  {}\n", st.dim(&more)));
+                let _ = writeln!(body, "  {}", st.dim(&more));
             }
             Rendered {
                 count: Some(total),
@@ -328,7 +333,7 @@ fn render_file_header(st: Style, path: &Path, parsed: &ParsedFile<'_>) -> String
     if parsed.fileid().extension_mismatch() {
         subtitle.push(st.fg(FG_ERROR, "extension mismatch"));
     }
-    out.push_str(&format!("\n  {}\n", subtitle.join(&st.dim(" · "))));
+    let _ = writeln!(out, "\n  {}", subtitle.join(&st.dim(" · ")));
     out.push_str(&st.fg(FG_RULE, &"─".repeat(st.width)));
     out.push('\n');
     out
@@ -373,7 +378,7 @@ fn render_fileid(st: Style, value: &Value) -> String {
             other => st.fg(FG_VALUE, &other.to_string()),
         };
         let label = st.fg(FG_LABEL, &format!("{k:<key_w$}"));
-        out.push_str(&format!("  {label}  {formatted}\n"));
+        let _ = writeln!(out, "  {label}  {formatted}");
     }
     out
 }
@@ -399,7 +404,7 @@ fn render_tree_node(st: Style, out: &mut String, value: &Value, indent: usize) {
             let key_w = scalars.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
             for (k, v) in scalars {
                 let label = st.fg(FG_LABEL, &format!("{k:<key_w$}"));
-                out.push_str(&format!("{pad}{label}  {}\n", format_scalar(st, v)));
+                let _ = writeln!(out, "{pad}{label}  {}", format_scalar(st, v));
             }
             for (k, v) in nested {
                 // Compact short scalar-only arrays inline.
@@ -412,39 +417,44 @@ fn render_tree_node(st: Style, out: &mut String, value: &Value, indent: usize) {
                         .map(|item| format_scalar(st, item))
                         .collect::<Vec<_>>()
                         .join(&st.dim(", "));
-                    out.push_str(&format!(
-                        "{pad}{label}  {open}{inline}{close}\n",
+                    let _ = writeln!(
+                        out,
+                        "{pad}{label}  {open}{inline}{close}",
                         label = st.fg(FG_LABEL, k),
                         open = st.dim("["),
                         close = st.dim("]"),
-                    ));
+                    );
                     continue;
                 }
-                out.push_str(&format!("{pad}{}\n", st.bold(FG_VALUE, k)));
+                let _ = writeln!(out, "{pad}{}", st.bold(FG_VALUE, k));
                 render_tree_node(st, out, v, indent + 2);
             }
         }
         Value::Array(items) => {
             if items.is_empty() {
-                out.push_str(&format!("{pad}{}\n", st.dim("[]")));
+                let _ = writeln!(out, "{pad}{}", st.dim("[]"));
                 return;
             }
             for (i, v) in items.iter().take(ARRAY_PREVIEW_LIMIT).enumerate() {
                 let idx = st.dim(&format!("[{i}]"));
                 match v {
                     Value::Object(_) | Value::Array(_) => {
-                        out.push_str(&format!("{pad}{idx}\n"));
+                        let _ = writeln!(out, "{pad}{idx}");
                         render_tree_node(st, out, v, indent + 2);
                     }
-                    _ => out.push_str(&format!("{pad}{idx} {}\n", format_scalar(st, v))),
+                    _ => {
+                        let _ = writeln!(out, "{pad}{idx} {}", format_scalar(st, v));
+                    }
                 }
             }
             if items.len() > ARRAY_PREVIEW_LIMIT {
                 let more = format!("... {} more", items.len() - ARRAY_PREVIEW_LIMIT);
-                out.push_str(&format!("{pad}{}\n", st.dim(&more)));
+                let _ = writeln!(out, "{pad}{}", st.dim(&more));
             }
         }
-        _ => out.push_str(&format!("{pad}{}\n", format_scalar(st, value))),
+        _ => {
+            let _ = writeln!(out, "{pad}{}", format_scalar(st, value));
+        }
     }
 }
 
@@ -481,7 +491,7 @@ fn render_metrics(st: Style, metrics: &filefacts::Metrics) -> String {
     }
     let mut out = String::new();
     for (group, entries) in groups {
-        out.push_str(&format!("  {}\n", st.bold(FG_VALUE, group)));
+        let _ = writeln!(out, "  {}", st.bold(FG_VALUE, group));
         // Drop the group prefix on each row.
         let strip_prefix = format!("{group}.");
         let rows: Vec<(&str, String)> = entries
@@ -494,7 +504,7 @@ fn render_metrics(st: Style, metrics: &filefacts::Metrics) -> String {
         let key_w = rows.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
         for (label, value) in rows {
             let label = st.fg(FG_LABEL, &format!("{label:<key_w$}"));
-            out.push_str(&format!("    {label}  {value}\n"));
+            let _ = writeln!(out, "    {label}  {value}");
         }
     }
     out
@@ -573,11 +583,12 @@ fn render_text(st: Style, text: &Text) -> Rendered {
         if total == 0 {
             continue;
         }
-        out.push_str(&format!(
-            "\n  {} {}\n",
+        let _ = writeln!(
+            out,
+            "\n  {} {}",
             st.bold(FG_VALUE, category),
             st.dim(&format!("({total})")),
-        ));
+        );
         let rows: Vec<_> = match category {
             "ascii" => text.ascii().take(STRING_PREVIEW_LIMIT).collect(),
             _ => text.utf16le().take(STRING_PREVIEW_LIMIT).collect(),
@@ -587,15 +598,16 @@ fn render_text(st: Style, text: &Text) -> Rendered {
                 .kind
                 .map(|kind| format!("  {}", st.dim(&format!("{kind:?}"))))
                 .unwrap_or_default();
-            out.push_str(&format!(
-                "    {} {}{kind}\n",
+            let _ = writeln!(
+                out,
+                "    {} {}{kind}",
                 st.fg(FG_HEX, &format!("0x{:08x}", row.data_offset)),
                 st.fg(FG_STR, &string_excerpt(&row.value, 80)),
-            ));
+            );
         }
         if total > STRING_PREVIEW_LIMIT {
             let more = format!("... {} more", total - STRING_PREVIEW_LIMIT);
-            out.push_str(&format!("    {}\n", st.dim(&more)));
+            let _ = writeln!(out, "    {}", st.dim(&more));
         }
     }
     Rendered {
@@ -616,22 +628,34 @@ fn string_excerpt(text: &str, max: usize) -> String {
     }
 }
 
-/// `text` with terminal control and bidirectional formatting characters
-/// written as escapes, so file-derived text cannot drive or visually reorder
-/// terminal output. Idempotent: the output holds no unsafe characters.
+/// Whether a terminal must not be shown `c` raw: a control character, a
+/// bidirectional formatting character, which visually reorders the line, or
+/// a character that draws nothing, which makes one name read as another or
+/// hides text (Unicode tags) in what the analyst copies. The zero-width
+/// joiners are left alone: scripts and emoji need them to render.
+pub(crate) fn is_unsafe_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{061c}'
+                | '\u{200b}'
+                | '\u{200e}'
+                | '\u{200f}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{feff}'
+                | '\u{e0000}'..='\u{e007f}'
+        )
+}
+
+/// `text` with the characters [`is_unsafe_char`] names written as escapes,
+/// so file-derived text cannot drive, visually reorder or hide terminal
+/// output. Idempotent: the output holds no unsafe characters.
 pub(crate) fn escape_controls(text: &str) -> Cow<'_, str> {
-    let unsafe_char = |c: char| {
-        c.is_control()
-            || matches!(
-                c,
-                '\u{061c}'
-                    | '\u{200e}'
-                    | '\u{200f}'
-                    | '\u{202a}'..='\u{202e}'
-                    | '\u{2066}'..='\u{2069}'
-            )
-    };
-    if !text.chars().any(unsafe_char) {
+    if !text.chars().any(is_unsafe_char) {
         return Cow::Borrowed(text);
     }
     let mut out = String::with_capacity(text.len() + 8);
@@ -640,8 +664,12 @@ pub(crate) fn escape_controls(text: &str) -> Cow<'_, str> {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if c.is_control() => out.push_str(&format!("\\x{:02x}", c as u32)),
-            c if unsafe_char(c) => out.push_str(&format!("\\u{{{:04x}}}", c as u32)),
+            c if c.is_control() => {
+                let _ = write!(out, "\\x{:02x}", c as u32);
+            }
+            c if is_unsafe_char(c) => {
+                let _ = write!(out, "\\u{{{:04x}}}", c as u32);
+            }
             c => out.push(c),
         }
     }
@@ -686,11 +714,12 @@ fn render_sections(st: Style, sections: &Sections) -> String {
                 st.fg(FG_NUM, &format!("{entropy:.2}")),
             ));
         }
-        out.push_str(&format!(
-            "  {}  {}\n",
+        let _ = writeln!(
+            out,
+            "  {}  {}",
             st.bold(FG_VALUE, &r.section.name),
             tail.join(&st.dim("  ·  ")),
-        ));
+        );
         let extent = |label: &str, lo: &str, hi: &str, size: &str| {
             format!(
                 "    {}   {} {} {}   {}\n",
@@ -706,16 +735,17 @@ fn render_sections(st: Style, sections: &Sections) -> String {
         if r.section.file_size > 0 {
             out.push_str(&extent("disk", &r.file_lo, &r.file_hi, &r.file_size));
         } else {
-            out.push_str(&format!(
-                "    {}   {}\n",
+            let _ = writeln!(
+                out,
+                "    {}   {}",
                 st.fg(FG_LABEL, "disk"),
                 st.dim("(no on-disk bytes)"),
-            ));
+            );
         }
     }
     if rows.len() > SECTIONS_PREVIEW_LIMIT {
         let more = format!("... {} more", rows.len() - SECTIONS_PREVIEW_LIMIT);
-        out.push_str(&format!("  {}\n", st.dim(&more)));
+        let _ = writeln!(out, "  {}", st.dim(&more));
     }
     out
 }
@@ -826,11 +856,12 @@ fn render_imports(st: Style, symbols: &[&Symbol]) -> String {
     }
     let mut out = String::new();
     for (lib, entries) in by_lib {
-        out.push_str(&format!(
-            "  {} {}\n",
+        let _ = writeln!(
+            out,
+            "  {} {}",
             st.bold(FG_VALUE, lib),
             st.dim(&format!("({})", entries.len())),
-        ));
+        );
         let show = entries.get(..IMPORTS_PREVIEW_PER_LIB).unwrap_or(&entries);
         let off_w = hex_width(show.iter().map(|(_, offset, _)| *offset));
         for (name, offset, ordinal) in show {
@@ -839,15 +870,16 @@ fn render_imports(st: Style, symbols: &[&Symbol]) -> String {
                 Some(o) => format!("  {}", st.dim(&format!("#{o}"))),
                 None => String::new(),
             };
-            out.push_str(&format!(
-                "    {}  {}{tail}\n",
+            let _ = writeln!(
+                out,
+                "    {}  {}{tail}",
                 st.fg(FG_HEX, &format!("{offset:>off_w$}")),
                 st.fg(FG_VALUE, name),
-            ));
+            );
         }
         if entries.len() > show.len() {
             let more = format!("... {} more", entries.len() - show.len());
-            out.push_str(&format!("    {}\n", st.dim(&more)));
+            let _ = writeln!(out, "    {}", st.dim(&more));
         }
     }
     out
@@ -886,15 +918,16 @@ fn render_exports(st: Style, symbols: &[&Symbol]) -> String {
         } else {
             format!("  {}", tail.join(&st.dim(" ")))
         };
-        out.push_str(&format!(
-            "  {}  {}{tail}\n",
+        let _ = writeln!(
+            out,
+            "  {}  {}{tail}",
             st.fg(FG_HEX, &format!("{offset:>off_w$}")),
             st.fg(FG_VALUE, name),
-        ));
+        );
     }
     if exports.len() > EXPORTS_PREVIEW_LIMIT {
         let more = format!("... {} more", exports.len() - EXPORTS_PREVIEW_LIMIT);
-        out.push_str(&format!("  {}\n", st.dim(&more)));
+        let _ = writeln!(out, "  {}", st.dim(&more));
     }
     out
 }
@@ -927,11 +960,12 @@ fn render_functions(st: Style, symbols: &[&Symbol]) -> String {
             Some(c) => format!("  {}", st.fg(FG_LABEL, &format!("cx={c}"))),
             None => String::new(),
         };
-        out.push_str(&format!(
-            "  {}  {}{tail}\n",
+        let _ = writeln!(
+            out,
+            "  {}  {}{tail}",
             st.fg(FG_HEX, &format!("{offset:>off_w$}")),
             st.fg(FG_VALUE, name),
-        ));
+        );
         if !callees.is_empty() {
             let inline = callees
                 .iter()
@@ -944,17 +978,18 @@ fn render_functions(st: Style, symbols: &[&Symbol]) -> String {
             } else {
                 String::new()
             };
-            out.push_str(&format!(
-                "    {} {}{}\n",
+            let _ = writeln!(
+                out,
+                "    {} {}{}",
                 st.dim("→"),
                 st.dim(&inline),
                 st.dim(&suffix),
-            ));
+            );
         }
     }
     if functions.len() > FUNCTIONS_PREVIEW_LIMIT {
         let more = format!("... {} more", functions.len() - FUNCTIONS_PREVIEW_LIMIT);
-        out.push_str(&format!("  {}\n", st.dim(&more)));
+        let _ = writeln!(out, "  {}", st.dim(&more));
     }
     out
 }
@@ -984,16 +1019,17 @@ fn render_symbols(st: Style, symbols: &[&Symbol]) -> String {
             _ => ("symbol", String::new()),
         };
         let spacer = if extras.is_empty() { "" } else { "  " };
-        out.push_str(&format!(
-            "  {} {}{spacer}{}\n",
+        let _ = writeln!(
+            out,
+            "  {} {}{spacer}{}",
             st.dim(&format!("{kind:>10}")),
             st.fg(FG_VALUE, symbol.name().unwrap_or("·")),
             st.dim(&extras),
-        ));
+        );
     }
     if symbols.len() > SYMBOL_PREVIEW_LIMIT {
         let more = format!("... {} more", symbols.len() - SYMBOL_PREVIEW_LIMIT);
-        out.push_str(&format!("    {}\n", st.dim(&more)));
+        let _ = writeln!(out, "    {}", st.dim(&more));
     }
     out
 }
@@ -1054,15 +1090,16 @@ fn render_archive_members(st: Style, members: &[filefacts::ArchiveMember]) -> St
         } else {
             format!("  {}", tail.join(&st.dim(" ")))
         };
-        out.push_str(&format!(
-            "  {}  {}{tail}\n",
+        let _ = writeln!(
+            out,
+            "  {}  {}{tail}",
             st.fg(FG_NUM, &format!("{size:>size_w$}")),
             st.fg(FG_VALUE, &string_excerpt(&m.path, 120)),
-        ));
+        );
     }
     if members.len() > shown.len() {
         let more = format!("... {} more", members.len() - shown.len());
-        out.push_str(&format!("  {}\n", st.dim(&more)));
+        let _ = writeln!(out, "  {}", st.dim(&more));
     }
     out
 }
@@ -1075,12 +1112,13 @@ fn render_errors(st: Style, errors: &Errors) -> String {
     }
     let mut out = String::new();
     for diagnostic in errors.iter() {
-        out.push_str(&format!(
-            "  {} {}  {}\n",
+        let _ = writeln!(
+            out,
+            "  {} {}  {}",
             st.bold(FG_ERROR, diagnostic.kind.as_str()),
             st.dim(diagnostic.stage.as_str()),
             st.fg(FG_VALUE, &diagnostic.message),
-        ));
+        );
     }
     out
 }

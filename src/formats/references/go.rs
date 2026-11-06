@@ -19,9 +19,16 @@ pub(crate) mod source {
     pub(crate) const INCOMPLETE: &str = "go.manifest.incomplete";
 }
 
+/// Largest manifest read; a bigger one is marked incomplete unread.
+const MAX_MANIFEST_BYTES: usize = 2 * 1024 * 1024;
+/// Most manifest lines read; the rest are marked incomplete.
+const MAX_MANIFEST_LINES: usize = 20_000;
+/// Most words on one directive line.
+const MAX_LINE_WORDS: usize = 64;
+
 // Tokenize directive lines without mistaking quoted // for comments. A
 // malformed quoted token is not guessed. No shell or environment expansion.
-pub(crate) fn words(line: &str) -> Option<Vec<String>> {
+fn words(line: &str) -> Option<Vec<String>> {
     let mut words = Vec::new();
     let mut chars = line.chars().peekable();
     while let Some(c) = chars.next() {
@@ -34,7 +41,7 @@ pub(crate) fn words(line: &str) -> Option<Vec<String>> {
         if c == '=' && chars.peek() == Some(&'>') {
             chars.next();
             words.push("=>".into());
-            if words.len() > 64 {
+            if words.len() > MAX_LINE_WORDS {
                 return None;
             }
             continue;
@@ -59,7 +66,7 @@ pub(crate) fn words(line: &str) -> Option<Vec<String>> {
                 return None;
             }
             if quote == '"' {
-                value = crate::decode_source_escapes(&value);
+                value = crate::decode_source_escapes_for_type(&value, crate::FileType::Go);
             }
             words.push(value);
         } else if matches!(c, '(' | ')') {
@@ -70,11 +77,8 @@ pub(crate) fn words(line: &str) -> Option<Vec<String>> {
                 if c.is_whitespace() || matches!(c, '(' | ')') {
                     break;
                 }
-                let mut ahead = chars.clone();
-                ahead.next();
-                if (c == '=' && ahead.next() == Some('>'))
-                    || (c == '/' && chars.clone().nth(1) == Some('/'))
-                {
+                let next = chars.clone().nth(1);
+                if (c == '=' && next == Some('>')) || (c == '/' && next == Some('/')) {
                     break;
                 }
                 value.push(c);
@@ -82,7 +86,7 @@ pub(crate) fn words(line: &str) -> Option<Vec<String>> {
             }
             words.push(value);
         }
-        if words.len() > 64 {
+        if words.len() > MAX_LINE_WORDS {
             return None;
         }
     }
@@ -109,13 +113,13 @@ fn incomplete(out: &mut Refs<'_>, manifest: &str, evidence: &str) {
 /// [`source::WORK`].
 pub(super) fn manifest(out: &mut Refs<'_>, manifest: &str) {
     let Some(text) = out.text else { return };
-    if text.len() > 2 * 1024 * 1024 {
+    if text.len() > MAX_MANIFEST_BYTES {
         incomplete(out, manifest, "source-byte-budget");
         return;
     }
     let mut block = String::new();
     for (index, line) in text.lines().enumerate() {
-        if index >= 20_000 {
+        if index >= MAX_MANIFEST_LINES {
             incomplete(out, manifest, "directive-budget");
             break;
         }
@@ -181,6 +185,12 @@ pub(super) fn manifest(out: &mut Refs<'_>, manifest: &str) {
                     line.trim().strip_prefix("replace").unwrap_or(line).trim(),
                     None,
                 );
+                if let (Some(reference), Some(module)) = (out.refs.last_mut(), fields.first()) {
+                    let version = (split == 2)
+                        .then(|| fields.get(1).map(|v| (*v).to_string()))
+                        .flatten();
+                    reference.replaces = Some(crate::Replaced::new(*module, version));
+                }
             }
             ("exclude", [module, version]) if manifest == source::MOD => out.push(
                 RefLocator::Purl(purl(module, version)),
@@ -214,12 +224,12 @@ pub(super) fn manifest(out: &mut Refs<'_>, manifest: &str) {
 
 pub(super) fn sums(out: &mut Refs<'_>) {
     let Some(text) = out.text else { return };
-    if text.len() > 2 * 1024 * 1024 {
+    if text.len() > MAX_MANIFEST_BYTES {
         incomplete(out, "go.sum", "source-byte-budget");
         return;
     }
     for (index, line) in text.lines().enumerate() {
-        if index >= 20_000 {
+        if index >= MAX_MANIFEST_LINES {
             incomplete(out, "go.sum", "checksum-budget");
             break;
         }
@@ -255,12 +265,12 @@ pub(super) fn sums(out: &mut Refs<'_>) {
 
 pub(super) fn vendor(out: &mut Refs<'_>) {
     let Some(text) = out.text else { return };
-    if text.len() > 2 * 1024 * 1024 {
+    if text.len() > MAX_MANIFEST_BYTES {
         incomplete(out, "modules.txt", "source-byte-budget");
         return;
     }
     for (index, line) in text.lines().enumerate() {
-        if index >= 20_000 {
+        if index >= MAX_MANIFEST_LINES {
             incomplete(out, "modules.txt", "vendor-budget");
             break;
         }
@@ -268,16 +278,16 @@ pub(super) fn vendor(out: &mut Refs<'_>) {
             continue;
         };
         let fields: Vec<_> = entry.split_whitespace().take(3).collect();
-        if let [module, version, ..] = fields.as_slice() {
-            if version.starts_with('v') {
-                out.push(
-                    RefLocator::Purl(purl(module, version)),
-                    RefKind::Undefined,
-                    source::VENDOR_MODULE,
-                    line,
-                    None,
-                );
-            }
+        if let [module, version, ..] = fields.as_slice()
+            && version.starts_with('v')
+        {
+            out.push(
+                RefLocator::Purl(purl(module, version)),
+                RefKind::Undefined,
+                source::VENDOR_MODULE,
+                line,
+                None,
+            );
         }
     }
 }

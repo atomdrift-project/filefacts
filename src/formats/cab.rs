@@ -16,7 +16,7 @@
 //! Reading the header directly also means a cabinet the crate rejects still
 //! yields facts. It refuses any file whose CFFILE folder index is out of range,
 //! which is exactly how the spec encodes a member continued from or into
-//! another cabinet (0xFFFD/0xFFFE/0xFFFF), so every spanned set failed whole.
+//! another cabinet (0xFFFD/0xFFFE/0xFFFF), so it rejects every spanned set.
 //! The header walk stands alone and the member table is layered on when it can
 //! be read; what could not be read is reported in `cab.limits`.
 //!
@@ -131,19 +131,21 @@ fn parse_header(bytes: &[u8]) -> Result<Header, Error> {
         header_reserve = bytes.get(pos..end).unwrap_or_default().to_vec();
         pos = end;
     }
-    let prev_cabinet = if flags & FLAG_PREV_CABINET != 0 {
-        cstr_at(bytes, pos).and_then(|(cab, next)| {
-            cstr_at(bytes, next).map(|(disk, after)| {
-                pos = after;
-                (cab, disk)
-            })
-        })
-    } else {
-        None
+    // A spanning (cabinet, disk) name pair at `at`, and the offset past it.
+    let name_pair = |at: usize| {
+        let (cabinet, next) = cstr_at(bytes, at)?;
+        let (disk, after) = cstr_at(bytes, next)?;
+        Some(((cabinet, disk), after))
     };
+    let mut prev_cabinet = None;
+    if flags & FLAG_PREV_CABINET != 0
+        && let Some((pair, after)) = name_pair(pos)
+    {
+        prev_cabinet = Some(pair);
+        pos = after;
+    }
     let next_cabinet = if flags & FLAG_NEXT_CABINET != 0 {
-        cstr_at(bytes, pos)
-            .and_then(|(cab, next)| cstr_at(bytes, next).map(|(disk, _)| (cab, disk)))
+        name_pair(pos).map(|(pair, _)| pair)
     } else {
         None
     };
@@ -227,19 +229,13 @@ pub(super) fn extract(
 
     // Spanning names are operator-chosen and travel with the campaign, so they
     // identify a set the way a PDB path identifies a build.
-    if let Some((cabinet, disk)) = &header.prev_cabinet {
-        values.insert_key(
-            value_key!("cab.prev_cabinet"),
-            JsonValue::String(cabinet.clone()),
-        );
-        values.insert_key(value_key!("cab.prev_disk"), JsonValue::String(disk.clone()));
+    if let Some((cabinet, disk)) = header.prev_cabinet {
+        values.insert_key(value_key!("cab.prev_cabinet"), JsonValue::String(cabinet));
+        values.insert_key(value_key!("cab.prev_disk"), JsonValue::String(disk));
     }
-    if let Some((cabinet, disk)) = &header.next_cabinet {
-        values.insert_key(
-            value_key!("cab.next_cabinet"),
-            JsonValue::String(cabinet.clone()),
-        );
-        values.insert_key(value_key!("cab.next_disk"), JsonValue::String(disk.clone()));
+    if let Some((cabinet, disk)) = header.next_cabinet {
+        values.insert_key(value_key!("cab.next_cabinet"), JsonValue::String(cabinet));
+        values.insert_key(value_key!("cab.next_disk"), JsonValue::String(disk));
     }
     if !header.header_reserve.is_empty() {
         // abReserve is a spec-sanctioned opaque region every extractor skips,
@@ -300,16 +296,15 @@ pub(super) fn extract(
     // shape of a CAB polyglot or a payload stapled to a benign cabinet.
     // Same concept zip already reports under this name -- an author hunting
     // appended payloads should not have to know a per-format spelling.
-    let trailing_at = header.declared_total_size as usize;
+    let trailing_at = bytes::sat_usize(header.declared_total_size);
     let trailing = (bytes.len() as u64).saturating_sub(u64::from(header.declared_total_size));
     metrics.insert(metric!("archive.trailing_bytes"), trailing as f64);
 
     // Authenticode for a cabinet is a PKCS#7 SignedData blob appended past
     // `cbCabinet`, so the trailing region is not automatically suspicious --
     // on a Microsoft-signed cabinet it *is* the signature. Parsing it is what
-    // separates a real signed cabinet from an attacker's, and without it every
-    // signed cabinet reported `trust: unsigned`, indistinguishable from one
-    // that was never signed at all.
+    // separates a real signed cabinet from an attacker's, and from one that
+    // was never signed at all.
     //
     // The blob is the same structure PE and Mach-O carry, so it goes through
     // the same parser and is published under a `signatures[0]` key of the same
@@ -336,7 +331,7 @@ pub(super) fn extract(
                 // ended here.
                 metrics.insert(
                     metric!("cab.post_signature_bytes"),
-                    crate::bytes::sat_usize(trailing).saturating_sub(der_len) as f64,
+                    bytes::sat_usize(trailing).saturating_sub(der_len) as f64,
                 );
             }
             None => tracing::debug!(
@@ -435,12 +430,7 @@ pub(super) fn extract(
     values.insert_key(value_key!("archive.members"), JsonValue::Array(members));
     values.insert_key(
         value_key!("cab.compression"),
-        JsonValue::Array(
-            compressions
-                .into_iter()
-                .map(JsonValue::String)
-                .collect::<Vec<_>>(),
-        ),
+        JsonValue::Array(compressions.into_iter().map(JsonValue::String).collect()),
     );
     limits.emit(values, value_key!("cab.limits"));
 

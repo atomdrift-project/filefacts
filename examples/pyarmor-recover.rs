@@ -9,13 +9,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = fs::read(runtime)?;
     let input = fs::read(input)?;
     let directory = PathBuf::from(directory);
-    let mut containers = filefacts::pyarmor::python_containers(&input);
+    let mut containers = filefacts::recover::pyarmor::python_containers(&input);
     if containers.is_empty() {
         containers.push(input);
     }
     fs::create_dir_all(&directory)?;
     for (index, container) in containers.iter().enumerate() {
-        let recovery = filefacts::pyarmor::recover(&runtime, container)
+        let recovery = filefacts::recover::pyarmor::recover(&runtime, container)
             .ok_or("unsupported container or runtime")?;
         let pyc = recovery.pyc()?;
         fs::write(directory.join(format!("{index}.analysis.pyc")), &pyc.data)?;

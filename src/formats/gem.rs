@@ -3,10 +3,11 @@
 //! A gem is an uncompressed `ustar` tar holding three members:
 //! `metadata.gz` (a gzipped `Gem::Specification` YAML), `data.tar.gz` (the
 //! installed files), and `checksums.yaml.gz`. The package's *identity* —
-//! name, version, dependencies, authors — lives only in `metadata.gz`; it
-//! never appears in the installed file tree. This extractor reads that one
-//! member (gunzipping just it, no other decompression) and surfaces the
-//! identity as `gem.*` facts.
+//! name, version, dependencies, authors — lives only in `metadata.gz` (or
+//! an uncompressed `metadata`, which RubyGems also reads); it never appears
+//! in the installed file tree. This extractor reads that member (gunzipping
+//! just it, no other decompression) and surfaces the identity as `gem.*`
+//! facts.
 //!
 //! Emitted keys:
 //!
@@ -27,14 +28,14 @@ use serde_json::Value as JsonValue;
 use crate::output::{Errors, Metrics, Stage, Values};
 use crate::value_key;
 
-use super::bounded::{MemberFailure, inflate_capped};
+use super::bounded::{MAX_MANIFEST_BYTES, MemberFailure, OnError, inflate_capped};
+use super::common::put_str;
 use super::structured::parse_yaml;
 
 /// The outer-tar member holding the gzipped `Gem::Specification`.
 const METADATA: &str = "metadata.gz";
-/// Cap on the compressed `metadata.gz` we read from the outer tar. Real gem
-/// specifications are a few KiB; anything larger is malformed or hostile.
-const MAX_METADATA_GZ: u64 = 1 << 20; // 1 MiB
+/// The member holding it uncompressed, which RubyGems reads as well.
+const METADATA_PLAIN: &str = "metadata";
 /// Cap on the decompressed YAML, guarding against a gzip bomb in `metadata.gz`.
 const MAX_METADATA_YAML: u64 = 8 << 20; // 8 MiB
 /// Cap on the number of list entries (authors, licenses, dependency names)
@@ -59,73 +60,61 @@ pub(super) fn extract(
         }
     };
 
-    if let Some(name) = field_str(&spec, "name") {
-        values.insert_key(value_key!("gem.name"), JsonValue::String(name.to_string()));
-    }
     // `version` is a nested `!ruby/object:Gem::Version` mapping: { version: x }.
-    if let Some(version) = spec.get("version").and_then(|v| field_str(v, "version")) {
-        values.insert_key(
-            value_key!("gem.version"),
-            JsonValue::String(version.to_string()),
-        );
-    }
-    if let Some(platform) = field_str(&spec, "platform") {
-        values.insert_key(
-            value_key!("gem.platform"),
-            JsonValue::String(platform.to_string()),
-        );
-    }
-    if let Some(summary) = field_str(&spec, "summary") {
-        values.insert_key(
-            value_key!("gem.description"),
-            JsonValue::String(summary.to_string()),
-        );
-    }
-    if let Some(homepage) = field_str(&spec, "homepage") {
-        values.insert_key(
-            value_key!("gem.homepage"),
-            JsonValue::String(homepage.to_string()),
-        );
-    }
-
-    // `licenses` (plural, a sequence) is current; `license` (singular) is the
-    // legacy single-value form. Prefer the sequence, fall back to the scalar.
-    let mut licenses = collect_strings(spec.get("licenses"));
-    if licenses.is_empty() {
-        if let Some(l) = field_str(&spec, "license") {
-            licenses.push(l.to_string());
+    let version = spec.get("version").and_then(|v| field_str(v, "version"));
+    for (key, value) in [
+        (value_key!("gem.name"), field_str(&spec, "name")),
+        (value_key!("gem.version"), version),
+        (value_key!("gem.platform"), field_str(&spec, "platform")),
+        (value_key!("gem.description"), field_str(&spec, "summary")),
+        (value_key!("gem.homepage"), field_str(&spec, "homepage")),
+    ] {
+        if let Some(value) = value {
+            put_str(values, key, value);
         }
     }
+
+    // `licenses` and `authors` (sequences) are current; `license` and
+    // `author` (scalars) are the legacy single-value forms. Prefer the
+    // sequence, fall back to the scalar. Sequences are bounded.
+    let strings = |plural: &str, singular: &str| -> Vec<&str> {
+        let listed: Vec<&str> = spec
+            .get(plural)
+            .and_then(JsonValue::as_array)
+            .into_iter()
+            .flatten()
+            .take(MAX_LIST)
+            .filter_map(JsonValue::as_str)
+            .collect();
+        if listed.is_empty() {
+            field_str(&spec, singular).into_iter().collect()
+        } else {
+            listed
+        }
+    };
     // Several licenses mean the user may pick any of them.
+    let licenses = strings("licenses", "license");
     if !licenses.is_empty() {
-        values.insert_key(
-            value_key!("gem.license"),
-            JsonValue::String(licenses.join(" OR ")),
-        );
+        put_str(values, value_key!("gem.license"), licenses.join(" OR "));
     }
-
-    // Same plural/singular split for authors (`authors` seq vs `author` scalar).
-    let mut authors = collect_strings(spec.get("authors"));
-    if authors.is_empty() {
-        if let Some(a) = field_str(&spec, "author") {
-            authors.push(a.to_string());
-        }
-    }
+    let authors = strings("authors", "author");
     super::people::put(
         values,
         value_key!("gem.authors"),
         authors
             .iter()
-            .map(|name| super::people::Person::from_fields(Some(name), None)),
+            .map(|&name| super::people::Person::from_fields(Some(name), None)),
     );
 
     extract_dependencies(&spec, values, metrics);
 }
 
-/// Walk the outer (uncompressed) tar, gunzip `metadata.gz` straight from the
-/// member, and parse the `Gem::Specification` YAML. Its Ruby tags are
-/// dropped, leaving plain mappings. `Ok(None)` when the gem has no
-/// `metadata.gz`; `Err` names the stage and step that failed.
+/// Walk the outer (uncompressed) tar, read its `Gem::Specification` YAML --
+/// gunzipped from `metadata.gz`, or as stored in `metadata` -- and parse it.
+/// Its Ruby tags are dropped, leaving plain mappings. RubyGems loads every
+/// such member in turn, so the last one is the gem's specification: an
+/// earlier one is a decoy. `Ok(None)` when the gem has neither; `Err` names
+/// the stage and step that failed.
 fn read_metadata(bytes: &[u8]) -> Result<Option<JsonValue>, MemberFailure> {
     let walk = |e: std::io::Error| {
         MemberFailure::new(
@@ -135,17 +124,38 @@ fn read_metadata(bytes: &[u8]) -> Result<Option<JsonValue>, MemberFailure> {
         )
     };
     let mut archive = tar::Archive::new(bytes);
+    let mut spec = Ok(None);
     for entry in archive.entries().map_err(walk)? {
-        let mut entry = entry.map_err(walk)?;
-        if *entry.path_bytes() != *METADATA.as_bytes() {
-            continue;
-        }
-        // An over-cap `metadata.gz` ends mid-stream and fails to gunzip; an
-        // over-cap YAML is refused rather than parsed short. Either lands
-        // below as an error naming the step.
-        let yaml = inflate_capped(
-            flate2::read::GzDecoder::new(entry.by_ref().take(MAX_METADATA_GZ)),
+        let mut entry = match entry {
+            Ok(entry) => entry,
+            Err(e) if matches!(spec, Ok(None)) => return Err(walk(e)),
+            // RubyGems refuses a gem whose tar breaks off; what was read
+            // before the break is kept.
+            Err(e) => {
+                tracing::debug!(target: "filefacts::gem", stage = "tar", error = %e, "gem unreadable past its metadata");
+                break;
+            }
+        };
+        let member = match &*entry.path_bytes() {
+            b"metadata.gz" => METADATA,
+            b"metadata" => METADATA_PLAIN,
+            _ => continue,
+        };
+        spec = read_spec(&mut entry, member).map(Some);
+    }
+    spec
+}
+
+/// Read and parse one specification member, `metadata.gz` or `metadata`.
+fn read_spec(entry: &mut impl Read, member: &str) -> Result<JsonValue, MemberFailure> {
+    // An over-cap `metadata.gz` ends mid-stream and fails to gunzip; an
+    // over-cap YAML is refused rather than parsed short. Either lands
+    // below as an error naming the step.
+    let yaml = if member == METADATA {
+        inflate_capped(
+            flate2::read::GzDecoder::new(entry.take(MAX_MANIFEST_BYTES)),
             MAX_METADATA_YAML,
+            OnError::Discard,
         )
         .map_err(|e| {
             MemberFailure::new(
@@ -153,19 +163,19 @@ fn read_metadata(bytes: &[u8]) -> Result<Option<JsonValue>, MemberFailure> {
                 format!("{METADATA}: gunzip failed"),
                 e,
             )
-        })?;
-        if yaml.truncated {
-            return Err(MemberFailure::new(
-                Stage::FormatExtract,
-                METADATA,
-                format!("YAML over the {MAX_METADATA_YAML}-byte cap"),
-            ));
-        }
-        return parse_yaml(&yaml.bytes)
-            .map(Some)
-            .map_err(|e| MemberFailure::new(Stage::FormatExtract, METADATA, e));
+        })?
+    } else {
+        inflate_capped(entry, MAX_METADATA_YAML, OnError::Discard)
+            .map_err(|e| MemberFailure::new(Stage::TarParse, member, e))?
+    };
+    if yaml.truncated {
+        return Err(MemberFailure::new(
+            Stage::FormatExtract,
+            member,
+            format!("YAML over the {MAX_METADATA_YAML}-byte cap"),
+        ));
     }
-    Ok(None)
+    parse_yaml(&yaml.bytes).map_err(|e| MemberFailure::new(Stage::FormatExtract, member, e))
 }
 
 /// Surface the dependency shape. Each dependency is a
@@ -175,7 +185,7 @@ fn extract_dependencies(spec: &JsonValue, values: &mut Values, metrics: &mut Met
     let Some(deps) = spec.get("dependencies").and_then(JsonValue::as_array) else {
         return;
     };
-    let mut runtime: Vec<String> = Vec::new();
+    let mut runtime: Vec<&str> = Vec::new();
     let mut runtime_count: u64 = 0;
     let mut development_count: u64 = 0;
     for dep in deps {
@@ -191,7 +201,7 @@ fn extract_dependencies(spec: &JsonValue, values: &mut Values, metrics: &mut Met
         } else {
             runtime_count += 1;
             if runtime.len() < MAX_LIST {
-                runtime.push(name.to_string());
+                runtime.push(name);
             }
         }
     }
@@ -205,28 +215,13 @@ fn extract_dependencies(spec: &JsonValue, values: &mut Values, metrics: &mut Met
         development_count as f64,
     );
     if !runtime.is_empty() {
-        values.insert_key(value_key!("gem.dependencies"), string_array(&runtime));
+        values.insert_key(value_key!("gem.dependencies"), JsonValue::from(runtime));
     }
 }
 
 /// Convenience: the string value of `key` within a mapping.
 fn field_str<'a>(v: &'a JsonValue, key: &str) -> Option<&'a str> {
     v.get(key).and_then(JsonValue::as_str)
-}
-
-/// Collect the string entries of a sequence, bounded.
-fn collect_strings(v: Option<&JsonValue>) -> Vec<String> {
-    v.and_then(JsonValue::as_array)
-        .into_iter()
-        .flatten()
-        .take(MAX_LIST)
-        .filter_map(JsonValue::as_str)
-        .map(str::to_string)
-        .collect()
-}
-
-fn string_array(items: &[String]) -> JsonValue {
-    JsonValue::Array(items.iter().cloned().map(JsonValue::String).collect())
 }
 
 #[cfg(test)]

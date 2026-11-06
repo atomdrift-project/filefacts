@@ -51,3 +51,36 @@ fn regions_tolerate_line_breaks_but_not_prose() {
     assert!(!is_base64_region(prose.as_bytes()));
     assert!(!is_base64_region(b"QUJD"));
 }
+
+#[test]
+fn random_token_rule() {
+    for token in [
+        "AKIAZ7QX4M2PLRWB9TKD",
+        "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+        "q3Zt9vX2LkP0mWbN8rJc5YhG1sFdA7eUo4TiK6wRzEx=",
+    ] {
+        assert!(is_random_token(token.as_bytes()), "{token}");
+    }
+    for text in [
+        "The quick brown fox jumps over the lazy dog",
+        "initializeComponentRegistry",
+        "deadbeefdeadbeefdeadbeef",
+        "1234567890123456789",
+        "aB3dE5gH",
+        "/usr/lib/x86_64-linux-gnu/libc.so.6",
+    ] {
+        assert!(!is_random_token(text.as_bytes()), "{text}");
+    }
+}
+
+#[test]
+fn expected_random_entropy_approaches_the_alphabet() {
+    // Sixteen symbols from sixteen: about ten distinct, 3.3 bits.
+    let short = expected_random_entropy(16, 16);
+    assert!((3.0..3.5).contains(&short), "{short}");
+    for k in [16, 64] {
+        let long = expected_random_entropy(1 << 20, k);
+        let max = f64::from(k).log2();
+        assert!(long < max && long > 0.99 * max, "{k}: {long}");
+    }
+}

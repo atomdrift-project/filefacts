@@ -278,22 +278,22 @@ fn emit_units(sections: &DwarfSections<'_>, values: &mut Values, metrics: &mut M
                 }
                 gimli::DW_AT_language => {
                     if let gimli::AttributeValue::Language(lang) = attr.value() {
-                        languages.insert(language_name(lang).to_string());
+                        languages.insert(language_name(lang));
                     }
                 }
                 _ => {}
             }
         }
 
-        if let Some(name) = cu_name {
-            if source_files.len() < MAX_SOURCE_FILES {
-                let full = match cu_comp_dir.as_deref() {
-                    Some(dir) if !name.starts_with('/') => format!("{}/{}", dir, name),
-                    _ => name,
-                };
-                if !source_files.contains(&full) {
-                    source_files.push(full);
-                }
+        if let Some(name) = cu_name
+            && source_files.len() < MAX_SOURCE_FILES
+        {
+            let full = match cu_comp_dir.as_deref() {
+                Some(dir) if !name.starts_with('/') => format!("{dir}/{name}"),
+                _ => name,
+            };
+            if !source_files.contains(&full) {
+                source_files.push(full);
             }
         }
     }
@@ -313,7 +313,7 @@ fn emit_units(sections: &DwarfSections<'_>, values: &mut Values, metrics: &mut M
     if !languages.is_empty() {
         values.insert_key(
             value_key!("elf.dwarf.languages"),
-            JsonValue::Array(languages.into_iter().map(JsonValue::String).collect()),
+            JsonValue::Array(languages.into_iter().map(JsonValue::from).collect()),
         );
     }
     if !source_files.is_empty() {

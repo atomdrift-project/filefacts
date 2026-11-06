@@ -65,13 +65,22 @@ fn doc() -> Vec<u8> {
     out
 }
 
+/// An element's attributes as `(name, value)` pairs.
+fn pairs(element: &Element) -> Vec<(String, String)> {
+    element
+        .attrs
+        .iter()
+        .map(|a| (a.name.clone(), a.value.clone()))
+        .collect()
+}
+
 #[test]
 fn reads_element_and_attribute_from_a_utf8_pool() {
     let els = parse(&doc());
     assert_eq!(els.len(), 1);
     assert_eq!(els[0].name, "manifest");
     assert_eq!(
-        els[0].attrs,
+        pairs(&els[0]),
         vec![("package".to_string(), "com.example.app".to_string())]
     );
 }
@@ -169,9 +178,21 @@ fn extended_attribute_stride_keeps_known_prefix() {
     bytes[4..8].copy_from_slice(&file_size.to_le_bytes());
     let elements = parse(&bytes);
     assert_eq!(
-        elements[0].attrs,
+        pairs(&elements[0]),
         vec![("package".into(), "com.example.app".into())]
     );
     bytes[element + 26..element + 28].copy_from_slice(&19u16.to_le_bytes());
     assert!(parse(&bytes)[0].attrs.is_empty());
+}
+
+/// An attribute's namespace is kept: `android:package` and `package` are
+/// different attributes to Android.
+#[test]
+fn attribute_namespace_is_kept() {
+    let mut bytes = doc();
+    let pool_size = u32_le(&bytes, 12).unwrap() as usize;
+    let attr_ns = 8 + pool_size + 36;
+    assert!(!parse(&bytes)[0].attrs[0].namespaced);
+    bytes[attr_ns..attr_ns + 4].copy_from_slice(&0u32.to_le_bytes());
+    assert!(parse(&bytes)[0].attrs[0].namespaced);
 }

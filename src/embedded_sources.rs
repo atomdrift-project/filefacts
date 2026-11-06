@@ -9,21 +9,55 @@ pub(crate) mod html;
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct EmbeddedSource<'a> {
-    /// JSON Pointer into the original structured values. Not a byte offset:
-    /// YAML folding and escapes can make the decoded body non-contiguous.
+    /// Where the body was found. For [`Origin::Value`] a JSON Pointer into
+    /// the file's [`Values`]; for [`Origin::Script`] the name
+    /// `/html/scripts/<n>`, where `n` counts the page's `<script>` elements
+    /// from zero, which points into nothing.
     pub pointer: String,
-    /// Decoded script body: borrowed from the existing values tree, or an
-    /// owned view built from the host bytes (see [`layer`](Self::layer)).
+    /// Decoded script body: borrowed from the values tree or the host bytes,
+    /// or owned when decoding changed it.
     pub source: Cow<'a, str>,
     /// Known declared interpreter, or None for missing/dynamic/custom shells.
     /// None is an analysis limitation, not evidence that the body is benign.
     pub file_type: Option<FileType>,
-    /// The body is a view of the host file itself, not a separate program:
-    /// it has the host's length and line breaks, so its offsets and lines
-    /// are the host's, and it runs in the host's scope (a page's inline
-    /// scripts). Analyze it as a layer of the host. `false` for an
-    /// independent unit, such as one workflow step among others.
-    pub layer: bool,
+    /// How the body relates to its host file.
+    pub origin: Origin,
+}
+
+/// How an [`EmbeddedSource`] relates to the file that declares it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Origin {
+    /// An independent program held in a structured value, such as one
+    /// workflow step among others: its own offsets, lines and scope. Not a
+    /// byte range of the host: YAML folding and escapes can make the decoded
+    /// body non-contiguous.
+    Value,
+    /// A script in the host's own markup (a page's inline `<script>`): part
+    /// of the host, to be analysed as a layer of it, but parsed on its own as
+    /// the browser parses it.
+    Script {
+        /// Byte offset in the host of the body's first byte.
+        offset: usize,
+        /// Which scope the script runs in.
+        scope: ScriptScope,
+        /// Byte `i` of the source is byte `offset + i` of the host, so the
+        /// host's offsets and line breaks apply. `false` when decoding (an
+        /// SVG script's character references) changed widths; offsets past
+        /// the first decoded reference are then approximate.
+        aligned: bool,
+    },
+}
+
+/// The scope a page script runs in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ScriptScope {
+    /// A classic script: its top-level declarations are globals that every
+    /// other classic script of the page sees.
+    Classic,
+    /// A module script (`type="module"`): its own module scope.
+    Module,
 }
 
 /// Interpreter for a declared `shell:` value: a GitHub built-in name, or a
@@ -96,7 +130,7 @@ fn steps<'a>(
                 pointer: format!("{prefix}/{index}/run"),
                 source: Cow::Borrowed(source),
                 file_type: step.get("shell").map_or(default_shell, shell_type),
-                layer: false,
+                origin: Origin::Value,
             })
         })
 }
@@ -153,7 +187,7 @@ fn rpm_interpreter(script: &Value) -> Option<FileType> {
 
 pub(crate) fn rpm(values: Option<&Values>) -> impl Iterator<Item = EmbeddedSource<'_>> {
     values
-        .and_then(|v| v.get_key(crate::value_key!("rpm.scriptlets")))
+        .and_then(|v| v.lookup(crate::value_key!("rpm.scriptlets")))
         .and_then(Value::as_object)
         .into_iter()
         .flatten()
@@ -162,14 +196,14 @@ pub(crate) fn rpm(values: Option<&Values>) -> impl Iterator<Item = EmbeddedSourc
                 pointer: format!("/rpm/scriptlets/{name}/body"),
                 source: Cow::Borrowed(script.get("body")?.as_str()?),
                 file_type: rpm_interpreter(script),
-                layer: false,
+                origin: Origin::Value,
             })
         })
 }
 
 pub(crate) fn rpyc(values: Option<&Values>) -> impl Iterator<Item = EmbeddedSource<'_>> {
     values
-        .and_then(|v| v.get_key(crate::value_key!("rpyc")))
+        .and_then(|v| v.lookup(crate::value_key!("rpyc")))
         .and_then(|v| v.get("python_sources"))
         .and_then(Value::as_array)
         .into_iter()
@@ -180,7 +214,7 @@ pub(crate) fn rpyc(values: Option<&Values>) -> impl Iterator<Item = EmbeddedSour
                 pointer: format!("/rpyc/python_sources/{index}/source"),
                 source: Cow::Borrowed(item.get("source")?.as_str()?),
                 file_type: Some(FileType::Python),
-                layer: false,
+                origin: Origin::Value,
             })
         })
 }

@@ -19,17 +19,9 @@ fn crate_with(members: &[(&str, &[u8])]) -> Vec<u8> {
 }
 
 fn run(bytes: &[u8]) -> (Values, Errors) {
-    let mut v = Values::new();
-    let mut e = Errors::new();
-    extract(
-        bytes,
-        FileType::Crate,
-        &mut v,
-        &mut Metrics::new(),
-        &mut Vec::new(),
-        &mut e,
-    )
-    .unwrap();
+    let mut sinks = crate::formats::Sinks::default();
+    extract(bytes, sinks.ctx()).unwrap();
+    let (v, e) = (sinks.values, sinks.errors);
     (v, e)
 }
 
@@ -80,7 +72,7 @@ fn corrupt_gzip_stream_records_one_tar_parse_error() {
 
 #[test]
 fn oversized_manifest_is_a_limit_not_an_error() {
-    let big = vec![b'#'; MAX_MANIFEST as usize + 1];
+    let big = vec![b'#'; MAX_MANIFEST_BYTES as usize + 1];
     let (v, e) = run(&crate_with(&[("w-0.1.0/Cargo.toml", &big)]));
     assert!(e.is_empty(), "{e:?}");
     let limits = v.get("crate.limits").and_then(|x| x.as_array()).unwrap();

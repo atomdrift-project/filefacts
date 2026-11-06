@@ -187,8 +187,7 @@ fn synthetic_elf_builder_parses_and_names_sections() {
 }
 
 fn has_go_pclntab(elf: &Elf<'_>, bytes: &[u8]) -> bool {
-    read_section(elf, bytes, ".gopclntab")
-        .is_some_and(crate::formats::go_buildinfo::has_pclntab_magic)
+    read_section(elf, bytes, ".gopclntab").is_some_and(crate::formats::go_pclntab::has_magic)
 }
 
 #[test]

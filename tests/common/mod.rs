@@ -14,7 +14,7 @@ pub(crate) mod iso;
 use std::hint::black_box;
 use std::path::Path;
 
-use filefacts::{OpenOptions, ParsedFile, Symbol, SymbolKind};
+use filefacts::{DiagnosticKind, OpenOptions, ParsedFile, Symbol, SymbolKind};
 
 /// Options for a hermetic open: no disk cache.
 pub(crate) fn options() -> OpenOptions<'static> {
@@ -32,7 +32,10 @@ pub(crate) fn open_named<'a>(name: &str, bytes: &'a [u8]) -> ParsedFile<'a> {
 }
 
 /// Touch every view so each lazy extraction stage runs, the flow graph and
-/// the source AST included.
+/// the source AST included, and fail if any stage panicked.
+///
+/// The pipeline catches an extractor's panic and records it in `errors()`
+/// rather than unwinding, so without this check a panic would pass silently.
 pub(crate) fn touch_all(parsed: &ParsedFile<'_>) {
     black_box(parsed.fileid().file_type());
     black_box(parsed.values());
@@ -47,8 +50,13 @@ pub(crate) fn touch_all(parsed: &ParsedFile<'_>) {
     black_box(parsed.flow());
     black_box(parsed.identity());
     black_box(parsed.references().len());
-    black_box(parsed.errors());
     black_box(parsed.embedded_sources().count());
+    let panics: Vec<_> = parsed
+        .errors()
+        .iter()
+        .filter(|d| d.kind == DiagnosticKind::Panic)
+        .collect();
+    assert!(panics.is_empty(), "caught extractor panics: {panics:?}");
 }
 
 /// Every call target (`Symbol::Call.target`) of a parsed file, dropping

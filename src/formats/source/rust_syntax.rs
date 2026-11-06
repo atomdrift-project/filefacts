@@ -12,14 +12,11 @@ fn expand(node: Node<'_>, source: &str, prefix: &str, out: &mut Vec<(String, u64
     if depth > 64 || out.len() >= MAX_ITEMS {
         return;
     }
-    let owned = |n: Node<'_>| text(n, source).to_string();
+    let text = |n: Node<'_>| text(n, source);
     match node.kind() {
         "scoped_use_list" => {
-            let path = node
-                .child_by_field_name("path")
-                .map(owned)
-                .unwrap_or_default();
-            let joined = join(prefix, &path);
+            let path = node.child_by_field_name("path").map_or("", text);
+            let joined = join(prefix, path);
             if let Some(list) = node.child_by_field_name("list") {
                 expand(list, source, &joined, out, depth + 1);
             }
@@ -36,13 +33,13 @@ fn expand(node: Node<'_>, source: &str, prefix: &str, out: &mut Vec<(String, u64
                 node.child_by_field_name("alias"),
             ) {
                 out.push((
-                    format!("{} as {}", join(prefix, &owned(path)), owned(alias)),
+                    format!("{} as {}", join(prefix, text(path)), text(alias)),
                     node.start_byte() as u64,
                 ));
             }
         }
         "identifier" | "scoped_identifier" | "self" | "use_wildcard" => {
-            out.push((join(prefix, &owned(node)), node.start_byte() as u64));
+            out.push((join(prefix, text(node)), node.start_byte() as u64));
         }
         _ => {}
     }
@@ -135,12 +132,12 @@ impl Items {
             self.test_only.insert(node.id());
             frame.open = false;
         }
-        if ids.use_declaration.contains(visit.kind_id) {
-            if let Some(argument) = node.child_by_field_name("argument") {
-                expand(argument, source, "", &mut self.imports, 0);
-                if self.imports.len() >= MAX_ITEMS {
-                    self.imports_limited = true;
-                }
+        if ids.use_declaration.contains(visit.kind_id)
+            && let Some(argument) = node.child_by_field_name("argument")
+        {
+            expand(argument, source, "", &mut self.imports, 0);
+            if self.imports.len() >= MAX_ITEMS {
+                self.imports_limited = true;
             }
         }
         if frame.open && !self.limited {
@@ -255,7 +252,9 @@ pub(super) fn resolve_calls(symbols: &mut Symbols) {
                 let local = alias
                     .clone()
                     .or_else(|| name.rsplit("::").next().map(str::to_string))?;
-                (local != "*").then(|| (local, name.clone()))
+                // A path past the cap would be copied into every call.
+                (local != "*" && name.len() <= super::MAX_ALIAS_BYTES)
+                    .then(|| (local, name.clone()))
             } else {
                 None
             }

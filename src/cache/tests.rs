@@ -2,7 +2,7 @@ use super::*;
 
 /// SHA-256 a byte slice, returning the lowercase hex digest.
 fn sha256_hex(bytes: &[u8]) -> String {
-    hex(&Sha256::digest(bytes))
+    crate::formats::common::hex_encode(&Sha256::digest(bytes))
 }
 
 fn unique_bytes(tag: &str) -> Vec<u8> {
@@ -107,7 +107,9 @@ fn host_cache_dir_is_used_and_untrusted_dir_is_skipped() {
     let bytes = unique_bytes("host_dir");
     let stored = open_with_cache(Some(tmp.path()), &bytes, "", || Computed::Cacheable(3u32));
     assert_eq!(stored, 3);
-    assert!(entry_path(tmp.path(), &bytes, "").exists());
+    let root = tmp.path().join(ROOT_NAME);
+    assert!(is_tagged(&root), "the cache tags the root it creates");
+    assert!(entry_path(&root, &bytes, "").exists());
     let hit = open_with_cache(Some(tmp.path()), &bytes, "", || Computed::Cacheable(4u32));
     assert_eq!(hit, 3, "served from the host's directory");
 
@@ -246,6 +248,7 @@ fn build_fingerprint_is_a_source_hash() {
 #[test]
 fn prune_old_versions_removes_lower_versions() {
     let tmp = tempfile::tempdir().expect("tempdir");
+    write_tag(tmp.path());
     let old = tmp.path().join("v0");
     fs::create_dir_all(&old).expect("create v0");
     let canary = old.join("canary");
@@ -354,4 +357,86 @@ fn corrupt_entry_is_a_miss() {
         Some(9),
         "and overwritten"
     );
+}
+
+/// Write `name` under `dir` with an mtime `age` in the past.
+fn aged_file(dir: &Path, name: &str, age: Duration) -> PathBuf {
+    fs::create_dir_all(dir).expect("dir");
+    file_with_mtime(dir, name, SystemTime::now() - age)
+}
+
+#[test]
+fn host_cache_dir_keeps_what_the_cache_did_not_create() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // The host's own files, named the way a cache version and entry are.
+    let host_version = aged_file(&tmp.path().join("v1"), "keep", Duration::ZERO);
+    let host_entry = aged_file(
+        &version_location(tmp.path()).join("ab"),
+        "x.bin",
+        Duration::from_hours(400 * 24),
+    );
+    let bytes = unique_bytes("host_dir_kept");
+    assert_eq!(
+        open_with_cache(Some(tmp.path()), &bytes, "", || Computed::Cacheable(1u32)),
+        1
+    );
+    let root = resolve_root(Some(tmp.path())).expect("usable root");
+    prune_old_versions(&root);
+    Sweep::claim(&version_location(&root))
+        .expect("unclaimed")
+        .run(&BUDGET, Gate::Now);
+    assert!(host_version.exists(), "a host directory named v1 survives");
+    assert!(
+        host_entry.exists(),
+        "a host file shaped like an entry survives"
+    );
+}
+
+#[test]
+fn existing_untagged_root_is_not_adopted() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let keep = aged_file(
+        &tmp.path().join("filefacts").join("v1"),
+        "keep",
+        Duration::ZERO,
+    );
+    assert_eq!(resolve_root(Some(tmp.path())), None);
+    let bytes = unique_bytes("untagged_root");
+    let value = open_with_cache(Some(tmp.path()), &bytes, "", || Computed::Cacheable(2u32));
+    assert_eq!(value, 2, "computed without the cache");
+    let root = tmp.path().join("filefacts");
+    prune_old_versions(&root);
+    assert!(
+        keep.exists(),
+        "nothing is pruned from a directory the cache did not tag"
+    );
+    assert!(
+        !entry_path(&root, &bytes, "").exists(),
+        "nothing stored there"
+    );
+}
+
+#[test]
+fn cleanup_in_sweeps_a_host_cache_dir() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let bytes = unique_bytes("cleanup_in");
+    open_with_cache(Some(tmp.path()), &bytes, "", || Computed::Cacheable(3u32));
+    let root = resolve_root(Some(tmp.path())).expect("usable root");
+    let entry = entry_path(&root, &bytes, "");
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&entry)
+        .expect("entry stored")
+        .set_modified(SystemTime::now() - BUDGET.max_age - Duration::from_hours(24))
+        .expect("set mtime");
+    cleanup_in(tmp.path());
+    // The sweep runs on its own thread; wait for it to finish.
+    let marker = version_location(&root).join(".last-sweep");
+    for _ in 0..600 {
+        if fs::read(&marker).is_ok_and(|m| m == b"d") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!entry.exists(), "an entry past the age budget is swept");
 }

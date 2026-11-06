@@ -2,7 +2,7 @@
 //! output: each one is a [`Diagnostic`], collected in the [`Errors`] view.
 //!
 //! Filefacts' contract is *return as much data as we possibly can*: a
-//! truncated PE that goblin chokes on still gets its byte-level
+//! truncated PE whose headers fail to parse still gets its byte-level
 //! metrics emitted; a malformed Mach-O fat header still gets a
 //! Magic-byte–derived [`crate::FileId`]. When a sub-extractor fails
 //! or panics, the surrounding extractor *records the failure here*

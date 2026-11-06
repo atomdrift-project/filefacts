@@ -46,8 +46,8 @@ pub(super) fn header_and_layout(
         elf.shdr_relocs.len() as f64,
     );
 
-    // Program headers / segments. PT_LOAD = 1, PT_GNU_STACK = 0x6474_e551.
-    // PF_X = 1, PF_W = 2.
+    // Program headers / segments.
+    use goblin::elf::program_header::{PF_W, PF_X};
     let mut max_file_size: u64 = 0;
     let mut max_memory_size: u64 = 0;
     let mut has_gnu_stack = false;
@@ -56,20 +56,20 @@ pub(super) fn header_and_layout(
     let mut executable_segment_count: u64 = 0;
     let mut entry_in_writable_segment = false;
     let mut entry_in_exec_segment = false;
-    let mut entry_in_any_segment = false;
     let mut interp_count: u64 = 0;
     let mut min_load_offset: Option<u64> = None;
     let mut load_ranges: Vec<(u64, u64, usize)> = Vec::new();
-    let mut last_load_vaddr: u64 = 0;
-    let mut last_load_idx: Option<usize> = None;
+    // The PT_LOAD with the highest `p_vaddr`, as (vaddr, index).
+    let mut last_load: Option<(u64, usize)> = None;
+    // The last PT_LOAD holding the entry point, by index.
     let mut entry_load_idx: Option<usize> = None;
     let entry = elf.header.e_entry;
     for (idx, ph) in elf.program_headers.iter().enumerate() {
         if ph.p_type == program_header::PT_LOAD {
             max_file_size = max_file_size.max(ph.p_filesz);
             max_memory_size = max_memory_size.max(ph.p_memsz);
-            let writable = ph.p_flags & 0x2 != 0;
-            let executable = ph.p_flags & 0x1 != 0;
+            let writable = ph.p_flags & PF_W != 0;
+            let executable = ph.p_flags & PF_X != 0;
             if writable && executable {
                 wx_segment_count += 1;
             }
@@ -80,7 +80,6 @@ pub(super) fn header_and_layout(
             let end = ph.p_vaddr.saturating_add(span);
             load_ranges.push((ph.p_vaddr, end, idx));
             if entry != 0 && entry >= ph.p_vaddr && entry < end {
-                entry_in_any_segment = true;
                 if writable {
                     entry_in_writable_segment = true;
                 }
@@ -89,20 +88,15 @@ pub(super) fn header_and_layout(
                 }
                 entry_load_idx = Some(idx);
             }
-            if last_load_idx.is_none() || ph.p_vaddr > last_load_vaddr {
-                last_load_idx = Some(idx);
-                last_load_vaddr = ph.p_vaddr;
+            if last_load.is_none_or(|(vaddr, _)| ph.p_vaddr > vaddr) {
+                last_load = Some((ph.p_vaddr, idx));
             }
-            min_load_offset = Some(
-                min_load_offset
-                    .map(|m| m.min(ph.p_offset))
-                    .unwrap_or(ph.p_offset),
-            );
+            min_load_offset = Some(min_load_offset.map_or(ph.p_offset, |m| m.min(ph.p_offset)));
         }
         if ph.p_type == program_header::PT_GNU_STACK {
             has_gnu_stack = true;
-            // PF_X = 1; an executable GNU stack disables NX.
-            if ph.p_flags & 0x1 != 0 {
+            // An executable GNU stack disables NX.
+            if ph.p_flags & PF_X != 0 {
                 nx_enabled = false;
             }
         }
@@ -135,6 +129,7 @@ pub(super) fn header_and_layout(
     if entry_in_writable_segment {
         metrics.insert(metric!("elf.entry_in_writable_segment"), 1.0);
     }
+    let entry_in_any_segment = entry_load_idx.is_some();
     if entry != 0 && !entry_in_any_segment {
         metrics.insert(metric!("elf.entry_outside_segments"), 1.0);
     }
@@ -151,10 +146,10 @@ pub(super) fn header_and_layout(
     // Entry-in-last-segment: the EP's containing PT_LOAD is the one with
     // the highest p_vaddr. UPX-style packers stash the unpacker stub
     // there; vendor binaries land EPs in earlier segments.
-    if let (Some(ep_idx), Some(last_idx)) = (entry_load_idx, last_load_idx) {
-        if ep_idx == last_idx {
-            metrics.insert(metric!("elf.entry_in_last_segment"), 1.0);
-        }
+    if let (Some(ep_idx), Some((_, last_idx))) = (entry_load_idx, last_load)
+        && ep_idx == last_idx
+    {
+        metrics.insert(metric!("elf.entry_in_last_segment"), 1.0);
     }
     // PT_LOAD segments whose address ranges intersect another's.
     let overlap = overlapping(load_ranges);
@@ -174,13 +169,13 @@ pub(super) fn header_and_layout(
         .header
         .e_phoff
         .saturating_add(u64::from(elf.header.e_phnum) * u64::from(elf.header.e_phentsize));
-    if let Some(first_off) = min_load_offset {
-        if first_off > header_end {
-            metrics.insert(
-                metric!("elf.first_segment_gap"),
-                (first_off - header_end) as f64,
-            );
-        }
+    if let Some(first_off) = min_load_offset
+        && first_off > header_end
+    {
+        metrics.insert(
+            metric!("elf.first_segment_gap"),
+            (first_off - header_end) as f64,
+        );
     }
     // Section header count mismatch — `e_shnum` vs walked sections.
     if usize::from(elf.header.e_shnum) != elf.section_headers.len() {
@@ -228,7 +223,7 @@ pub(super) fn header_and_layout(
     let mut has_eh_frame = false;
     let mut has_note = false;
     let mut note_count: u64 = 0;
-    let mut entry_section: Option<String> = None;
+    let mut entry_section: Option<&str> = None;
     let mut has_dot_hash = false;
     let mut has_gnu_hash_sect = false;
     let mut has_symtab = false;
@@ -268,10 +263,9 @@ pub(super) fn header_and_layout(
         }
         if name.starts_with(".note") {
             has_note = true;
-            // SHT_NOTE = 7. Each note section can hold multiple notes;
-            // the byte count is approximate (real walk requires
-            // `iter_note_headers`, which we tally separately below).
-            if sh.sh_type == 7 && sh.sh_size > 0 {
+            // Each note section can hold multiple notes; the count is
+            // approximate (the real walk is the PT_NOTE one, tallied below).
+            if sh.sh_type == goblin::elf::section_header::SHT_NOTE && sh.sh_size > 0 {
                 note_count = note_count.saturating_add(1);
             }
         }
@@ -281,7 +275,7 @@ pub(super) fn header_and_layout(
             && entry >= sh.sh_addr
             && entry < sh.sh_addr.saturating_add(sh.sh_size)
         {
-            entry_section = Some(name.to_string());
+            entry_section = Some(name);
         }
     }
     metrics.insert(metric!("elf.has_plt"), f64::from(u8::from(has_plt)));
@@ -346,10 +340,10 @@ pub(super) fn header_and_layout(
         // toolchain allowlist (`.attack`, a random appended name) is the
         // entry-redirection tell shared by note-cavity, EPO, and appending
         // infectors. Reuses the single well-known-section source of truth.
-        if !crate::is_well_known_section_name(&name) {
+        if !crate::is_well_known_section_name(name) {
             metrics.insert(metric!("elf.entry_in_nonstandard_section"), 1.0);
         }
-        put_str(values, value_key!("elf.entry_section"), &name);
+        put_str(values, value_key!("elf.entry_section"), name);
     } else if entry != 0 && entry_in_any_segment && elf.section_headers.len() > 1 {
         // The entry lands inside a loadable segment but no section covers
         // it, even though a real section table is present. That is the
@@ -482,7 +476,7 @@ pub(super) fn absent_metadata(elf: &Elf<'_>, values: &mut Values, metrics: &mut 
     let stripped: Vec<JsonValue> = EXPECTED
         .iter()
         .filter(|name| !present.contains(*name))
-        .map(|name| JsonValue::String((*name).to_string()))
+        .map(|&name| JsonValue::from(name))
         .collect();
 
     metrics.insert(

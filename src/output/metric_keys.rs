@@ -25,9 +25,13 @@ use std::borrow::Cow;
 /// The inner string is private: the only constructors are filefacts' own
 /// compile-time-checked `metric!` and the public family functions below,
 /// which is what makes "emitted but undeclared" unrepresentable rather than
-/// merely unlikely. A key read back from serialized metrics is taken as
-/// written.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// merely unlikely. A key read back from serialized metrics (the disk cache,
+/// a consumer's stored facts) is taken as written: the catalog check guards
+/// emitters, and these were checked when they were emitted.
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(transparent)]
 pub struct MetricKey(Cow<'static, str>);
 
 impl MetricKey {
@@ -59,21 +63,6 @@ impl From<MetricKey> for String {
 impl std::borrow::Borrow<str> for MetricKey {
     fn borrow(&self) -> &str {
         &self.0
-    }
-}
-
-impl serde::Serialize for MetricKey {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.0)
-    }
-}
-
-/// A key read back from serialized metrics (the disk cache, a consumer's
-/// stored facts) is taken as written: the catalog check guards emitters, and
-/// these were checked when they were emitted.
-impl<'de> serde::Deserialize<'de> for MetricKey {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        String::deserialize(deserializer).map(|key| Self(Cow::Owned(key)))
     }
 }
 
@@ -139,7 +128,8 @@ pub(crate) use metric;
 ///
 /// Keep it sorted and keep one key per line: this list is read as a diff far
 /// more often than it is read as a list.
-pub const CATALOG: &[&str] = &[
+pub(crate) const CATALOG: &[&str] = &[
+    "7z.header_crc_mismatch_count",
     "android.component_count",
     "android.debuggable",
     "android.exported_component_count",
@@ -214,6 +204,7 @@ pub const CATALOG: &[&str] = &[
     "ast.max_numeric_array",
     "ast.max_numeric_sequence",
     "ast.member_count",
+    "ast.members_capped",
     "ast.node_count",
     "ast.self_compare_count",
     "ast.sequence_count",
@@ -929,6 +920,7 @@ pub const CATALOG: &[&str] = &[
     "strings.path_count",
     "strings.shell",
     "strings.sql",
+    "strings.text_truncated",
     "strings.unicode_heavy",
     "strings.url_count",
     "strings.url_encoded",
@@ -1002,7 +994,7 @@ pub const CATALOG: &[&str] = &[
 /// and no larger. Prefer a fixed key in [`CATALOG`] whenever the set of
 /// values is closed — a family is a hole in the check, kept only where the
 /// segment genuinely comes from the file being parsed.
-pub const FAMILIES: &[&str] = &[
+pub(crate) const FAMILIES: &[&str] = &[
     "archive.compression.method_counts.<method>",
     "archive.format.<entry_type>_count",
     "ast.op.<operator>",
@@ -1058,7 +1050,6 @@ pub(crate) fn dmg_codec_count(codec: &str) -> MetricKey {
 
 /// Which tree-sitter query budget a `source.query_limited.<query>` hit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub(crate) enum QueryLimit {
     /// The query ran, but was cut off by one of the budgets below.
     Any,
@@ -1085,53 +1076,4 @@ pub(crate) fn source_query_limited(query: &str, which: QueryLimit) -> MetricKey 
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The catalog is the contract downstream reads; an unsorted or
-    /// duplicated entry means a merge went wrong.
-    #[test]
-    fn catalog_is_sorted_and_unique() {
-        for pair in CATALOG.windows(2) {
-            assert!(
-                pair[0] < pair[1],
-                "CATALOG must be sorted and free of duplicates: {:?} then {:?}",
-                pair[0],
-                pair[1]
-            );
-        }
-    }
-
-    /// Every declared key is a dotted lowercase path. Catches a stray
-    /// description or a copy-paste of a `Values` path.
-    #[test]
-    fn catalog_entries_are_dotted_paths() {
-        for key in CATALOG {
-            assert!(
-                key.contains('.')
-                    && key.bytes().all(|b| b.is_ascii_lowercase()
-                        || b.is_ascii_digit()
-                        || b == b'.'
-                        || b == b'_'),
-                "not a metric path: {key}"
-            );
-        }
-    }
-
-    #[test]
-    fn declared_resolves_to_the_literal() {
-        assert_eq!(metric!("file.entropy").as_str(), "file.entropy");
-    }
-
-    #[test]
-    fn families_build_the_documented_shape() {
-        assert_eq!(
-            archive_method_count("deflate").as_str(),
-            "archive.compression.method_counts.deflate"
-        );
-        assert_eq!(
-            source_query_limited("identifiers", QueryLimit::Output).as_str(),
-            "source.query_limited.identifiers.output_limit"
-        );
-    }
-}
+mod tests;

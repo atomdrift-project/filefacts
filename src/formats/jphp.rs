@@ -1,7 +1,15 @@
 //! Bounded framing of the Java class files stored in a JPHP compiled module.
 use crate::bytes::Reader;
 
-fn class_len(data: &[u8]) -> Option<usize> {
+/// Take one table entry from `steps`; `None` once none are left.
+fn step(steps: &mut usize) -> Option<()> {
+    *steps = steps.checked_sub(1)?;
+    Some(())
+}
+
+/// The length of the class file at the start of `data`, spending one of
+/// `steps` per constant, field and attribute read.
+fn class_len(data: &[u8], steps: &mut usize) -> Option<usize> {
     let mut r = Reader::new(data);
     if r.u32_be()? != 0xcafebabe {
         return None;
@@ -16,6 +24,7 @@ fn class_len(data: &[u8]) -> Option<usize> {
     }
     let mut slot = 1;
     while slot < count {
+        step(steps)?;
         match r.u8()? {
             1 => {
                 let len = r.u16_be()?;
@@ -38,8 +47,9 @@ fn class_len(data: &[u8]) -> Option<usize> {
     r.skip(6)?;
     let interfaces = r.u16_be()?;
     r.skip(usize::from(interfaces).checked_mul(2)?)?;
-    fn attributes(r: &mut Reader<'_>) -> Option<()> {
+    fn attributes(r: &mut Reader<'_>, steps: &mut usize) -> Option<()> {
         for _ in 0..r.u16_be()? {
+            step(steps)?;
             r.skip(2)?;
             let len = usize::try_from(r.u32_be()?).ok()?;
             r.skip(len)?;
@@ -49,11 +59,12 @@ fn class_len(data: &[u8]) -> Option<usize> {
     for _ in 0..2 {
         // fields, then methods
         for _ in 0..r.u16_be()? {
+            step(steps)?;
             r.skip(6)?;
-            attributes(&mut r)?;
+            attributes(&mut r, steps)?;
         }
     }
-    attributes(&mut r)?;
+    attributes(&mut r, steps)?;
     Some(r.pos())
 }
 
@@ -70,6 +81,11 @@ pub fn class_frames(data: &[u8]) -> (Vec<(usize, usize)>, bool) {
         .get(..data.len().min(64 * 1024 * 1024))
         .unwrap_or_default();
     let mut frames = Vec::new();
+    // Entries every candidate together may read. An honest class spends at
+    // least three bytes on each, so a module's real classes never run out;
+    // without the shared budget, a thousand candidates whose tables all run
+    // into one long tail of fields each re-read the whole tail.
+    let mut steps = data.len();
     let mut attempts = 0;
     let mut malformed = false;
     let mut offset = 4;
@@ -84,11 +100,15 @@ pub fn class_frames(data: &[u8]) -> (Vec<(usize, usize)>, bool) {
             break;
         };
         offset += relative;
-        if let Some(len) = class_len(data.get(offset..).unwrap_or_default()) {
+        if let Some(len) = class_len(data.get(offset..).unwrap_or_default(), &mut steps) {
             frames.push((offset, len));
             offset += len;
         } else {
             malformed = true;
+            if steps == 0 {
+                tracing::debug!(target: "filefacts::jphp", stage = "class-frames", offset, "class table budget spent; later candidates not framed");
+                break;
+            }
             offset += 4;
         }
     }
@@ -99,57 +119,4 @@ pub fn class_frames(data: &[u8]) -> (Vec<(usize, usize)>, bool) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::class_frames;
-    fn class() -> Vec<u8> {
-        let mut b = vec![0xca, 0xfe, 0xba, 0xbe, 0, 0, 0, 52, 0, 5];
-        for (tag, bytes) in [
-            (1u8, b"\0\x07Example".as_slice()),
-            (7, b"\0\x01"),
-            (1, b"\0\x10java/lang/Object"),
-            (7, b"\0\x03"),
-        ] {
-            b.push(tag);
-            b.extend_from_slice(bytes);
-        }
-        b.extend_from_slice(&[0, 0x21, 0, 2, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0]);
-        b
-    }
-    #[test]
-    fn skips_magic_in_attributes_and_reports_resource_limits() {
-        let c = class();
-        let mut outer = c.clone();
-        let n = outer.len();
-        outer[n - 1] = 1; // one class-level attribute
-        outer.extend_from_slice(&[0, 1]);
-        outer.extend_from_slice(&(c.len() as u32).to_be_bytes());
-        outer.extend_from_slice(&c);
-        let mut carrier = vec![0x1c, 0x9a, 0x4a, 0x92];
-        carrier.extend_from_slice(&outer);
-        assert_eq!(class_frames(&carrier), (vec![(4, outer.len())], false));
-        let mut many = vec![0x1c, 0x9a, 0x4a, 0x92];
-        for _ in 0..257 {
-            many.extend_from_slice(&c);
-        }
-        let (frames, incomplete) = class_frames(&many);
-        assert_eq!(frames.len(), 256);
-        assert!(incomplete);
-    }
-    #[test]
-    fn frames_multiple_classes_and_ignores_truncated_candidates() {
-        let c = class();
-        let mut carrier = vec![0x1c, 0x9a, 0x4a, 0x92, 0, 0, 0];
-        let first = carrier.len();
-        carrier.extend_from_slice(&c);
-        carrier.extend_from_slice(&[0xca, 0xfe, 0xba, 0xbe, 0]);
-        let second = carrier.len();
-        carrier.extend_from_slice(&c);
-        assert_eq!(
-            class_frames(&carrier),
-            (vec![(first, c.len()), (second, c.len())], true)
-        );
-        assert!(class_frames(&c).0.is_empty());
-        carrier.truncate(first + c.len() - 1);
-        assert!(class_frames(&carrier).0.is_empty());
-    }
-}
+mod tests;

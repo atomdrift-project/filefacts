@@ -83,3 +83,24 @@ fn module_prefixes_follow_inline_modules() {
         ]))
     );
 }
+
+/// An import path is copied into every call through its alias, so a path
+/// longer than [`super::super::MAX_ALIAS_BYTES`] qualifies none of them.
+#[test]
+fn long_import_paths_do_not_qualify_calls() {
+    let path = "a".repeat(super::super::MAX_ALIAS_BYTES);
+    let source = format!("use {path}::b as X;\nuse c::d as Y;\nfn main() {{ X::f(); Y::g(); }}\n");
+    let parsed = OpenOptions::new()
+        .path(Path::new("lib.rs"))
+        .open(source.as_bytes());
+    let targets: Vec<_> = parsed
+        .symbols()
+        .iter()
+        .filter_map(|s| match s {
+            Symbol::Call { target, .. } => target.as_deref(),
+            _ => None,
+        })
+        .collect();
+    assert!(targets.contains(&"X::f"), "{targets:?}");
+    assert!(targets.contains(&"c::d::g"), "{targets:?}");
+}

@@ -514,3 +514,33 @@ fn missing_signature_is_malformed() {
     let err = extract(b"not a rar", &mut values, &mut metrics, &mut typed).unwrap_err();
     assert!(matches!(err, Error::Malformed { format: "rar", .. }));
 }
+
+/// A FILETIME before 1970 is a negative Unix time, not an absent one.
+#[test]
+fn pre_1970_filetime_is_negative() {
+    let ticks = (11_644_473_600u64 - 2_208_988_800) * 10_000_000;
+    let bytes = ticks.to_le_bytes();
+    assert_eq!(unix_time(0, &mut Reader::new(&bytes)), Some(-2_208_988_800));
+}
+
+/// A RAR4 Unicode name decodes as unrar decodes it: a correction run
+/// spends one correction byte on the whole run, applied to the stored
+/// name's bytes under the high byte.
+#[test]
+fn rar4_unicode_correction_run_matches_unrar() {
+    // "abc", its NUL, then: high byte 0x04, flags (run), run of 3 with
+    // correction 0x10.
+    let raw = b"abc\x00\x04\xc0\x81\x10";
+    assert_eq!(rar4_name(raw, true), "\u{471}\u{472}\u{473}");
+}
+
+/// A run copies from the stored name field and stops at its end, as unrar
+/// does, so a few bytes of runs cannot spell a name hundreds of times
+/// longer than the field.
+#[test]
+fn rar4_unicode_runs_stop_at_the_stored_name() {
+    let raw = b"ab\x00\x00\xff\x7f\x7f\x7f\x7f";
+    let name = rar4_name(raw, true);
+    assert_eq!(name.encode_utf16().count(), raw.len(), "{name:?}");
+    assert!(name.starts_with("ab\0"), "{name:?}");
+}

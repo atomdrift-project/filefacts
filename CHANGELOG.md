@@ -13,6 +13,39 @@ The output schema is versioned separately by `filefacts::SCHEMA_VERSION`; a bump
 - Stop reporting header-only PE signatures as verified without checking the digest.
 - Require the codeSigning EKU before granting platform or Developer ID trust.
 - Ignore commented-out execution levels that could hide a manifest's real `requestedExecutionLevel`.
+- Fix a panic in the public `rpa::members` on crafted Ren'Py pickles; add an `rpa` fuzz target.
+- Stop one inline HTML script hiding the next behind an unclosed comment or template literal: each script is its own embedded source, ended where a browser ends it (script-data escapes, `<!-->`, `--!>`, SVG CDATA).
+- Keep the disk cache inside a `filefacts/` directory it creates and tags, so a sweep never deletes a host's own `v*` directories.
+- Stop trusting group-writable cache directories; on macOS every user shares the `staff` group.
+- Catch binform panics in layout reading and function recovery, keeping the file's other facts.
+- Bound quadratic work on hostile input: connect-wrapper search, call-target naming, people lists, pclntab candidates, nested `sh -c` parses and Go package flow.
+- Bind a Mach-O or APK signature to the file's own CodeDirectory or `.SF`: a lifted SignedData carrying content of its own no longer verifies against that content.
+- Grant CA-signed and vendor trust only over a verified issuer link; a leaf that merely names a CA as issuer is self-signed.
+- Stop matching a PE image digest when the certificate table is not the file's tail, where appended bytes would go unhashed.
+- Require every CRX3 proof to verify, as Chrome does.
+- Verify APK v1 signatures end to end: the `.SF` must bind `MANIFEST.MF` and the manifest every member's digest, with duplicate entries refused and hashing budgeted; a grafted `.SF` no longer reads as verified, and identity credits only a bound signer.
+- Let a verified RFC 3161 or countersignature time outrank the signer's own `signingTime`, and judge `signed_within_validity` only on an attested time.
+- Grant Apple Platform trust only under Apple's Code Signing Certification Authority, not on a leaf's `O=Apple Inc.`.
+- Refuse a CRX3 header, proof or signed data that does not parse to its end.
+- Keep certificate attribute values untrimmed, so an escaped space cannot pose as another organization.
+- Read PE section data where the loader maps it, rounding raw pointers down to 512 for binform as Windows does.
+- Read the last duplicate member of npm, sdist, crate and OCI archives, as their installers do, and claim no identity past the inflate budget.
+- Record Python 2 pickle globals under the names Python 3 imports (`__builtin__.eval` is `builtins.eval`).
+- Cap byte-scan strings at two million rows (`strings.text_truncated`), multi-stage PDF filter output per document, and flow-walk frame size.
+- Stop identifying binary data as a Makefile when its bytes happen to hold a `name:` line and a tab-led line.
+- Read the package identity a real installer reads: the last `control` in a deb, the last gem metadata member, an un-namespaced APK `package`, a jar's main-section `Main-Class` (case-insensitive manifest name, bare CR line ends), Go build info inside its sentinels, the first LNK ExtraData block of each kind.
+- Identify an executable or shebang script by its head, not by a trailer, an offset signature or a text header behind it (PE+MP4/DMG/VHD polyglots, printable DOS headers), and a `.php`/`.bat` page by its name over a markup prologue.
+- Read zip package marks from the central directory, so a decoy first entry cannot make an APK look like an OpenDocument file.
+- Find a VBA project part whatever its name's case, an npm manifest under any top directory, and PKGBUILD array elements after a quoted `)` or `+=`.
+- Decode RAR4 Unicode names exactly as unrar does.
+- Clear a decoy Rich marker that made goblin drop every header, resource and signature fact.
+- Report a PE overlay hidden behind a raw-size-zero section or a short certificate table.
+- Stop process aborts from deep nesting: values paths built from file data, and Go `// +build` line chains.
+- Bound CPU and memory on hostile input: goblin's resource descent, binform and entropy over forged section counts, CLR/IL and DEX name copies, gzip carrier probes, OOXML, VBA and rpyc decompression budgets charged for refused parts, RPA chunk prefixes, 7z header counts and empty-file rescans, DEX switch payloads, jphp framing, member-chain and import-alias expansion, `go:generate` aliases, batch `%var%` expansion, Cargo module walks, Windows Script Host tag scans, and Rich and debug-directory entry lists.
+- Escape zero-width, line-separator, invisible-operator, BOM and tag characters in terminal and JSON output.
+- Stop caching extractions whose source queries hit a time limit, which can depend on load.
+- Count backslash and drive-letter paths as archive path traversal.
+- Open inputs with `O_NOCTTY`, and run the HTML inline-script scan under the panic guard.
 
 ### Features
 
@@ -35,9 +68,32 @@ The output schema is versioned separately by `filefacts::SCHEMA_VERSION`; a bump
 - Detect shell FIFO network loops and measure batch variable cycles.
 - Place every file type in one of 19 groups through `filefacts::Group`.
 - Expose the CLI's versioned JSON document to library users through `ParsedFile::bundle`.
+- Emit binform's sections, imports, exports and functions for PE and Mach-O images goblin cannot parse.
+- Read every PE version-info string, with its offset, in the header-only fallback too.
+- Resolve Cargo bin, example, test and bench targets, declared and discovered, and honour `build = false`.
+- Report Go package flow facts in `GoPackage::files`, under one `ContextLimits::max_flow_steps` budget.
+- Add `Reference::replaces` for Go `replace` directives, `cache::cleanup_in`, `recovery_stats` and `DetectionSource::Unidentified`.
+- Count 7z header CRC mismatches in `7z.header_crc_mismatch_count`.
+- Report truncated wheel, sdist and Arch metadata, cut people lists and exhausted nested parses (`source.shell.fifo_limited`) as limits.
+- Let `detect_content` report FAT boot sectors, DOS COM programs, shellcode and known headerless data shapes.
 - Breaking: stop running rizin; its module, options, environment variable and CLI flags are gone.
 - Breaking: bump `SCHEMA_VERSION` to 11, renaming people, hash, summary and archive-member keys.
 - Breaking: report PE delay-load import offsets as RVAs, as every other PE import does.
+- Breaking: decode string literals without their delimiters or prefixes in Python, Scala, Swift, Rust, C#, C and Objective-C.
+- Breaking: spell unnamed PE import, PE export and NE ordinals `Ordinal_<n>`.
+- Breaking: rename the `static-lib` file type to `static_lib`, and report `unidentified`, not `heuristic`, as the source of an unknown file.
+- Breaking: report `lnk.header.*_time` as signed Unix seconds, and pre-1970 RAR and OLE2 times as negative seconds or dates.
+- Breaking: count key-, digest- and blob-shaped strings in `binary.high_entropy_string_count`, which almost never counted anything.
+- Breaking: leave data sections out of `sections.code_size`, matching `binary.code_entropy`.
+- Breaking: omit `wasm.has_start` when there is no start function.
+- Breaking: take the last value of a repeated Arch `.PKGINFO` field, as pacman does.
+- Breaking: keep a host's cache under `{cache_dir}/filefacts/`.
+- Breaking: group recovery under `recover::{pyarmor, rc4, rpa, jphp_class_frames}` and the Go context functions under `package_context`.
+- Breaking: make `rc4::recover` take `Option<&AtomicBool>` and `pyarmor::Recovery::pyc` return `Error`, like the rest of the API.
+- Breaking: replace `log_stats` with `recovery_stats`, and `OpenOptions::recovery_fingerprint()` with `RECOVERY_FINGERPRINT`.
+- Breaking: replace `EmbeddedSource::layer` with `origin`, keep module scripts separate, and treat a script `type` with parameters as data.
+- Breaking: rename `FileType::is_program` and `is_binary` to `is_analyzed` and `is_executable_code`, and make `fileid::container` private.
+- Breaking: make `View::ALL` and `Text::rows()` slices, and drop the root catalog constants (use `known_metrics` and `known_values`), `VALUE_FAMILIES`, `decode_source_escapes` and `Phase::as_str`.
 - Breaking: make `OpenOptions::new` read no environment, so the cache stays off unless enabled.
 - Breaking: drop `pe.signature_expired_days`, which went stale in cached facts; use not_after_unix instead.
 - Breaking: remove public cache internals, metric and value key types, and the CLI's pretty flag.
@@ -45,6 +101,7 @@ The output schema is versioned separately by `filefacts::SCHEMA_VERSION`; a bump
 ### Fixes
 
 - Compute PE imphash for ordinal imports as pefile and VirusTotal do.
+- Name LNK digit hotkeys by their digit (`ctrl+7`), not a control character.
 - Type a file as go.mod only when every line is a go.mod directive, so Ruby modules get analyzed.
 - Read ELF and Mach-O files goblin rejects, plus ELF and ordinal-only PE exports it dropped.
 - Resolve long PE section names through the COFF string table.
@@ -58,6 +115,24 @@ The output schema is versioned separately by `filefacts::SCHEMA_VERSION`; a bump
 - Keep Rust ctor and Go generate facts on files over 2 MiB.
 - Route two tree-sitter parses through the parse budget and abort guard.
 - Bound Rust attribute and ISO namespace walks, OLE2 stream reads and the zstd window.
+- Detect LZMA-alone files whose dictionary is 2^n + 2^(n-1) bytes.
+- Recognise Makefile targets on CRLF lines, and lowercase `dockerfile` and `containerfile` names.
+- Type left-padded JavaScript and PHP by the same window the language scorer reads.
+- Fix Go 1.13–1.17 build info missing from Windows binaries.
+- Keep the imports found before a malformed NE relocation, and the tar members walked before a damaged header.
+- Check Mach-O bind opcodes as dyld does, without truncating dylib ordinals to a byte.
+- Keep PE export aliasing metrics and TLS callback names when goblin's export walk is over budget.
+- Stop an embedded UPX payload marking its host as packed; bound the UPX version token.
+- Walk the VBA dir stream by record id to its 0x0010 terminator, so a decoy no longer hides modules.
+- Return a CRC-checked prefix, not an error, for oversized members with a false encryption flag.
+- Cap the ISO/UDF member union at the archive member limit.
+- Match credential paths on decoded literals, catching escaped and Windows-separator paths.
+- Match JAR, APK and XPI signature files without regard to case.
+- Decode RFC 4514 escapes in signer names.
+- Reject impossible calendar dates in DOS and civil date conversion.
+- Check Terraform registry lookalikes for names without a namespace.
+- Match Markdown GitHub links on the `github.com` host only.
+- Stop embedded PHP analysis depending on wall-clock time.
 
 ### Optimizations
 
@@ -65,6 +140,24 @@ The output schema is versioned separately by `filefacts::SCHEMA_VERSION`; a bump
 - Check a signed phar's digest during extraction instead of hashing the whole file on identification.
 - Stop decoding 4 MiB of UTF-16 on every identification.
 - Drop the sevenz-rust and xz2 dependencies, parsing 7z headers in-house with one LZMA implementation.
+- Stop parsing PE imports and attribute certificates with goblin; binform's walk supplies them and the unwalkable-table signal.
+- Check a Go pclntab's span before walking its records.
+- Parse each Go package member once, and read the package clause without a parse.
+- Stop scanning every XML file and shell script for a phar stub, and every large text file for a DOS COM program.
+- Parse the OLE2 container and `package.json` once, and sniff an MSBuild root before parsing the XML.
+- Remove the O(depth × size) copying in BER-to-DER normalization.
+- Share one capped inflater, marshal walker, pickle opcode table, `.PKGINFO` parser, time module and byte cursor across formats.
+- Remove the unused signal-hook dependency, bump base64 to 0.23 and drop goblin's archive feature.
+- Clip function extents for the call walk where they overlap past twice the code: an x86 ELF with shared tails took 274 s and 17.7 GB, now 3 s and 204 MB.
+- Start an embedded PHP parse in media only at a tag followed by code, not at a `<?=` that compressed bytes contain by chance.
+- Identify a `.pod` document opening with a POD command as text rather than the language of its examples.
+
+### Project
+
+- Add NOTICE for the Ghidra and pefile ordinal tables, the root certificates and the vendored clojure grammar, and record every fixture's provenance.
+- Exclude test fixtures from the packaged crate.
+- Lint the library without default features, the fuzz crate and the public and private docs; cross-build illumos and FreeBSD; pin CI actions by commit.
+- Drop the `dirs` dependency: the per-user cache directory comes from `LOCALAPPDATA`, `HOME` or `XDG_CACHE_HOME`.
 
 ## 2.0.1 (2026-10-10)
 

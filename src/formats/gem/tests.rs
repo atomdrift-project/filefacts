@@ -185,3 +185,55 @@ fn unreadable_metadata_is_recorded() {
         );
     }
 }
+
+/// A gem of the given `(path, contents)` members.
+fn gem_of(members: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut b = tar::Builder::new(&mut out);
+    for (path, data) in members {
+        let mut h = tar::Header::new_ustar();
+        h.set_path(path).unwrap();
+        h.set_size(data.len() as u64);
+        h.set_mode(0o644);
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_cksum();
+        b.append(&h, *data).unwrap();
+    }
+    b.finish().unwrap();
+    drop(b);
+    out
+}
+
+fn gzipped(text: &str) -> Vec<u8> {
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    enc.write_all(text.as_bytes()).unwrap();
+    enc.finish().unwrap()
+}
+
+fn gem_name(gem: &[u8]) -> Option<String> {
+    let mut v = Values::new();
+    extract(gem, &mut v, &mut Metrics::new(), &mut Errors::new());
+    v.get("gem.name")
+        .and_then(|x| x.as_str())
+        .map(str::to_string)
+}
+
+/// RubyGems reads an uncompressed `metadata` as it does `metadata.gz`.
+#[test]
+fn an_uncompressed_metadata_member_is_read() {
+    let gem = gem_of(&[("metadata", RAILS_SPEC.as_bytes()), ("data.tar.gz", b"")]);
+    assert_eq!(gem_name(&gem).as_deref(), Some("rails"));
+}
+
+/// RubyGems loads every specification member in turn and keeps the last, so
+/// a decoy `metadata.gz` ahead of the real `metadata` must not name the gem.
+#[test]
+fn the_last_specification_member_names_the_gem() {
+    let decoy = RAILS_SPEC.replace("name: rails", "name: decoy");
+    let gem = gem_of(&[
+        ("metadata.gz", &gzipped(&decoy)),
+        ("data.tar.gz", b""),
+        ("metadata", RAILS_SPEC.as_bytes()),
+    ]);
+    assert_eq!(gem_name(&gem).as_deref(), Some("rails"));
+}

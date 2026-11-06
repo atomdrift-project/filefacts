@@ -9,7 +9,7 @@ contains the Go runtime (BSD-3-Clause).
 
 `a_stripped_go_macho_reads_its_functions_from_the_pclntab`
 (`src/formats/go_pclntab/tests.rs`) asserts that all 1,435 functions come
-from the pclntab and that rizin never starts. Go 1.27 writes the pclntab
+from the pclntab and that binform's function recovery never runs. Go 1.27 writes the pclntab
 header's text-start word as zero, so the entries resolve only against the
 image's own `__text` section.
 

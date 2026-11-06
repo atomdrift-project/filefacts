@@ -205,5 +205,18 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// Whether `haystack` ends with `suffix`, ignoring ASCII case. Names from a
+/// hostile archive or path arrive in any case, and the readers that matter
+/// match them case-insensitively: Windows (`.PYD`), OPC part names (`.XML`,
+/// `.RELS`), the JDK's `META-INF/*.SF` lookup.
+pub(crate) fn ends_with_ci(haystack: impl AsRef<[u8]>, suffix: impl AsRef<[u8]>) -> bool {
+    let (haystack, suffix) = (haystack.as_ref(), suffix.as_ref());
+    haystack
+        .len()
+        .checked_sub(suffix.len())
+        .and_then(|start| haystack.get(start..))
+        .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix))
+}
+
 #[cfg(test)]
 mod tests;

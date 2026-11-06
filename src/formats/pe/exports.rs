@@ -4,30 +4,26 @@ use std::collections::HashMap;
 
 use goblin::pe::PE;
 use goblin::pe::optional_header::{MAGIC_32, MAGIC_64};
+use goblin::pe::section_table::IMAGE_SCN_MEM_EXECUTE;
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Mnemonic, OpKind};
 
-use super::layout::{file_backed_size, rva_to_file_offset};
+use super::layout;
 use crate::formats::common::put_i64;
 use crate::metric;
-use crate::output::{Metrics, Values};
+use crate::output::Metrics;
 use crate::value_key;
-
-/// `IMAGE_SCN_MEM_EXECUTE`.
-const SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 
 /// The export table, from binform: one export per function the table
 /// lists, an unnamed one as `Ordinal_n`, within binform's walk budget.
 pub(super) fn exports(
-    layout: Option<&binform::Binary<'_>>,
+    layout: &binform::Binary<'_>,
     image_base: u64,
     pe: Option<&PE<'_>>,
     bytes: &[u8],
-    values: &mut Values,
-    metrics: &mut Metrics,
-    symbols_out: &mut crate::Symbols,
+    ctx: &mut crate::formats::ExtractCtx<'_>,
 ) {
     let mut forwarded_count: u32 = 0;
-    for exp in layout.iter().flat_map(|layout| layout.exports()) {
+    for exp in layout.exports() {
         // A forwarder names its target as the table spells it, `DLL.symbol`
         // or `DLL.#ordinal` (`IMAGE_EXPORT_DIRECTORY` §6.3.1), so consumers
         // don't have to switch on a discriminator. A normal export (RVA
@@ -35,7 +31,7 @@ pub(super) fn exports(
         forwarded_count = forwarded_count.saturating_add(u32::from(exp.forward.is_some()));
         // The RVA, not the file offset: it is what `dumpbin /exports`, IDA,
         // Ghidra and the PE specification key exports by.
-        symbols_out.push(crate::Symbol::Export {
+        ctx.symbols.push(crate::Symbol::Export {
             name: exp.name.clone(),
             offset: exp.addr.map(|addr| addr.wrapping_sub(image_base)),
             ordinal: None,
@@ -44,7 +40,7 @@ pub(super) fn exports(
     }
     // Export count flows through cross-format `exports.count`.
     if forwarded_count > 0 {
-        metrics.insert(
+        ctx.metrics.insert(
             metric!("pe.forwarded_export_count"),
             f64::from(forwarded_count),
         );
@@ -60,11 +56,12 @@ pub(super) fn exports(
     if let Some(export_data) = &pe.export_data {
         let ts = export_data.export_directory_table.time_date_stamp;
         if ts != 0 {
-            put_i64(values, value_key!("pe.export_timestamp"), i64::from(ts));
-            metrics.insert(metric!("pe.export_timestamp"), f64::from(ts));
+            put_i64(ctx.values, value_key!("pe.export_timestamp"), i64::from(ts));
+            ctx.metrics
+                .insert(metric!("pe.export_timestamp"), f64::from(ts));
         }
     }
-    entry_code_shapes(pe, bytes, metrics);
+    entry_code_shapes(layout.exports(), image_base, pe, bytes, ctx.metrics);
 }
 
 /// One decoding pass over the code at every export's entry, for two shapes:
@@ -76,8 +73,17 @@ pub(super) fn exports(
 ///   non-forwarded exports in executable sections whose first straight-line
 ///   instructions make the same direct call. This reports a code shape; it
 ///   does not establish invocation or the callee's behavior.
-fn entry_code_shapes(pe: &PE<'_>, bytes: &[u8], metrics: &mut Metrics) {
-    if pe.exports.is_empty() {
+///
+/// `exports` are binform's, at addresses in an image based at `image_base`;
+/// their code is read through goblin's section table, as the loader maps it.
+fn entry_code_shapes(
+    exports: &[binform::Export],
+    image_base: u64,
+    pe: &PE<'_>,
+    bytes: &[u8],
+    metrics: &mut Metrics,
+) {
+    if exports.is_empty() {
         return;
     }
     let Some(opt) = pe.header.optional_header.as_ref() else {
@@ -91,11 +97,16 @@ fn entry_code_shapes(pe: &PE<'_>, bytes: &[u8], metrics: &mut Metrics) {
     let alignment = Some(opt.windows_fields.file_alignment);
     let mut first_targets: HashMap<u64, u32> = HashMap::new();
     let mut early_calls: HashMap<u64, u32> = HashMap::new();
-    for export in &pe.exports {
-        let Ok(rva) = u32::try_from(export.rva) else {
+    for export in exports {
+        // A forwarder has no code of its own.
+        let Some(Ok(rva)) = export
+            .addr
+            .map(|addr| u32::try_from(addr.wrapping_sub(image_base)))
+        else {
             continue;
         };
-        let Some(offset) = rva_to_file_offset(pe, rva) else {
+        let Some((section, offset, available)) = layout::resolve(&pe.sections, alignment, rva)
+        else {
             continue;
         };
         let ip = u64::from(rva);
@@ -114,23 +125,19 @@ fn entry_code_shapes(pe: &PE<'_>, bytes: &[u8], metrics: &mut Metrics) {
             *first_targets.entry(target).or_default() += 1;
         }
 
-        if export.name.is_none() || export.reexport.is_some() {
+        // binform names an export by ordinal alone `Ordinal_<n>`.
+        let unnamed = export
+            .name
+            .strip_prefix("Ordinal_")
+            .is_some_and(|n| n.parse::<u32>().is_ok());
+        // Overlapping section headers must not let an executable section
+        // bless bytes the loader maps from another section.
+        if unnamed
+            || export.forward.is_some()
+            || section.characteristics & IMAGE_SCN_MEM_EXECUTE == 0
+        {
             continue;
         }
-        // The same first-match rule as the RVA mapper, including its
-        // loader-aligned raw extent: overlapping section headers must not
-        // let an executable section bless bytes mapped from another section.
-        let Some(section) = pe.sections.iter().find(|s| {
-            rva.checked_sub(s.virtual_address)
-                .is_some_and(|delta| u64::from(delta) < file_backed_size(s, alignment))
-        }) else {
-            continue;
-        };
-        if section.characteristics & SCN_MEM_EXECUTE == 0 {
-            continue;
-        }
-        let available =
-            file_backed_size(section, alignment) - u64::from(rva - section.virtual_address);
         let end = offset
             .saturating_add(usize::try_from(available.min(64)).unwrap_or(0))
             .min(bytes.len());

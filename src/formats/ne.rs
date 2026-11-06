@@ -7,24 +7,22 @@
 
 use std::collections::BTreeSet;
 
+use crate::bytes::{u16_le, u32_le};
 use crate::error::Error;
+use crate::formats::common::unnamed_ordinal;
 use crate::metric;
 use crate::output::{Metrics, Symbol, Symbols};
 
 const MAX_SEGMENTS: usize = 4096;
 const MAX_RELOCATIONS: usize = 65_536;
 
-fn word(data: &[u8], offset: usize) -> Option<u16> {
-    Some(u16::from_le_bytes(
-        data.get(offset..offset.checked_add(2)?)?.try_into().ok()?,
-    ))
-}
-
-fn dword(data: &[u8], offset: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(
-        data.get(offset..offset.checked_add(4)?)?.try_into().ok()?,
-    ))
-}
+/// Relocation target types, the low two bits of a record's flag byte.
+const IMPORTED_ORDINAL: u8 = 1;
+const IMPORTED_NAME: u8 = 2;
+/// Segment flag `NSRELOC`: relocation records follow the segment's data.
+const SEGMENT_HAS_RELOCATIONS: u16 = 0x0100;
+/// `ne_exetyp` of a Windows module.
+const TARGET_WINDOWS: u8 = 2;
 
 fn pascal(data: &[u8], offset: usize) -> Option<String> {
     let n = usize::from(*data.get(offset)?);
@@ -140,6 +138,33 @@ fn ordinal_name(library: &str, ordinal: u16) -> Option<&'static str> {
     })
 }
 
+/// The import an [`IMPORTED_ORDINAL`] or [`IMPORTED_NAME`] relocation
+/// record at `at` names: its module from `names`, its name, and
+/// its ordinal. `None` for a record whose module or name lies outside the
+/// tables.
+fn import<'n>(
+    data: &[u8],
+    at: usize,
+    kind: u8,
+    names: &'n [String],
+    import_table: usize,
+    windows: bool,
+) -> Option<(&'n str, String, Option<u32>)> {
+    let module = usize::from(u16_le(data, at.checked_add(4)?)?);
+    let lib = names.get(module.checked_sub(1)?)?;
+    let target = u16_le(data, at.checked_add(6)?)?;
+    Some(if kind == IMPORTED_ORDINAL {
+        let name = windows
+            .then(|| ordinal_name(lib, target))
+            .flatten()
+            .map_or_else(|| unnamed_ordinal(target), str::to_owned);
+        (lib, name, Some(u32::from(target)))
+    } else {
+        let name = pascal(data, import_table.checked_add(usize::from(target))?)?;
+        (lib, name, None)
+    })
+}
+
 pub(super) fn extract(
     data: &[u8],
     symbols: &mut Symbols,
@@ -149,28 +174,29 @@ pub(super) fn extract(
         if data.get(..2)? != b"MZ" {
             return None;
         }
-        let base = usize::try_from(dword(data, 0x3c)?).ok()?;
+        let base = usize::try_from(u32_le(data, 0x3c)?).ok()?;
         if data.get(base..base.checked_add(2)?)? != b"NE" {
             return None;
         }
-        let segments = usize::from(word(data, base.checked_add(0x1c)?)?);
-        let modules = usize::from(word(data, base.checked_add(0x1e)?)?);
+        let segments = usize::from(u16_le(data, base.checked_add(0x1c)?)?);
+        let modules = usize::from(u16_le(data, base.checked_add(0x1e)?)?);
         if segments > MAX_SEGMENTS || modules > MAX_SEGMENTS {
             return None;
         }
-        let segment_table = base.checked_add(usize::from(word(data, base.checked_add(0x22)?)?))?;
-        let module_table = base.checked_add(usize::from(word(data, base.checked_add(0x28)?)?))?;
-        let import_table = base.checked_add(usize::from(word(data, base.checked_add(0x2a)?)?))?;
-        let shift = u32::from(word(data, base.checked_add(0x32)?)?);
+        let segment_table =
+            base.checked_add(usize::from(u16_le(data, base.checked_add(0x22)?)?))?;
+        let module_table = base.checked_add(usize::from(u16_le(data, base.checked_add(0x28)?)?))?;
+        let import_table = base.checked_add(usize::from(u16_le(data, base.checked_add(0x2a)?)?))?;
+        let shift = u32::from(u16_le(data, base.checked_add(0x32)?)?);
         if shift > 16 {
             return None;
         }
-        let windows = *data.get(base.checked_add(0x36)?)? == 2;
+        let windows = *data.get(base.checked_add(0x36)?)? == TARGET_WINDOWS;
         data.get(segment_table..segment_table.checked_add(segments.checked_mul(8)?)?)?;
         data.get(module_table..module_table.checked_add(modules.checked_mul(2)?)?)?;
         let mut names = Vec::with_capacity(modules);
         for index in 0..modules {
-            let offset = usize::from(word(
+            let offset = usize::from(u16_le(
                 data,
                 module_table.checked_add(index.checked_mul(2)?)?,
             )?);
@@ -181,15 +207,15 @@ pub(super) fn extract(
         let mut total = 0usize;
         for index in 0..segments {
             let entry = segment_table.checked_add(index.checked_mul(8)?)?;
-            let sector = usize::from(word(data, entry)?);
-            let size = usize::from(word(data, entry.checked_add(2)?)?);
-            let flags = word(data, entry.checked_add(4)?)?;
-            if sector == 0 || flags & 0x0100 == 0 {
+            let sector = usize::from(u16_le(data, entry)?);
+            let size = usize::from(u16_le(data, entry.checked_add(2)?)?);
+            let flags = u16_le(data, entry.checked_add(4)?)?;
+            if sector == 0 || flags & SEGMENT_HAS_RELOCATIONS == 0 {
                 continue;
             }
             let start = sector.checked_shl(shift)?;
             let table = start.checked_add(if size == 0 { 65_536 } else { size })?;
-            let count = usize::from(word(data, table)?);
+            let count = usize::from(u16_le(data, table)?);
             total = total.checked_add(count)?;
             if total > MAX_RELOCATIONS {
                 return None;
@@ -199,30 +225,26 @@ pub(super) fn extract(
             for r in 0..count {
                 let at = records.checked_add(r.checked_mul(8)?)?;
                 let kind = *data.get(at.checked_add(1)?)? & 3;
-                if kind != 1 && kind != 2 {
+                if kind != IMPORTED_ORDINAL && kind != IMPORTED_NAME {
                     continue;
                 }
-                let module = usize::from(word(data, at.checked_add(4)?)?);
-                let lib = names.get(module.checked_sub(1)?)?;
-                let target = word(data, at.checked_add(6)?)?;
-                let (name, ordinal) = if kind == 1 {
-                    let name = windows
-                        .then(|| ordinal_name(lib, target))
-                        .flatten()
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| format!("ordinal_{target}"));
-                    (name, Some(u32::from(target)))
-                } else {
-                    (
-                        pascal(data, import_table.checked_add(usize::from(target))?)?,
-                        None,
-                    )
+                let Some((lib, name, ordinal)) =
+                    import(data, at, kind, &names, import_table, windows)
+                else {
+                    tracing::debug!(
+                        target: "filefacts::ne",
+                        format = "ne",
+                        stage = "relocations",
+                        offset = at,
+                        "relocation record names no module or import; skipped"
+                    );
+                    continue;
                 };
-                if seen.insert((lib.clone(), name.clone(), ordinal)) {
+                if seen.insert((lib.to_owned(), name.clone(), ordinal)) {
                     output.push(Symbol::Import {
                         name,
                         alias: None,
-                        library: Some(lib.clone()),
+                        library: Some(lib.to_owned()),
                         offset: Some(at as u64),
                         ordinal,
                     });

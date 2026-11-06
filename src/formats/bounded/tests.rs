@@ -49,6 +49,32 @@ fn search_stops_at_the_inflate_budget() {
     assert!(matches!(found, TarGzSearch::Found { .. }));
 }
 
+/// Package managers extract every member, so of two with the sought path
+/// the later overwrites the earlier: the last one is the package's.
+#[test]
+fn the_last_matching_member_wins() {
+    let bytes = targz(&[
+        ("pkg/manifest", b"decoy"),
+        ("pkg/a", b"x"),
+        ("pkg/manifest", b"real"),
+    ]);
+    let found = find_targz_member(&bytes, |p| p == "pkg/manifest", 64).unwrap();
+    let TarGzSearch::Found { prefix, .. } = found else {
+        panic!("member not found");
+    };
+    assert_eq!(prefix.bytes, b"real");
+}
+
+/// A match is final only once the tarball's end is reached: a budget that
+/// runs out after it leaves room for a later member to replace it.
+#[test]
+fn a_match_before_the_inflate_budget_runs_out_is_not_claimed() {
+    let padding = vec![0_u8; 1 << 20];
+    let bytes = targz(&[("pkg/manifest", b"{}"), ("pkg/pad", &padding)]);
+    let found = find_targz_member_within(&bytes, |p| p == "pkg/manifest", 64, 64 << 10).unwrap();
+    assert!(matches!(found, TarGzSearch::InflateCapped));
+}
+
 #[test]
 fn utf8_prefix_drops_a_character_cut_by_the_cap() {
     let cut = MemberPrefix {
@@ -73,12 +99,12 @@ fn limits_emit_in_order_and_only_when_hit() {
     let mut values = Values::new();
     let key = crate::value_key!("pdf.limits");
     Limits::default().emit(&mut values, key);
-    assert!(values.get_key(key).is_none());
+    assert!(values.lookup(key).is_none());
     let mut limits = Limits::default();
     limits.push("a", "first");
     limits.push("b", "second");
     limits.emit(&mut values, key);
-    let list = values.get_key(key).and_then(JsonValue::as_array).unwrap();
+    let list = values.lookup(key).and_then(JsonValue::as_array).unwrap();
     assert_eq!(list.len(), 2);
     assert_eq!(list[1]["stage"].as_str(), Some("b"));
     assert_eq!(list[1]["reason"].as_str(), Some("second"));
@@ -86,12 +112,30 @@ fn limits_emit_in_order_and_only_when_hit() {
 
 #[test]
 fn inflate_capped_marks_a_member_past_the_cap() {
-    let exact = inflate_capped(&b"abcd"[..], 4).unwrap();
+    let exact = inflate_capped(&b"abcd"[..], 4, OnError::Discard).unwrap();
     assert_eq!(exact.bytes, b"abcd");
     assert!(!exact.truncated);
-    let over = inflate_capped(&b"abcde"[..], 4).unwrap();
+    let over = inflate_capped(&b"abcde"[..], 4, OnError::Discard).unwrap();
     assert_eq!(over.bytes, b"abcd");
     assert!(over.truncated);
+}
+
+#[test]
+fn inflate_capped_keeps_or_discards_a_damaged_tail_as_asked() {
+    let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+    enc.write_all(&vec![b'x'; 64 << 10]).unwrap();
+    let full = enc.finish().unwrap();
+    let cut = &full[..full.len() - 8];
+    let decoder = || flate2::read::ZlibDecoder::new(cut);
+    assert!(inflate_capped(decoder(), 1 << 20, OnError::Discard).is_err());
+    let kept = inflate_capped(decoder(), 1 << 20, OnError::KeepPartial).unwrap();
+    assert!(!kept.bytes.is_empty() && kept.bytes.iter().all(|&b| b == b'x'));
+    assert!(!kept.truncated);
+    let capped = inflate_capped(decoder(), 16, OnError::KeepPartial).unwrap();
+    assert_eq!(capped.bytes.len(), 16);
+    assert!(capped.truncated);
+    let garbage = flate2::read::ZlibDecoder::new(&b"not zlib at all"[..]);
+    assert!(inflate_capped(garbage, 16, OnError::KeepPartial).is_err());
 }
 
 /// A zstd frame whose header asks for a `2^window_log` window: no content

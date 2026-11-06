@@ -6,7 +6,7 @@
 
 /// Build a 256-entry byte-frequency histogram of `bytes`.
 #[must_use]
-pub(crate) fn histogram(bytes: &[u8]) -> [u64; 256] {
+fn histogram(bytes: &[u8]) -> [u64; 256] {
     let mut h = [0u64; 256];
     for &b in bytes {
         if let Some(count) = h.get_mut(usize::from(b)) {
@@ -43,11 +43,7 @@ pub(crate) fn shannon_from_histogram(histogram: &[u64; 256], total: usize) -> f6
 /// else.
 #[must_use]
 pub(crate) fn shannon(bytes: &[u8]) -> f64 {
-    if bytes.is_empty() {
-        return 0.0;
-    }
-    let h = histogram(bytes);
-    shannon_from_histogram(&h, bytes.len())
+    shannon_from_histogram(&histogram(bytes), bytes.len())
 }
 
 /// Fixed analysis window for [`windowed`]. 1 KiB is the smallest size at
@@ -56,7 +52,7 @@ pub(crate) fn shannon(bytes: &[u8]) -> f64 {
 /// (you see ~251 of 256 distinct values). It is also the smallest concealed
 /// region we aim to localise. Applies to any byte stream — a script's
 /// embedded blob is found the same way as a binary's.
-pub(crate) const WINDOW_BYTES: usize = 1024;
+const WINDOW_BYTES: usize = 1024;
 
 /// Windows within this many bits/byte of the file's peak window belong to
 /// the same region. This is a *structural* smoothing constant for bounding
@@ -109,9 +105,6 @@ pub(crate) struct WindowedEntropy {
 #[must_use]
 pub(crate) fn windowed(bytes: &[u8]) -> WindowedEntropy {
     let mut out = WindowedEntropy::default();
-    if bytes.is_empty() {
-        return out;
-    }
     let mut global = [0u64; 256];
     let mut windows: Vec<f64> = Vec::with_capacity(bytes.len() / WINDOW_BYTES + 1);
     for window in bytes.chunks(WINDOW_BYTES) {
@@ -158,16 +151,11 @@ pub(crate) fn windowed(bytes: &[u8]) -> WindowedEntropy {
     }
 
     out.peak_bytes = runs.iter().map(|&(_, len)| len).sum();
-    // Largest run, ties broken toward the earliest offset.
-    let mut best_len = 0u64;
-    for &(off, len) in &runs {
-        if len > best_len {
-            best_len = len;
-            out.peak_offset = off;
-        }
-    }
-    // Report the largest runs first, bounded — the aggregate above is exact.
+    // Largest runs first; the sort is stable, so ties keep the earliest
+    // offset first.
     runs.sort_by_key(|&(_, len)| std::cmp::Reverse(len));
+    out.peak_offset = runs.first().map_or(0, |&(off, _)| off);
+    // Report a bounded sample — the aggregate above is exact.
     runs.truncate(MAX_SPANS);
     out.spans = runs;
     out

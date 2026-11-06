@@ -4,7 +4,7 @@
 use serde_json::{Value as JsonValue, json};
 
 use super::{File, Pvd, SECTOR, SYSTEM_AREA_SECTORS};
-use crate::formats::common::bytes_at::u32_le;
+use crate::bytes::u32_le;
 use crate::metric;
 use crate::output::{ArchiveMember, EntryType, Metrics, Values};
 use crate::value_key;

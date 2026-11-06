@@ -86,9 +86,24 @@ fn a_package_without_pkginfo_has_no_package_fields() {
 }
 
 #[test]
-fn an_oversized_pkginfo_is_skipped() {
-    let big = vec![b'x'; usize::try_from(MAX_PKGINFO_BYTES).unwrap() + 1];
+fn an_oversized_pkginfo_is_skipped_as_a_reported_limit() {
+    let mut text = PKGINFO.to_vec();
+    text.resize(usize::try_from(MAX_MANIFEST_BYTES).unwrap() + 1, b'\n');
     let mut values = Values::new();
-    extract(&tar_of(".PKGINFO", &big), &mut values);
-    assert!(values.get("pkg").is_none());
+    extract(&tar_of(".PKGINFO", &text), &mut values);
+    assert_eq!(values.get("pkg.pkgname"), None);
+    assert_eq!(
+        values
+            .get("pkg.limits[0].stage")
+            .and_then(serde_json::Value::as_str),
+        Some("pkginfo")
+    );
+}
+
+#[test]
+fn repeated_single_field_takes_the_last_value_as_pacman_does() {
+    let text = b"pkgname = first\npkgname = second\n";
+    let mut values = Values::new();
+    extract(&tar_of(".PKGINFO", text), &mut values);
+    assert_eq!(values.get("pkg.pkgname"), Some(&"second".into()));
 }

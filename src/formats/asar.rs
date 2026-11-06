@@ -71,9 +71,8 @@ fn parse_index(bytes: &[u8]) -> Result<AsarIndex, Error> {
         .map_err(|e| Error::malformed_with_source("asar", "invalid header json", e))?;
     // Moved out of the parsed header, not cloned: the table is the whole
     // header, and can run to megabytes.
-    let files = match header.get_mut("files").map(JsonValue::take) {
-        Some(JsonValue::Object(files)) => files,
-        _ => return Err(Error::malformed("asar", "missing files table")),
+    let Some(JsonValue::Object(files)) = header.get_mut("files").map(JsonValue::take) else {
+        return Err(Error::malformed("asar", "missing files table"));
     };
 
     Ok(AsarIndex {

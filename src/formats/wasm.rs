@@ -4,17 +4,18 @@
 //! of length-delimited sections. The high-signal behavioural facts live in the
 //! **import** section (the host functions the module needs — its capability
 //! surface, the WASM analogue of an ELF `.dynsym` / PE IAT) and the **export**
-//! section (callable surface + toolchain fingerprint). rizin's `wasm` plugin
-//! reads imports but drops the import *module* and returns no exports, so this
-//! native walk parses the sections directly: complete, panic-free on hostile
-//! input, and with no subprocess cost.
+//! section (callable surface + toolchain fingerprint). Each import keeps its
+//! *module* as its library, since the module names the host the capability
+//! comes from. The walk reads the sections directly, bounded and panic-free
+//! on hostile input.
 //!
 //! Emitted facts:
 //!   - `Symbol::Import { name, library }` per import (matchable via `type:
 //!     import`) — `library` is the WASM module (`gojs`, `wasi_snapshot_preview1`).
 //!   - `Symbol::Export { name }` per export.
 //!   - `wasm.import_modules` / `wasm.imports` / `wasm.exports` value arrays.
-//!   - `wasm.has_start`, `wasm.memory.initial` / `.max` value scalars.
+//!   - `wasm.has_start` (present only when the module has a start
+//!     function), `wasm.memory.initial` / `.max` value scalars.
 //!   - `wasm.producers.*` from the `producers` custom section (toolchain).
 //!   - `wasm.{import,export,section}_count` metrics.
 //!
@@ -280,33 +281,32 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
     super::common::extract_binary_strings(bytes, strings, super::common::XorScan::No);
     let decoded = xor::recover(bytes);
     if !decoded.is_empty() {
+        let decoded_bytes: usize = decoded.iter().map(|r| r.bytes.len()).sum();
         metrics.insert(
             metric!("wasm.xor_decoded_range_count"),
             decoded.len() as f64,
         );
-        metrics.insert(
-            metric!("wasm.xor_decoded_bytes"),
-            decoded.iter().map(|r| r.bytes.len()).sum::<usize>() as f64,
-        );
+        metrics.insert(metric!("wasm.xor_decoded_bytes"), decoded_bytes as f64);
         values.insert_key(
             value_key!("wasm.xor_decode"),
             serde_json::json!({
                 "range_count": decoded.len(),
-                "decoded_bytes": decoded.iter().map(|r| r.bytes.len()).sum::<usize>(),
+                "decoded_bytes": decoded_bytes,
             }),
         );
-        let options = stng::ExtractOptions::new(4)
-            .with_garbage_filter(true)
-            .with_caller_provides_symbols(true);
         let mut rows = Vec::new();
         for range in decoded {
+            // Already decoded: no XOR search over the plaintext.
+            let options = super::common::string_opts_for(super::common::XorScan::No, &range.bytes);
             for mut row in stng::extract_strings_with_options(&range.bytes, &options) {
                 row.data_offset = row.data_offset.saturating_add(range.offset as u64);
                 row.method = stng::StringMethod::XorDecode;
                 rows.push(row);
             }
         }
-        strings.text.append_rows(&rows);
+        strings
+            .text
+            .append_rows(&rows, super::common::MAX_TEXT_ROWS);
     }
 
     let mut r = Reader::new(bytes);
@@ -395,7 +395,9 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
         r.pos = end;
     }
 
-    values.insert_key(value_key!("wasm.has_start"), JsonValue::Bool(has_start));
+    if has_start {
+        values.insert_key(value_key!("wasm.has_start"), JsonValue::Bool(true));
+    }
     if !modules.order.is_empty() {
         values.insert_key(
             value_key!("wasm.import_modules"),

@@ -11,13 +11,12 @@ mod decode;
 mod fixture;
 mod parser;
 
+use crate::formats::ExtractCtx;
 use std::collections::BTreeSet;
 
 use crate::Error;
 use crate::metric;
-use crate::output::{
-    Arg, Literal, LiteralEncoding, LiteralMethod, Metrics, Strings, Symbol, Symbols, Values,
-};
+use crate::output::{Arg, Literal, LiteralEncoding, LiteralMethod, Symbol};
 use crate::value_key;
 use parser::Value;
 use serde_json::json;
@@ -63,13 +62,14 @@ impl TextReader {
     }
 }
 
-pub(super) fn extract(
-    bytes: &[u8],
-    values: &mut Values,
-    strings: &mut Strings,
-    metrics: &mut Metrics,
-    symbols: &mut Symbols,
-) -> Result<(), Error> {
+pub(super) fn extract(bytes: &[u8], ctx: ExtractCtx<'_>) -> Result<(), Error> {
+    let ExtractCtx {
+        values,
+        strings,
+        metrics,
+        symbols,
+        ..
+    } = ctx;
     // Plaintext AppleScript retains the generic extraction path. A compiled
     // script may carry a `#!/usr/bin/osascript` line ahead of its magic; the
     // parser skips it, so only the gate needs to look past it.
@@ -144,8 +144,11 @@ pub(super) fn extract(
     // The analysis is consumed: its owned names and recovered text move into
     // the symbol and literal views rather than being copied into them.
     for function in analysis.functions {
+        for reason in function.limitations {
+            limitations.push(json!({"handler": function.name, "reason": reason}));
+        }
         symbols.push(Symbol::Function {
-            name: function.name.clone(),
+            name: function.name,
             offset: Some(function.offset as u64),
             complexity: None,
             callees: function
@@ -186,9 +189,6 @@ pub(super) fn extract(
                         .with_method(LiteralMethod::ScptConstant),
                 );
             }
-        }
-        for reason in function.limitations {
-            limitations.push(json!({"handler": function.name, "reason": reason}));
         }
     }
     let (decoded, limited) = decode::recover(&mut strings.literals);

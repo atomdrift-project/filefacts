@@ -80,7 +80,7 @@ pub(super) fn extract(
 
 /// Return the numeric tail of a control word (`\rtf1` → `"1"`,
 /// `\ansicpg1252` → `"1252"`). Negative numbers (`-1`) supported.
-fn parse_numeric_control(bytes: &[u8], cw: &[u8]) -> Option<String> {
+fn parse_numeric_control<'a>(bytes: &'a [u8], cw: &[u8]) -> Option<&'a str> {
     let pos = memchr::memmem::find(bytes, cw)?;
     let tail = bytes.get(pos + cw.len()..)?;
     let number = tail.get(..param_len(tail))?;
@@ -88,7 +88,7 @@ fn parse_numeric_control(bytes: &[u8], cw: &[u8]) -> Option<String> {
     if !number.last().is_some_and(u8::is_ascii_digit) {
         return None;
     }
-    std::str::from_utf8(number).ok().map(str::to_string)
+    std::str::from_utf8(number).ok()
 }
 
 /// Length of the optional signed numeric parameter at the front of
@@ -147,7 +147,7 @@ fn info_group(bytes: &[u8], values: &mut Values) {
     let Some(info_start) = find_group(bytes, b"\\info") else {
         return;
     };
-    let group_end = match_group_end(bytes, info_start);
+    let group_end = match_group_end(bytes, info_start, 0);
     let Some(inner) = bytes.get(info_start + 1..group_end) else {
         return;
     };
@@ -160,26 +160,25 @@ fn info_group(bytes: &[u8], values: &mut Values) {
         .and_then(|rest| rest.iter().position(|&b| b == b'{'))
     {
         let child_start = i + rel;
-        let child_end = match_group_end(inner, child_start);
+        let child_end = match_group_end(inner, child_start, 0);
         let child = inner.get(child_start + 1..child_end).unwrap_or_default();
         // First control word is the key.
         if let Some(word) = child.strip_prefix(b"\\") {
             let (key, after) = split_control_word(word);
-            let key = std::str::from_utf8(key).ok().map(str::to_lowercase);
-            if let Some(k) = key {
-                // Skip past the control word's trailing delimiter.
-                let raw = after.strip_prefix(b" ").unwrap_or(after);
-                let value = if matches!(k.as_str(), "creatim" | "revtim" | "printim" | "buptim") {
-                    // Date fields are nested control words; return
-                    // the raw token sequence (`\yr2024\mo1\dy1`) so
-                    // trait rules can regex on the encoded value.
-                    String::from_utf8_lossy(raw).trim().to_string()
-                } else {
-                    decode_text(raw)
-                };
-                if !value.is_empty() {
-                    info.insert(k, JsonValue::String(value));
-                }
+            // The key is ASCII letters, so this decodes losslessly.
+            let k = String::from_utf8_lossy(key).to_ascii_lowercase();
+            // Skip past the control word's trailing delimiter.
+            let raw = after.strip_prefix(b" ").unwrap_or(after);
+            let value = if matches!(k.as_str(), "creatim" | "revtim" | "printim" | "buptim") {
+                // Date fields are nested control words; return
+                // the raw token sequence (`\yr2024\mo1\dy1`) so
+                // trait rules can regex on the encoded value.
+                String::from_utf8_lossy(raw).trim().to_string()
+            } else {
+                decode_text(raw)
+            };
+            if !value.is_empty() {
+                info.insert(k, JsonValue::String(value));
             }
         }
         i = child_end + 1;
@@ -260,27 +259,7 @@ fn fields(bytes: &[u8], values: &mut Values) {
         // Capture the field's body up to the closing brace of its
         // enclosing group. The body decodes through `decode_text`
         // which already drops nested control words.
-        let mut end = cursor;
-        let mut depth = 1_i32;
-        while let Some(&b) = bytes.get(end) {
-            match b {
-                b'\\' if matches!(bytes.get(end + 1), Some(b'{') | Some(b'}') | Some(b'\\')) => {
-                    end += 2;
-                }
-                b'{' => {
-                    depth += 1;
-                    end += 1;
-                }
-                b'}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        break;
-                    }
-                    end += 1;
-                }
-                _ => end += 1,
-            }
-        }
+        let end = match_group_end(bytes, cursor, 1);
         let body = decode_text(bytes.get(cursor..end).unwrap_or_default());
         let mut parts = body.splitn(2, char::is_whitespace);
         let kind = parts.next().unwrap_or("").trim().to_string();
@@ -346,9 +325,8 @@ fn objects(bytes: &[u8], values: &mut Values, strings: &mut Strings, metrics: &m
 /// `{\*\objclass Equation.3}` next to it, which the scan above reads.
 /// A weaponized one does not: it writes only `\objdata`, and the class
 /// name lives inside the blob, in the header Windows itself parses.
-/// Without decoding it there is no class at all — so every rule keyed on
-/// `rtf.objects[*].class` was blind to exactly the documents it was
-/// written for.
+/// Without decoding it there is no class at all, and a rule keyed on
+/// `rtf.objects[*].class` misses exactly the documents it is written for.
 ///
 /// The header is the OLE1.0 `EmbeddedObject` layout: version, format,
 /// then length-prefixed ANSI class, topic and item strings, then the
@@ -478,7 +456,7 @@ fn ole1_header(data: &[u8]) -> Option<JsonValue> {
     /// read out of something that is not a header.
     const MAX_NAME: usize = 256;
 
-    let u32_at = |off: usize| crate::bytes::u32_le(data, off).map(|v| v as usize);
+    let u32_at = |off: usize| crate::bytes::u32_le(data, off).map(crate::bytes::sat_usize);
     // version(4) format(4) then the length-prefixed class string.
     let format = u32_at(4)?;
     let mut off = 8;
@@ -529,7 +507,7 @@ fn native_kind(native: &[u8]) -> Option<&'static str> {
         // A PE offset that lands inside the buffer distinguishes a real
         // executable from two bytes that happen to read `MZ`.
         let is_pe = crate::bytes::u32_le(native, 0x3c)
-            .and_then(|off| native.get(off as usize..))
+            .and_then(|off| native.get(crate::bytes::sat_usize(off)..))
             .is_some_and(|nt| nt.starts_with(b"PE\0\0"));
         return Some(if is_pe { "pe" } else { "mz-dos" });
     }
@@ -561,22 +539,13 @@ fn features(bytes: &[u8], values: &mut Values) {
         (b"\\shppict", "shppict"),
         (b"\\datafield", "datafield"),
     ];
-    let mut found: Vec<&str> = Vec::new();
-    for (cw, name) in CHECKS {
-        if has_control_word(bytes, cw) && !found.contains(name) {
-            found.push(name);
-        }
-    }
+    let found: Vec<JsonValue> = CHECKS
+        .iter()
+        .filter(|(cw, _)| has_control_word(bytes, cw))
+        .map(|&(_, name)| JsonValue::String(name.into()))
+        .collect();
     if !found.is_empty() {
-        values.insert_key(
-            value_key!("rtf.features"),
-            JsonValue::Array(
-                found
-                    .into_iter()
-                    .map(|s| JsonValue::String(s.into()))
-                    .collect(),
-            ),
-        );
+        values.insert_key(value_key!("rtf.features"), JsonValue::Array(found));
     }
 }
 
@@ -615,8 +584,8 @@ fn shape(bytes: &[u8], values: &mut Values, metrics: &mut Metrics) {
             b'\\' if after.first().is_some_and(u8::is_ascii_alphabetic) => {
                 // A control word is letters, an optional parameter, then a
                 // delimiter. Encrypted bytes after a stub header are full of
-                // `\` + letter pairs; counting those made a payload look as
-                // dense as a document and the sparse-body check never fired.
+                // `\` + letter pairs; counting those would make a payload
+                // look as dense as a document.
                 let (_, tail) = split_control_word(after);
                 let delimited = tail.first().is_none_or(|b| {
                     matches!(b, b' ' | b'\\' | b'{' | b'}' | b'\n' | b'\r' | b'\t' | b';')
@@ -629,9 +598,7 @@ fn shape(bytes: &[u8], values: &mut Values, metrics: &mut Metrics) {
             b'{' => {
                 braces_open += 1;
                 depth += 1;
-                if depth > max_depth {
-                    max_depth = depth;
-                }
+                max_depth = max_depth.max(depth);
                 after
             }
             b'}' => {
@@ -642,11 +609,14 @@ fn shape(bytes: &[u8], values: &mut Values, metrics: &mut Metrics) {
             _ => after,
         };
     }
-    let mut obj = serde_json::Map::new();
-    obj.insert("control_word_count".into(), json!(control_words));
-    obj.insert("group_depth_max".into(), json!(max_depth));
-    obj.insert("brace_count".into(), json!(braces_open + braces_close));
-    values.insert_key(value_key!("rtf.shape"), JsonValue::Object(obj));
+    values.insert_key(
+        value_key!("rtf.shape"),
+        json!({
+            "control_word_count": control_words,
+            "group_depth_max": max_depth,
+            "brace_count": braces_open + braces_close,
+        }),
+    );
     metrics.insert(metric!("rtf.control_word_count"), control_words as f64);
     metrics.insert(metric!("rtf.max_group_depth"), f64::from(max_depth));
     // Control words per kilobyte. A document is mostly formatting: real RTF
@@ -689,11 +659,12 @@ fn find_group(bytes: &[u8], control_word: &[u8]) -> Option<usize> {
 /// groups without closing them.
 const MAX_GROUP_DEPTH: i32 = 256;
 
-/// Return the position of the matching `}` for the `{` at `start`.
-/// Returns `bytes.len()` on unterminated groups or when nesting
-/// exceeds [`MAX_GROUP_DEPTH`].
-fn match_group_end(bytes: &[u8], start: usize) -> usize {
-    let mut depth = 0_i32;
+/// Return the position of the `}` that closes the group open at `start`:
+/// the `{` at `start` when `open` is 0, or the innermost of `open` groups
+/// already open there. Returns `bytes.len()` on unterminated groups or when
+/// nesting exceeds [`MAX_GROUP_DEPTH`].
+fn match_group_end(bytes: &[u8], start: usize, open: i32) -> usize {
+    let mut depth = open;
     let mut i = start;
     while let Some(&b) = bytes.get(i) {
         match b {

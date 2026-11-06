@@ -810,3 +810,57 @@ fn repeated_embedding_relationships_update_one_entry() {
     assert_eq!(embedded[0]["relationship_type"], "oleObject");
     assert_eq!(embedded[0]["source"], "word/document.xml");
 }
+
+/// A package of `members` deflated, so oversized parts stay small on disk.
+fn build_deflated(members: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut w = ZipWriter::new(Cursor::new(Vec::<u8>::new()));
+    for (path, body) in members {
+        w.start_file(*path, SimpleFileOptions::default()).unwrap();
+        w.write_all(body).unwrap();
+    }
+    w.finish().unwrap().into_inner()
+}
+
+/// A part refused at the scan cap was still inflated up to it. Every part
+/// may be a small deflate bomb (or many directory entries may point at one),
+/// so that work comes out of the scan budget too.
+#[test]
+fn oversized_xml_parts_spend_the_scan_budget() {
+    let ct = content_types_with_overrides(0);
+    let part = format!("<a>{}</a>", " ".repeat(MAX_SCAN_PART_BYTES as usize));
+    let count = (MAX_SCAN_TOTAL_BYTES / MAX_SCAN_PART_BYTES) as usize + 3;
+    let names: Vec<String> = (0..count).map(|i| format!("word/part{i}.xml")).collect();
+    let mut members: Vec<(&str, &[u8])> = vec![("[Content_Types].xml", ct.as_bytes())];
+    members.extend(names.iter().map(|n| (n.as_str(), part.as_bytes())));
+    let (v, _, e) = run_with_errors(&build_deflated(&members));
+    assert!(e.is_empty(), "{e:?}");
+    let limits = v.get("office.limits").and_then(|x| x.as_array()).unwrap();
+    let reason = limits
+        .iter()
+        .find(|l| l["stage"].as_str() == Some("part-scan-budget"))
+        .and_then(|l| l["reason"].as_str())
+        .unwrap_or_else(|| panic!("{limits:?}"));
+    assert!(reason.starts_with("3 XML part(s)"), "{reason}");
+}
+
+/// The same holds for relationship parts refused at their read cap.
+#[test]
+fn oversized_relationship_parts_spend_the_rels_budget() {
+    let part = format!(
+        "<Relationships>{}</Relationships>",
+        " ".repeat(MAX_PART_BYTES as usize)
+    );
+    let count = (MAX_RELS_TOTAL_BYTES / MAX_PART_BYTES) as usize + 3;
+    let names: Vec<String> = (0..count).map(|i| format!("p{i}/_rels/x.rels")).collect();
+    let mut members: Vec<(&str, &[u8])> =
+        vec![("[Content_Types].xml", CONTENT_TYPES_DOCX.as_bytes())];
+    members.extend(names.iter().map(|n| (n.as_str(), part.as_bytes())));
+    let (v, _, _) = run_with_errors(&build_deflated(&members));
+    let limits = v.get("office.limits").and_then(|x| x.as_array()).unwrap();
+    let reason = limits
+        .iter()
+        .find(|l| l["stage"].as_str() == Some("rels-budget"))
+        .and_then(|l| l["reason"].as_str())
+        .unwrap_or_else(|| panic!("{limits:?}"));
+    assert!(reason.starts_with("3 relationship part(s)"), "{reason}");
+}

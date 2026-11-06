@@ -73,36 +73,25 @@ fn is_known_field(key: &str) -> bool {
     SCALAR_FIELDS.contains(&key) || ARRAY_FIELDS.contains(&base_field(key))
 }
 
-fn is_array_field(key: &str) -> bool {
-    ARRAY_FIELDS.contains(&base_field(key))
-    // `pkgname` is scalar in a PKGBUILD but may repeat in a split-package
-    // .SRCINFO; the caller decides via `force_array`.
-}
-
 /// Insert a value under `pkg.<key>`, accumulating array fields.
 fn push(root: &mut Map<String, JsonValue>, key: &str, value: String) {
-    if is_array_field(key) {
-        match root.get_mut(key) {
-            Some(JsonValue::Array(arr)) => arr.push(JsonValue::String(value)),
-            _ => {
-                root.insert(
-                    key.to_string(),
-                    JsonValue::Array(vec![JsonValue::String(value)]),
-                );
-            }
+    let value = JsonValue::String(value);
+    let array = ARRAY_FIELDS.contains(&base_field(key));
+    match root.get_mut(key) {
+        Some(JsonValue::Array(arr)) => arr.push(value),
+        // A repeated scalar (a split-package .SRCINFO's `pkgname`) is
+        // promoted to an array so nothing is lost.
+        Some(existing) if !array => {
+            let prior = std::mem::replace(existing, JsonValue::Null);
+            *existing = JsonValue::Array(vec![prior, value]);
         }
-    } else {
-        // Scalar: first write wins for pkgver/pkgrel/etc.; a repeated scalar
-        // (e.g. split-package pkgname) is promoted to an array so nothing is lost.
-        match root.get_mut(key) {
-            None => {
-                root.insert(key.to_string(), JsonValue::String(value));
-            }
-            Some(JsonValue::Array(arr)) => arr.push(JsonValue::String(value)),
-            Some(existing) => {
-                let prior = std::mem::replace(existing, JsonValue::Null);
-                *existing = JsonValue::Array(vec![prior, JsonValue::String(value)]);
-            }
+        _ => {
+            let value = if array {
+                JsonValue::Array(vec![value])
+            } else {
+                value
+            };
+            root.insert(key.to_string(), value);
         }
     }
 }
@@ -113,23 +102,18 @@ fn finalize(root: Map<String, JsonValue>, values: &mut Values) {
     // comparable across a PKGBUILD and its .SRCINFO with a scalar equality
     // rule — the core "what builds differs from what was reviewed" signal.
     // Sorted + deduped so ordering or algorithm-list differences don't matter.
-    let mut sums: Vec<String> = Vec::new();
-    for (key, value) in &root {
-        if base_field(key).ends_with("sums") {
-            if let JsonValue::Array(arr) = value {
-                for e in arr {
-                    if let JsonValue::String(s) = e {
-                        let s = s.trim();
-                        // SKIP is a verification opt-out, not a digest — exclude
-                        // it so its presence/absence doesn't drive the compare.
-                        if !s.is_empty() && !s.eq_ignore_ascii_case("SKIP") {
-                            sums.push(s.to_string());
-                        }
-                    }
-                }
-            }
-        }
-    }
+    let mut sums: Vec<String> = root
+        .iter()
+        .filter(|(key, _)| base_field(key).ends_with("sums"))
+        .filter_map(|(_, value)| value.as_array())
+        .flatten()
+        .filter_map(JsonValue::as_str)
+        .map(str::trim)
+        // SKIP is a verification opt-out, not a digest — exclude it so its
+        // presence/absence doesn't drive the compare.
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("SKIP"))
+        .map(str::to_string)
+        .collect();
     sums.sort();
     sums.dedup();
     // Normalized GitHub-owner projections for provenance comparison in traits.
@@ -141,30 +125,27 @@ fn finalize(root: Map<String, JsonValue>, values: &mut Values) {
     // difference (project site vs CDN vs GitHub releases) is normal and is
     // deliberately NOT projected, so only same-host owner divergence is
     // comparable. Parsing lives here; the comparison is pure YAML.
-    let url_owner = match root.get("url") {
-        Some(JsonValue::String(url)) => github_owner(url),
-        _ => None,
-    };
+    let url_owner = root
+        .get("url")
+        .and_then(JsonValue::as_str)
+        .and_then(github_owner);
     let mut source_owners: Vec<JsonValue> = Vec::new();
     // First-seen order for the output; the set keeps a PKGBUILD listing
     // thousands of sources from deduplicating quadratically.
     let mut seen_owners = std::collections::HashSet::new();
-    for (key, value) in &root {
-        if base_field(key) != "source" {
-            continue;
-        }
-        let JsonValue::Array(arr) = value else {
-            continue;
-        };
-        for e in arr {
-            let JsonValue::String(s) = e else { continue };
-            // Honor `filename::url` rename syntax — read the URL half.
-            let u = s.rsplit_once("::").map_or(s.as_str(), |(_, u)| u);
-            if let Some(owner) = github_owner(u)
-                && seen_owners.insert(owner.clone())
-            {
-                source_owners.push(JsonValue::String(owner));
-            }
+    let sources = root
+        .iter()
+        .filter(|(key, _)| base_field(key) == "source")
+        .filter_map(|(_, value)| value.as_array())
+        .flatten()
+        .filter_map(JsonValue::as_str);
+    for s in sources {
+        // Honor `filename::url` rename syntax — read the URL half.
+        let u = s.rsplit_once("::").map_or(s, |(_, u)| u);
+        if let Some(owner) = github_owner(u)
+            && seen_owners.insert(owner.clone())
+        {
+            source_owners.push(JsonValue::String(owner));
         }
     }
     // Insert each field under `pkg.<field>` so the subtree merges alongside the
@@ -244,21 +225,82 @@ fn split_array(body: &str) -> Vec<String> {
     out
 }
 
+/// The body of a bash array whose `(` came just before `first`: the text up
+/// to the `)` bash ends it at, which is not one inside quotes, escaped, or
+/// in a comment, with any further `lines` it spans joined by spaces.
+fn array_body<'a>(first: &str, lines: &mut impl Iterator<Item = &'a str>) -> String {
+    let mut body = String::new();
+    let mut quote: Option<char> = None;
+    let mut text = first;
+    loop {
+        let mut chars = text.chars();
+        let mut word_start = true;
+        while let Some(c) = chars.next() {
+            match quote {
+                Some(q) if c == q => quote = None,
+                None if c == ')' => return body,
+                None if c == '\'' || c == '"' => quote = Some(c),
+                None if c == '#' && word_start => {
+                    // A comment runs to the end of the line.
+                    body.push(c);
+                    body.push_str(chars.as_str());
+                    break;
+                }
+                Some('\'') => {}
+                _ if c == '\\' => {
+                    body.push(c);
+                    body.extend(chars.next());
+                    word_start = false;
+                    continue;
+                }
+                _ => {}
+            }
+            word_start = quote.is_none() && c.is_whitespace();
+            body.push(c);
+        }
+        let Some(next) = lines.next() else {
+            return body;
+        };
+        body.push(' ');
+        text = next;
+    }
+}
+
+/// One line of a `key = value` metadata file.
+pub(super) enum InfoLine<'a> {
+    /// A `#` comment, without the `#`, trimmed.
+    Comment(&'a str),
+    /// A `key = value` assignment, both sides trimmed.
+    Field(&'a str, &'a str),
+}
+
+/// The comments and assignments of a `key = value` metadata file: a
+/// `.SRCINFO`, or the `.PKGINFO` of an Arch or Alpine built package. Lines
+/// are trimmed; blank lines and lines without `=` are skipped.
+///
+/// Every key may repeat. A reader that keeps one value for a key keeps the
+/// last line's, as pacman's `.PKGINFO` reader and apk-tools both assign each
+/// line over the one before; a repeatable key collects every line in order.
+pub(super) fn info_lines(text: &str) -> impl Iterator<Item = InfoLine<'_>> {
+    text.lines().filter_map(|line| {
+        let line = line.trim();
+        if let Some(comment) = line.strip_prefix('#') {
+            return Some(InfoLine::Comment(comment.trim()));
+        }
+        let (key, value) = line.split_once('=')?;
+        Some(InfoLine::Field(key.trim(), value.trim()))
+    })
+}
+
 /// Parse a `.SRCINFO`: `key = value` lines, leading tabs, repeated keys.
 pub(super) fn extract_srcinfo(bytes: &[u8], values: &mut Values) -> Result<(), crate::Error> {
     let text = std::str::from_utf8(bytes)
         .map_err(|e| crate::Error::malformed_with_source("srcinfo", "input is not utf-8", e))?;
     let mut root: Map<String, JsonValue> = Map::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
+    for line in info_lines(text) {
+        let InfoLine::Field(key, value) = line else {
             continue;
         };
-        let key = key.trim();
-        let value = value.trim();
         if value.is_empty() || !is_known_field(key) {
             continue;
         }
@@ -297,28 +339,16 @@ pub(super) fn extract_pkgbuild(bytes: &[u8], values: &mut Values, errors: &mut E
         let Some((key, rest)) = line.split_once('=') else {
             continue;
         };
+        // `key+=(…)` appends to the array, as bash does.
         let key = key.trim();
+        let key = key.strip_suffix('+').unwrap_or(key);
         if !is_known_field(key) {
             continue;
         }
         let rest = rest.trim_start();
         if let Some(after) = rest.strip_prefix('(') {
             // Array assignment, possibly spanning lines until the closing ')'.
-            let mut body = String::new();
-            if let Some((inner, _)) = after.split_once(')') {
-                body.push_str(inner);
-            } else {
-                body.push_str(after);
-                for next in lines.by_ref() {
-                    if let Some((inner, _)) = next.split_once(')') {
-                        body.push(' ');
-                        body.push_str(inner);
-                        break;
-                    }
-                    body.push(' ');
-                    body.push_str(next);
-                }
-            }
+            let body = array_body(after, &mut lines);
             for elem in split_array(&body) {
                 push(&mut root, key, elem);
             }

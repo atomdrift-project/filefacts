@@ -30,41 +30,82 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - run: rustup toolchain install stable --profile minimal --component rustfmt,clippy && rustup default stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: make lint and make test
         if: runner.os != 'Windows'
         run: make lint && make test
       # Windows runners do not reliably ship make; run the same commands directly.
       - name: lint and test (cargo)
         if: runner.os == 'Windows'
+        env:
+          RUSTDOCFLAGS: -D warnings
         run: |
+          cargo doc --no-deps
+          cargo doc --no-deps --document-private-items
           cargo fmt --all --check
           cargo clippy --all-targets --all-features -- -D warnings
+          cargo clippy --lib --no-default-features -- -D warnings
+          cargo clippy -p filefacts-fuzz --all-targets -- -D warnings
           cargo test
+
+  library:
+    name: library as a dependency (no default features)
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - run: rustup toolchain install stable --profile minimal --component clippy && rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # What a crate depending on filefacts compiles: no CLI, no jemalloc.
+      - run: cargo build --lib --no-default-features --locked
+      - run: cargo clippy --lib --no-default-features --locked -- -D warnings
+
+  cross:
+    name: build (${{ matrix.target }})
+    if: github.event_name != 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        # Platforms with C dependencies' own quirks (tree-sitter's endian.h on
+        # illumos, the system jemalloc on FreeBSD) and no hosted runner;
+        # `cross` builds them in a container with the target's C toolchain
+        # and sysroot. Build-only: neither target can run tests here.
+        target: [x86_64-unknown-illumos, x86_64-unknown-freebsd]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
+        with:
+          tool: cross
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.target }}
+      - run: cross build --locked --target ${{ matrix.target }}
 
   msrv:
     name: MSRV
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - name: Install the rust-version from Cargo.toml
         run: |
           msrv=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)
           test -n "$msrv"
           rustup toolchain install "$msrv" --profile minimal
           rustup default "$msrv"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo check --all-targets --all-features --locked
 
   audit:
     name: cargo audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: taiki-e/install-action@v2
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
         with:
           tool: cargo-audit
       # Accepted advisories, each with its justification: .cargo/audit.toml.
@@ -75,12 +116,13 @@ jobs:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - run: rustup toolchain install nightly --profile minimal && rustup default nightly
-      - uses: taiki-e/install-action@v2
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - run: rustup toolchain install nightly --profile minimal --component clippy && rustup default nightly
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
         with:
           tool: cargo-fuzz
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo clippy -p filefacts-fuzz --all-targets --locked -- -D warnings
       - run: cargo fuzz build
 
   slow:
@@ -88,15 +130,9 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - run: rustup toolchain install stable --profile minimal && rustup default stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # Release mode enables the release-only budgets in tests/hostile_inputs.rs.
       - run: cargo test --release
-      # The ignored tests, minus the Linux subprocess probes that only make
-      # sense when spawned by their parent test.
-      - run: >-
-          cargo test --release -- --ignored
-          --skip linux_child_limits_probe
-          --skip linux_waiting_child_probe
-          --skip linux_parent_death_driver
+      - run: cargo test --release -- --ignored

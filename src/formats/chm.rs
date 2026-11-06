@@ -21,20 +21,22 @@
 //!   default_font, compiler_version, chm_filename, locale_id,
 //!   timestamp}` — `#SYSTEM` records.
 //! - `chm.content_sections[]` — names from `::DataSpace/NameList`.
-//! - `chm.features[]` — Pike-style flag array: `html`, `toc`,
+//! - `chm.features[]` — presence flags: `html`, `toc`,
 //!   `index`, `objinst`, `keyword_links`, `associative_links`,
 //!   `fifti`.
 //! - `chm.entries[]` — distinct user-visible internal file names
 //!   (capped at 256 entries — `metrics.chm.user_entry_count` carries
 //!   the raw count).
 
+use crate::formats::ExtractCtx;
 use crate::metric;
 use crate::value_key;
 use serde_json::{Value as JsonValue, json};
 
+use crate::bytes::ends_with_ci;
 use crate::bytes::{self, Reader};
-use crate::formats::common::{XorScan, ends_with_ci, extract_binary_strings};
-use crate::output::{Metrics, Strings, Values};
+use crate::formats::common::{XorScan, extract_binary_strings};
+use crate::output::{Metrics, Values};
 
 const MAX_ENTRIES_SURFACED: usize = 256;
 /// Directory entries parsed. An entry takes as little as four bytes of
@@ -43,13 +45,14 @@ const MAX_ENTRIES_SURFACED: usize = 256;
 /// largest real help files carry tens of thousands of entries.
 const MAX_DIR_ENTRIES: usize = 1 << 18;
 
-pub(super) fn extract(
-    bytes: &[u8],
-    values: &mut Values,
-    strings: &mut Strings,
-    metrics: &mut Metrics,
-    image_end: &mut Option<u64>,
-) {
+pub(super) fn extract(bytes: &[u8], ctx: ExtractCtx<'_>) {
+    let ExtractCtx {
+        values,
+        strings,
+        metrics,
+        image_end,
+        ..
+    } = ctx;
     extract_binary_strings(bytes, strings, XorScan::No);
 
     let Some(header) = bytes
@@ -127,7 +130,7 @@ pub(super) fn extract(
 
     // Presence-flag accumulator + user-visible entry list + roll-ups.
     let mut features: Vec<&'static str> = Vec::new();
-    let mut user_entries: Vec<String> = Vec::new();
+    let mut user_entries: Vec<&str> = Vec::new();
     let mut user_names_lower: Vec<String> = Vec::new();
     let mut html_count = 0_u32;
     let mut script_count = 0_u32;
@@ -139,7 +142,9 @@ pub(super) fn extract(
 
     for e in &entries {
         let stripped = e.name.strip_prefix('/').unwrap_or(&e.name);
-        if is_control_name(stripped) {
+        // CHM-internal entries (`#SYSTEM`, `$OBJINST`, `::DataSpace/...`)
+        // share the `#` / `::` / `$` prefix convention.
+        if stripped.starts_with('#') || stripped.starts_with("::") || stripped.starts_with('$') {
             control_count += 1;
             match stripped {
                 "$OBJINST" => push_unique(&mut features, "objinst"),
@@ -155,9 +160,7 @@ pub(super) fn extract(
         }
         user_count += 1;
         user_total = user_total.saturating_add(e.length);
-        if e.length > user_max {
-            user_max = e.length;
-        }
+        user_max = user_max.max(e.length);
         let has_ext = |exts: &[&str]| exts.iter().any(|ext| ends_with_ci(&e.name, ext));
         if has_ext(&[".html", ".htm"]) {
             html_count += 1;
@@ -176,7 +179,7 @@ pub(super) fn extract(
         }
         user_names_lower.push(stripped.to_ascii_lowercase());
         if user_entries.len() < MAX_ENTRIES_SURFACED {
-            user_entries.push(e.name.clone());
+            user_entries.push(&e.name);
         }
     }
     if html_count > 0 {
@@ -185,18 +188,13 @@ pub(super) fn extract(
     if !features.is_empty() {
         values.insert_key(
             value_key!("chm.features"),
-            JsonValue::Array(
-                features
-                    .into_iter()
-                    .map(|s| JsonValue::String(s.into()))
-                    .collect(),
-            ),
+            JsonValue::Array(features.into_iter().map(JsonValue::from).collect()),
         );
     }
     if !user_entries.is_empty() {
         values.insert_key(
             value_key!("chm.entries"),
-            JsonValue::Array(user_entries.into_iter().map(JsonValue::String).collect()),
+            JsonValue::Array(user_entries.into_iter().map(JsonValue::from).collect()),
         );
     }
 
@@ -218,15 +216,15 @@ pub(super) fn extract(
 
     // Content-section names from `::DataSpace/NameList` (Uncompressed
     // section 0 — no LZX needed).
-    if let Some(name_list_entry) = entries.iter().find(|e| e.name == "::DataSpace/NameList") {
-        if let Some(body) = read_uncompressed(bytes, data_offset, name_list_entry) {
-            let sections = parse_namelist(body);
-            if !sections.is_empty() {
-                values.insert_key(
-                    value_key!("chm.content_sections"),
-                    JsonValue::Array(sections.into_iter().map(JsonValue::String).collect()),
-                );
-            }
+    if let Some(name_list_entry) = entries.iter().find(|e| e.name == "::DataSpace/NameList")
+        && let Some(body) = read_uncompressed(bytes, data_offset, name_list_entry)
+    {
+        let sections = parse_namelist(body);
+        if !sections.is_empty() {
+            values.insert_key(
+                value_key!("chm.content_sections"),
+                JsonValue::Array(sections.into_iter().map(JsonValue::String).collect()),
+            );
         }
     }
 
@@ -286,36 +284,31 @@ fn emit_lzx_framing(
     values: &mut Values,
     metrics: &mut Metrics,
 ) {
+    let read = |e: &DirEntry| read_uncompressed(bytes, data_offset, e);
     let Some(content) = entries
         .iter()
         .find(|e| e.name == "::DataSpace/Storage/MSCompressed/Content")
     else {
         return;
     };
-    let Some(control) = entries
+    let Some(cd) = entries
         .iter()
         .find(|e| e.name == "::DataSpace/Storage/MSCompressed/ControlData")
+        .and_then(read)
+        .and_then(parse_control_data)
     else {
         return;
     };
-    let Some(reset) = entries.iter().find(|e| {
-        e.name
-            .starts_with("::DataSpace/Storage/MSCompressed/Transform/")
-            && e.name.ends_with("/InstanceData/ResetTable")
-    }) else {
-        return;
-    };
-
-    let Some(cd_bytes) = read_uncompressed(bytes, data_offset, control) else {
-        return;
-    };
-    let Some(rt_bytes) = read_uncompressed(bytes, data_offset, reset) else {
-        return;
-    };
-    let Some(cd) = parse_control_data(cd_bytes) else {
-        return;
-    };
-    let Some(rt) = parse_reset_table(rt_bytes) else {
+    let Some(rt) = entries
+        .iter()
+        .find(|e| {
+            e.name
+                .starts_with("::DataSpace/Storage/MSCompressed/Transform/")
+                && e.name.ends_with("/InstanceData/ResetTable")
+        })
+        .and_then(read)
+        .and_then(parse_reset_table)
+    else {
         return;
     };
 
@@ -385,7 +378,6 @@ fn parse_reset_table(data: &[u8]) -> Option<ResetTable> {
     })
 }
 
-#[derive(Debug, Clone)]
 struct DirEntry {
     name: String,
     section: u64,
@@ -410,9 +402,9 @@ fn parse_directory(section: &[u8]) -> (Vec<DirEntry>, bool) {
         return (out, false);
     }
     // The length check above covers all three fields.
-    let header_len = bytes::u32_le(section, 0x08).unwrap_or(0) as usize;
-    let chunk_size = bytes::u32_le(section, 0x10).unwrap_or(0) as usize;
-    let chunk_count = bytes::u32_le(section, 0x2c).unwrap_or(0) as usize;
+    let header_len = bytes::sat_usize(bytes::u32_le(section, 0x08).unwrap_or(0));
+    let chunk_size = bytes::sat_usize(bytes::u32_le(section, 0x10).unwrap_or(0));
+    let chunk_count = bytes::sat_usize(bytes::u32_le(section, 0x2c).unwrap_or(0));
     if chunk_size < 0x14 {
         return (out, false);
     }
@@ -432,7 +424,7 @@ fn parse_directory(section: &[u8]) -> (Vec<DirEntry>, bool) {
         if !chunk.starts_with(b"PMGL") {
             continue;
         }
-        let Some(quickref) = bytes::u32_le(chunk, 0x04).map(|n| n as usize) else {
+        let Some(quickref) = bytes::u32_le(chunk, 0x04).map(bytes::sat_usize) else {
             continue;
         };
         if quickref >= chunk_size {
@@ -606,14 +598,8 @@ fn insert_cstr(
     Some(owned)
 }
 
-/// CHM-internal entries (`#SYSTEM`, `$OBJINST`, `::DataSpace/...`)
-/// share the `'#'` / `'::'` / `'$'` prefix convention.
-fn is_control_name(stripped: &str) -> bool {
-    stripped.starts_with('#') || stripped.starts_with("::") || stripped.starts_with('$')
-}
-
 fn push_unique(features: &mut Vec<&'static str>, name: &'static str) {
-    if !features.iter().any(|f| *f == name) {
+    if !features.contains(&name) {
         features.push(name);
     }
 }

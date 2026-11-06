@@ -30,13 +30,18 @@ pub(super) fn extract(
     values: &mut Values,
     metrics: &mut Metrics,
 ) {
-    let mut signatures = certificate_table(opt, bytes, metrics)
-        .map(cms::certificate_table)
+    let table = certificate_table(opt, bytes, metrics);
+    // The image hash leaves out the file's last `size` bytes, where the table
+    // belongs. A table the directory places anywhere else is not what the
+    // hash left out, and the bytes it did leave out are signed by nothing.
+    let table_is_tail = table.is_none_or(|(offset, table)| offset + table.len() == bytes.len());
+    let mut signatures = table
+        .map(|(_, table)| cms::certificate_table(table))
         .unwrap_or_default();
     let hashes = pe
         .map(|pe| image_hash::extract(pe, bytes, &signatures, values, metrics))
         .unwrap_or_default();
-    let Some(integrity) = trust::judge(&mut signatures, &hashes) else {
+    let Some(integrity) = trust::judge(&mut signatures, &hashes, table_is_tail) else {
         return;
     };
     values.insert_key(
@@ -49,7 +54,7 @@ pub(super) fn extract(
     );
 }
 
-/// The Certificate Table's bytes, recording its size as
+/// The Certificate Table's offset and bytes, recording its size as
 /// `pe.cert_table_size`. For this directory alone the `virtual_address` is a
 /// file offset (a PE/COFF spec carve-out), so the bytes are read directly; a
 /// table outside the file means the header was tampered with, flagged as
@@ -58,15 +63,15 @@ fn certificate_table<'a>(
     opt: &OptionalHeader,
     bytes: &'a [u8],
     metrics: &mut Metrics,
-) -> Option<&'a [u8]> {
+) -> Option<(usize, &'a [u8])> {
     let dir = opt.data_directories.get_certificate_table()?;
     if dir.size == 0 {
         return None;
     }
     metrics.insert(metric!("pe.cert_table_size"), f64::from(dir.size));
-    let offset = dir.virtual_address as usize;
+    let offset = crate::bytes::sat_usize(dir.virtual_address);
     let table = offset
-        .checked_add(dir.size as usize)
+        .checked_add(crate::bytes::sat_usize(dir.size))
         .and_then(|end| bytes.get(offset..end));
     if table.is_none() {
         tracing::debug!(
@@ -81,5 +86,8 @@ fn certificate_table<'a>(
             metrics.insert(metric!("pe.security_directory_out_of_bounds"), 1.0);
         }
     }
-    table
+    table.map(|table| (offset, table))
 }
+
+#[cfg(test)]
+mod tests;

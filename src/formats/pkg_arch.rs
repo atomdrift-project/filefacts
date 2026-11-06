@@ -12,6 +12,8 @@ use std::io::Read;
 
 use serde_json::{Map, Value as JsonValue};
 
+use super::bounded::{Limits, MAX_MANIFEST_BYTES, OnError, inflate_capped};
+use super::pkgmeta::{InfoLine, info_lines};
 use crate::output::Values;
 use crate::value_key;
 
@@ -21,11 +23,9 @@ use crate::value_key;
 /// package; a crafted one cannot make this inflate the whole payload.
 const METADATA_SCAN_LIMIT: u64 = 4 * 1024 * 1024;
 
-/// Largest `.PKGINFO` read.
-const MAX_PKGINFO_BYTES: u64 = 1024 * 1024;
-
 /// `.PKGINFO` keys and the `pkg.*` field each lands in. Repeatable keys
-/// become arrays, as their PKGBUILD counterparts are.
+/// become arrays, as their PKGBUILD counterparts are; any other key keeps
+/// its last value (see [`info_lines`]).
 const FIELDS: &[(&str, &str, bool)] = &[
     ("pkgname", "pkgname", false),
     ("pkgbase", "pkgbase", false),
@@ -48,25 +48,26 @@ const FIELDS: &[(&str, &str, bool)] = &[
 ];
 
 pub(super) fn extract(bytes: &[u8], values: &mut Values) {
-    let Some(text) = pkginfo(bytes) else {
+    let mut limits = Limits::default();
+    let text = pkginfo(bytes, &mut limits);
+    limits.emit(values, value_key!("pkg.limits"));
+    let Some(text) = text else {
         return;
     };
     let mut root = Map::new();
-    for line in text.lines() {
-        let Some((key, value)) = line.split_once('=') else {
+    for line in info_lines(&text) {
+        let InfoLine::Field(key, value) = line else {
             continue;
         };
-        let (key, value) = (key.trim(), value.trim());
-        if key.starts_with('#') {
-            continue;
-        }
         if key == "pkgver" {
             // `.PKGINFO` carries `[epoch:]pkgver-pkgrel` in one field; a
             // PKGBUILD has three, so split to match.
             let (version, release) = value.rsplit_once('-').unwrap_or((value, ""));
             let (epoch, version) = version.split_once(':').unwrap_or(("", version));
             for (field, part) in [("epoch", epoch), ("pkgver", version), ("pkgrel", release)] {
-                if !part.is_empty() {
+                if part.is_empty() {
+                    root.remove(field);
+                } else {
                     root.insert(field.into(), JsonValue::String(part.into()));
                 }
             }
@@ -84,7 +85,7 @@ pub(super) fn extract(bytes: &[u8], values: &mut Values) {
                 list.push(value);
             }
         } else {
-            root.entry(field).or_insert(value);
+            root.insert(field.into(), value);
         }
     }
     for (field, value) in root {
@@ -93,8 +94,9 @@ pub(super) fn extract(bytes: &[u8], values: &mut Values) {
 }
 
 /// The text of the package's `.PKGINFO` member, decompressing only as far
-/// as [`METADATA_SCAN_LIMIT`].
-fn pkginfo(bytes: &[u8]) -> Option<String> {
+/// as [`METADATA_SCAN_LIMIT`]. A `.PKGINFO` over [`MAX_MANIFEST_BYTES`], and
+/// a scan window spent before one is found, are recorded in `limits`.
+fn pkginfo(bytes: &[u8], limits: &mut Limits) -> Option<String> {
     let reader: Box<dyn Read + '_> = if bytes.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
         let decoder = super::bounded::zstd_decoder(bytes)
             .inspect_err(|error| log_abandoned("zstd", error))
@@ -113,40 +115,35 @@ fn pkginfo(bytes: &[u8]) -> Option<String> {
         .inspect_err(|error| log_abandoned("tar", error))
         .ok()?;
     for entry in entries {
-        let entry = entry
-            .inspect_err(|error| log_abandoned("tar", error))
-            .ok()?;
+        let Ok(entry) = entry.inspect_err(|error| log_abandoned("tar", error)) else {
+            break;
+        };
         let is_pkginfo = entry
             .path()
             .is_ok_and(|path| path.as_os_str() == ".PKGINFO" || path.as_os_str() == "./.PKGINFO");
         if !is_pkginfo {
             continue;
         }
-        if entry.size() > MAX_PKGINFO_BYTES {
-            tracing::debug!(
-                target: "filefacts::pkg_arch",
-                format = "pkg-arch",
-                stage = "pkginfo",
-                len = entry.size(),
-                "`.PKGINFO` is over its size cap; package metadata skipped"
+        let prefix = inflate_capped(entry, MAX_MANIFEST_BYTES, OnError::Discard)
+            .inspect_err(|error| log_abandoned("pkginfo", error))
+            .ok()?;
+        if prefix.truncated {
+            limits.push(
+                "pkginfo",
+                format!(".PKGINFO over the {MAX_MANIFEST_BYTES}-byte cap; not parsed"),
             );
             return None;
         }
-        let mut text = Vec::new();
-        entry
-            .take(MAX_PKGINFO_BYTES)
-            .read_to_end(&mut text)
-            .inspect_err(|error| log_abandoned("pkginfo", error))
-            .ok()?;
-        return Some(String::from_utf8_lossy(&text).into_owned());
+        return Some(String::from_utf8_lossy(&prefix.bytes).into_owned());
     }
-    tracing::debug!(
-        target: "filefacts::pkg_arch",
-        format = "pkg-arch",
-        stage = "tar",
-        len = METADATA_SCAN_LIMIT,
-        "no `.PKGINFO` within the metadata scan window"
-    );
+    // The window is spent when the `Take` has nothing left: whatever the tar
+    // reader made of the cut-off stream, the scan ran out, not the package.
+    if archive.into_inner().limit() == 0 {
+        limits.push(
+            "metadata-scan",
+            format!("no .PKGINFO in the first {METADATA_SCAN_LIMIT} decompressed bytes"),
+        );
+    }
     None
 }
 

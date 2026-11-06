@@ -31,6 +31,7 @@
 //!   `dmg.volume.formatted_by`, and `dmg.volume.{file,folder,symlink}_count`.
 
 use crate::metric;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 
 use serde_json::{Map as JsonMap, Value as JsonValue};
@@ -177,7 +178,7 @@ fn parse_blkx(bytes: &[u8], koly: &Koly) -> Vec<Partition> {
     let Ok(start) = usize::try_from(koly.xml_offset) else {
         return Vec::new();
     };
-    let len = usize::try_from(koly.xml_length.min(MAX_XML as u64)).unwrap_or(MAX_XML);
+    let len = crate::bytes::sat_usize(koly.xml_length).min(MAX_XML);
     let Some(xml) = bytes.get(start..start.saturating_add(len)) else {
         return Vec::new();
     };
@@ -215,25 +216,29 @@ fn parse_blkx(bytes: &[u8], koly: &Koly) -> Vec<Partition> {
     out
 }
 
+/// Where a `mish` (BLKXTable) blob's chunk descriptors start, after its
+/// fixed header, and the size of each.
+const MISH_CHUNKS_AT: usize = 204;
+const MISH_CHUNK_LEN: usize = 40;
+
 /// Decode a `mish` (BLKXTable) blob: a fixed header followed by an array of
-/// 40-byte chunk descriptors starting at offset 204.
+/// chunk descriptors.
 fn parse_mish(name: String, data: &[u8]) -> Option<Partition> {
     if !data.starts_with(b"mish") {
         return None;
     }
     let sector_count = u64_be(data, 16)?;
     let data_offset = u64_be(data, 24)?;
-    let declared = u32_be(data, 200)? as usize;
+    let declared = crate::bytes::sat_usize(u32_be(data, 200)?);
     // The chunk count is attacker-controlled; clamp to what the blob holds.
-    let available = data.len().saturating_sub(204) / 40;
+    let available = data.len().saturating_sub(MISH_CHUNKS_AT) / MISH_CHUNK_LEN;
     let count = declared.min(available);
 
     let mut chunks = Vec::with_capacity(count);
     for i in 0..count {
-        let off = 204 + i * 40;
-        let entry_type = u32_be(data, off)?;
+        let off = MISH_CHUNKS_AT + i * MISH_CHUNK_LEN;
         chunks.push(Chunk {
-            entry_type,
+            entry_type: u32_be(data, off)?,
             sector_number: u64_be(data, off + 8)?,
             sector_count: u64_be(data, off + 16)?,
             comp_offset: u64_be(data, off + 24)?,
@@ -259,34 +264,41 @@ fn emit_partitions(
     metrics.insert(metric!("dmg.partition_count"), partitions.len() as f64);
 
     // Codec chunk counts across all partitions. BTreeMap → stable order.
-    let mut codec_counts: std::collections::BTreeMap<&'static str, u64> =
-        std::collections::BTreeMap::new();
-    let mut compressors: std::collections::BTreeSet<&'static str> =
-        std::collections::BTreeSet::new();
+    let mut codec_counts: BTreeMap<&'static str, u64> = BTreeMap::new();
+    let mut compressors: BTreeSet<&'static str> = BTreeSet::new();
 
     let mut members = Vec::with_capacity(partitions.len());
     let mut archive_values = Vec::with_capacity(partitions.len());
     let mut stats = ArchiveStats::new(AGGS);
     for p in partitions {
-        let mut part_codecs: std::collections::BTreeMap<&'static str, u64> =
-            std::collections::BTreeMap::new();
+        let mut part_codecs: BTreeMap<&'static str, u64> = BTreeMap::new();
         let mut compressed: u64 = 0;
         for c in &p.chunks {
-            let codec = codec_name(c.entry_type);
+            let codec = Codec::of(c.entry_type);
             // Terminator / comment chunks carry no payload.
-            if matches!(codec, "last" | "comment") {
+            if matches!(codec, Codec::Last | Codec::Comment) {
                 continue;
             }
-            *codec_counts.entry(codec).or_insert(0) += 1;
-            *part_codecs.entry(codec).or_insert(0) += 1;
+            let name = codec.name();
+            *codec_counts.entry(name).or_insert(0) += 1;
+            *part_codecs.entry(name).or_insert(0) += 1;
             compressed = compressed.saturating_add(c.comp_length);
-            if is_compressor(codec) {
-                compressors.insert(codec);
+            // Only these compress; the rest are raw, zero or structural.
+            if matches!(
+                codec,
+                Codec::Adc | Codec::Zlib | Codec::Bzip2 | Codec::Lzfse | Codec::Lzma
+            ) {
+                compressors.insert(name);
             }
         }
 
         let size_bytes = p.sector_count.saturating_mul(SECTOR);
-        let method = dominant_codec(&part_codecs);
+        // The codec backing the most chunks (the later name on a tie),
+        // `none` when the partition has no payload chunks.
+        let method = part_codecs
+            .iter()
+            .max_by_key(|(_, count)| **count)
+            .map_or("none", |(codec, _)| *codec);
 
         let mut obj = JsonMap::new();
         obj.insert("name".into(), JsonValue::String(p.name.clone()));
@@ -321,10 +333,7 @@ fn emit_partitions(
     );
     stats.emit(values, metrics);
 
-    let codecs: Vec<JsonValue> = codec_counts
-        .keys()
-        .map(|k| JsonValue::String((*k).into()))
-        .collect();
+    let codecs: Vec<JsonValue> = codec_counts.keys().map(|&k| JsonValue::from(k)).collect();
     values.insert_key(
         value_key!("dmg.compression.codecs"),
         JsonValue::Array(codecs),
@@ -379,10 +388,9 @@ fn volume_facts(
         return;
     };
 
-    if let Some(()) = hfs_volume_facts(&prefix, values, metrics) {
-        return;
+    if hfs_volume_facts(&prefix, values, metrics).is_none() {
+        apfs_volume_facts(&prefix, values, metrics);
     }
-    apfs_volume_facts(&prefix, values, metrics);
 }
 
 /// Inflated bytes [`reconstruct_prefix`] decodes across every chunk. The
@@ -396,8 +404,8 @@ const MAX_PREFIX_INFLATE: usize = 4 * MAX_VOL_PREFIX;
 /// inflate budget alone does not bound the work: a chunk whose stream
 /// inflates to nothing (a run of empty deflate blocks) still consumes its
 /// whole source, and chunks that rewrite the same sectors while one stays
-/// unwritten each handle up to the window. Hundreds of thousands of such
-/// descriptors multiplied the image size by the descriptor count.
+/// unwritten each handle up to the window. Without it, hundreds of thousands
+/// of such descriptors would multiply the image size by the descriptor count.
 const MAX_PREFIX_WORK: usize = 4 * MAX_VOL_PREFIX;
 
 /// Decompress the leading `max` bytes of a partition using only the codecs
@@ -435,19 +443,17 @@ fn reconstruct_prefix(
         else {
             continue; // beyond the window — irrelevant to the superblock.
         };
-        let want = usize::try_from(c.sector_count.saturating_mul(SECTOR))
-            .unwrap_or(usize::MAX)
-            .min(max - out_off);
-        let codec = codec_name(c.entry_type);
-        let n = match codec {
-            "zero" | "ignore" => {
+        let want =
+            crate::bytes::sat_usize(c.sector_count.saturating_mul(SECTOR)).min(max - out_off);
+        let n = match Codec::of(c.entry_type) {
+            Codec::Zero | Codec::Ignore => {
                 // Already zero-filled; only the sectors are marked.
                 let n = want.min(work_budget);
                 work_budget -= n;
                 n
             }
-            "comment" | "last" => continue,
-            "raw" => {
+            Codec::Comment | Codec::Last => continue,
+            Codec::Raw => {
                 let Some(src) = chunk_source(bytes, fork_base, c) else {
                     continue;
                 };
@@ -456,7 +462,7 @@ fn reconstruct_prefix(
                 fill(&mut buf, out_off, src);
                 src.len()
             }
-            "zlib" => {
+            Codec::Zlib => {
                 if inflate_budget == 0 {
                     break;
                 }
@@ -475,13 +481,15 @@ fn reconstruct_prefix(
                     .read_to_end(&mut out);
                 // Charged at least a sector: setting up an inflater costs
                 // that much even for a stream that consumes nothing.
-                let consumed = usize::try_from(zlib.total_in()).unwrap_or(usize::MAX);
+                let consumed = crate::bytes::sat_usize(zlib.total_in());
                 work_budget = work_budget.saturating_sub(consumed.max(sector));
                 inflate_budget -= out.len();
                 fill(&mut buf, out_off, &out);
                 out.len()
             }
-            _ => return None, // adc / bzip2 / lzfse / lzma
+            Codec::Adc | Codec::Bzip2 | Codec::Lzfse | Codec::Lzma | Codec::Unknown => {
+                return None;
+            }
         };
         let first = out_off / sector;
         let last = out_off
@@ -533,7 +541,7 @@ fn hfs_volume_facts(prefix: &[u8], values: &mut Values, metrics: &mut Metrics) -
     let lmv: String = vh[8..12]
         .iter()
         .filter(|&&b| b != 0)
-        .map(|&b| b as char)
+        .map(|&b| char::from(b))
         .collect();
     if !lmv.is_empty() {
         values.insert_key(
@@ -545,21 +553,21 @@ fn hfs_volume_facts(prefix: &[u8], values: &mut Values, metrics: &mut Metrics) -
     // Dates are seconds since 1904. Per the HFS+ spec `createDate` is local
     // time while `modifyDate` is GMT, so their delta is the build machine's
     // timezone offset — surfaced separately rather than normalized away.
-    let create = u32_be(vh, 16)?;
-    let modify = u32_be(vh, 20)?;
-    if let Some(t) = hfs_to_unix(create) {
+    let created = hfs_to_unix(u32_be(vh, 16)?);
+    let modified = hfs_to_unix(u32_be(vh, 20)?);
+    if let Some(t) = created {
         values.insert_key(
             value_key!("dmg.volume.created_unix"),
             JsonValue::Number(t.into()),
         );
     }
-    if let Some(t) = hfs_to_unix(modify) {
+    if let Some(t) = modified {
         values.insert_key(
             value_key!("dmg.volume.modified_unix"),
             JsonValue::Number(t.into()),
         );
     }
-    if let (Some(c), Some(m)) = (hfs_to_unix(create), hfs_to_unix(modify)) {
+    if let (Some(c), Some(m)) = (created, modified) {
         metrics.insert(metric!("dmg.volume.timezone_skew_seconds"), (c - m) as f64);
     }
 
@@ -626,36 +634,56 @@ fn apfs_volume_facts(prefix: &[u8], values: &mut Values, metrics: &mut Metrics) 
     Some(())
 }
 
-/// Map a `BLKXChunkEntry` type to filefacts' stable codec vocabulary.
-fn codec_name(entry_type: u32) -> &'static str {
-    match entry_type {
-        0x0000_0000 => "zero",
-        0x0000_0001 => "raw",
-        0x0000_0002 => "ignore",
-        0x8000_0004 => "adc",
-        0x8000_0005 => "zlib",
-        0x8000_0006 => "bzip2",
-        0x8000_0007 => "lzfse",
-        0x8000_0008 => "lzma",
-        0x7fff_fffe => "comment",
-        0xffff_ffff => "last",
-        _ => "unknown",
+/// How a `BLKXChunkEntry` stores its sectors.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Codec {
+    Zero,
+    Raw,
+    Ignore,
+    Adc,
+    Zlib,
+    Bzip2,
+    Lzfse,
+    Lzma,
+    Comment,
+    Last,
+    Unknown,
+}
+
+impl Codec {
+    /// The codec a chunk's `entry_type` names.
+    fn of(entry_type: u32) -> Self {
+        match entry_type {
+            0x0000_0000 => Self::Zero,
+            0x0000_0001 => Self::Raw,
+            0x0000_0002 => Self::Ignore,
+            0x8000_0004 => Self::Adc,
+            0x8000_0005 => Self::Zlib,
+            0x8000_0006 => Self::Bzip2,
+            0x8000_0007 => Self::Lzfse,
+            0x8000_0008 => Self::Lzma,
+            0x7fff_fffe => Self::Comment,
+            0xffff_ffff => Self::Last,
+            _ => Self::Unknown,
+        }
     }
-}
 
-/// Whether a codec actually compresses (vs. raw/zero/structural markers).
-fn is_compressor(codec: &str) -> bool {
-    matches!(codec, "adc" | "zlib" | "bzip2" | "lzfse" | "lzma")
-}
-
-/// The codec backing the most chunks in a partition (`mixed` on a tie of
-/// distinct compressors, `none` when empty).
-fn dominant_codec(counts: &std::collections::BTreeMap<&'static str, u64>) -> &'static str {
-    counts
-        .iter()
-        .max_by_key(|(_, c)| **c)
-        .map(|(k, _)| *k)
-        .unwrap_or("none")
+    /// The codec in filefacts' stable vocabulary.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Zero => "zero",
+            Self::Raw => "raw",
+            Self::Ignore => "ignore",
+            Self::Adc => "adc",
+            Self::Zlib => "zlib",
+            Self::Bzip2 => "bzip2",
+            Self::Lzfse => "lzfse",
+            Self::Lzma => "lzma",
+            Self::Comment => "comment",
+            Self::Last => "last",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 /// Inner filesystem named in a partition label (`disk image (Apple_HFS : 4)`).

@@ -10,8 +10,9 @@ use std::sync::LazyLock;
 
 use aho_corasick::AhoCorasick;
 
+use crate::bytes::ends_with_ci;
 use crate::bytes::sat_u32;
-use crate::formats::common::{ends_with_ci, starts_with_ci};
+use crate::formats::common::starts_with_ci;
 use crate::metric;
 use crate::output::Metrics;
 use crate::scan::classify::{is_base64_literal, is_hex_literal};
@@ -256,7 +257,7 @@ fn is_url(s: &str) -> bool {
 
 fn is_file_path(s: &str) -> bool {
     if s.starts_with('/') && s.len() > 1 && !s.starts_with("//") {
-        return s.as_bytes().contains(&b'/');
+        return true;
     }
     if let [drive, b':', b'\\' | b'/', ..] = s.as_bytes()
         && drive.is_ascii_alphabetic()
@@ -276,9 +277,8 @@ fn is_file_path(s: &str) -> bool {
 }
 
 fn is_ip_address(s: &str) -> bool {
-    let parts: Vec<&str> = s.split('.').collect();
-    if parts.len() == 4 {
-        return parts.iter().all(|p| p.parse::<u8>().is_ok());
+    if s.bytes().filter(|&b| b == b'.').count() == 3 {
+        return s.split('.').all(|p| p.parse::<u8>().is_ok());
     }
     if s.contains(':') && !s.contains("://") {
         let colon_count = s.bytes().filter(|&b| b == b':').count();
@@ -293,11 +293,11 @@ fn is_email(s: &str) -> bool {
     if !s.contains('@') || s.len() < 5 {
         return false;
     }
-    let parts: Vec<&str> = s.split('@').collect();
-    let [local, domain] = parts.as_slice() else {
+    let Some((local, domain)) = s.split_once('@') else {
         return false;
     };
     !local.is_empty()
+        && !domain.contains('@')
         && !domain.is_empty()
         && domain.contains('.')
         && !domain.starts_with('.')

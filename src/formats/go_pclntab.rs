@@ -2,10 +2,10 @@
 //!
 //! The runtime needs the table to unwind stacks and print tracebacks, so even
 //! a stripped Go binary (`-ldflags="-s -w"`) keeps it whole: every function's
-//! name and entry address. Reading it takes a fraction of a second; asking
-//! a disassembler to rediscover the same functions (rizin, once) took a 75 MB
-//! Kubernetes controller more than half an hour. A typed function inventory
-//! is what lets a Go binary skip binform's recovery.
+//! name and entry address. Reading it is one pass over the table, where
+//! rediscovering the same functions by disassembly costs a walk of every
+//! instruction. A typed function inventory is what lets a Go binary skip
+//! binform's recovery.
 //!
 //! The layouts, as Go's `debug/gosym` reads them. Offsets count from the
 //! table's start; `P` is the pointer size, and a functab field is `P` wide
@@ -29,11 +29,11 @@
 //! word: the word may be unrelocated, and Go 1.27's linker writes it as zero.
 //!
 //! In a hostile binary the table is attacker-controlled bytes, and a table
-//! that parses keeps binform from recovering the file's functions. So a table is believed
-//! only whole: functab entries ascending, every `_func` record agreeing with
-//! the functab on its entry, every name in bounds, and an address span inside
-//! the executable code that covers most of it. A decoy grafted onto a payload
-//! to dodge disassembly fails the last test.
+//! that parses keeps binform from recovering the file's functions. So a table
+//! is believed only whole: functab entries ascending, every `_func` record
+//! agreeing with the functab on its entry, every name in bounds, and an
+//! address span inside the executable code that covers most of it. A decoy
+//! grafted onto a payload to dodge disassembly fails the last test.
 
 use crate::bytes;
 use crate::output::Symbol;
@@ -111,18 +111,43 @@ struct Header {
     records: usize,
 }
 
+/// The pclntab magics across releases and the layout each introduced, in
+/// both byte orders: the table is laid out in the target's, little-endian
+/// for amd64/arm64/386/arm and big-endian for s390x/mips/ppc64.
+const MAGICS: [([u8; 4], Version, bool); 8] = [
+    ([0xfb, 0xff, 0xff, 0xff], Version::Go12, false),
+    ([0xfa, 0xff, 0xff, 0xff], Version::Go116, false),
+    ([0xf0, 0xff, 0xff, 0xff], Version::Go118, false),
+    ([0xf1, 0xff, 0xff, 0xff], Version::Go118, false),
+    ([0xff, 0xff, 0xff, 0xfb], Version::Go12, true),
+    ([0xff, 0xff, 0xff, 0xfa], Version::Go116, true),
+    ([0xff, 0xff, 0xff, 0xf0], Version::Go118, true),
+    ([0xff, 0xff, 0xff, 0xf1], Version::Go118, true),
+];
+
+/// The layout and byte order `table`'s magic names.
+fn magic(table: &[u8]) -> Option<(Version, bool)> {
+    let magic = table.first_chunk::<4>()?;
+    MAGICS
+        .iter()
+        .find(|(known, ..)| known == magic)
+        .map(|&(_, version, big_endian)| (version, big_endian))
+}
+
+/// Whether `data` begins with a Go pclntab magic: proof a `.gopclntab` /
+/// `__gopclntab` section is a Go function table, not a same-named decoy
+/// grafted onto a stripped payload to make it look like Go and spare it
+/// binform's recovery.
+pub(super) fn has_magic(data: &[u8]) -> bool {
+    magic(data).is_some()
+}
+
 impl Header {
     fn read(table: &[u8]) -> Result<Self, &'static str> {
-        let magic = table.get(..4).ok_or("shorter than a header")?;
-        let (version, big_endian) = match magic {
-            [0xfb, 0xff, 0xff, 0xff] => (Version::Go12, false),
-            [0xfa, 0xff, 0xff, 0xff] => (Version::Go116, false),
-            [0xf0 | 0xf1, 0xff, 0xff, 0xff] => (Version::Go118, false),
-            [0xff, 0xff, 0xff, 0xfb] => (Version::Go12, true),
-            [0xff, 0xff, 0xff, 0xfa] => (Version::Go116, true),
-            [0xff, 0xff, 0xff, 0xf0 | 0xf1] => (Version::Go118, true),
-            _ => return Err("no pclntab magic"),
-        };
+        if table.len() < 8 {
+            return Err("shorter than a header");
+        }
+        let (version, big_endian) = magic(table).ok_or("no pclntab magic")?;
         let &[0, 0, quantum, pointer] = table.get(4..8).ok_or("shorter than a header")? else {
             return Err("nonzero header padding");
         };
@@ -228,7 +253,20 @@ fn read(table: &[u8], code: Code, text: u64) -> Result<Vec<Symbol>, &'static str
             .uint(table, at, field)
             .ok_or("functab runs past the table")
     };
+    // The span the functab claims, first entry to closing address, is
+    // checked against the code before any record is walked: a forged count
+    // of up to `MAX_FUNCTIONS` records must not cost a walk to be refused.
+    let first = header.address(raw(header.functab)?, text);
     let end = header.address(raw(end_field)?, text);
+    if end < first {
+        return Err("functab end precedes its last entry");
+    }
+    if first < code.start || end > code.end {
+        return Err("functions lie outside the executable code");
+    }
+    if !code.mostly_covered_by(end - first) {
+        return Err("functions cover too little of the executable code");
+    }
     // Names are disjoint slices of the funcname table in an honest table; a
     // forged one can point every record at one long name, so the copies are
     // bounded by the table's size.
@@ -276,15 +314,8 @@ fn read(table: &[u8], code: Code, text: u64) -> Result<Vec<Symbol>, &'static str
             callees: Vec::new(),
         });
     }
-    let first = header.address(raw(header.functab)?, text);
-    if end < previous.unwrap_or(first) {
+    if previous.is_some_and(|last| end < last) {
         return Err("functab end precedes its last entry");
-    }
-    if first < code.start || end > code.end {
-        return Err("functions lie outside the executable code");
-    }
-    if !code.mostly_covered_by(end - first) {
-        return Err("functions cover too little of the executable code");
     }
     tracing::debug!(
         version = ?header.version,
@@ -301,10 +332,13 @@ fn read(table: &[u8], code: Code, text: u64) -> Result<Vec<Symbol>, &'static str
 /// into `.rdata`). Each candidate header is held to everything [`functions`]
 /// checks, so a stray magic in the data cannot pass.
 pub(super) fn find(region: &[u8], code: Code, text: u64) -> Option<Vec<Symbol>> {
-    let mut starts: Vec<usize> = super::go_buildinfo::PCLNTAB_MAGICS
+    let mut starts: Vec<usize> = MAGICS
         .iter()
-        .flat_map(|magic| memchr::memmem::find_iter(region, magic))
-        .filter(|&at| region.get(at + 4..at + 6) == Some(&[0, 0]))
+        .flat_map(|(magic, ..)| {
+            memchr::memmem::find_iter(region, magic)
+                .filter(|&at| region.get(at + 4..at + 6) == Some(&[0, 0]))
+                .take(MAX_CANDIDATES)
+        })
         .collect();
     starts.sort_unstable();
     starts.truncate(MAX_CANDIDATES);

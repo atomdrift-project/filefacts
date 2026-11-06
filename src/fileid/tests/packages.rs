@@ -315,13 +315,13 @@ fn is_archive_returns_true_for_archives() {
 
 #[test]
 fn is_binary_returns_true_for_binaries() {
-    assert!(FileType::Elf.is_binary());
-    assert!(FileType::Pe.is_binary());
-    assert!(FileType::MachO.is_binary());
-    assert!(FileType::JavaClass.is_binary());
-    assert!(FileType::Dex.is_binary());
-    assert!(!FileType::Zip.is_binary());
-    assert!(!FileType::Python.is_binary());
+    assert!(FileType::Elf.is_executable_code());
+    assert!(FileType::Pe.is_executable_code());
+    assert!(FileType::MachO.is_executable_code());
+    assert!(FileType::JavaClass.is_executable_code());
+    assert!(FileType::Dex.is_executable_code());
+    assert!(!FileType::Zip.is_executable_code());
+    assert!(!FileType::Python.is_executable_code());
 }
 
 #[test]

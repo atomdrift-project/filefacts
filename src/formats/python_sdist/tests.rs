@@ -1,4 +1,5 @@
 use super::*;
+use crate::output::Errors;
 use std::io::Write;
 
 /// A gzipped tar holding the given members.
@@ -19,17 +20,9 @@ fn tgz(members: &[(&str, &[u8])]) -> Vec<u8> {
 }
 
 fn run(bytes: &[u8]) -> (Values, Errors) {
-    let mut v = Values::new();
-    let mut e = Errors::new();
-    extract(
-        bytes,
-        FileType::PythonSdist,
-        &mut v,
-        &mut Metrics::new(),
-        &mut Vec::new(),
-        &mut e,
-    )
-    .unwrap();
+    let mut sinks = crate::formats::Sinks::default();
+    extract(bytes, sinks.ctx()).unwrap();
+    let (v, e) = (sinks.values, sinks.errors);
     (v, e)
 }
 
@@ -81,7 +74,7 @@ fn corrupt_gzip_stream_records_one_tar_parse_error() {
 fn oversized_pkg_info_is_read_up_to_the_cap() {
     for body_start in ["", "x"] {
         let mut meta = format!("Name: demo\nVersion: 1\n\n{body_start}").into_bytes();
-        while meta.len() as u64 <= MAX_MANIFEST {
+        while meta.len() as u64 <= MAX_MANIFEST_BYTES {
             meta.extend_from_slice("\u{e9}".as_bytes());
         }
         let (v, e) = run(&tgz(&[("demo-1.0/PKG-INFO", &meta)]));
@@ -89,6 +82,10 @@ fn oversized_pkg_info_is_read_up_to_the_cap() {
         assert_eq!(
             v.get("python.name").and_then(JsonValue::as_str),
             Some("demo")
+        );
+        assert_eq!(
+            v.get("python.limits[0].stage").and_then(JsonValue::as_str),
+            Some("pkg-info")
         );
     }
 }

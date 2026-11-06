@@ -4,7 +4,7 @@
 use serde_json::{Value as JsonValue, json};
 
 use super::{MAX_BOOT_ENTRIES, Pvd, SECTOR, decode_field, field, sector_at};
-use crate::formats::common::bytes_at::{u16_le, u32_le};
+use crate::bytes::{u16_le, u32_le};
 use crate::metric;
 use crate::output::{ArchiveMember, EntryType, Metrics, Values};
 use crate::value_key;
@@ -29,11 +29,12 @@ pub(super) fn emit_boot(
 ) -> BootTally {
     let mut tally = BootTally::default();
     let boot_system = decode_field(&field(body, 7, 32), false);
+    let el_torito = boot_system.to_ascii_uppercase().starts_with("EL TORITO");
     values.insert_key(
         value_key!("iso.boot.system_id"),
-        JsonValue::String(boot_system.clone()),
+        JsonValue::String(boot_system),
     );
-    if !boot_system.to_ascii_uppercase().starts_with("EL TORITO") {
+    if !el_torito {
         // A boot record that isn't El Torito still means "this image
         // claims to boot"; record the claim without inventing a catalog.
         values.insert_key(value_key!("iso.boot.bootable"), JsonValue::Bool(true));
@@ -45,7 +46,7 @@ pub(super) fn emit_boot(
     if catalog_lba >= pvd.volume_space_sectors {
         tally.anomalies.push("boot-catalog-out-of-range");
     }
-    let Some(catalog) = sector_at(bytes, catalog_lba as usize) else {
+    let Some(catalog) = sector_at(bytes, crate::bytes::sat_usize(catalog_lba)) else {
         tally.anomalies.push("boot-catalog-unreadable");
         return tally;
     };

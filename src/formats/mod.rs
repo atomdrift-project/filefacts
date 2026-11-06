@@ -20,9 +20,99 @@ use crate::output::{ArchiveMember, Errors, Metrics, Section, Strings, Symbols, V
 use crate::value_key;
 
 mod ani;
+mod apk_alpine;
+mod apk_android;
+mod archive_stats;
+mod asar;
+mod axml;
+mod binary_attribution;
+pub(crate) mod bounded;
+mod build_toolchain;
+mod cab;
+mod carrier;
+pub(crate) mod cfml;
+mod chm;
+mod class;
+pub(crate) mod cms;
+pub(crate) mod common;
+mod containers;
+mod core_metadata;
+mod cpio;
+mod crx;
+mod cws;
+mod deb;
 mod desktop_entry;
 mod dex;
+mod dmg;
+mod elf;
+mod embedded_php;
+mod font;
+mod gem;
+mod generic;
+mod go_buildinfo;
+mod go_pclntab;
+pub(crate) mod goblin_safe;
+mod image4;
+mod image_stats;
+pub(crate) mod iso;
+mod jar;
+mod jpeg;
+pub(crate) mod jphp;
+mod lnk;
+mod macho;
+mod markdown;
+mod marshal;
+mod maven_pom;
+mod msbuild;
+mod ne;
+mod nib;
+mod npm;
+mod nupkg;
+mod oci;
+mod ole2;
+mod ooxml;
+mod pbxproj;
+mod pdf;
+mod pe;
+pub(crate) mod people;
+pub(crate) mod phar;
+mod pickle;
+mod pkg_arch;
+mod pkgmeta;
+mod plist_guard;
+mod png;
+mod png_stego;
+pub(crate) mod pyarmor;
+mod pyc;
+mod python_sdist;
+mod rar;
+pub(crate) mod references;
+mod registry;
+pub(crate) mod rpa;
+mod rpm;
+mod rpyc;
+mod rtf;
+mod rust_crate;
+mod scpt;
+mod sevenz;
+mod shellcode;
+pub(crate) mod source;
+mod source_meta;
+mod structured;
+mod symbol_hashes;
 mod systemd;
+mod tar;
+#[cfg(test)]
+mod testutil;
+mod udf;
+mod upx;
+mod vba;
+pub(crate) mod vba_symbols;
+mod vsix;
+mod wasm;
+mod whl;
+mod xpi;
+mod zip;
 
 /// Mutable output collectors that every format extractor writes into.
 /// Bundled to keep the [`extract`] dispatch signature manageable and
@@ -102,92 +192,6 @@ impl Sinks {
         }
     }
 }
-mod apk_alpine;
-mod apk_android;
-mod archive_stats;
-mod asar;
-mod axml;
-mod binary_attribution;
-mod bounded;
-mod build_toolchain;
-mod cab;
-mod carrier;
-pub(crate) mod cfml;
-mod chm;
-mod class;
-pub(crate) mod cms;
-pub(crate) mod common;
-mod containers;
-mod cpio;
-mod crx;
-mod deb;
-mod dmg;
-mod elf;
-mod embedded_php;
-mod font;
-mod gem;
-mod generic;
-mod go_buildinfo;
-mod go_pclntab;
-pub(crate) mod goblin_safe;
-mod image4;
-mod image_stats;
-pub(crate) mod iso;
-mod jar;
-mod jpeg;
-mod lnk;
-mod macho;
-mod markdown;
-mod maven_pom;
-mod msbuild;
-mod ne;
-mod nib;
-mod npm;
-mod nupkg;
-mod oci;
-mod ole2;
-mod ooxml;
-mod pbxproj;
-mod pdf;
-mod pe;
-pub(crate) mod people;
-pub(crate) mod phar;
-mod pickle;
-mod pkg_arch;
-mod pkgmeta;
-mod plist_guard;
-mod png;
-mod png_stego;
-pub(crate) mod pyarmor;
-mod pyc;
-mod python_sdist;
-mod rar;
-pub(crate) mod references;
-mod registry;
-pub(crate) mod rpa;
-mod rpm;
-mod rpyc;
-mod rtf;
-mod rust_crate;
-mod scpt;
-mod sevenz;
-mod shellcode;
-pub(crate) mod source;
-mod source_meta;
-mod structured;
-mod symbol_hashes;
-mod tar;
-#[cfg(test)]
-mod testutil;
-mod udf;
-mod upx;
-mod vba;
-pub(crate) mod vba_symbols;
-mod vsix;
-mod wasm;
-mod whl;
-mod xpi;
-mod zip;
 
 /// Run one container walker and emit the shared `media.*` facts.
 ///
@@ -213,15 +217,18 @@ fn media_container(
 /// reads member contents, is then skipped.
 fn zip_package<'a>(
     bytes: &'a [u8],
-    values: &mut Values,
-    metrics: &mut Metrics,
-    archive_members: &mut Vec<ArchiveMember>,
-    errors: &mut Errors,
-    package: impl FnOnce(&mut zip::Archive<'a>, &mut Values, &mut Metrics, &mut Errors),
+    mut ctx: ExtractCtx<'_>,
+    package: impl FnOnce(&mut zip::Archive<'a>, ExtractCtx<'_>),
 ) -> Result<(), Error> {
-    if let Some(mut archive) = zip::open_and_walk(bytes, values, metrics, archive_members, errors)?
-    {
-        package(&mut archive, values, metrics, errors);
+    let walked = zip::open_and_walk(
+        bytes,
+        ctx.values,
+        ctx.metrics,
+        ctx.archive_members,
+        ctx.errors,
+    )?;
+    if let Some(mut archive) = walked {
+        package(&mut archive, ctx.reborrow());
     }
     Ok(())
 }
@@ -239,22 +246,12 @@ pub(crate) fn extract(
     // extractors layer on top of (and may shadow with more accurate
     // values) what generic emits.
     generic::extract(bytes, ctx.metrics);
-    if file_type == FileType::Dex {
-        dex::extract(bytes, ctx.symbols, &mut ctx.strings.literals, ctx.values);
-    }
-    if file_type == FileType::Xml {
-        msbuild::extract(bytes, ctx.values);
-    }
-    if file_type == FileType::Xml && axml::looks_like_axml(bytes) {
-        axml::extract_values(bytes, ctx.values);
-    }
     if let Some(key) = ctx.xor_pe_key {
         generic::extract_xor_pe(key, ctx.values, ctx.metrics);
     }
-    if ctx
-        .basename
-        .is_some_and(|name| crate::has_named_reference_metadata(std::path::Path::new(name)))
-    {
+    if ctx.basename.is_some_and(|name| {
+        crate::package_context::has_named_reference_metadata(std::path::Path::new(name))
+    }) {
         ctx.values.insert_key(
             value_key!("go_manifest.kind"),
             serde_json::json!(ctx.basename),
@@ -267,7 +264,8 @@ pub(crate) fn extract(
     // here. Emitted centrally so every archive arm gets it; the codec for an
     // Arch `.pkg.tar.*` is resolved from the bytes. Non-archive types emit
     // nothing.
-    if let Some(container) = crate::fileid::container_of(file_type, bytes) {
+    let container = crate::fileid::container_of(file_type, bytes);
+    if let Some(container) = container {
         ctx.values.insert_key(
             value_key!("archive.container.archive"),
             serde_json::Value::String(container.archive.label().into()),
@@ -279,9 +277,7 @@ pub(crate) fn extract(
     }
 
     let result = match file_type {
-        FileType::AppleScript => {
-            scpt::extract(bytes, ctx.values, ctx.strings, ctx.metrics, ctx.symbols)
-        }
+        FileType::AppleScript => scpt::extract(bytes, ctx.reborrow()),
         FileType::Pe => pe::extract(bytes, ctx.reborrow()),
         FileType::Ne => ne::extract(bytes, ctx.symbols, ctx.metrics),
         FileType::Elf => {
@@ -298,24 +294,14 @@ pub(crate) fn extract(
         }
         // An APK is a zip: walk it for members, then read AndroidManifest.xml
         // and the v1 signature block for the android.* identity facts.
-        FileType::ApkAndroid => zip_package(
-            bytes,
-            ctx.values,
-            ctx.metrics,
-            ctx.archive_members,
-            ctx.errors,
-            apk_android::extract_from_archive,
-        ),
+        FileType::ApkAndroid => zip_package(bytes, ctx.reborrow(), |archive, ctx| {
+            apk_android::extract_from_archive(archive, ctx.values, ctx.metrics, ctx.errors);
+        }),
         // A plain zip may be a source release: the walk's archive is probed
         // for a WordPress or autoconf identity.
-        FileType::Zip => zip_package(
-            bytes,
-            ctx.values,
-            ctx.metrics,
-            ctx.archive_members,
-            ctx.errors,
-            |archive, values, _, _| source_meta::probe_zip(archive, values),
-        ),
+        FileType::Zip => zip_package(bytes, ctx.reborrow(), |archive, ctx| {
+            source_meta::probe_zip(archive, ctx.values);
+        }),
         FileType::GoModule
         | FileType::Composer
         | FileType::Odf
@@ -325,48 +311,24 @@ pub(crate) fn extract(
             // Zip-based packages (Android apk, conda, egg, ipa): the generic
             // archive walk surfaces their member listing and the identity
             // manifests inside (PKG-INFO, Info.plist, …).
-            zip::extract(
-                bytes,
-                ctx.values,
-                ctx.metrics,
-                ctx.archive_members,
-                ctx.errors,
-            )
+            zip_package(bytes, ctx.reborrow(), |_, _| {})
         }
         FileType::Cab => cab::extract(bytes, ctx.values, ctx.metrics, ctx.archive_members),
         // RAR's headers hold the member table even when payloads are encrypted.
         // Metadata-only, matching CAB/7z: never decompress, never shell out.
         FileType::Rar => rar::extract(bytes, ctx.values, ctx.metrics, ctx.archive_members),
         // The inner `.nuspec` carries the nupkg.* NuGet publisher identity.
-        FileType::Nupkg => zip_package(
-            bytes,
-            ctx.values,
-            ctx.metrics,
-            ctx.archive_members,
-            ctx.errors,
-            nupkg::extract_from_archive,
-        ),
+        FileType::Nupkg => zip_package(bytes, ctx.reborrow(), |archive, ctx| {
+            nupkg::extract_from_archive(archive, ctx.values, ctx.errors);
+        }),
         // The inner extension.vsixmanifest carries the vsix.identity.*
         // publisher/id/version triple.
-        FileType::Vsix => zip_package(
-            bytes,
-            ctx.values,
-            ctx.metrics,
-            ctx.archive_members,
-            ctx.errors,
-            |archive, values, metrics, errors| {
-                vsix::extract_from_archive(archive, values, ctx.strings, metrics, errors);
-            },
-        ),
+        FileType::Vsix => zip_package(bytes, ctx.reborrow(), |archive, ctx| {
+            vsix::extract_from_archive(archive, ctx.values, ctx.strings, ctx.metrics, ctx.errors);
+        }),
         // CRX is a ZIP with a signed header prepended: walk the ZIP, then
         // decode the header for the public key and derived extension id.
-        FileType::Crx => crx::extract(
-            bytes,
-            ctx.values,
-            ctx.metrics,
-            ctx.archive_members,
-            ctx.errors,
-        ),
+        FileType::Crx => crx::extract(bytes, ctx.reborrow()),
         FileType::Asar => asar::extract(bytes, ctx.values, ctx.metrics, ctx.archive_members),
         FileType::Phar => phar::extract(bytes, ctx.values, ctx.metrics, ctx.archive_members),
         FileType::Cpio => cpio::extract(bytes, ctx.values, ctx.metrics, ctx.archive_members),
@@ -377,61 +339,49 @@ pub(crate) fn extract(
         // for OOXML, mirroring the OleDoc arm. A macro-free doc leaves it
         // unset; a project that is present but broken is recorded in
         // `errors`.
-        FileType::Ooxml => zip_package(
-            bytes,
-            ctx.values,
-            ctx.metrics,
-            ctx.archive_members,
-            ctx.errors,
-            |archive, values, metrics, errors| {
-                ooxml::extract_from_archive(archive, values, metrics, errors);
-                vba::extract_from_zip(archive, values, metrics, ctx.symbols, errors);
-            },
-        ),
+        FileType::Ooxml => zip_package(bytes, ctx.reborrow(), |archive, ctx| {
+            ooxml::extract_from_archive(archive, ctx.values, ctx.metrics, ctx.errors);
+            vba::extract_from_zip(archive, ctx.values, ctx.metrics, ctx.symbols, ctx.errors);
+        }),
         FileType::OleDoc | FileType::Msi => {
-            ole2::extract(bytes, ctx.values, ctx.metrics, ctx.errors)?;
+            let mut comp = ole2::open(bytes)?;
+            ole2::extract(&mut comp, ctx.values, ctx.metrics, ctx.errors);
             // VBA module source-text extraction. A doc without macros just
             // leaves `office.vba.*` unpopulated; a broken project is
             // recorded in `errors`. MSI rarely carries VBA; the call is
             // still cheap and keeps the OLE2 extract path uniform.
-            vba::extract(bytes, ctx.values, ctx.metrics, ctx.symbols, ctx.errors);
+            vba::extract(&mut comp, ctx.values, ctx.metrics, ctx.symbols, ctx.errors);
             Ok(())
         }
-        FileType::Jar => zip_package(
-            bytes,
-            ctx.values,
-            ctx.metrics,
-            ctx.archive_members,
-            ctx.errors,
-            jar::extract_from_archive,
-        ),
+        FileType::Jar => zip_package(bytes, ctx.reborrow(), |archive, ctx| {
+            jar::extract_from_archive(archive, ctx.values, ctx.metrics, ctx.errors);
+        }),
         // The XPI-specific signing-shape layer.
-        FileType::Xpi => zip_package(
-            bytes,
-            ctx.values,
-            ctx.metrics,
-            ctx.archive_members,
-            ctx.errors,
-            xpi::extract_from_archive,
-        ),
+        FileType::Xpi => zip_package(bytes, ctx.reborrow(), |archive, ctx| {
+            xpi::extract_from_archive(archive, ctx.values, ctx.errors);
+        }),
         // The wheel-specific dist-info / RECORD layer.
-        FileType::Whl => zip_package(
-            bytes,
-            ctx.values,
-            ctx.metrics,
-            ctx.archive_members,
-            ctx.errors,
-            whl::extract_from_archive,
-        ),
+        FileType::Whl => zip_package(bytes, ctx.reborrow(), |archive, ctx| {
+            whl::extract_from_archive(archive, ctx.values, ctx.metrics, ctx.errors);
+        }),
         // Plain and Gentoo binpkg tars are uncompressed — walked in full.
         // Gentoo's nested `metadata.tar.*`/`image.tar.*` identity isn't cheap
-        // to reach, so it stops at the member listing for now.
+        // to reach, so it stops at the member listing for now. Compressed-tar
+        // packages: format label only, like the other compressed-tar
+        // variants; unpacking the members is the caller's.
         FileType::Tar
         | FileType::TarGz
         | FileType::TarBz2
         | FileType::TarXz
         | FileType::TarZst
-        | FileType::GentooBinpkg => tar::extract(
+        | FileType::GentooBinpkg
+        | FileType::Hex
+        | FileType::Pub
+        | FileType::Cran
+        | FileType::Cpan
+        | FileType::Hackage
+        | FileType::PkgFreebsd
+        | FileType::Xbps => tar::extract(
             bytes,
             file_type,
             ctx.values,
@@ -450,21 +400,6 @@ pub(crate) fn extract(
             apk_alpine::extract(bytes, ctx.values, ctx.metrics);
             Ok(())
         }
-        // Compressed-tar packages: format label only, like the other
-        // compressed-tar variants; unpacking the members is the caller's.
-        FileType::Hex
-        | FileType::Pub
-        | FileType::Cran
-        | FileType::Cpan
-        | FileType::Hackage
-        | FileType::PkgFreebsd
-        | FileType::Xbps => tar::extract(
-            bytes,
-            file_type,
-            ctx.values,
-            ctx.metrics,
-            ctx.archive_members,
-        ),
         // An Arch package's `.PKGINFO` lands in `pkg.*`, as a PKGBUILD's
         // fields do.
         FileType::PkgArch => {
@@ -479,14 +414,7 @@ pub(crate) fn extract(
         }
         // A Python sdist is a gzip tar: read `<root>/PKG-INFO` for the
         // python.* publisher identity, then list members (format label only).
-        FileType::PythonSdist => python_sdist::extract(
-            bytes,
-            file_type,
-            ctx.values,
-            ctx.metrics,
-            ctx.archive_members,
-            ctx.errors,
-        ),
+        FileType::PythonSdist => python_sdist::extract(bytes, ctx.reborrow()),
         // An OCI/Docker image is an uncompressed tar: walk it for the member
         // listing, then read the image manifest for the oci.* identity facts.
         FileType::OciImage => {
@@ -502,24 +430,10 @@ pub(crate) fn extract(
         }
         // A Rust `.crate` is a gzipped tar: walk it, then read the embedded
         // `Cargo.toml` for the crate.* publisher identity.
-        FileType::Crate => rust_crate::extract(
-            bytes,
-            file_type,
-            ctx.values,
-            ctx.metrics,
-            ctx.archive_members,
-            ctx.errors,
-        ),
+        FileType::Crate => rust_crate::extract(bytes, ctx.reborrow()),
         // An npm package is a gzipped tar: walk it for the member listing,
         // then read `package/package.json` for the npm.* publisher identity.
-        FileType::Npm => npm::extract(
-            bytes,
-            file_type,
-            ctx.values,
-            ctx.metrics,
-            ctx.archive_members,
-            ctx.errors,
-        ),
+        FileType::Npm => npm::extract(bytes, ctx.reborrow()),
         // A gem is an uncompressed `ustar` tar. Walk it for the generic
         // archive.* surface, then read the gzipped metadata member for the
         // gem.* identity facts (name/version/deps live only in `metadata.gz`).
@@ -537,17 +451,19 @@ pub(crate) fn extract(
         // Structured manifests parse their entire content into `values`
         // with the format-native key shape (the parsed JSON/YAML/TOML
         // tree, verbatim).
-        FileType::PackageLockJson
-        | FileType::ChromeManifest
-        | FileType::PipfileLock
-        | FileType::ComposerLock => structured::extract_json(bytes, ctx.values, ctx.errors),
+        FileType::PackageLockJson | FileType::PipfileLock | FileType::ComposerLock => {
+            structured::extract_json(bytes, ctx.values, ctx.errors)
+        }
+        FileType::ChromeManifest => {
+            structured::extract_manifest_json(bytes, ctx.values, ctx.errors)
+        }
         FileType::ComposerJson => structured::extract_composer_json(bytes, ctx.values, ctx.errors),
-        // A bare package.json: the verbatim JSON tree, plus the same
-        // npm.* identity layer the tarball path emits.
+        // A bare package.json: the same npm.* identity layer the tarball path
+        // emits, then the verbatim JSON tree, from one parse.
         FileType::PackageJson => {
-            structured::extract_json(bytes, ctx.values, ctx.errors)?;
-            if let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(bytes) {
+            if let Some(manifest) = structured::parse_manifest_json(bytes, ctx.values)? {
                 npm::emit(&manifest, ctx.values, ctx.metrics);
+                structured::merge_document(manifest, ctx.values, ctx.errors);
             }
             Ok(())
         }
@@ -588,21 +504,12 @@ pub(crate) fn extract(
             Ok(())
         }
         FileType::Nib => nib::extract(bytes, ctx.values, ctx.strings, ctx.metrics),
-        FileType::Pbxproj => {
-            pbxproj::extract(bytes, ctx.values, ctx.strings, ctx.metrics, ctx.errors)
-        }
+        FileType::Pbxproj => pbxproj::extract(bytes, ctx.reborrow()),
         FileType::PkgInfo => structured::extract_pkginfo(bytes, ctx.values, ctx.errors),
         FileType::SrcInfo => pkgmeta::extract_srcinfo(bytes, ctx.values),
         FileType::Registry => registry::extract(bytes, ctx.values, ctx.metrics),
-        // A Windows registry export is a text script, not package metadata:
-        // `text.*` metrics for the UTF-8 spellings, and the shared string scan
-        // below for every encoding (`regedit` writes UTF-16LE).
-        FileType::Reg => {
-            source::extract_text_only(bytes, ctx.metrics);
-            Ok(())
-        }
         FileType::Chm => {
-            chm::extract(bytes, ctx.values, ctx.strings, ctx.metrics, ctx.image_end);
+            chm::extract(bytes, ctx.reborrow());
             Ok(())
         }
         FileType::JavaClass => {
@@ -689,17 +596,10 @@ pub(crate) fn extract(
             Ok(())
         }
         FileType::PythonBytecode => {
-            pyc::extract(
-                bytes,
-                ctx.values,
-                ctx.strings,
-                ctx.metrics,
-                ctx.symbols,
-                ctx.errors,
-            );
+            pyc::extract(bytes, ctx.reborrow());
             Ok(())
         }
-        FileType::Rpm => rpm::extract(bytes, ctx.values, ctx.strings, ctx.metrics, ctx.errors),
+        FileType::Rpm => rpm::extract(bytes, ctx.reborrow()),
         FileType::Deb => deb::extract(bytes, ctx.values, ctx.metrics, ctx.errors),
         FileType::Dmg => dmg::extract(bytes, ctx.values, ctx.metrics, ctx.archive_members),
         FileType::Iso => {
@@ -737,7 +637,8 @@ pub(crate) fn extract(
         | FileType::Elixir
         | FileType::Clojure
         | FileType::Batch
-        | FileType::Makefile => {
+        | FileType::Makefile
+        | FileType::Shell => {
             source::extract(
                 bytes,
                 tree_cache,
@@ -746,22 +647,10 @@ pub(crate) fn extract(
                 ctx.metrics,
                 ctx.symbols,
             );
-            Ok(())
-        }
-
-        // Shell gets the normal source/AST extraction; a PKGBUILD additionally
-        // gets its package-metadata fields lifted into a pkg.* value tree so it
-        // can be compared field-for-field against a sibling .SRCINFO.
-        FileType::Shell => {
-            source::extract(
-                bytes,
-                tree_cache,
-                ctx.values,
-                ctx.strings,
-                ctx.metrics,
-                ctx.symbols,
-            );
-            if ctx.basename == Some("PKGBUILD") {
+            // A PKGBUILD additionally gets its package-metadata fields lifted
+            // into a pkg.* value tree so it can be compared field-for-field
+            // against a sibling .SRCINFO.
+            if file_type == FileType::Shell && ctx.basename == Some("PKGBUILD") {
                 pkgmeta::extract_pkgbuild(bytes, ctx.values, ctx.errors);
             }
             Ok(())
@@ -769,8 +658,11 @@ pub(crate) fn extract(
 
         // Text-like languages without a tree-sitter binding in filefacts.
         // They still earn `text.*` metrics — pure byte/line analysis,
-        // no AST required.
-        FileType::Vbs | FileType::Jcl => {
+        // no AST required. A Windows registry export is a text script, not
+        // package metadata: `text.*` metrics for the UTF-8 spellings, and the
+        // shared string scan below for every encoding (`regedit` writes
+        // UTF-16LE).
+        FileType::Vbs | FileType::Jcl | FileType::Reg => {
             source::extract_text_only(bytes, ctx.metrics);
             Ok(())
         }
@@ -792,12 +684,6 @@ pub(crate) fn extract(
             image4::extract(bytes, ctx.values);
             Ok(())
         }
-        // Recognized, but nothing past the type to extract: the generic
-        // metrics and string scan below are the whole view.
-        FileType::Data
-        | FileType::Nrbf
-        | FileType::FatBootSector
-        | FileType::CertificateSignature => Ok(()),
         FileType::DesktopEntry => {
             desktop_entry::extract(bytes, ctx.values, ctx.errors);
             Ok(())
@@ -806,7 +692,60 @@ pub(crate) fn extract(
             systemd::extract(bytes, ctx.values, ctx.errors);
             Ok(())
         }
-        _ => Ok(()),
+        FileType::Dex => {
+            dex::extract(bytes, ctx.symbols, &mut ctx.strings.literals, ctx.values);
+            Ok(())
+        }
+        // An MSBuild project, or Android binary XML.
+        FileType::Xml => {
+            msbuild::extract(bytes, ctx.values);
+            if axml::looks_like_axml(bytes) {
+                axml::extract_values(bytes, ctx.values);
+            }
+            Ok(())
+        }
+        // Recognized, but nothing to extract here: bare compressed streams
+        // (the caller decompresses them), package and disk images walked by
+        // the caller, lockfiles and manifests read by the reference layer,
+        // and text the source and string passes cover. The generic metrics
+        // and the string scan below are the whole view.
+        FileType::Data
+        | FileType::Nrbf
+        | FileType::FatBootSector
+        | FileType::CertificateSignature
+        | FileType::Gz
+        | FileType::Bz2
+        | FileType::Xz
+        | FileType::Lzma
+        | FileType::Zst
+        | FileType::Beam
+        | FileType::RequirementsTxt
+        | FileType::GemfileLock
+        | FileType::YarnLock
+        | FileType::GoMod
+        | FileType::GoSum
+        | FileType::StaticLib
+        | FileType::PkgMacos
+        | FileType::Vhd
+        | FileType::SquashFs
+        | FileType::Snap
+        | FileType::Flatpak
+        | FileType::Cmake
+        | FileType::Tiff
+        | FileType::Html
+        | FileType::Jsp
+        | FileType::Asp
+        | FileType::Cfml
+        | FileType::Tex
+        | FileType::Yara
+        | FileType::PostScript
+        | FileType::DosCom
+        | FileType::Mirc
+        | FileType::IrcII
+        | FileType::Dockerfile
+        | FileType::PgpSignature
+        | FileType::Text
+        | FileType::Unknown => Ok(()),
     };
 
     // filefacts is the single string-extraction authority. Binary formats
@@ -830,7 +769,7 @@ pub(crate) fn extract(
     let compressed_stream = matches!(
         file_type,
         FileType::Gz | FileType::Bz2 | FileType::Xz | FileType::Lzma | FileType::Zst
-    ) || crate::fileid::container_of(file_type, bytes)
+    ) || container
         .is_some_and(|c| c.compression != crate::fileid::Compression::None);
     if !file_type.is_structured_data() && !compressed_stream && ctx.strings.text.is_empty() {
         // This is the fallback path — everything without its own format
@@ -856,34 +795,8 @@ pub(crate) fn extract(
         common::extract_text_strings(bytes, ctx.strings, xor);
         // A compressed Flash movie (CWS) stores its strings past a zlib
         // stream. The raw bytes are codec noise; the movie is the text.
-        if let Some(movie) = inflate_cws(bytes) {
+        if let Some(movie) = cws::movie(bytes) {
             common::extract_text_strings(&movie, ctx.strings, common::XorScan::No);
-        }
-    }
-
-    /// Inflate a CWS body. The u32 at offset 4 is the uncompressed movie size,
-    /// header included. Refuse anything past a megabyte so a hostile length
-    /// cannot expand without bound.
-    fn inflate_cws(bytes: &[u8]) -> Option<Vec<u8>> {
-        let body = bytes.strip_prefix(b"CWS")?.get(5..)?;
-        let skipped = |reason: &str| {
-            tracing::debug!(target: "filefacts::formats", format = "cws", reason, "movie not inflated");
-        };
-        let declared = crate::bytes::u32_le(bytes, 4)?;
-        if !(8..=1 << 20).contains(&declared) {
-            skipped("declared movie size out of range");
-            return None;
-        }
-        match bounded::inflate_capped(flate2::read::ZlibDecoder::new(body), u64::from(declared)) {
-            Ok(movie) if !movie.bytes.is_empty() => Some(movie.bytes),
-            Ok(_) => {
-                skipped("empty zlib stream");
-                None
-            }
-            Err(e) => {
-                skipped(&format!("zlib stream did not inflate: {e}"));
-                None
-            }
         }
     }
 
@@ -906,5 +819,3 @@ pub(crate) fn extract(
 
 #[cfg(test)]
 mod tests;
-
-pub(crate) mod jphp;

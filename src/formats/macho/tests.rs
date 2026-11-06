@@ -14,12 +14,12 @@ fn cpu_type_string_known() {
 #[test]
 fn macho_go_pclntab_magic_is_validated() {
     let pclntab = [0xf0, 0xff, 0xff, 0xff, 0x00, 0x00, 0x01, 0x08];
-    assert!(crate::formats::go_buildinfo::has_pclntab_magic(&pclntab));
+    assert!(crate::formats::go_pclntab::has_magic(&pclntab));
 }
 
 #[test]
 fn macho_spoofed_pclntab_is_not_treated_as_go() {
-    assert!(!crate::formats::go_buildinfo::has_pclntab_magic(
+    assert!(!crate::formats::go_pclntab::has_magic(
         b"not a real pclntab"
     ));
 }
@@ -504,7 +504,7 @@ fn function_starts_count_stops_at_the_terminator_or_a_truncated_delta() {
     assert_eq!(count(&[0x10, 0x80]), Some(1.0));
 }
 
-/// Run [`extract`] on a 2 MiB thread — a Rayon worker's stack — and return
+/// Run [`extract`] on a 2 MiB thread — a typical host worker's stack — and return
 /// what it recorded in the errors view.
 fn errors_on_worker_stack(bytes: Vec<u8>) -> Errors {
     std::thread::Builder::new()
@@ -527,7 +527,7 @@ fn oversized_bind_stream_is_recorded_as_malformed() {
     // through the fixture's real dylib ordinal and segment so the count is
     // what trips.
     let bind = [0xC0, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x00, 0x00];
-    let file = crate::formats::goblin_safe::tests::macho_with_bind_tables(&bind);
+    let file = macho_with_bind_tables(&bind);
     let errors = errors_on_worker_stack(file);
     assert!(
         errors
@@ -544,16 +544,10 @@ fn oversized_bind_stream_is_recorded_as_malformed() {
 /// recursion for the depth to overflow.
 #[test]
 fn deep_export_trie_yields_no_overlong_export() {
-    let file = crate::formats::goblin_safe::tests::macho_with_dyld_info(
-        &[],
-        &crate::formats::goblin_safe::tests::chain_trie(5000),
-    );
+    let file = macho_with_dyld_info(&[], &chain_trie(5000));
     let layout = binform::parse(&file).expect("binform reads the fixture");
     assert!(layout.exports().iter().all(|e| e.name.len() <= 1 << 12));
-    let shallow = crate::formats::goblin_safe::tests::macho_with_dyld_info(
-        &[],
-        &crate::formats::goblin_safe::tests::chain_trie(200),
-    );
+    let shallow = macho_with_dyld_info(&[], &chain_trie(200));
     let layout = binform::parse(&shallow).expect("binform reads the fixture");
     assert_eq!(
         layout
@@ -810,17 +804,14 @@ fn the_primary_slice_is_the_preferred_one_that_parses() {
         let arches = arches(&file);
         let layouts = fat::layouts(&file, &arches);
         let mut out = crate::formats::Sinks::default();
-        fat::analyse(
-            &file,
-            &arches,
-            &layouts,
-            &mut out.values,
-            &mut out.metrics,
-            &mut out.sections,
-            &mut out.symbols,
-            &mut out.errors,
-        )
-        .primary
+        let mut views = Views {
+            values: &mut out.values,
+            metrics: &mut out.metrics,
+            sections: &mut out.sections,
+            symbols: &mut out.symbols,
+            errors: &mut out.errors,
+        };
+        fat::analyse(&file, &arches, &layouts, &mut views).primary
     };
     let x86_64 = thin_macho(&[], &[]);
     let mut unknown = x86_64.clone();
@@ -828,4 +819,145 @@ fn the_primary_slice_is_the_preferred_one_that_parses() {
     assert_eq!(primary(&[b"junk", &x86_64, &x86_64]), Some(0x2000));
     assert_eq!(primary(&[&unknown, &x86_64]), Some(0x2000));
     assert_eq!(primary(&[&unknown, &unknown]), Some(0x1000));
+}
+
+/// A straight chain of `depth` non-terminal nodes, each with one edge `a`, and
+/// a terminal leaf at the bottom: its one export's name is `depth` bytes.
+pub(super) fn chain_trie(depth: usize) -> Vec<u8> {
+    let mut trie = Vec::new();
+    for _ in 0..depth {
+        // Three-byte child ULEB so every node is the same seven bytes.
+        let child = trie.len() + 7;
+        assert!(child < 1 << 21);
+        trie.extend_from_slice(&[0x00, 0x01, b'a', 0x00]);
+        trie.extend_from_slice(&[
+            (child as u8 & 0x7f) | 0x80,
+            ((child >> 7) as u8 & 0x7f) | 0x80,
+            (child >> 14) as u8,
+        ]);
+    }
+    trie.extend_from_slice(&[0x02, 0x00, 0x10, 0x00]);
+    trie
+}
+
+/// A minimal 64-bit Mach-O executable whose only load command is an
+/// `LC_DYLD_INFO_ONLY` pointing at `bind` and `export` in the file.
+pub(super) fn macho_with_dyld_info(bind: &[u8], export: &[u8]) -> Vec<u8> {
+    const HEADER: usize = 32;
+    const DYLD_INFO: usize = 48;
+    let bind_off = HEADER + DYLD_INFO;
+    let export_off = bind_off + bind.len();
+    let mut file = Vec::new();
+    for word in [
+        0xfeed_facf_u32,
+        0x0100_0007,
+        3,
+        2,
+        1,
+        DYLD_INFO as u32,
+        0,
+        0,
+    ] {
+        file.extend_from_slice(&word.to_le_bytes());
+    }
+    let fields = [
+        0x8000_0022_u32, // LC_DYLD_INFO_ONLY
+        DYLD_INFO as u32,
+        0,
+        0, // rebase
+        bind_off as u32,
+        bind.len() as u32,
+        0,
+        0, // weak bind
+        0,
+        0, // lazy bind
+        export_off as u32,
+        export.len() as u32,
+    ];
+    for word in fields {
+        file.extend_from_slice(&word.to_le_bytes());
+    }
+    file.extend_from_slice(bind);
+    file.extend_from_slice(export);
+    file
+}
+
+/// A 64-bit Mach-O with one `__DATA` segment, one `LC_LOAD_DYLIB`
+/// (`libx.dylib`, ordinal 1 after goblin's `self`), and `bind` as its bind
+/// stream at file offset 192.
+pub(super) fn macho_with_bind_tables(bind: &[u8]) -> Vec<u8> {
+    const SEGMENT: u32 = 72;
+    const DYLIB: u32 = 40;
+    const DYLD_INFO: u32 = 48;
+    let bind_off = 32 + SEGMENT + DYLIB + DYLD_INFO;
+    let mut file = Vec::new();
+    let words = |file: &mut Vec<u8>, ws: &[u32]| {
+        for w in ws {
+            file.extend_from_slice(&w.to_le_bytes());
+        }
+    };
+    words(
+        &mut file,
+        &[
+            0xfeed_facf,
+            0x0100_0007,
+            3,
+            2,
+            3,
+            SEGMENT + DYLIB + DYLD_INFO,
+            0,
+            0,
+        ],
+    );
+    words(&mut file, &[0x19, SEGMENT]);
+    file.extend_from_slice(b"__DATA\0\0\0\0\0\0\0\0\0\0");
+    // vmaddr, vmsize, fileoff, filesize: no file bytes, so any file fits.
+    for q in [0x1000_u64, 0x1000, 0, 0] {
+        file.extend_from_slice(&q.to_le_bytes());
+    }
+    words(&mut file, &[3, 3, 0, 0]);
+    words(&mut file, &[0x0c, DYLIB, 24, 0, 0, 0]);
+    file.extend_from_slice(b"libx.dylib\0\0\0\0\0\0");
+    words(
+        &mut file,
+        &[
+            0x8000_0022,
+            DYLD_INFO,
+            0,
+            0,
+            bind_off,
+            bind.len() as u32,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ],
+    );
+    assert_eq!(file.len(), bind_off as usize);
+    file.extend_from_slice(bind);
+    file
+}
+
+/// binform reads a thin Mach-O goblin rejects (an `LC_SYMTAB` whose symbol
+/// table lies past the file), and its views stand.
+#[test]
+fn binform_views_survive_an_image_goblin_rejects() {
+    let mut bytes = read_fixture("test.macho");
+    let ncmds = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
+    let mut at = 32;
+    for _ in 0..ncmds {
+        let cmd = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        let size = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+        if cmd == 0x2 {
+            bytes[at + 8..at + 12].copy_from_slice(&0xffff_fff0_u32.to_le_bytes());
+        }
+        at += size;
+    }
+    assert!(goblin::mach::Mach::parse(&bytes).is_err());
+    let mut out = crate::formats::Sinks::default();
+    extract(&bytes, out.ctx());
+    assert_eq!(out.metrics.get("macho.parse_failed"), Some(1.0));
+    assert!(out.sections.iter().any(|s| s.name == "__TEXT,__text"));
 }

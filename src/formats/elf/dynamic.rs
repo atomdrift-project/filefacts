@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use goblin::elf::sym::{STB_WEAK, STT_FUNC, STT_GNU_IFUNC, STV_HIDDEN, STV_PROTECTED};
 use goblin::elf::{Elf, dynamic, header, program_header};
 use serde_json::Value as JsonValue;
 
@@ -39,23 +40,13 @@ pub(super) fn dt_flags(elf: &Elf<'_>, values: &mut Values) {
     if !flags.is_empty() {
         values.insert_key(
             value_key!("elf.dt_flags"),
-            JsonValue::Array(
-                flags
-                    .iter()
-                    .map(|s| JsonValue::String((*s).to_string()))
-                    .collect(),
-            ),
+            JsonValue::Array(flags.into_iter().map(JsonValue::from).collect()),
         );
     }
     if !flags1.is_empty() {
         values.insert_key(
             value_key!("elf.dt_flags_1"),
-            JsonValue::Array(
-                flags1
-                    .iter()
-                    .map(|s| JsonValue::String((*s).to_string()))
-                    .collect(),
-            ),
+            JsonValue::Array(flags1.into_iter().map(JsonValue::from).collect()),
         );
     }
 }
@@ -469,7 +460,7 @@ pub(super) fn names(elf: &Elf<'_>, file_len: usize, values: &mut Values) {
     let mut copy = |list: &[&str]| -> Vec<JsonValue> {
         list.iter()
             .take_while(|s| names.take(s.len()))
-            .map(|s| JsonValue::String((*s).to_string()))
+            .map(|&s| JsonValue::from(s))
             .collect()
     };
     let needed = copy(&elf.libraries);
@@ -622,14 +613,16 @@ pub(super) fn dynsym_funcs(elf: &Elf<'_>, file_len: usize, values: &mut Values) 
     let mut names = NameBudget::new(file_len);
     for sym in elf.dynsyms.iter() {
         let st_type = sym.st_info & 0x0f;
-        // STT_FUNC = 2, STT_GNU_IFUNC = 10.
-        if !matches!(st_type, 2 | 10) {
+        if !matches!(st_type, STT_FUNC | STT_GNU_IFUNC) {
             continue;
         }
         let st_bind = sym.st_info >> 4;
         let st_vis = sym.st_other & 0x03;
         let defined = sym.st_shndx != 0;
-        let interesting = st_type == 10 || st_bind == 2 || matches!(st_vis, 2 | 3) || !defined;
+        let interesting = st_type == STT_GNU_IFUNC
+            || st_bind == STB_WEAK
+            || matches!(st_vis, STV_HIDDEN | STV_PROTECTED)
+            || !defined;
         if !interesting {
             continue;
         }
@@ -646,7 +639,11 @@ pub(super) fn dynsym_funcs(elf: &Elf<'_>, file_len: usize, values: &mut Values) 
         node.insert("name".into(), JsonValue::String(name.to_string()));
         node.insert(
             "kind".into(),
-            JsonValue::String((if st_type == 10 { "ifunc" } else { "func" }).to_string()),
+            JsonValue::from(if st_type == STT_GNU_IFUNC {
+                "ifunc"
+            } else {
+                "func"
+            }),
         );
         let binding = match st_bind {
             0 => "local",
@@ -701,10 +698,10 @@ enum RelocKind {
 impl RelocKind {
     fn as_str(self) -> &'static str {
         match self {
-            RelocKind::Relative => "relative",
-            RelocKind::Irelative => "irelative",
-            RelocKind::Abs64 => "abs64",
-            RelocKind::GlobDat => "glob_dat",
+            Self::Relative => "relative",
+            Self::Irelative => "irelative",
+            Self::Abs64 => "abs64",
+            Self::GlobDat => "glob_dat",
         }
     }
 }
@@ -782,7 +779,7 @@ impl<'a> DynsymAddressIndex<'a> {
                 continue;
             }
             let st_type = sym.st_info & 0x0f;
-            if !matches!(st_type, 2 | 10) || sym.st_value == 0 {
+            if !matches!(st_type, STT_FUNC | STT_GNU_IFUNC) || sym.st_value == 0 {
                 continue;
             }
             let Some(name) = elf.dynstrtab.get_at(sym.st_name) else {

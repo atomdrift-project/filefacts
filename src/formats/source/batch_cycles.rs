@@ -3,8 +3,8 @@
 use super::batch_lines::{BODY_BUDGET, Lines, Unmodelled, comment};
 use crate::{Metrics, metric};
 
-pub(super) fn emit(source: &str, metrics: &mut Metrics) {
-    let (count, limited) = cycles(source);
+pub(super) fn emit(lines: &Result<Lines<'_>, Unmodelled>, metrics: &mut Metrics) {
+    let (count, limited) = cycles(lines);
     metrics.insert(
         metric!("source.batch.unconditional_start_cycles"),
         count as f64,
@@ -16,19 +16,10 @@ pub(super) fn emit(source: &str, metrics: &mut Metrics) {
 
 /// The number of loops whose body only starts programs, without waiting,
 /// and whether a cap cut the count short.
-fn cycles(source: &str) -> (usize, bool) {
-    let lines = match Lines::new(source) {
+fn cycles(lines: &Result<Lines<'_>, Unmodelled>) -> (usize, bool) {
+    let lines = match lines {
         Ok(lines) => lines,
-        Err(why) => {
-            tracing::debug!(
-                target: "filefacts::source",
-                format = "batch",
-                len = source.len(),
-                reason = ?why,
-                "batch cycles: file not modelled"
-            );
-            return (0, why == Unmodelled::TooLarge);
-        }
+        Err(why) => return (0, *why == Unmodelled::TooLarge),
     };
     let mut count = 0;
     let mut budget = BODY_BUDGET;

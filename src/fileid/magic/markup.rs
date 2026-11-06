@@ -4,7 +4,10 @@
 use std::path::Path;
 
 use super::{DetectionSource, FileType, Sniff};
-use crate::fileid::text::{find_ci, strip_utf8_bom};
+use crate::fileid::{
+    ext::lowercase_ext,
+    text::{find_ci, strip_utf8_bom},
+};
 
 /// How far into a Windows Script Host document the `<script>` element is
 /// looked for. Droppers pad the opening tags with whitespace.
@@ -34,11 +37,10 @@ pub(super) fn script_host_document(sniff: &Sniff<'_>) -> Option<FileType> {
     // Some WSF carriers put unquoted junk before the XML job. Honor the
     // declared script language for that carrier, but never search past an
     // earlier markup root or into a quoted source/documentation string.
-    let carrier = sniff.path.extension().is_some_and(|ext| {
-        ["wsf", "wsc", "sct"]
-            .iter()
-            .any(|name| ext.eq_ignore_ascii_case(name))
-    });
+    let carrier = matches!(
+        lowercase_ext(sniff.path).as_deref(),
+        Some("wsf" | "wsc" | "sct")
+    );
     let data = if xml_head(data).is_none() && carrier {
         let window = data.get(..WSH_SCRIPT_WINDOW).unwrap_or(data);
         let at = memchr::memchr(b'<', window)?;
@@ -63,11 +65,14 @@ pub(super) fn script_host_document(sniff: &Sniff<'_>) -> Option<FileType> {
         let Some(after) = rest.get(at + b"<script".len()..) else {
             break;
         };
-        let tag = memchr::memchr(b'>', after)
+        // A tag ends at its `>`. XML allows no `<` inside one, so the next
+        // `<` ends a tag left open, and no byte is read for two tags.
+        let tag = memchr::memchr2(b'>', b'<', after)
             .and_then(|end| after.get(..end))
             .unwrap_or(after);
         if let Some(language) = attribute_value(tag, b"language") {
-            let language = decode_char_refs(language).to_ascii_lowercase();
+            let mut language = decode_char_refs(language);
+            language.make_ascii_lowercase();
             if language.starts_with("vbs") {
                 return Some(FileType::Vbs);
             }
@@ -111,11 +116,19 @@ pub(super) fn decode_char_refs(value: &[u8]) -> String {
     let mut rest = value;
     while let Some((&b, tail)) = rest.split_first() {
         if b == b'&' && tail.first() == Some(&b'#') {
-            if let Some(end) = tail.iter().position(|&c| c == b';') {
+            // A reference is `x` and digits up to its `;`. The search stops
+            // at the first other byte, so no byte is read for two of them.
+            let len = tail
+                .iter()
+                .skip(1)
+                .take_while(|c| c.is_ascii_alphanumeric())
+                .count();
+            let end = len + 1;
+            if tail.get(end) == Some(&b';') {
                 let digits = tail
                     .get(1..end)
                     .and_then(|d| std::str::from_utf8(d).ok())
-                    .unwrap_or("");
+                    .unwrap_or_default();
                 let code = match digits.strip_prefix(['x', 'X']) {
                     Some(hex) => u32::from_str_radix(hex, 16).ok(),
                     None => digits.parse().ok(),
@@ -146,11 +159,7 @@ pub(super) fn encoded_script(path: &Path, head: &[u8]) -> Option<FileType> {
     {
         return None;
     }
-    let jse = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case("jse"));
-    Some(if jse {
+    Some(if lowercase_ext(path).as_deref() == Some("jse") {
         FileType::JavaScript
     } else {
         FileType::Vbs

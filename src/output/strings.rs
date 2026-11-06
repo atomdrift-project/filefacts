@@ -142,23 +142,15 @@ impl Literal {
 /// Producer-side row for the tree-sitter extractors, which locate nodes by
 /// `usize` byte offset. Converted to a [`Literal`] on push; new producers
 /// build a [`Literal`] directly.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct ExtractedString {
     pub(crate) value: String,
     pub(crate) offset: usize,
-    /// Never set by the source extractors; present so their
-    /// `..Default::default()` row literals stay meaningful.
-    pub(crate) method: Option<LiteralMethod>,
 }
 
 impl From<ExtractedString> for Literal {
     fn from(row: ExtractedString) -> Self {
-        Self {
-            value: row.value,
-            offset: row.offset as u64,
-            method: row.method,
-            encoding: None,
-        }
+        Self::new(row.value, row.offset as u64)
     }
 }
 
@@ -179,6 +171,8 @@ pub struct Text {
     /// ([`Text::ascii`] / [`Text::utf16le`]) over `rows`, which is also the
     /// serialized `{ascii, utf16le}` shape.
     rows: std::sync::Arc<[stng::ExtractedString]>,
+    /// Rows the scan found past the per-file cap and did not keep.
+    dropped: usize,
 }
 
 impl Text {
@@ -188,7 +182,20 @@ impl Text {
     }
     /// Wrap the shared rows stng produced (no copy).
     pub(crate) fn from_rows(rows: std::sync::Arc<[stng::ExtractedString]>) -> Self {
-        Self { rows }
+        Self { rows, dropped: 0 }
+    }
+    /// Keep the first `max` of `rows`, counting the rest as dropped.
+    pub(crate) fn capped(mut rows: Vec<stng::ExtractedString>, max: usize) -> Self {
+        let dropped = rows.len().saturating_sub(max);
+        rows.truncate(max);
+        Self {
+            rows: rows.into(),
+            dropped,
+        }
+    }
+    /// Rows the scan found past the per-file cap and did not keep.
+    pub(crate) fn dropped(&self) -> usize {
+        self.dropped
     }
     /// Append rows extracted from somewhere other than the file's own bytes.
     ///
@@ -197,17 +204,20 @@ impl Text {
     /// the extra rows cannot be had any other way -- text recovered from a
     /// decoded blob, whose plaintext does not exist anywhere in the file --
     /// so every other path keeps using [`Text::from_rows`] and stays copy-free.
-    pub(crate) fn append_rows(&mut self, extra: &[stng::ExtractedString]) {
-        if extra.is_empty() {
+    ///
+    /// No more than `max` rows are held in all; the extra rows past that are
+    /// counted as dropped.
+    pub(crate) fn append_rows(&mut self, extra: &[stng::ExtractedString], max: usize) {
+        let room = max.saturating_sub(self.rows.len());
+        let kept = extra.get(..room).unwrap_or(extra);
+        self.dropped = self.dropped.saturating_add(extra.len() - kept.len());
+        if kept.is_empty() {
             return;
         }
-        let mut rows: Vec<stng::ExtractedString> = self.rows.iter().cloned().collect();
-        rows.extend_from_slice(extra);
-        self.rows = rows.into();
+        self.rows = self.rows.iter().chain(kept).cloned().collect();
     }
-    /// The shared row slice — lets consumers hold an `Arc` clone (a refcount
-    /// bump) rather than cloning the string data.
-    pub fn rows(&self) -> &std::sync::Arc<[stng::ExtractedString]> {
+    /// Every run, both encodings, in extraction order.
+    pub fn rows(&self) -> &[stng::ExtractedString] {
         &self.rows
     }
     /// Total run count across both encodings.
@@ -269,9 +279,7 @@ impl<'de> Deserialize<'de> for Text {
         }
         let mut raw = Raw::deserialize(deserializer)?;
         raw.ascii.extend(raw.utf16le);
-        Ok(Self {
-            rows: raw.ascii.into(),
-        })
+        Ok(Self::from_rows(raw.ascii.into()))
     }
 }
 

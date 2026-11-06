@@ -40,6 +40,10 @@ own upstream license, noted beside them.
 | `dos-com/` | Two DOS COM viruses (real) for COM identification |
 | `macho/` | A universal Mach-O (real) for section and entropy classification |
 | `markdown/` | Third-party READMEs that once misidentified as source code |
+| `pyarmor/` | Synthetic PyArmor runtime and containers for static recovery |
+| `pyc/` | CPython 3.11 and 3.14 bytecode compiled from fixture modules |
 | `shell/` | An obfuscated Bash 5.3 script (real) for parser coverage |
 | `vbs/` | A JavaScript-in-VBS wrapper (real) for script identification |
 | `../tests/fixtures/` | Executables, signatures and documents for format extractors |
+| `../src/testdata/pickle/` | A legacy-format PyTorch tensor file for the pickle reader |
+| `../src/fileid/testdata/` | Small identification inputs, one real webshell (compressed) and one GPL-3.0 Binutils script |

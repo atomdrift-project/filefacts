@@ -75,11 +75,9 @@ pub(super) fn recognized(sniff: &Sniff<'_>) -> bool {
     let Ok(mut entry) = archive.by_name(&data_name) else {
         return false;
     };
+    // A pickle opens with PROTO and its protocol number.
     let mut header = [0; 2];
-    !entry.is_dir()
-        && entry.read_exact(&mut header).is_ok()
-        && header[0] == 0x80
-        && (2..=5).contains(&header[1])
+    !entry.is_dir() && entry.read_exact(&mut header).is_ok() && matches!(header, [0x80, 2..=5])
 }
 
 #[cfg(test)]

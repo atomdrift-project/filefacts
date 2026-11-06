@@ -1,13 +1,49 @@
 //! Bounded ECMA-335 metadata and IL inspection. No managed assembly is loaded.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashSet};
 
 use super::operands;
-use crate::formats::common::bytes_at::{u16_le, u32_le, u64_le};
+use crate::bytes::{sat_usize, u16_le, u32_le, u64_le};
 
 const MAX_ROWS: usize = 65536;
 const MAX_INSTRUCTIONS: usize = 2_000_000;
 const MAX_CALLS: usize = 32768;
+/// Name bytes one analysis may copy, counting every copy it keeps: a few
+/// hundred kilobytes of rows can name one 4 KiB heap string, or a type
+/// nested sixteen deep in such names, hundreds of thousands of times, and
+/// each name lands in several views.
+const MAX_NAME_BYTES: usize = 64 << 20;
+
+/// The metadata tables the walk reads, by number (ECMA-335 II.22).
+const TYPE_REF: usize = 1;
+const TYPE_DEF: usize = 2;
+const FIELD: usize = 4;
+const METHOD_PTR: usize = 5;
+const METHOD_DEF: usize = 6;
+const MEMBER_REF: usize = 10;
+const MODULE_REF: usize = 26;
+const TYPE_SPEC: usize = 27;
+const IMPL_MAP: usize = 28;
+const ASSEMBLY_REF: usize = 35;
+const METHOD_SPEC: usize = 43;
+
+/// Metadata tokens: the table number in the top byte, the row below it.
+const METHOD_DEF_TOKEN: u32 = 0x0600_0000;
+const MEMBER_REF_TOKEN: u32 = 0x0a00_0000;
+const METHOD_SPEC_TOKEN: u32 = 0x2b00_0000;
+
+/// The IL opcodes the body scan counts (ECMA-335 III).
+const CALL: u16 = 0x28;
+const CALLI: u16 = 0x29;
+const SWITCH: u16 = 0x45;
+const XOR: u16 = 0x61;
+const CALLVIRT: u16 = 0x6f;
+const NEWOBJ: u16 = 0x73;
+const STIND_I1: u16 = 0x9c;
+const LDTOKEN: u16 = 0xd0;
+/// The prefix of the two-byte opcodes.
+const PREFIX: u8 = 0xfe;
 
 #[derive(Debug, Clone)]
 pub(super) struct Named {
@@ -48,7 +84,7 @@ fn arity(sig: &[u8]) -> Option<usize> {
     if sig.first()? & 0x10 != 0 {
         p += compressed(sig, p)?.1;
     }
-    let n = compressed(sig, p)?.0 as usize;
+    let n = sat_usize(compressed(sig, p)?.0);
     (n <= 1024).then_some(n)
 }
 fn compressed(b: &[u8], p: usize) -> Option<(u32, usize)> {
@@ -85,13 +121,17 @@ struct Tables<'a> {
     s: usize,
     g: usize,
     b: usize,
+    /// Name bytes left to copy, of [`MAX_NAME_BYTES`].
+    names: Cell<usize>,
+    /// Whether a copy was ever refused for want of budget.
+    spent: Cell<bool>,
 }
 impl<'a> Tables<'a> {
     fn new(root: &'a [u8], root_offset: usize) -> Option<Self> {
         if root.get(..4)? != b"BSJB" {
             return None;
         }
-        let v = u32_le(root, 12)? as usize;
+        let v = sat_usize(u32_le(root, 12)?);
         let mut p = 16usize.checked_add(v.checked_add(3)? & !3)?;
         let n = usize::from(u16_le(root, p + 2)?);
         if n > 64 {
@@ -100,8 +140,8 @@ impl<'a> Tables<'a> {
         p += 4;
         let (mut strings, mut blob, mut table) = (None, None, None);
         for _ in 0..n {
-            let off = u32_le(root, p)? as usize;
-            let len = u32_le(root, p + 4)? as usize;
+            let off = sat_usize(u32_le(root, p)?);
+            let len = sat_usize(u32_le(root, p + 4)?);
             p += 8;
             let tail = root.get(p..)?;
             let end = tail.iter().take(32).position(|b| *b == 0)?;
@@ -128,7 +168,7 @@ impl<'a> Tables<'a> {
         p = 24;
         for (i, row) in rows.iter_mut().enumerate() {
             if valid & (1u64 << i) != 0 {
-                *row = u32_le(data, p)? as usize;
+                *row = sat_usize(u32_le(data, p)?);
                 p += 4;
                 if *row > MAX_ROWS {
                     return None;
@@ -149,6 +189,8 @@ impl<'a> Tables<'a> {
             s: if heap & 1 != 0 { 4 } else { 2 },
             g: if heap & 2 != 0 { 4 } else { 2 },
             b: if heap & 4 != 0 { 4 } else { 2 },
+            names: Cell::new(MAX_NAME_BYTES),
+            spent: Cell::new(false),
         };
         for (i, row_count) in rows.iter().enumerate().take(45) {
             *out.starts.get_mut(i)? = p;
@@ -177,6 +219,8 @@ impl<'a> Tables<'a> {
             2
         }
     }
+    /// The width of a row of table `t`, from the column layouts of
+    /// ECMA-335 II.22 in table-number order.
     fn row_width(&self, t: usize) -> usize {
         let (s, g, b) = (self.s, self.g, self.b);
         let i = |t| self.ix(t);
@@ -251,34 +295,54 @@ impl<'a> Tables<'a> {
             .checked_add((rid - 1).checked_mul(width)?)?;
         self.data.get(p..p.checked_add(width)?)
     }
+    /// Charge `len` name bytes to the budget; `None` once it cannot pay.
+    fn charge(&self, len: usize) -> Option<()> {
+        let Some(left) = self.names.get().checked_sub(len) else {
+            self.spent.set(true);
+            return None;
+        };
+        self.names.set(left);
+        Some(())
+    }
+    /// A copy of `named`, charged to the budget.
+    fn copy(&self, named: &Named) -> Option<Named> {
+        self.charge(
+            named
+                .name
+                .len()
+                .saturating_add(named.library.as_ref().map_or(0, String::len)),
+        )?;
+        Some(named.clone())
+    }
     fn string(&self, n: u32) -> Option<(String, usize)> {
-        let n = n as usize;
+        let n = sat_usize(n);
         if n >= self.strings_len {
             return None;
         }
         let p = self.strings.checked_add(n)?;
         let b = self.root.get(p..self.strings + self.strings_len)?;
         let end = b.iter().take(4096).position(|x| *x == 0)?;
+        self.charge(end)?;
         Some((
             std::str::from_utf8(b.get(..end)?).ok()?.to_string(),
             self.root_offset + p,
         ))
     }
     fn blob(&self, n: u32) -> Option<&'a [u8]> {
-        let n = n as usize;
+        let n = sat_usize(n);
         if n >= self.blob_len {
             return None;
         }
         let b = self.root.get(self.blob..self.blob + self.blob_len)?;
         let (len, w) = compressed(b, n)?;
-        b.get(n.checked_add(w)?..n.checked_add(w)?.checked_add(len as usize)?)
+        b.get(n.checked_add(w)?..n.checked_add(w)?.checked_add(sat_usize(len))?)
     }
     fn type_name(&self, t: usize, rid: usize, depth: u8) -> Option<(String, Option<String>)> {
         if depth > 16 {
             return None;
         }
         let row = self.row(t, rid)?;
-        if t == 27 {
+        if t == TYPE_SPEC {
             let blob = self.blob(index(row, 0, self.b)?)?;
             let mut p = 0;
             if blob.first() == Some(&0x15) {
@@ -290,18 +354,18 @@ impl<'a> Tables<'a> {
             let (v, _) = compressed(blob, p + 1)?;
             return self.type_name(
                 if v & 3 == 1 {
-                    1
+                    TYPE_REF
                 } else if v.trailing_zeros() >= 2 {
-                    2
+                    TYPE_DEF
                 } else {
-                    27
+                    TYPE_SPEC
                 },
-                (v >> 2) as usize,
+                sat_usize(v >> 2),
                 depth + 1,
             );
         }
-        let p = if t == 1 {
-            self.coded(2, &[0, 26, 35, 1])
+        let p = if t == TYPE_REF {
+            self.coded(2, &[0, MODULE_REF, ASSEMBLY_REF, TYPE_REF])
         } else {
             4
         };
@@ -313,20 +377,20 @@ impl<'a> Tables<'a> {
             format!("{ns}.{name}")
         };
         let mut lib = None;
-        if t == 1 {
+        if t == TYPE_REF {
             let scope = index(row, 0, p)?;
-            let rid = (scope >> 2) as usize;
+            let rid = sat_usize(scope >> 2);
             match scope & 3 {
                 2 => {
-                    let a = self.row(35, rid)?;
+                    let a = self.row(ASSEMBLY_REF, rid)?;
                     lib = Some(self.string(index(a, 12 + self.b, self.s)?)?.0);
                 }
                 1 => {
-                    let m = self.row(26, rid)?;
+                    let m = self.row(MODULE_REF, rid)?;
                     lib = Some(self.string(index(m, 0, self.s)?)?.0);
                 }
                 3 => {
-                    let parent = self.type_name(1, rid, depth + 1)?;
+                    let parent = self.type_name(TYPE_REF, rid, depth + 1)?;
                     full = format!("{}.{}", parent.0, name);
                     lib = parent.1;
                 }
@@ -365,7 +429,7 @@ fn il_body(bytes: &[u8], offset: usize, budget: usize) -> Body {
         let Some(len) = u32_le(bytes, offset + 4) else {
             return out;
         };
-        (offset + hdr, len as usize)
+        (offset + hdr, sat_usize(len))
     } else {
         return out;
     };
@@ -384,20 +448,23 @@ fn il_body(bytes: &[u8], offset: usize, budget: usize) -> Body {
             return out;
         }
         let at = p;
-        let mut op = u16::from(*code.get(p).unwrap_or(&0));
+        let Some(&first) = code.get(p) else {
+            return out;
+        };
+        let mut op = u16::from(first);
         p += 1;
-        if op == 0xfe {
+        if first == PREFIX {
             let Some(b) = code.get(p) else {
                 return out;
             };
             op = 0xfe00 | u16::from(*b);
             p += 1;
         }
-        let n = if op == 0x45 {
+        let n = if op == SWITCH {
             let Some(n) = u32_le(code, p) else {
                 return out;
             };
-            let Some(n) = (n as usize).checked_mul(4).and_then(|n| n.checked_add(4)) else {
+            let Some(n) = sat_usize(n).checked_mul(4).and_then(|n| n.checked_add(4)) else {
                 return out;
             };
             n
@@ -411,23 +478,23 @@ fn il_body(bytes: &[u8], offset: usize, budget: usize) -> Body {
             return out;
         };
         out.instructions += 1;
-        if op == 0x29 {
+        if op == CALLI {
             out.calli += 1;
         }
-        if op == 0x61 {
+        if op == XOR {
             out.xor += 1;
         }
-        if op == 0x9c {
+        if op == STIND_I1 {
             out.store_byte += 1;
         }
-        if matches!(op, 0x28 | 0x6f | 0x73) {
+        if matches!(op, CALL | CALLVIRT | NEWOBJ) {
             if let Some(token) = u32_le(code, p) {
                 if out.calls.len() < MAX_CALLS {
                     out.calls.push((token, code_start + at));
                 }
             }
         }
-        if op == 0xd0 {
+        if op == LDTOKEN {
             if let Some(token) = u32_le(code, p) {
                 out.tokens.push(token);
             }
@@ -446,39 +513,69 @@ pub(super) fn analyze(
 ) -> Option<Analysis> {
     let t = Tables::new(root, root_offset)?;
     let mut result = Analysis {
-        method_count: t.rows[6],
+        method_count: t.rows[METHOD_DEF],
         ..Analysis::default()
     };
-    let mut definitions = vec![String::new(); t.rows[6] + 1];
-    for rid in 1..=t.rows[2] {
-        let row = t.row(2, rid)?;
-        let p = 4 + 2 * t.s + t.coded(2, &[2, 1, 27]) + t.ix(4);
-        let start = index(row, p, t.ix(6))? as usize;
-        let end = if rid < t.rows[2] {
-            index(t.row(2, rid + 1)?, p, t.ix(6))? as usize
-        } else if t.rows[5] > 0 {
-            t.rows[5] + 1
+    let walked = walk(&t, &mut result, bytes, map);
+    // A malformed table yields nothing; a spent name budget keeps what was
+    // read within it.
+    if t.spent.get() {
+        tracing::debug!(
+            target: "filefacts::pe",
+            format = "pe",
+            stage = "clr-il",
+            budget = MAX_NAME_BYTES,
+            "CLR names past the copy budget; analysis cut short"
+        );
+        result.truncated = true;
+    } else {
+        walked?;
+    }
+    Some(result)
+}
+
+/// Read the names, references and method bodies of `t` into `result`.
+/// `None` for a malformed table or once the name budget is spent.
+fn walk(
+    t: &Tables<'_>,
+    result: &mut Analysis,
+    bytes: &[u8],
+    map: impl Fn(u32) -> Option<usize>,
+) -> Option<()> {
+    let mut definitions = vec![String::new(); t.rows[METHOD_DEF] + 1];
+    for rid in 1..=t.rows[TYPE_DEF] {
+        let row = t.row(TYPE_DEF, rid)?;
+        // TypeDef's MethodList column, past Flags, Name, Namespace,
+        // Extends and FieldList.
+        let p = 4 + 2 * t.s + t.coded(2, &[TYPE_DEF, TYPE_REF, TYPE_SPEC]) + t.ix(FIELD);
+        let start = sat_usize(index(row, p, t.ix(METHOD_DEF))?);
+        let end = if rid < t.rows[TYPE_DEF] {
+            sat_usize(index(t.row(TYPE_DEF, rid + 1)?, p, t.ix(METHOD_DEF))?)
+        } else if t.rows[METHOD_PTR] > 0 {
+            t.rows[METHOD_PTR] + 1
         } else {
-            t.rows[6] + 1
+            t.rows[METHOD_DEF] + 1
         };
-        if start > end || end > t.rows[6] + 1 {
+        if start > end || end > t.rows[METHOD_DEF] + 1 {
             return None;
         }
-        let owner = t.type_name(2, rid, 0)?.0;
+        let owner = t.type_name(TYPE_DEF, rid, 0)?.0;
         for list in start..end {
-            let m = if t.rows[5] > 0 {
-                index(t.row(5, list)?, 0, t.ix(6))? as usize
+            let m = if t.rows[METHOD_PTR] > 0 {
+                sat_usize(index(t.row(METHOD_PTR, list)?, 0, t.ix(METHOD_DEF))?)
             } else {
                 list
             };
-            let row = t.row(6, m)?;
-            *definitions.get_mut(m)? = format!("{}.{}", owner, t.string(index(row, 8, t.s)?)?.0);
+            let row = t.row(METHOD_DEF, m)?;
+            let name = t.string(index(row, 8, t.s)?)?.0;
+            t.charge(owner.len().saturating_add(1))?;
+            *definitions.get_mut(m)? = format!("{owner}.{name}");
         }
     }
     let mut references = BTreeMap::new();
-    for rid in 1..=t.rows[10] {
-        let row = t.row(10, rid)?;
-        let w = t.coded(3, &[2, 1, 26, 6, 27]);
+    for rid in 1..=t.rows[MEMBER_REF] {
+        let row = t.row(MEMBER_REF, rid)?;
+        let w = t.coded(3, &[TYPE_DEF, TYPE_REF, MODULE_REF, METHOD_DEF, TYPE_SPEC]);
         let parent = index(row, 0, w)?;
         let (name, offset) = t.string(index(row, w, t.s)?)?;
         let sig = t.blob(index(row, w + t.s, t.b)?)?;
@@ -487,9 +584,9 @@ pub(super) fn analyze(
         }
         let tag = parent & 7;
         let owner = match tag {
-            0 => t.type_name(2, (parent >> 3) as usize, 0),
-            1 => t.type_name(1, (parent >> 3) as usize, 0),
-            4 => t.type_name(27, (parent >> 3) as usize, 0),
+            0 => t.type_name(TYPE_DEF, sat_usize(parent >> 3), 0),
+            1 => t.type_name(TYPE_REF, sat_usize(parent >> 3), 0),
+            4 => t.type_name(TYPE_SPEC, sat_usize(parent >> 3), 0),
             _ => None,
         };
         let Some((owner, lib)) = owner else {
@@ -501,20 +598,21 @@ pub(super) fn analyze(
             library: lib,
             arity: arity(sig),
         };
-        references.insert(0x0a000000 | u32::try_from(rid).ok()?, r.clone());
         if tag != 0 && r.library.is_some() {
-            result.references.push(r);
+            result.references.push(t.copy(&r)?);
         }
+        references.insert(MEMBER_REF_TOKEN | u32::try_from(rid).ok()?, r);
     }
     for (rid, name) in definitions.iter().enumerate().skip(1) {
+        t.charge(name.len())?;
         references.insert(
-            0x06000000 | u32::try_from(rid).ok()?,
+            METHOD_DEF_TOKEN | u32::try_from(rid).ok()?,
             Named {
                 name: name.clone(),
                 offset: 0,
                 library: None,
                 arity: t
-                    .row(6, rid)
+                    .row(METHOD_DEF, rid)
                     .and_then(|r| index(r, 8 + t.s, t.b))
                     .and_then(|n| t.blob(n))
                     .and_then(arity),
@@ -522,18 +620,18 @@ pub(super) fn analyze(
         );
     }
     // P/Invoke import maps bind a MethodDef to the actual native entry point.
-    for rid in 1..=t.rows[28] {
-        let row = t.row(28, rid)?;
-        let w = t.coded(1, &[4, 6]);
+    for rid in 1..=t.rows[IMPL_MAP] {
+        let row = t.row(IMPL_MAP, rid)?;
+        let w = t.coded(1, &[FIELD, METHOD_DEF]);
         let member = index(row, 2, w)?;
         if member & 1 == 0 {
             continue;
         }
         let (name, offset) = t.string(index(row, 2 + w, t.s)?)?;
-        let scope = index(row, 2 + w + t.s, t.ix(26))? as usize;
-        let lib = t.string(index(t.row(26, scope)?, 0, t.s)?)?.0;
+        let scope = sat_usize(index(row, 2 + w + t.s, t.ix(MODULE_REF))?);
+        let lib = t.string(index(t.row(MODULE_REF, scope)?, 0, t.s)?)?.0;
         let arity = references
-            .get(&(0x06000000 | (member >> 1)))
+            .get(&(METHOD_DEF_TOKEN | (member >> 1)))
             .and_then(|r| r.arity);
         let r = Named {
             name,
@@ -541,21 +639,26 @@ pub(super) fn analyze(
             library: Some(lib),
             arity,
         };
-        references.insert(0x06000000 | (member >> 1), r.clone());
-        result.references.push(r);
+        result.references.push(t.copy(&r)?);
+        references.insert(METHOD_DEF_TOKEN | (member >> 1), r);
     }
     // Generic MethodSpec call sites preserve their underlying MethodDef/MemberRef.
-    for rid in 1..=t.rows[43] {
-        let row = t.row(43, rid)?;
-        let m = index(row, 0, t.coded(1, &[6, 10]))?;
-        let token = if m & 1 == 0 { 0x06000000 } else { 0x0a000000 } | (m >> 1);
-        if let Some(r) = references.get(&token).cloned() {
-            references.insert(0x2b000000 | u32::try_from(rid).ok()?, r);
+    for rid in 1..=t.rows[METHOD_SPEC] {
+        let row = t.row(METHOD_SPEC, rid)?;
+        let m = index(row, 0, t.coded(1, &[METHOD_DEF, MEMBER_REF]))?;
+        let token = if m & 1 == 0 {
+            METHOD_DEF_TOKEN
+        } else {
+            MEMBER_REF_TOKEN
+        } | (m >> 1);
+        if let Some(r) = references.get(&token) {
+            let r = t.copy(r)?;
+            references.insert(METHOD_SPEC_TOKEN | u32::try_from(rid).ok()?, r);
         }
     }
     let mut budget = MAX_INSTRUCTIONS;
     for (rid, name) in definitions.iter().enumerate().skip(1) {
-        let row = t.row(6, rid)?;
+        let row = t.row(METHOD_DEF, rid)?;
         let rva = u32_le(row, 0)?;
         if rva == 0 || u16_le(row, 4)? & 3 != 0 {
             continue;
@@ -582,15 +685,14 @@ pub(super) fn analyze(
         let mut seen = HashSet::new();
         for (token, offset) in b.calls {
             if let Some(r) = references.get(&token) {
-                if seen.insert(r.name.clone()) {
+                if seen.insert(r.name.as_str()) {
+                    t.charge(r.name.len())?;
                     callees.push(r.name.clone());
                 }
                 if result.calls.len() < MAX_CALLS {
                     result.calls.push(Named {
-                        name: r.name.clone(),
                         offset,
-                        library: r.library.clone(),
-                        arity: r.arity,
+                        ..t.copy(r)?
                     });
                 } else {
                     result.truncated = true;
@@ -609,13 +711,14 @@ pub(super) fn analyze(
         {
             result.resource_xor_methods += 1;
         }
+        t.charge(name.len())?;
         result.methods.push(Method {
             name: name.clone(),
             offset,
             callees,
         });
     }
-    Some(result)
+    Some(())
 }
 
 #[cfg(test)]

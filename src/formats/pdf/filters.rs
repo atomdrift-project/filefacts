@@ -7,6 +7,7 @@ use std::fmt;
 use super::MAX_INFLATED;
 use super::lex::{decode_hex, is_white, key_ends, name_list};
 use super::objects::DictRegion;
+use crate::formats::bounded::{OnError, inflate_capped};
 
 /// The `/Filter` chain of a dictionary, outermost first, from its first
 /// `/Filter` entry: a single name or an array of them, without slashes.
@@ -35,6 +36,40 @@ pub(super) fn scan_filter_chains(bytes: &[u8], dict_regions: &[DictRegion]) -> V
     out
 }
 
+/// Bytes the stages before a chain's last may decode across every stream
+/// one walk of a document decodes. Each such stage holds up to
+/// [`MAX_INFLATED`] whatever the last stage keeps, so a walk over tens of
+/// thousands of streams whose first stage inflates a few hundred bytes to
+/// a megabyte would inflate tens of gigabytes. Real chains of more than one
+/// filter are rare, and their early stages small.
+pub(super) const MAX_STAGE_TOTAL: usize = 64 << 20;
+
+/// What the stages before a chain's last may still decode in one walk,
+/// and how many streams the walk left undecoded once it was spent.
+#[derive(Debug)]
+pub(super) struct StageBudget {
+    left: usize,
+    refused: usize,
+}
+
+impl StageBudget {
+    /// A budget of `left` decoded bytes.
+    pub(super) fn new(left: usize) -> Self {
+        Self { left, refused: 0 }
+    }
+
+    /// Streams left undecoded because the budget was spent.
+    pub(super) fn refused(&self) -> usize {
+        self.refused
+    }
+}
+
+impl Default for StageBudget {
+    fn default() -> Self {
+        Self::new(MAX_STAGE_TOTAL)
+    }
+}
+
 /// Why a stream body could not be decoded.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum DecodeError {
@@ -43,6 +78,8 @@ pub(super) enum DecodeError {
     Unsupported(String),
     /// A Flate stage that produced nothing.
     Corrupt,
+    /// The walk's [`StageBudget`] was spent before an intermediate stage.
+    OverBudget,
 }
 
 impl fmt::Display for DecodeError {
@@ -50,6 +87,7 @@ impl fmt::Display for DecodeError {
         match self {
             Self::Unsupported(name) => write!(f, "filter {name} is not decoded"),
             Self::Corrupt => f.write_str("flate data did not inflate"),
+            Self::OverBudget => f.write_str("the filter-stage decode budget was spent"),
         }
     }
 }
@@ -59,48 +97,52 @@ impl fmt::Display for DecodeError {
 /// full or abbreviated names; a body with no filter is its own prefix.
 ///
 /// Each stage before the last is held to [`MAX_INFLATED`] (or `cap`, if
-/// larger), so a chain cannot hold more than one inflate's worth at a time.
+/// larger), so a chain cannot hold more than one inflate's worth at a time,
+/// and what those stages decode is spent from `stages`; once it is gone, a
+/// chain of more than one filter is not decoded.
 pub(super) fn decode_stream(
     raw: &[u8],
     filters: &[String],
     cap: usize,
+    stages: &mut StageBudget,
 ) -> Result<Vec<u8>, DecodeError> {
     let mut data = Cow::Borrowed(raw);
     for (i, filter) in filters.iter().enumerate() {
-        let stage_cap = if i + 1 == filters.len() {
+        let last = i + 1 == filters.len();
+        let stage_cap = if last {
             cap
+        } else if stages.left == 0 {
+            stages.refused += 1;
+            return Err(DecodeError::OverBudget);
         } else {
-            cap.max(MAX_INFLATED)
+            cap.max(MAX_INFLATED).min(stages.left)
         };
         let next = match filter.as_str() {
-            "FlateDecode" | "Fl" => inflate_capped(&data, stage_cap).ok_or(DecodeError::Corrupt)?,
+            // A damaged stream keeps what decoded before the damage: viewers
+            // render that prefix, and malicious PDFs ship such streams on
+            // purpose to trip strict parsers.
+            "FlateDecode" | "Fl" => {
+                inflate_capped(
+                    flate2::read::ZlibDecoder::new(&*data),
+                    stage_cap as u64,
+                    OnError::KeepPartial,
+                )
+                .map_err(|_| DecodeError::Corrupt)?
+                .bytes
+            }
             "ASCIIHexDecode" | "AHx" => decode_hex(data.iter().copied(), stage_cap).0,
             "ASCII85Decode" | "A85" => ascii85_decode(&data, stage_cap),
             other => return Err(DecodeError::Unsupported(other.to_string())),
         };
+        if !last {
+            stages.left = stages.left.saturating_sub(next.len());
+        }
         data = Cow::Owned(next);
     }
     Ok(match data {
         Cow::Borrowed(raw) => raw.get(..cap).unwrap_or(raw).to_vec(),
         Cow::Owned(decoded) => decoded,
     })
-}
-
-/// Decode a FlateDecode stream into a buffer of at most `max` bytes, so an
-/// adversarial deflate bomb can't blow memory.
-///
-/// A truncated stream or one with a bad checksum still yields what decoded
-/// before the damage: viewers render that prefix, and malicious PDFs ship
-/// such streams on purpose to trip strict parsers. `None` only when nothing
-/// decoded at all.
-pub(super) fn inflate_capped(input: &[u8], max: usize) -> Option<Vec<u8>> {
-    use flate2::read::ZlibDecoder;
-    use std::io::Read;
-    let mut decoder = ZlibDecoder::new(input).take(max as u64);
-    let mut out = Vec::new();
-    // `read_to_end` keeps what it read before an error.
-    let complete = decoder.read_to_end(&mut out).is_ok();
-    (complete || !out.is_empty()).then_some(out)
 }
 
 /// Decode ASCII85 (ISO 32000-1 §7.4.3) up to its `~>` end marker, keeping

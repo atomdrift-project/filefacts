@@ -26,35 +26,45 @@
 //! (CRX3: RSA-PKCS#1 v1.5 or ECDSA P-256 over SHA-256 of
 //! `"CRX3 SignedData\0" ‖ le32(len) ‖ signed_header_data ‖ archive`;
 //! CRX2: RSA-PKCS#1 v1.5 over SHA-1 of the archive), and `false` otherwise.
+//! As in Chrome, a CRX3 verifies only when every proof in its header does.
 
 use super::people::{self, Person};
+use crate::formats::ExtractCtx;
 use std::io::Read;
 
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 
 use super::bounded::Limits;
+use crate::bytes::{sat_usize, u32_le};
 use crate::error::Error;
-use crate::formats::common::bytes_at::u32_le;
 use crate::formats::common::hex_encode;
-use crate::output::{ArchiveMember, Errors, Metrics, Stage, ValueKey, Values};
+use crate::output::{Errors, Stage, ValueKey, Values};
 use crate::value_key;
 
-/// Proofs carrying the developer key whose signatures are checked. A real
-/// CRX3 has one; each check is a public-key operation, and a header can
-/// repeat the same proof as often as its length allows.
+/// Proofs whose signatures are checked. A real CRX3 has one or two (the
+/// developer's, and the Web Store's); each check is a public-key operation,
+/// and a header can repeat a proof as often as its length allows. A header
+/// with more proofs than this does not verify, since Chrome checks them all.
 const MAX_PROOF_CHECKS: usize = 4;
+
+/// `CrxFileHeader` field numbers: the RSA and ECDSA `AsymmetricKeyProof`s,
+/// and the `SignedData` the proofs sign.
+const RSA_PROOF: u64 = 2;
+const ECDSA_PROOF: u64 = 3;
+const SIGNED_HEADER_DATA: u64 = 10_000;
 
 /// The context string CRX3 signs ahead of the signed header data.
 const CRX3_SIGNATURE_CONTEXT: &[u8] = b"CRX3 SignedData\x00";
 
-pub(super) fn extract(
-    bytes: &[u8],
-    values: &mut Values,
-    metrics: &mut Metrics,
-    archive_members: &mut Vec<ArchiveMember>,
-    errors: &mut Errors,
-) -> Result<(), Error> {
+pub(super) fn extract(bytes: &[u8], ctx: ExtractCtx<'_>) -> Result<(), Error> {
+    let ExtractCtx {
+        values,
+        metrics,
+        archive_members,
+        errors,
+        ..
+    } = ctx;
     // Header decode is best-effort identity enrichment; a malformed
     // header must not stop the ZIP walk.
     header(bytes, values);
@@ -212,7 +222,10 @@ fn header(bytes: &[u8], values: &mut Values) {
 
     let verified = match version {
         2 => {
-            let Some(public_key) = crx2_public_key(bytes) else {
+            // The DER key follows the 16-byte fixed header.
+            let Some(public_key) =
+                u32_le(bytes, 8).and_then(|key_len| bytes.get(16..)?.get(..sat_usize(key_len)))
+            else {
                 return;
             };
             let digest = Sha256::digest(public_key);
@@ -227,20 +240,29 @@ fn header(bytes: &[u8], values: &mut Values) {
             crx2_verified(bytes, public_key)
         }
         3 => {
-            let Some((header, archive)) = crx3_parts(bytes) else {
+            // The protobuf header follows the 12-byte fixed header, and the
+            // archive follows it.
+            let Some((header, archive)) = u32_le(bytes, 8)
+                .and_then(|header_len| bytes.get(12..)?.split_at_checked(sat_usize(header_len)))
+            else {
                 return;
             };
             let Some(signed_data) = signed_header_data(header) else {
                 return;
             };
-            let Some(crx_id) = signed_crx_id(signed_data) else {
+            // `SignedData.crx_id` (field 1); a valid extension id is 16 bytes.
+            let Some(crx_id) = last_field(signed_data, 1).filter(|id| id.len() == 16) else {
                 return;
             };
             values.insert_key(
                 value_key!("crx.extension_id"),
                 JsonValue::String(extension_id(crx_id)),
             );
-            if let Some(public_key) = matching_developer_public_key(header, crx_id) {
+            // The developer key is a claim until `crx3_verified` checks it.
+            if let Some((_, public_key, _)) = proofs(header)
+                .flatten()
+                .find(|&(_, key, _)| is_developer_key(key, crx_id))
+            {
                 let digest = Sha256::digest(public_key);
                 values.insert_key(
                     value_key!("crx.public_key_sha256"),
@@ -257,12 +279,6 @@ fn header(bytes: &[u8], values: &mut Values) {
     );
 }
 
-fn crx2_public_key(bytes: &[u8]) -> Option<&[u8]> {
-    let key_len = u32_le(bytes, 8)? as usize;
-    let start = 16usize;
-    bytes.get(start..start.checked_add(key_len)?)
-}
-
 /// Whether the CRX2 signature, which follows the key, is the key's RSA
 /// PKCS#1 v1.5 SHA-1 signature over the archive that follows it.
 fn crx2_verified(bytes: &[u8], public_key: &[u8]) -> bool {
@@ -270,7 +286,7 @@ fn crx2_verified(bytes: &[u8], public_key: &[u8]) -> bool {
         return false;
     };
     let sig_start = 16 + public_key.len();
-    let Some(archive_start) = sig_start.checked_add(sig_len as usize) else {
+    let Some(archive_start) = sig_start.checked_add(sat_usize(sig_len)) else {
         return false;
     };
     let (Some(signature), Some(archive)) = (
@@ -288,62 +304,61 @@ fn crx2_verified(bytes: &[u8], public_key: &[u8]) -> bool {
     )
 }
 
-/// The CRX3 protobuf header and the archive after it.
-fn crx3_parts(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
-    let header_len = u32_le(bytes, 8)? as usize;
-    let end = 12usize.checked_add(header_len)?;
-    Some((bytes.get(12..end)?, bytes.get(end..)?))
-}
-
-/// Whether a proof carrying the key that hashes to `crx_id` signs this
-/// header's `signed_data` and `archive`. Proofs under other keys (the Web
-/// Store's publisher proof) cannot establish the id and are not checked.
+/// Whether the header parses in full, every proof signs this header's
+/// `signed_data` and `archive`, and one of them is by the key that hashes to
+/// `crx_id`. Chrome refuses a file with a malformed header or any proof that
+/// does not verify, the Web Store's publisher proof included, and only a key
+/// hashing to the id establishes it.
 fn crx3_verified(header: &[u8], signed_data: &[u8], crx_id: &[u8], archive: &[u8]) -> bool {
     let Ok(signed_len) = u32::try_from(signed_data.len()) else {
         return false;
     };
-    // The signed message is the whole file past the header; hash it once,
-    // and only if a candidate proof exists.
-    let mut digest = None;
-    let mut checks = 0;
-    let mut pos = 0;
-    while let Some((field, proof)) = next_field(header, &mut pos) {
-        if field != 2 && field != 3 {
-            continue;
-        }
-        let Some((public_key, signature)) = proof_parts(proof) else {
-            continue;
-        };
-        if Sha256::digest(public_key).get(..16) != Some(crx_id) {
-            continue;
-        }
-        if checks == MAX_PROOF_CHECKS {
-            return false;
-        }
-        checks += 1;
-        let digest = digest.get_or_insert_with(|| {
-            Sha256::new()
-                .chain_update(CRX3_SIGNATURE_CONTEXT)
-                .chain_update(signed_len.to_le_bytes())
-                .chain_update(signed_data)
-                .chain_update(archive)
-                .finalize()
-        });
-        let ok = if field == 2 {
+    let proof_messages = || {
+        fields(header)
+            .filter(|&(field, _)| matches!(field, RSA_PROOF | ECDSA_PROOF))
+            .map(|(_, proof)| proof)
+    };
+    if !well_formed(header) || !well_formed(signed_data) || !proof_messages().all(well_formed) {
+        tracing::debug!(
+            target: "filefacts::crx",
+            stage = "header",
+            len = header.len(),
+            "CRX3 header is not well-formed protobuf; signature not verified"
+        );
+        return false;
+    }
+    let Some(proofs) = proofs(header)
+        .take(MAX_PROOF_CHECKS + 1)
+        .collect::<Option<Vec<_>>>()
+        .filter(|proofs| proofs.len() <= MAX_PROOF_CHECKS)
+    else {
+        return false;
+    };
+    if !proofs
+        .iter()
+        .any(|&(_, public_key, _)| is_developer_key(public_key, crx_id))
+    {
+        return false;
+    }
+    // The signed message is the whole file past the header; hash it once.
+    let digest = Sha256::new()
+        .chain_update(CRX3_SIGNATURE_CONTEXT)
+        .chain_update(signed_len.to_le_bytes())
+        .chain_update(signed_data)
+        .chain_update(archive)
+        .finalize();
+    proofs.iter().all(|&(field, public_key, signature)| {
+        if field == RSA_PROOF {
             verify_rsa(
                 public_key,
                 rsa::Pkcs1v15Sign::new::<Sha256>(),
-                digest,
+                &digest,
                 signature,
             )
         } else {
-            verify_p256(public_key, digest, signature)
-        };
-        if ok {
-            return true;
+            verify_p256(public_key, &digest, signature)
         }
-    }
-    false
+    })
 }
 
 /// RSA PKCS#1 v1.5 over a precomputed digest, with the key as a DER
@@ -406,81 +421,96 @@ fn varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
     None
 }
 
-/// Return the bytes of a length-delimited field, advancing `pos`; skip
-/// other wire types. Returns `(field_number, payload)`.
-fn next_field<'a>(buf: &'a [u8], pos: &mut usize) -> Option<(u64, &'a [u8])> {
-    while *pos < buf.len() {
-        let tag = varint(buf, pos)?;
-        let field = tag >> 3;
-        match tag & 0x07 {
-            0 => {
-                varint(buf, pos)?;
-            }
-            1 => *pos = pos.checked_add(8)?,
-            5 => *pos = pos.checked_add(4)?,
-            2 => {
-                let len = usize::try_from(varint(buf, pos)?).ok()?;
-                let end = pos.checked_add(len)?;
-                let data = buf.get(*pos..end)?;
-                *pos = end;
-                return Some((field, data));
-            }
-            _ => return None,
+/// The next field of any wire type, advancing `pos`: its number, and its
+/// payload when it is length-delimited. `None` at the end of `buf` and at a
+/// malformed field: field number zero, a group or unknown wire type, or a
+/// value running past the end.
+fn next_field<'a>(buf: &'a [u8], pos: &mut usize) -> Option<(u64, Option<&'a [u8]>)> {
+    if *pos >= buf.len() {
+        return None;
+    }
+    let tag = varint(buf, pos)?;
+    let field = tag >> 3;
+    if field == 0 {
+        return None;
+    }
+    let fixed = |pos: &mut usize, len: usize| {
+        let end = pos.checked_add(len).filter(|&end| end <= buf.len())?;
+        *pos = end;
+        Some((field, None))
+    };
+    match tag & 0x07 {
+        0 => varint(buf, pos).map(|_| (field, None)),
+        1 => fixed(pos, 8),
+        5 => fixed(pos, 4),
+        2 => {
+            let len = usize::try_from(varint(buf, pos)?).ok()?;
+            let end = pos.checked_add(len)?;
+            let data = buf.get(*pos..end)?;
+            *pos = end;
+            Some((field, Some(data)))
+        }
+        _ => None,
+    }
+}
+
+/// Whether `buf` parses to its end as protobuf wire format. Chrome parses
+/// the header, each proof and the signed data in full and refuses the file
+/// when any of them does not, so a malformed field cannot hide the fields
+/// after it.
+fn well_formed(buf: &[u8]) -> bool {
+    let mut pos = 0;
+    while pos < buf.len() {
+        if next_field(buf, &mut pos).is_none() {
+            return false;
         }
     }
-    None
+    true
 }
 
 /// The last length-delimited `field` in `buf`. Protobuf keeps the last
 /// occurrence of a repeated scalar field, and so does Chrome: reading the
 /// first would let a decoy field name an id Chrome never sees.
 fn last_field(buf: &[u8], field: u64) -> Option<&[u8]> {
-    let mut pos = 0;
-    let mut last = None;
-    while let Some((number, data)) = next_field(buf, &mut pos) {
-        if number == field {
-            last = Some(data);
-        }
-    }
-    last
+    fields(buf)
+        .filter(|&(number, _)| number == field)
+        .last()
+        .map(|(_, data)| data)
 }
 
 /// `CrxFileHeader.signed_header_data` (field 10000): the bytes the proofs
 /// sign.
 fn signed_header_data(header: &[u8]) -> Option<&[u8]> {
-    last_field(header, 10_000)
+    last_field(header, SIGNED_HEADER_DATA)
 }
 
-/// `SignedData.crx_id` (field 1). A valid Chrome extension id is 16 bytes.
-fn signed_crx_id(signed_data: &[u8]) -> Option<&[u8]> {
-    last_field(signed_data, 1).filter(|id| id.len() == 16)
-}
-
-/// An `AsymmetricKeyProof`'s public key (field 1) and non-empty signature
-/// (field 2).
-fn proof_parts(proof: &[u8]) -> Option<(&[u8], &[u8])> {
-    let public_key = last_field(proof, 1)?;
-    let signature = last_field(proof, 2).filter(|s| !s.is_empty())?;
-    Some((public_key, signature))
-}
-
-/// Return the RSA or ECDSA proof key whose SHA-256 prefix equals the signed
-/// CRX id. Publisher proofs (notably the shared Chrome Web Store key) do not
-/// satisfy this relation and are intentionally ignored. The key is a claim
-/// until [`crx3_verified`] checks its signature.
-fn matching_developer_public_key<'a>(header: &'a [u8], crx_id: &[u8]) -> Option<&'a [u8]> {
+/// The length-delimited fields of `buf` in order, up to the first malformed
+/// one; [`well_formed`] says whether there was one.
+fn fields(buf: &[u8]) -> impl Iterator<Item = (u64, &[u8])> {
     let mut pos = 0;
-    while let Some((field, proof)) = next_field(header, &mut pos) {
-        if field != 2 && field != 3 {
-            continue;
-        }
-        if let Some((public_key, _)) = proof_parts(proof)
-            && Sha256::digest(public_key).get(..16) == Some(crx_id)
-        {
-            return Some(public_key);
-        }
-    }
-    None
+    std::iter::from_fn(move || next_field(buf, &mut pos))
+        .filter_map(|(field, data)| Some((field, data?)))
+}
+
+/// The RSA (field 2) and ECDSA (field 3) proofs, as `(field, public_key,
+/// signature)`: `None` for a proof without a key or a non-empty signature,
+/// which no verifier accepts.
+fn proofs(header: &[u8]) -> impl Iterator<Item = Option<(u64, &[u8], &[u8])>> {
+    fields(header)
+        .filter(|&(field, _)| matches!(field, RSA_PROOF | ECDSA_PROOF))
+        .map(|(field, proof)| {
+            // An `AsymmetricKeyProof`: public key (field 1) and signature
+            // (field 2).
+            let public_key = last_field(proof, 1)?;
+            let signature = last_field(proof, 2).filter(|s| !s.is_empty())?;
+            Some((field, public_key, signature))
+        })
+}
+
+/// Whether `public_key`'s SHA-256 prefix is the signed CRX id. Publisher
+/// proofs (notably the shared Chrome Web Store key) do not satisfy this.
+fn is_developer_key(public_key: &[u8], crx_id: &[u8]) -> bool {
+    Sha256::digest(public_key).get(..16) == Some(crx_id)
 }
 
 #[cfg(test)]

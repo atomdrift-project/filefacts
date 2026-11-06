@@ -1,17 +1,29 @@
 //! Fast file format identification by magic bytes, shebangs, and extensions.
 //!
-//! `fileid` identifies file formats with a content-first pipeline, an
-//! ordered table of rules where the first that claims the file decides:
+//! `fileid` identifies file formats with a content-first pipeline, one
+//! ordered table of rules (`RULES`) where the first that claims the file
+//! decides:
 //!
 //! 1. **Signatures** — magic bytes, shebangs and structural markers. Most sit
 //!    in the first few bytes; some are read further in (a tar header at 257, an
 //!    ISO volume descriptor at 32 KiB, a DMG trailer at the end), and archives
-//!    are walked far enough to see which package layout they carry
-//! 2. **Content rules** — document shapes, unmistakable marks and the language
-//!    scorer, over a bounded window (a few KiB, plus the tail of a padded file;
-//!    no tree-sitter)
+//!    are walked far enough to see which package layout they carry. The name
+//!    never claims a type here; it only splits a signature that several
+//!    formats share, where the bytes at hand cannot: OLE2 storage (Office or
+//!    Installer, when the root directory is out of reach), SquashFS (a Snap),
+//!    pickle protocols 2 and 3, Script Encoder output (JScript or VBScript), a
+//!    Script Host carrier with junk before its root, and a tar or zip whose
+//!    members name no package. A signature is then settled against the name
+//!    where the two are known to meet (a server page's HTML prologue, a
+//!    shebang on a script named for another language, `go.mod`).
+//! 2. **Content rules** — formats a name and content establish together (a
+//!    workflow, an extension manifest), document shapes, unmistakable marks
+//!    and the language scorer, over a bounded window (a few KiB, plus the
+//!    tail of a padded file; no tree-sitter)
 //! 3. **Filename and extension fallback** — used only when content does not
-//!    identify a stronger type
+//!    identify a stronger type; a body the name is wrong about is identified
+//!    by content after all, down to the headerless programs (a DOS COM, known
+//!    data shapes, shellcode) that nothing else can claim
 //!
 //! How far a name is believed against content is one column of the
 //! [`FileType`] table, its extension strength: weak names and container names
@@ -30,8 +42,8 @@
 //! assert_eq!(id.file_type(), FileType::Elf);
 //! ```
 
-mod commodore;
-pub mod container;
+mod container;
+mod data_shapes;
 mod dos;
 mod ext;
 mod file_type;
@@ -44,17 +56,14 @@ mod marks;
 mod package_layout;
 mod perl_shell_shim;
 pub(crate) mod phar;
-mod prodos;
-mod restructuredtext;
-mod rexx_cms;
-mod sap_abap;
+mod php_tag;
 mod scripts;
+mod shebang;
 pub(crate) mod shellcode;
-mod sign_of_misery;
 mod sniff;
 mod text;
+mod text_shapes;
 mod torch;
-mod unix_aout16;
 mod zip_probe;
 
 pub use container::{ArchiveFormat, Compression, Container, container_of};
@@ -152,7 +161,7 @@ impl FileId {
             },
             None => Self {
                 file_type: FileType::Unknown,
-                source: DetectionSource::Heuristic,
+                source: DetectionSource::Unidentified,
                 ext_match: ExtensionMatch::Consistent,
                 xor_pe_key: None,
             },
@@ -250,7 +259,9 @@ impl FileId {
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DetectionSource {
-    /// Magic bytes at the start of the file.
+    /// A signature in the bytes: a magic number where the format puts it (at
+    /// the start, at a fixed offset, in a trailer) or a structure that parses
+    /// (an archive's members, a manifest's JSON).
     Magic,
     /// Shebang line (`#!...`).
     Shebang,
@@ -269,6 +280,8 @@ pub enum DetectionSource {
     /// inner source of a `python3 -c "<code>"` payload, whose extracted
     /// body has no shebang, extension, or magic to detect.
     Forced,
+    /// No rule identified the file, so the type is [`FileType::Unknown`].
+    Unidentified,
     /// Detection panicked on these bytes, so the type is
     /// [`FileType::Unknown`]. [`crate::ParsedFile::errors`] records it under
     /// [`crate::Stage::Identify`].
@@ -285,7 +298,7 @@ pub(crate) enum ExtensionMatch {
     /// Extension is present but not recognized by fileid.
     Unknown,
     /// The extension was believed over a shebang naming another scripting
-    /// language (see [`is_shebang_juke`]), so the detected type is the
+    /// language (see [`shebang_jukes`]), so the detected type is the
     /// extension's. Holds the type the shebang claimed.
     ShebangClaimed(FileType),
     /// The extension disagrees with the content by a known format convention
@@ -370,6 +383,16 @@ impl Detection {
         }
     }
 
+    /// `file_type`, found by content heuristics in a body its name is wrong
+    /// about; `named` is the type the name claimed.
+    fn misnamed(file_type: FileType, named: FileType) -> Self {
+        Self {
+            file_type,
+            source: DetectionSource::Heuristic,
+            ext_match: ExtensionMatch::Different(named),
+        }
+    }
+
     /// True when content-based detection identified a different type than
     /// the file's extension implies.
     ///
@@ -449,7 +472,7 @@ impl Detection {
 /// scripting language. We treat the extension as authoritative in this case.
 /// We deliberately do NOT generalise to all script-vs-script mismatches —
 /// `#!/usr/bin/env python3` on a `.py` file with no other indicators is fine.
-fn is_shebang_juke(detected: FileType, ext_type: FileType) -> bool {
+fn shebang_jukes(detected: FileType, ext_type: FileType) -> bool {
     matches!(detected, FileType::Shell)
         && matches!(
             ext_type,
@@ -474,11 +497,7 @@ struct Convention<'s, 'a> {
 
 impl Convention<'_, '_> {
     fn name_ends_ci(&self, suffix: &str) -> bool {
-        self.sniff
-            .path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| ext::ends_with_ci(n.as_bytes(), suffix.as_bytes()))
+        ext::name_ends_with_ci(self.sniff.path, suffix)
     }
 
     /// The legacy PyTorch and `torch.save` model suffixes.
@@ -569,7 +588,8 @@ const CONVENTIONS: &[(&str, Holds)] = &[
     // `.apk` names Android's zip and Alpine's gzip tar; the container
     // decides which, and `.pkg` names macOS, FreeBSD and Arch packages.
     ("shared_package_suffix", |c| {
-        (c.name_ends_ci(".apk") && matches!(c.content, FileType::ApkAndroid | FileType::ApkAlpine))
+        (ext::names_apk(c.sniff.path)
+            && matches!(c.content, FileType::ApkAndroid | FileType::ApkAlpine))
             || (c.name_ends_ci(".pkg")
                 && matches!(c.content, FileType::PkgFreebsd | FileType::PkgArch))
     }),
@@ -653,7 +673,7 @@ pub(crate) fn identify(path: &Path, data: &[u8]) -> (Option<Detection>, Option<R
             // no name at all; Unknown is not analyzed, so the program shape
             // is the last word.
             None => (
-                headerless_program(data).map(|ft| Detection::heuristic(&sniff, ft)),
+                headerless_program(&sniff).map(|ft| Detection::heuristic(&sniff, ft)),
                 None,
             ),
         },
@@ -677,16 +697,13 @@ type Rule = fn(&Sniff<'_>) -> Option<Detection>;
 /// Each is named for the decision log.
 const RULES: &[(&str, Rule)] = &[
     ("signature", signature),
-    ("fat_boot_sector", fat_boot_sector),
+    ("github_actions_workflow", github_actions_workflow),
+    ("chrome_manifest", chrome_manifest),
     ("jest_snapshot", jest_snapshot),
-    ("gcc_specs", gcc_specs),
-    ("git_config", git_config),
     ("batch_polyglot", batch_polyglot),
-    ("ftp_command_script", ftp_command_script),
-    ("rexx_cms_script", rexx_cms_script),
-    ("sap_abap_report", sap_abap_report),
-    ("restructuredtext_document", restructuredtext_document),
+    ("text_document", text_document),
     ("markdown_document", markdown_document),
+    ("pod_document", pod_document),
     ("unmistakable_mark", unmistakable_mark),
     ("powershell_named_postscript", powershell_named_postscript),
     ("cmake", cmake),
@@ -723,22 +740,46 @@ fn detect_known(sniff: &Sniff<'_>) -> Option<Detection> {
 fn signature(sniff: &Sniff<'_>) -> Option<Detection> {
     let (file_type, source) = magic::detect_from_sniff(sniff)?;
     let ext_ft = sniff.ext_type();
-    if file_type == FileType::Html {
-        if scripts::html_prefixed_batch(sniff.data) {
-            return Some(Detection::heuristic(sniff, FileType::Batch));
-        }
-        // A `.jsp` / `.asp` / `.cfm` page often opens with an HTML prologue.
-        // That prologue is magic for HTML, but the extension is what the
-        // server executes. Prefer it; the prologue is not a different type.
-        if let Some(ext_type) = ext_ft.filter(|ft| is_server_page(*ft)) {
-            return Some(Detection::named(ext_type, DetectionSource::Extension));
-        }
-        // A saved page can open with a doctype and still be the server
-        // page a few lines later. The mark replaces that HTML prologue
-        // the same way it replaces a `.txt` name.
-        if let Some(marked) = sniff.unmistakable().filter(|ft| is_server_page(*ft)) {
-            return Some(Detection::heuristic(sniff, marked));
-        }
+    // A Go module manifest is recognised by its grammar under any name; under
+    // its canonical one, the name is what identifies it.
+    if file_type == FileType::GoMod
+        && sniff
+            .claim()
+            .is_some_and(|c| c.by_name && c.file_type == FileType::GoMod)
+    {
+        return Some(Detection::named(FileType::GoMod, DetectionSource::Filename));
+    }
+    if file_type == FileType::Html && scripts::html_prefixed_batch(sniff.data) {
+        return Some(Detection::heuristic(sniff, FileType::Batch));
+    }
+    // cmd.exe reports a markup line it cannot run and carries on, so under a
+    // batch name the line grammar decides what the file is.
+    if matches!(file_type, FileType::Html | FileType::Xml | FileType::Svg)
+        && ext_ft == Some(FileType::Batch)
+        && sniff.evidence().verdict() == Some(FileType::Batch)
+    {
+        return Some(Detection::named(
+            FileType::Batch,
+            DetectionSource::Heuristic,
+        ));
+    }
+    // A `.php` / `.jsp` / `.asp` / `.cfm` page often opens with an HTML or
+    // XML prologue. That prologue is magic for markup, but the extension is
+    // what the server executes, and everything outside the page's code
+    // delimiters is its output. Prefer it; the prologue is not a different
+    // type.
+    if matches!(file_type, FileType::Html | FileType::Xml | FileType::Svg)
+        && let Some(ext_type) = ext_ft.filter(|ft| is_server_page(*ft))
+    {
+        return Some(Detection::named(ext_type, DetectionSource::Extension));
+    }
+    // A saved page can open with a doctype and still be the server page a
+    // few lines later. The mark replaces that HTML prologue the same way it
+    // replaces a `.txt` name.
+    if file_type == FileType::Html
+        && let Some(marked) = sniff.unmistakable().filter(|ft| is_server_page(*ft))
+    {
+        return Some(Detection::heuristic(sniff, marked));
     }
     if source == DetectionSource::Shebang {
         // A Perl script that re-executes itself under Perl from a shell
@@ -754,9 +795,7 @@ fn signature(sniff: &Sniff<'_>) -> Option<Detection> {
         // treats the file as. JavaScript `.js` carrying `#!/bin/bash` is a
         // textbook static-analysis evasion, so the extension is believed
         // and the shebang's claim is kept beside it.
-        if let Some(ext_type) =
-            ext_ft.filter(|&ext| ext != file_type && is_shebang_juke(file_type, ext))
-        {
+        if let Some(ext_type) = ext_ft.filter(|&ext| shebang_jukes(file_type, ext)) {
             return Some(Detection {
                 file_type: ext_type,
                 source: DetectionSource::ExtensionOverridesShebang,
@@ -772,16 +811,71 @@ fn signature(sniff: &Sniff<'_>) -> Option<Detection> {
     Some(Detection::found(sniff, file_type, source))
 }
 
-/// The server-page types, whose sources open with HTML by design.
+/// The server-page types, whose sources open with markup by design.
 const fn is_server_page(ft: FileType) -> bool {
-    matches!(ft, FileType::Jsp | FileType::Asp | FileType::Cfml)
+    matches!(
+        ft,
+        FileType::Php | FileType::Jsp | FileType::Asp | FileType::Cfml
+    )
 }
 
-/// A standalone FAT volume boot sector has no container magic, so its
-/// validated BPB identifies it before an opaque name can leave it unscanned.
-fn fat_boot_sector(sniff: &Sniff<'_>) -> Option<Detection> {
-    dos::looks_like_fat_boot_sector(sniff.data)
-        .then(|| Detection::heuristic(sniff, FileType::FatBootSector))
+/// A GitHub Actions workflow outside `.github/workflows/`: a YAML name and
+/// top-level `on:` and `jobs:` keys.
+fn github_actions_workflow(sniff: &Sniff<'_>) -> Option<Detection> {
+    if !(ext::name_ends_with_ci(sniff.path, ".yml") || ext::name_ends_with_ci(sniff.path, ".yaml"))
+    {
+        return None;
+    }
+
+    let text = std::str::from_utf8(sniff.data.get(..16 * 1024).unwrap_or(sniff.data)).ok()?;
+
+    let mut has_on = false;
+    let mut has_jobs = false;
+    for line in text.lines() {
+        let line = line.trim_end();
+        if line.is_empty() || line.starts_with("---") || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with(' ') || line.starts_with('\t') {
+            continue;
+        }
+
+        let Some((key, _)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim_matches(|c| c == '\'' || c == '"' || c == ' ');
+        match key {
+            "on" => has_on = true,
+            "jobs" => has_jobs = true,
+            _ => {}
+        }
+        if has_on && has_jobs {
+            return Some(Detection::found(
+                sniff,
+                FileType::GithubActions,
+                DetectionSource::Heuristic,
+            ));
+        }
+    }
+    None
+}
+
+/// A Chrome extension manifest: `manifest.json` carrying `manifest_version`
+/// and at least one Chrome-specific key. The name alone is shared with web
+/// app manifests and container image indexes.
+fn chrome_manifest(sniff: &Sniff<'_>) -> Option<Detection> {
+    let named = sniff
+        .path
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("manifest.json"));
+    let has = |key: &[u8]| memchr::memmem::find(sniff.data, key).is_some();
+    (named
+        && has(b"\"manifest_version\"")
+        && (has(b"\"permissions\"")
+            || has(b"\"content_scripts\"")
+            || has(b"\"background\"")
+            || has(b"\"host_permissions\"")))
+    .then(|| Detection::found(sniff, FileType::ChromeManifest, DetectionSource::Filename))
 }
 
 /// Jest's `.snap` files are CommonJS exports of template strings. The
@@ -800,139 +894,21 @@ fn jest_snapshot(sniff: &Sniff<'_>) -> Option<Detection> {
     .then(|| Detection::heuristic(sniff, FileType::JavaScript))
 }
 
-/// GCC's extensionless specs files contain named `*spec:` sections. A name
-/// alone is ambiguous, so both the filename and a section header are
-/// required, and binary magic and executable shebangs have already won.
-fn gcc_specs(sniff: &Sniff<'_>) -> Option<Detection> {
-    let data = sniff.data;
-    (sniff.path.file_name().is_some_and(|name| name == "specs")
-        && magic::content_is_text(data)
-        && data.split(|b| *b == b'\n').any(|line| {
-            line.trim_ascii()
-                .strip_prefix(b"*")
-                .and_then(|s| s.strip_suffix(b":"))
-                .is_some_and(|name| {
-                    !name.is_empty() && name.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'_')
-                })
-        }))
-    .then(|| Detection::heuristic(sniff, FileType::Text))
-}
-
-/// `.git/config` is normally extensionless. Its section/key structure is a
-/// strong content signature, and may correct even a misleading filename
-/// before source-language or exact-name fallbacks get a chance to win.
-fn git_config(sniff: &Sniff<'_>) -> Option<Detection> {
-    sniff
-        .looks_like_git_config()
-        .then(|| Detection::heuristic(sniff, FileType::Text))
-}
-
-/// CMS REXX EXECs may be extensionless and otherwise look like comment-led
-/// prose. Recognize a bounded combination of REXX statements and CMS I/O.
-fn rexx_cms_script(sniff: &Sniff<'_>) -> Option<Detection> {
-    (sniff.ext_type().is_none_or(|ft| ft == FileType::Text)
-        && rexx_cms::looks_like_cms_exec(sniff.text()))
-    .then(|| Detection::heuristic(sniff, FileType::Text))
-}
-
-/// Extensionless ABAP report source with SAP repository I/O.
-fn sap_abap_report(sniff: &Sniff<'_>) -> Option<Detection> {
-    (sniff.ext_type().is_none_or(|ft| ft == FileType::Text)
-        && sap_abap::looks_like_report(sniff.text()))
-    .then(|| Detection::heuristic(sniff, FileType::Text))
-}
-
 /// A real batch prologue precedes the binary body in BAT/COM hybrids.
 /// Registered suffixes must not discard the same content evidence that
 /// identifies the hybrid under an unknown or prose suffix.
 fn batch_polyglot(sniff: &Sniff<'_>) -> Option<Detection> {
-    ((sniff.binary_not_source() || dos::looks_like_dos_com(sniff.data))
+    ((sniff.binary_not_source() || dos::looks_like_dos_com(sniff))
         && scripts::binary_batch_prologue(sniff))
     .then(|| Detection::heuristic(sniff, FileType::Batch))
 }
 
-/// A line-oriented FTP client command file is data for the FTP client, not
-/// source code merely because its name ends in a language extension. Require
-/// the full connect / binary / download / exit sequence in order, so a single
-/// quoted or documented FTP command cannot override a source-file claim.
-fn ftp_command_script(sniff: &Sniff<'_>) -> Option<Detection> {
-    let data = sniff.data;
-    if data.len() > 4096 || !data.is_ascii() {
-        return None;
-    }
-    let mut lines = data
-        .split(|b| *b == b'\n')
-        .map(|line| line.trim_ascii())
-        .filter(|line| !line.is_empty());
-    let mut first = lines
-        .next()?
-        .split(|b| b.is_ascii_whitespace())
-        .filter(|s| !s.is_empty());
-    if !first.next()?.eq_ignore_ascii_case(b"open") {
-        return None;
-    }
-    let host = first.next()?;
-    if host.is_empty()
-        || !host
-            .iter()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b':'))
-    {
-        return None;
-    }
-    if let Some(port) = first.next() {
-        let valid_port = std::str::from_utf8(port)
-            .ok()
-            .and_then(|s| s.parse::<u16>().ok())
-            .is_some_and(|n| n > 0);
-        if !valid_port || first.next().is_some() {
-            return None;
-        }
-    }
-    let mut binary = false;
-    let mut get = false;
-    let mut ended = false;
-    for line in lines {
-        if ended {
-            return None;
-        }
-        if line
-            .iter()
-            .any(|b| !b.is_ascii_graphic() && !b.is_ascii_whitespace())
-        {
-            return None;
-        }
-        if line.eq_ignore_ascii_case(b"binary") || line.eq_ignore_ascii_case(b"bin") {
-            binary = true;
-        } else if get && (line.eq_ignore_ascii_case(b"bye") || line.eq_ignore_ascii_case(b"quit")) {
-            ended = true;
-        } else if binary {
-            let mut words = line
-                .split(|b| b.is_ascii_whitespace())
-                .filter(|s| !s.is_empty());
-            if words
-                .next()
-                .is_some_and(|word| word.eq_ignore_ascii_case(b"get"))
-                && words.next().is_some()
-            {
-                get = true;
-            }
-        }
-    }
-    ended.then(|| Detection::heuristic(sniff, FileType::Text))
-}
-
-/// ReStructuredText documents often contain executable-looking examples. A
-/// sectioned document with directives or literal blocks is a document by its
-/// content, even when those examples happen to score as a language or carry
-/// another format's mark.
-fn restructuredtext_document(sniff: &Sniff<'_>) -> Option<Detection> {
-    (sniff.ext_type() == Some(FileType::Text)
-        && sniff
-            .path
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("rst"))
-        && restructuredtext::document_structure(sniff.data))
-    .then(|| Detection::named(FileType::Text, DetectionSource::Heuristic))
+/// A document in one of the [`text_shapes::TEXT_SHAPES`]: data or prose that
+/// quotes a language without being one.
+fn text_document(sniff: &Sniff<'_>) -> Option<Detection> {
+    let shape = text_shapes::shape_of(sniff)?;
+    tracing::debug!(target: "filefacts::fileid", shape, "text document shape");
+    Some(Detection::heuristic(sniff, FileType::Text))
 }
 
 /// A document's fenced examples are not its execution language. Content
@@ -943,6 +919,24 @@ fn markdown_document(sniff: &Sniff<'_>) -> Option<Detection> {
         .then(|| Detection::named(FileType::Markdown, DetectionSource::Heuristic))
 }
 
+/// Perl's POD documentation is prose whose indented examples are often C
+/// or Perl. A `.pod` file that opens with a POD command (`=pod`, `=head1`,
+/// `=encoding`) is the document, whatever its examples score as.
+fn pod_document(sniff: &Sniff<'_>) -> Option<Detection> {
+    let named_pod = sniff
+        .path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("pod"));
+    let opens_with_command = sniff
+        .data
+        .trim_ascii_start()
+        .strip_prefix(b"=")
+        .and_then(<[u8]>::first)
+        .is_some_and(u8::is_ascii_alphabetic);
+    (named_pod && opens_with_command)
+        .then(|| Detection::named(FileType::Text, DetectionSource::Heuristic))
+}
+
 /// One unmistakable mark beats the language scorer. It replaces a name that
 /// yields to it (`.txt`, `.dat`, a container without its signature, a page),
 /// no name at all, and a language name whose body carries not one token of
@@ -950,6 +944,11 @@ fn markdown_document(sniff: &Sniff<'_>) -> Option<Detection> {
 /// so its name stays what it says.
 fn unmistakable_mark(sniff: &Sniff<'_>) -> Option<Detection> {
     let marked = sniff.unmistakable()?;
+    // Marks are text syntax; object code can hold their bytes by chance (a
+    // column-zero `x:` and a tab-led line read as a make target and recipe).
+    if sniff.binary_not_source() {
+        return None;
+    }
     sniff
         .claim()
         .is_none_or(|c| {
@@ -1039,7 +1038,7 @@ fn pyproject(sniff: &Sniff<'_>) -> Option<Detection> {
 /// Ordinary source extensions stay authoritative: keyword scoring is too
 /// weak to override `.go`, `.js`, `.swift`.
 fn language_score(sniff: &Sniff<'_>) -> Option<Detection> {
-    if !sniff.claim().is_none_or(|c| c.yields_to_scorer()) {
+    if !sniff.claim().is_none_or(ext::Claim::yields_to_scorer) {
         return None;
     }
     let file_type = sniff.scored_type()?;
@@ -1060,7 +1059,7 @@ fn named_text(sniff: &Sniff<'_>) -> Option<Detection> {
     (sniff.claim().is_none()
         && has_named_extension(sniff.path)
         && !sniff.data.is_empty()
-        && magic::content_is_text(sniff.data))
+        && text::head_is_text(sniff.data))
     .then_some(Detection {
         file_type: FileType::Text,
         source: DetectionSource::Heuristic,
@@ -1074,15 +1073,11 @@ fn named_text(sniff: &Sniff<'_>) -> Option<Detection> {
 fn foreign_body(sniff: &Sniff<'_>) -> Option<Detection> {
     let ext = sniff.claim().filter(|c| c.claims_language())?.file_type;
     let found = if sniff.binary_not_source() {
-        headerless_program(sniff.data).unwrap_or(FileType::Data)
+        headerless_program(sniff).unwrap_or(FileType::Data)
     } else {
         heuristics::contradicts_extension(ext, sniff)?
     };
-    Some(Detection {
-        file_type: found,
-        source: DetectionSource::Heuristic,
-        ext_match: ExtensionMatch::Different(ext),
-    })
+    Some(Detection::misnamed(found, ext))
 }
 
 /// A unit file and a desktop entry are text; a binary body under either
@@ -1091,11 +1086,9 @@ fn binary_unit_file(sniff: &Sniff<'_>) -> Option<Detection> {
     let ext = sniff
         .ext_type()
         .filter(|ft| matches!(ft, FileType::SystemdService | FileType::DesktopEntry))?;
-    sniff.binary_not_source().then_some(Detection {
-        file_type: FileType::Data,
-        source: DetectionSource::Heuristic,
-        ext_match: ExtensionMatch::Different(ext),
-    })
+    sniff
+        .binary_not_source()
+        .then_some(Detection::misnamed(FileType::Data, ext))
 }
 
 /// The extension fallback, once no content rule resolved and the name was
@@ -1103,13 +1096,7 @@ fn binary_unit_file(sniff: &Sniff<'_>) -> Option<Detection> {
 fn extension(sniff: &Sniff<'_>) -> Option<Detection> {
     let file_type = sniff.ext_type()?;
     let data = sniff.data;
-    let misnamed = || {
-        Some(Detection {
-            file_type: unclaimed_body_type(sniff),
-            source: DetectionSource::Heuristic,
-            ext_match: ExtensionMatch::Different(file_type),
-        })
-    };
+    let misnamed = || Some(Detection::misnamed(unclaimed_body_type(sniff), file_type));
     // A format defined by its magic, whose magic the signature stage did not
     // find. The name is the only thing claiming it, and the bytes have
     // already said no.
@@ -1124,7 +1111,7 @@ fn extension(sniff: &Sniff<'_>) -> Option<Detection> {
         && !data.is_empty()
         && !heuristics::has_language_evidence(file_type, sniff)
         && !heuristics::looks_like_c_family(data)
-        && !heuristics::is_utf16_text(data)
+        && !text::is_utf16_text(data)
     {
         return misnamed();
     }
@@ -1153,23 +1140,15 @@ fn extension(sniff: &Sniff<'_>) -> Option<Detection> {
         .is_some_and(|c| c.strength == file_type::Strength::Weak && c.claims_language())
         && heuristics::looks_like_html(sniff.text())
     {
-        return Some(Detection {
-            file_type: FileType::Html,
-            source: DetectionSource::Heuristic,
-            ext_match: ExtensionMatch::Different(file_type),
-        });
+        return Some(Detection::misnamed(FileType::Html, file_type));
     }
     // `.bin`/`.dat`/`.raw` say nothing about the content, and carved
     // programs routinely carry them. A program-shaped body under a generic
     // data name is the program.
     if file_type == FileType::Data
-        && let Some(program) = headerless_program(data)
+        && let Some(program) = headerless_program(sniff)
     {
-        return Some(Detection {
-            file_type: program,
-            source: DetectionSource::Heuristic,
-            ext_match: ExtensionMatch::Different(FileType::Data),
-        });
+        return Some(Detection::misnamed(program, FileType::Data));
     }
     Some(Detection::named(file_type, DetectionSource::Extension))
 }
@@ -1201,7 +1180,7 @@ fn has_named_extension(path: &Path) -> bool {
             .and_then(|stem| stem.to_str())
             .is_some_and(|stem| {
                 stem.contains('.')
-                    && ext.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+                    && ext.starts_with(|c: char| c.is_ascii_uppercase())
                     && ext.chars().any(|c| c.is_ascii_lowercase())
             });
     !dotted_camel_case_tail
@@ -1209,16 +1188,19 @@ fn has_named_extension(path: &Path) -> bool {
 
 /// Recognize selected headerless or lightly structured programs when no
 /// stronger format or filename rule has claimed the bytes.
-fn headerless_program(data: &[u8]) -> Option<FileType> {
-    if dos::looks_like_dos_com(data) {
+fn headerless_program(sniff: &Sniff<'_>) -> Option<FileType> {
+    if dos::looks_like_dos_com(sniff) {
         Some(FileType::DosCom)
-    } else if commodore::has_basic_sys_loader(data)
-        || prodos::has_prodos_system_code(data)
-        || prodos::has_prodos_boot_code(data)
-        || sign_of_misery::looks_like_script(data)
-        || unix_aout16::looks_like_image(data)
-    {
-        // These formats have no dedicated type yet, so use generic analysis.
+    } else {
+        headerless_binary(sniff.data)
+    }
+}
+
+/// [`headerless_program`] once a DOS COM is ruled out: a known data shape
+/// with no type of its own, or position-independent code.
+fn headerless_binary(data: &[u8]) -> Option<FileType> {
+    if let Some(shape) = data_shapes::shape_of(data) {
+        tracing::debug!(target: "filefacts::fileid", shape, "known headerless data shape");
         Some(FileType::Data)
     } else if shellcode::detect(data).is_some() {
         Some(FileType::Shellcode)
@@ -1230,9 +1212,10 @@ fn headerless_program(data: &[u8]) -> Option<FileType> {
 /// What a body is once its name has been ruled out: binary, a page, a
 /// language the scorer recognises, or plain text.
 fn unclaimed_body_type(sniff: &Sniff<'_>) -> FileType {
-    let data = sniff.data;
-    if sniff.binary_not_source() || dos::looks_like_dos_com(data) {
-        headerless_program(data).unwrap_or(FileType::Data)
+    if dos::looks_like_dos_com(sniff) {
+        FileType::DosCom
+    } else if sniff.binary_not_source() {
+        headerless_binary(sniff.data).unwrap_or(FileType::Data)
     } else if let Some(marked) = sniff.unmistakable() {
         marked
     } else if heuristics::looks_like_html(sniff.text()) {
@@ -1243,13 +1226,19 @@ fn unclaimed_body_type(sniff: &Sniff<'_>) -> FileType {
 }
 
 /// Detect file type from content alone: the signature stage (magic bytes,
-/// shebangs and structural markers such as a `go.mod` directive).
+/// shebangs and structural markers such as a `go.mod` directive), then the
+/// headerless programs [`detect`] falls back to.
 ///
 /// Does not consider file extensions or the language heuristics.
 #[must_use]
 pub fn detect_content(data: &[u8]) -> Option<Detection> {
     let sniff = Sniff::new(Path::new(""), data);
-    magic::detect_from_sniff(&sniff).map(|(file_type, source)| Detection::named(file_type, source))
+    magic::detect_from_sniff(&sniff)
+        .map(|(file_type, source)| Detection::named(file_type, source))
+        .or_else(|| {
+            headerless_program(&sniff)
+                .map(|file_type| Detection::named(file_type, DetectionSource::Heuristic))
+        })
 }
 
 /// Detect file type from path/extension alone.

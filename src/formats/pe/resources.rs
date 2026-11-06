@@ -1,7 +1,8 @@
-//! The resource directory: its type inventory, and the version-info and
-//! manifest resources inside it.
+//! The resource directory: its type inventory, and the manifest resource
+//! inside it.
 
 use goblin::pe::PE;
+use goblin::pe::resource::{RT_GROUP_ICON, RT_ICON};
 use serde_json::Value as JsonValue;
 
 use crate::formats::common::put_u64;
@@ -53,11 +54,8 @@ pub(super) fn extract(
         put_u64(values, value_key!("pe.resource_timestamp"), u64::from(ts));
     }
     // Presence comes from the directory itself, distinct from whether the
-    // version or manifest decoders below found anything in a malformed one.
-    if let Some(ref vi) = rd.version_info {
-        metrics.insert(metric!("pe.has_version_info"), 1.0);
-        super::version_info::extract(vi, bytes, values, metrics);
-    }
+    // manifest decoder below found anything in a malformed one. The version
+    // resource is read on its own (see `super::version_info`).
     if let Some(ref md) = rd.manifest_data {
         metrics.insert(metric!("pe.has_manifest"), 1.0);
         // goblin's resource parser returns slices borrowed from the PE
@@ -77,9 +75,11 @@ fn resource_types(ids: &[Option<u16>], values: &mut Values, metrics: &mut Metric
     // Resource count is the raw entry total — duplicates allowed.
     metrics.insert(metric!("pe.resource_count"), ids.len() as f64);
 
-    // RT_ICON (3) and RT_GROUP_ICON (14), counted apart from the total so
-    // icon presence reads on its own.
-    let icon_count = ids.iter().filter(|id| matches!(id, Some(3 | 14))).count();
+    // Icons, counted apart from the total so icon presence reads on its own.
+    let icon_count = ids
+        .iter()
+        .filter(|id| matches!(id, Some(RT_ICON | RT_GROUP_ICON)))
+        .count();
     if icon_count > 0 {
         metrics.insert(metric!("pe.icon_count"), icon_count as f64);
     }

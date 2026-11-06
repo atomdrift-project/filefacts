@@ -1,5 +1,5 @@
 use super::*;
-use crate::output::Symbol;
+use crate::output::{Errors, Metrics, Symbol, Symbols, Values};
 
 fn build_pyc(magic_word: u16, flags: u32, ts: u32, sz: u32, body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(16 + body.len());
@@ -13,32 +13,15 @@ fn build_pyc(magic_word: u16, flags: u32, ts: u32, sz: u32, body: &[u8]) -> Vec<
 }
 
 fn run(bytes: &[u8]) -> (Values, Metrics) {
-    let mut v = Values::new();
-    let mut s = Strings::default();
-    let mut m = Metrics::new();
-    extract(
-        bytes,
-        &mut v,
-        &mut s,
-        &mut m,
-        &mut Symbols::new(),
-        &mut Errors::new(),
-    );
-    (v, m)
+    let mut sinks = crate::formats::Sinks::default();
+    extract(bytes, sinks.ctx());
+    (sinks.values, sinks.metrics)
 }
 
 fn identifiers(bytes: &[u8]) -> (Symbols, Errors) {
-    let mut symbols = Symbols::new();
-    let mut errors = Errors::new();
-    extract(
-        bytes,
-        &mut Values::new(),
-        &mut Strings::default(),
-        &mut Metrics::new(),
-        &mut symbols,
-        &mut errors,
-    );
-    (symbols, errors)
+    let mut sinks = crate::formats::Sinks::default();
+    extract(bytes, sinks.ctx());
+    (sinks.symbols, sinks.errors)
 }
 
 #[test]

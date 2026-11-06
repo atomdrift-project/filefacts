@@ -178,10 +178,10 @@ pub fn container_of(file_type: FileType, bytes: &[u8]) -> Option<Container> {
     // PkgArch is the sole type whose compression the variant doesn't fix. The
     // whole file is the compressed tar, so its leading bytes are the codec
     // magic; trust a positive sniff and keep the declared default otherwise.
-    if file_type == FileType::PkgArch {
-        if let Some(sniffed) = Compression::sniff(bytes) {
-            container.compression = sniffed;
-        }
+    if file_type == FileType::PkgArch
+        && let Some(sniffed) = Compression::sniff(bytes)
+    {
+        container.compression = sniffed;
     }
     Some(container)
 }

@@ -4,11 +4,13 @@
 
 use goblin::elf::Elf;
 use goblin::elf::header;
-use goblin::elf::note::{Note, NoteIterator};
+use goblin::elf::note::{
+    NT_GNU_ABI_TAG, NT_GNU_BUILD_ID, NT_GNU_PROPERTY_TYPE_0, Note, NoteIterator,
+};
 use serde_json::Value as JsonValue;
 
 use super::RangeCover;
-use crate::formats::common::bytes_at::{u32_le, u64_le};
+use crate::bytes::{u32_le, u64_le};
 use crate::formats::common::{hex_encode, put_str};
 use crate::formats::goblin_safe;
 use crate::metric;
@@ -24,8 +26,9 @@ use crate::value_key;
 /// Surfaced as the `elf.package` subtree with the JSON keys verbatim
 /// (so trait authors write `elf.package.type == "apk"`).
 pub(super) fn package(notes: &[Note<'_>], values: &mut Values) {
+    const NT_FDO_PACKAGING_METADATA: u32 = 0xCAFE_1A7E;
     for note in notes {
-        if note.n_type != 0xCAFE_1A7E {
+        if note.n_type != NT_FDO_PACKAGING_METADATA {
             continue;
         }
         // Trim trailing NULs — the section may pad up to 4 bytes.
@@ -51,9 +54,10 @@ pub(super) fn package(notes: &[Note<'_>], values: &mut Values) {
 /// words: ABI (0 = Linux), major, minor, patch.
 pub(super) fn abi_tag(notes: &[Note<'_>], values: &mut Values) {
     for note in notes {
-        if note.name == "GNU" && note.n_type == 1 && note.desc.len() >= 16 {
-            let words: [u32; 4] = [0, 1, 2, 3].map(|i| u32_le(note.desc, i * 4).unwrap_or(0));
-            let os = match words[0] {
+        if note.name == "GNU" && note.n_type == NT_GNU_ABI_TAG && note.desc.len() >= 16 {
+            let [abi, major, minor, patch] =
+                [0, 1, 2, 3].map(|i| u32_le(note.desc, i * 4).unwrap_or(0));
+            let os = match abi {
                 0 => "linux",
                 1 => "hurd",
                 2 => "solaris",
@@ -66,7 +70,7 @@ pub(super) fn abi_tag(notes: &[Note<'_>], values: &mut Values) {
             obj.insert("os".into(), JsonValue::String(os.to_string()));
             obj.insert(
                 "min_kernel".into(),
-                JsonValue::String(format!("{}.{}.{}", words[1], words[2], words[3])),
+                JsonValue::String(format!("{major}.{minor}.{patch}")),
             );
             values.insert_key(value_key!("elf.abi"), JsonValue::Object(obj));
             return;
@@ -89,7 +93,7 @@ pub(super) fn gnu_property(
 ) {
     let is_aarch64 = elf.header.e_machine == header::EM_AARCH64;
     for note in notes {
-        if note.name != "GNU" || note.n_type != 5 {
+        if note.name != "GNU" || note.n_type != NT_GNU_PROPERTY_TYPE_0 {
             continue;
         }
         // Each property is `pr_type (u32) | pr_datasz (u32) | data | pad`
@@ -98,7 +102,7 @@ pub(super) fn gnu_property(
         let mut off = 0;
         while off + 8 <= note.desc.len() {
             let pr_type = u32_le(note.desc, off).unwrap_or(0);
-            let pr_datasz = u32_le(note.desc, off + 4).unwrap_or(0) as usize;
+            let pr_datasz = crate::bytes::sat_usize(u32_le(note.desc, off + 4).unwrap_or(0));
             let data_start = off + 8;
             let data_end = data_start.saturating_add(pr_datasz);
             if data_end > note.desc.len() {
@@ -129,12 +133,7 @@ pub(super) fn gnu_property(
                         if !feats.is_empty() {
                             entry.insert(
                                 "features".into(),
-                                JsonValue::Array(
-                                    feats
-                                        .into_iter()
-                                        .map(|s| JsonValue::String(s.into()))
-                                        .collect(),
-                                ),
+                                JsonValue::Array(feats.into_iter().map(JsonValue::from).collect()),
                             );
                         }
                     } else if !is_aarch64 && pr_type == 0xC000_0002 {
@@ -254,7 +253,7 @@ pub(super) fn build_id(
 fn gnu_build_id_desc<'a>(notes: &[Note<'a>]) -> Option<&'a [u8]> {
     notes
         .iter()
-        .find(|note| note.name == "GNU" && note.n_type == 3)
+        .find(|note| note.name == "GNU" && note.n_type == NT_GNU_BUILD_ID)
         .map(|note| note.desc)
 }
 

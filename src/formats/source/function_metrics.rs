@@ -16,23 +16,23 @@ use super::identifier_metrics::string_entropy;
 use super::visit::{NodeIds, Visit};
 
 /// Per-function info collected during the AST walk.
-#[derive(Default)]
-struct FunctionInfo {
-    name: String,
+struct FunctionInfo<'t> {
+    /// Empty for an anonymous function.
+    name: &'t str,
     line_count: u32,
     start_line: u32,
     end_line: u32,
     param_count: u32,
-    param_names: Vec<String>,
-    is_anonymous: bool,
+    /// Byte length of each parameter's name, for those that have one.
+    param_name_lens: Vec<usize>,
     nesting_depth: u32,
     contains_nested_functions: bool,
 }
 
 /// The function-definition nodes of one walk, in source order.
 #[derive(Default)]
-pub(super) struct Collector {
-    functions: Vec<FunctionInfo>,
+pub(super) struct Collector<'t> {
+    functions: Vec<FunctionInfo<'t>>,
     /// The collected functions enclosing the walk's current node, innermost
     /// last: index into `functions`, and tree depth.
     open: Vec<(usize, u32)>,
@@ -46,8 +46,8 @@ pub(super) struct Collector {
     line_row: u32,
 }
 
-impl Collector {
-    pub(super) fn enter(&mut self, visit: &Visit<'_>, source: &str, ids: &NodeIds) {
+impl<'t> Collector<'t> {
+    pub(super) fn enter(&mut self, visit: &Visit<'t>, source: &'t str, ids: &NodeIds) {
         // Nothing useful lives past the AST walk's depth cap, and a tree this
         // deep is itself an anti-analysis signal — record that we truncated.
         if visit.depth >= MAX_AST_DEPTH {
@@ -117,7 +117,7 @@ impl Collector {
 
 /// Emit `functions.*` metrics for what `collector` gathered. Returns the
 /// number of functions found, for the caller's ratios.
-pub(super) fn emit(collector: Collector, total_lines: u32, metrics: &mut Metrics) -> usize {
+pub(super) fn emit(collector: Collector<'_>, total_lines: u32, metrics: &mut Metrics) -> usize {
     let Collector {
         functions, capped, ..
     } = collector;
@@ -137,29 +137,25 @@ pub(super) fn emit(collector: Collector, total_lines: u32, metrics: &mut Metrics
 
 /// A function's info, without [`FunctionInfo::contains_nested_functions`],
 /// which the walk sets when it meets a nested function.
-fn build_info(
-    node: Node<'_>,
-    source: &str,
+fn build_info<'t>(
+    node: Node<'t>,
+    source: &'t str,
     depth: u32,
     start_line: u32,
     end_line: u32,
-) -> FunctionInfo {
-    let bytes = source.as_bytes();
+) -> FunctionInfo<'t> {
     let name = node
         .child_by_field_name("name")
-        .and_then(|n| n.utf8_text(bytes).ok())
-        .map(str::to_string)
+        .and_then(|n| n.utf8_text(source.as_bytes()).ok())
         .unwrap_or_default();
-    let is_anonymous = name.is_empty();
 
     let line_count = end_line.saturating_sub(start_line) + 1;
 
     // Every grammar here names the list `parameters`. A shell function has
     // none (it reads `$1`, `$@`), so it counts zero parameters.
-    let (param_count, param_names) = node
+    let (param_count, param_name_lens) = node
         .child_by_field_name("parameters")
-        .map(|params| collect_param_names(params, source))
-        .unwrap_or((0, Vec::new()));
+        .map_or((0, Vec::new()), |params| param_name_lens(params, source));
 
     FunctionInfo {
         name,
@@ -167,14 +163,15 @@ fn build_info(
         start_line,
         end_line,
         param_count,
-        param_names,
-        is_anonymous,
+        param_name_lens,
         nesting_depth: depth,
         contains_nested_functions: false,
     }
 }
 
-fn collect_param_names(params: Node<'_>, source: &str) -> (u32, Vec<String>) {
+/// The number of parameters in `params`, and the byte length of each one's
+/// name.
+fn param_name_lens(params: Node<'_>, source: &str) -> (u32, Vec<usize>) {
     let bytes = source.as_bytes();
     let mut count = 0u32;
     let mut names = Vec::new();
@@ -189,26 +186,21 @@ fn collect_param_names(params: Node<'_>, source: &str) -> (u32, Vec<String>) {
             .or_else(|| param.child_by_field_name("pattern"))
             .or_else(|| first_identifier(param))
             .and_then(|n| n.utf8_text(bytes).ok())
-            .unwrap_or_else(|| param.utf8_text(bytes).unwrap_or(""))
-            .to_string();
+            .unwrap_or_else(|| param.utf8_text(bytes).unwrap_or(""));
         if !name.is_empty() {
-            names.push(name);
+            names.push(name.len());
         }
     }
     (count, names)
 }
 
-fn first_identifier<'a>(node: Node<'a>) -> Option<Node<'a>> {
+fn first_identifier(node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.kind() == "identifier" {
-            return Some(child);
-        }
-    }
-    None
+    node.children(&mut cursor)
+        .find(|child| child.kind() == "identifier")
 }
 
-fn emit_metrics(functions: &[FunctionInfo], total_lines: u32, metrics: &mut Metrics) {
+fn emit_metrics(functions: &[FunctionInfo<'_>], total_lines: u32, metrics: &mut Metrics) {
     // `functions.count` is emitted by `lib.rs::extract_all` once
     // (cross-format: source-language counts and binary-disassembled
     // counts share the same canonical path). We compute the local
@@ -234,7 +226,9 @@ fn emit_metrics(functions: &[FunctionInfo], total_lines: u32, metrics: &mut Metr
     // Count their union rather than repeatedly counting enclosing bodies.
     let mut covered_lines = 0u64;
     let mut covered_until = 0u64;
-    let mut all_param_names: Vec<String> = Vec::new();
+    let mut param_names = 0usize;
+    let mut param_name_bytes = 0usize;
+    let mut single_char_params = 0usize;
 
     for func in functions {
         lengths.push(func.line_count);
@@ -247,9 +241,11 @@ fn emit_metrics(functions: &[FunctionInfo], total_lines: u32, metrics: &mut Metr
         if !func.name.is_empty() {
             name_lengths.push(func.name.len());
         }
-        all_param_names.extend(func.param_names.iter().cloned());
+        param_names += func.param_name_lens.len();
+        param_name_bytes += func.param_name_lens.iter().sum::<usize>();
+        single_char_params += func.param_name_lens.iter().filter(|&&len| len == 1).count();
 
-        if func.is_anonymous {
+        if func.name.is_empty() {
             anonymous += 1;
         }
         if func.contains_nested_functions {
@@ -274,10 +270,10 @@ fn emit_metrics(functions: &[FunctionInfo], total_lines: u32, metrics: &mut Metr
             if func.name.len() == 1 {
                 single_char_names += 1;
             }
-            if string_entropy(&func.name) > 3.5 {
+            if string_entropy(func.name) > 3.5 {
                 high_entropy_names += 1;
             }
-            if has_numeric_suffix(&func.name) {
+            if has_numeric_suffix(func.name) {
                 numeric_suffix_names += 1;
             }
         }
@@ -364,15 +360,16 @@ fn emit_metrics(functions: &[FunctionInfo], total_lines: u32, metrics: &mut Metr
         }
     }
 
-    if !all_param_names.is_empty() {
-        let total_len: usize = all_param_names.iter().map(String::len).sum();
-        let avg = total_len as f64 / all_param_names.len() as f64;
+    if param_names > 0 {
+        let avg = param_name_bytes as f64 / param_names as f64;
         if avg > 0.0 {
             metrics.insert(metric!("functions.avg_param_name_length"), avg);
         }
-        let single = all_param_names.iter().filter(|s| s.len() == 1).count();
-        if single > 0 {
-            metrics.insert(metric!("functions.single_char_params"), single as f64);
+        if single_char_params > 0 {
+            metrics.insert(
+                metric!("functions.single_char_params"),
+                single_char_params as f64,
+            );
         }
     }
 

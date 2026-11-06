@@ -341,3 +341,28 @@ fn objdata_stops_at_destination_boundary_and_obeys_both_limits() {
     assert!(decode_hex_run(b"\\bin4 4142", 100, 100).is_empty());
     assert!(decode_hex_run(b"\\{4142", 100, 100).is_empty());
 }
+
+/// A field's group is matched like every other group: nesting past
+/// `MAX_GROUP_DEPTH` reads to the end of input instead of being counted out.
+#[test]
+fn field_group_end_honours_the_depth_cap() {
+    let deep = usize::try_from(MAX_GROUP_DEPTH).unwrap() + 1;
+    let mut rtf = b"{\\rtf1 {\\field{\\*\\fldinst HYPERLINK x ".to_vec();
+    rtf.extend(std::iter::repeat_n(b'{', deep));
+    rtf.extend(std::iter::repeat_n(b'}', deep));
+    rtf.extend_from_slice(b"}}{\\field{\\*\\fldinst INCLUDETEXT y}}}");
+    let (values, _) = extract_rtf(&rtf);
+    let fields = values
+        .get("rtf.fields")
+        .and_then(JsonValue::as_array)
+        .unwrap();
+    assert_eq!(fields.len(), 1, "{fields:?}");
+    let mut shallow = b"{\\rtf1 {\\field{\\*\\fldinst HYPERLINK x {{}}}}".to_vec();
+    shallow.extend_from_slice(b"{\\field{\\*\\fldinst INCLUDETEXT y}}}");
+    let (values, _) = extract_rtf(&shallow);
+    let fields = values
+        .get("rtf.fields")
+        .and_then(JsonValue::as_array)
+        .unwrap();
+    assert_eq!(fields.len(), 2, "{fields:?}");
+}

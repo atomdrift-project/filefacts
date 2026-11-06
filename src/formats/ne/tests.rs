@@ -41,7 +41,7 @@ fn resolves_known_ordinals_and_retains_unknown_and_named_imports() {
     extract(&fixture(), &mut symbols, &mut Metrics::default()).unwrap();
     assert!(symbols.iter().any(|s| matches!(s, Symbol::Import { name, library: Some(lib), ordinal: Some(10), .. } if name == "SetTimer" && lib == "user")));
     assert!(symbols.iter().any(
-        |s| matches!(s, Symbol::Import { name, ordinal: Some(999), .. } if name == "ordinal_999")
+        |s| matches!(s, Symbol::Import { name, ordinal: Some(999), .. } if name == "Ordinal_999")
     ));
     assert!(
         symbols
@@ -68,7 +68,7 @@ fn does_not_apply_windows_ordinal_names_to_other_ne_targets() {
     let mut symbols = Symbols::new();
     extract(&bytes, &mut symbols, &mut Metrics::default()).unwrap();
     assert!(symbols.iter().any(
-        |s| matches!(s, Symbol::Import { name, ordinal: Some(10), .. } if name == "ordinal_10")
+        |s| matches!(s, Symbol::Import { name, ordinal: Some(10), .. } if name == "Ordinal_10")
     ));
 }
 
@@ -92,14 +92,29 @@ fn rejects_truncated_and_out_of_range_tables_without_partial_symbols() {
     bad.truncate(0x10b);
     cases.push(bad);
     let mut bad = fixture();
-    put16(&mut bad, 0x106 + 4, 2); // invalid module index
-    cases.push(bad);
-    let mut bad = fixture();
     put16(&mut bad, 0x40 + 0x32, 31); // unsupported alignment
     cases.push(bad);
     for bytes in cases {
         let mut symbols = Symbols::new();
         assert!(extract(&bytes, &mut symbols, &mut Metrics::default()).is_err());
         assert!(symbols.is_empty());
+    }
+}
+
+/// A relocation record naming a module or name outside the tables costs that
+/// record, not the imports the others name.
+#[test]
+fn a_bad_relocation_record_is_skipped() {
+    for (field, value) in [(4, 2), (4, 0), (6, 0xff00)] {
+        let mut bytes = fixture();
+        // The by-name record: a module index past the table, none, or a
+        // name offset past the file.
+        put16(&mut bytes, 0x106 + 16 + field, value);
+        let mut symbols = Symbols::new();
+        extract(&bytes, &mut symbols, &mut Metrics::default()).unwrap();
+        assert_eq!(symbols.len(), 2, "{field} = {value}");
+        assert!(symbols.iter().any(
+            |s| matches!(s, Symbol::Import { name, ordinal: Some(10), .. } if name == "SetTimer")
+        ));
     }
 }

@@ -10,17 +10,18 @@
 //! Windows icons and cursors (`.ico`, `.cur`), GIF, BMP, MP3 (ID3 + frames)
 //! and ISO base media (`.mp4`, `.m4a`, `.mov`).
 //!
-//! These formats were chosen because they are the assets a package copies
-//! verbatim and nobody opens: a favicon, a notification sound, a spritesheet.
-//! Before they had walkers they had no file type at all, so every one of them
-//! was skipped outright — an appended executable in a `.ico` produced no
-//! findings of any kind.
+//! These are the assets a package copies verbatim and nobody opens: a
+//! favicon, a notification sound, a spritesheet. Without a walker, an
+//! executable appended to a `.ico` would produce no findings of any kind.
 
 use crate::formats::carrier::Coverage;
 
 /// Chunk counts and box depths are bounded so a hostile header cannot turn a
 /// linear walk into a long one.
 const MAX_REGIONS: usize = 4096;
+
+/// Images an icon directory may list; more marks the file as not an icon.
+const MAX_ICON_IMAGES: usize = 512;
 
 /// RIFF: `RIFF` + u32 little-endian payload length + a 4-byte form type,
 /// then `id`/`size` chunks. Used by `.wav`, `.webp` and `.avi`. `RIFX` is
@@ -101,11 +102,9 @@ fn walk_chunks(
 
     // A reader stops at the declared length, so the walk must too: bytes past
     // it are not chunks no matter what they look like. Without this clamp an
-    // appended executable was parsed as a chunk and vanished from the
+    // appended executable would be parsed as a chunk and vanish from the
     // unaccounted-for region it belongs in.
-    let limit = usize::try_from(declared.saturating_add(8))
-        .unwrap_or(usize::MAX)
-        .min(bytes.len());
+    let limit = crate::bytes::sat_usize(declared.saturating_add(8)).min(bytes.len());
     let mut at = 12usize;
     let mut seen = 0usize;
     while let Some(&[i0, i1, i2, i3, s0, s1, s2, s3]) =
@@ -113,7 +112,7 @@ fn walk_chunks(
         && seen < MAX_REGIONS
     {
         let id = [i0, i1, i2, i3];
-        let size = read_size([s0, s1, s2, s3]) as usize;
+        let size = crate::bytes::sat_usize(read_size([s0, s1, s2, s3]));
         let body = at + 8;
         let Some(end) = body.checked_add(size) else {
             cov.problem("chunk size overflows");
@@ -150,17 +149,18 @@ pub(crate) fn ico(bytes: &[u8]) -> Coverage {
     if r0 != 0 || r1 != 0 || !matches!(kind, 1 | 2) {
         return Coverage::unrecognized();
     }
-    let count = u16::from_le_bytes([c0, c1]) as usize;
-    if count == 0 || count > 512 {
+    let count = usize::from(u16::from_le_bytes([c0, c1]));
+    if count == 0 || count > MAX_ICON_IMAGES {
         return Coverage::unrecognized();
     }
+    let label = if kind == 1 { "ico" } else { "cur" };
     let dir_end = 6 + count * 16;
     let Some(dir) = bytes.get(6..dir_end) else {
-        let mut c = Coverage::new(if kind == 1 { "ico" } else { "cur" }, 6);
+        let mut c = Coverage::new(label, 6);
         c.problem("icon directory truncated");
         return c;
     };
-    let mut cov = Coverage::new(if kind == 1 { "ico" } else { "cur" }, dir_end as u64);
+    let mut cov = Coverage::new(label, dir_end as u64);
     for entry in dir.as_chunks::<16>().0 {
         let [.., z0, z1, z2, z3, o0, o1, o2, o3] = *entry;
         let size = u64::from(u32::from_le_bytes([z0, z1, z2, z3]));
@@ -264,7 +264,7 @@ pub(crate) fn gif(bytes: &[u8]) -> Coverage {
 /// length). Returns the offset just past the terminator.
 fn skip_subblocks(bytes: &[u8], mut at: usize) -> Option<usize> {
     loop {
-        let len = *bytes.get(at)? as usize;
+        let len = usize::from(*bytes.get(at)?);
         at += 1;
         if len == 0 {
             return Some(at);

@@ -10,15 +10,29 @@ license = "MIT AND CC0-1.0"
 repository = "https://github.com/jerielverissimo/tree-sitter-clojure"
 readme = "README.md"
 publish = false
+# The library needs only the binding and the generated parser; the
+# grammar's corpus tests and documentation stay out of the package.
+include = [
+    "Cargo.toml",
+    "VENDORED.md",
+    "README.md",
+    "build.rs",
+    "src/**",
+    "grammar-src/COPYING.txt",
+    "grammar-src/src/**",
+]
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
+tree-sitter-language = "0.1"
+
+[dev-dependencies]
+# Only the binding's test and doctest load the grammar into a parser.
 # Upstream requires 0.25.6; filefacts needs 0.28, and `links = "tree-sitter"`
 # permits only one copy in the graph.
 tree-sitter = "0.28"
-tree-sitter-language = "0.1"
 
 [build-dependencies]
 cc = "1.11"

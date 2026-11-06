@@ -15,7 +15,7 @@ Never execute a fixture.
 | `go-pe-no-exports.exe.zst` | synthetic | [`go-pe-no-exports.md`](go-pe-no-exports.md) |
 | `pe-xor-decoder.exe` | synthetic | [`pe-xor-decoder.md`](pe-xor-decoder.md) |
 | `rtf/obfuscated-object.sample.zst` | real specimen | [`rtf/README.md`](rtf/README.md) |
-| `apk/CERT.SF`, `apk/CERT.RSA` | generated | [`apk/generate.sh`](apk/generate.sh) (throwaway key) |
+| `apk/CERT.SF`, `apk/CERT.RSA`, `apk/BOUND.MF`, `apk/BOUND.SF`, `apk/BOUND.RSA` | generated | [`apk/generate.sh`](apk/generate.sh) (throwaway key) |
 | `chains/*` | generated | [`chains/generate.sh`](chains/generate.sh) (throwaway keys) |
 
 ## Other fixtures

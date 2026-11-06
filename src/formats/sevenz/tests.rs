@@ -322,7 +322,7 @@ fn mtimes_convert_from_filetime() {
         stream: None,
     }];
     // 2001-09-09T01:46:40Z.
-    let ticks = (1_000_000_000 + FILETIME_UNIX_DIFF_SECS as u64) * 10_000_000;
+    let ticks = (1_000_000_000 + 11_644_473_600) * 10_000_000;
     let h = header(&[ID_LZMA2], &entries, 0, Some(ticks));
     let (_, _, members) = run(&archive_with(&h, h.len() as u64)).unwrap();
     assert_eq!(members[0].mtime_unix, Some(1_000_000_000));
@@ -386,5 +386,86 @@ fn encrypted_header_is_malformed() {
     rejected_because(
         &archive_with_packed(&[0], &encoded, encoded.len() as u64),
         "header is encrypted",
+    );
+}
+
+/// A start-header or next-header CRC that does not match is counted, as
+/// rar counts its header CRC mismatches, and the listing still stands.
+#[test]
+fn header_crc_mismatches_are_counted() {
+    let entries = [Entry {
+        name: "a.txt",
+        stream: Some(b"abc"),
+    }];
+    let good = archive(&[ID_LZMA2], &entries);
+    let (_, metrics, _) = run(&good).unwrap();
+    assert_eq!(metrics.get("7z.header_crc_mismatch_count"), Some(0.0));
+
+    // The start-header CRC covers bytes 12..32, the next-header CRC among
+    // them, so a wrong next-header CRC is re-sealed to test it alone.
+    let mut start = good.clone();
+    start[8] ^= 1;
+    let mut both = good.clone();
+    both[28] ^= 1;
+    let mut next = both.clone();
+    let sealed = crc32fast::hash(&next[12..32]).to_le_bytes();
+    next[8..12].copy_from_slice(&sealed);
+    for (bytes, count) in [(start, 1.0), (next, 1.0), (both, 2.0)] {
+        let (_, metrics, members) = run(&bytes).unwrap();
+        assert_eq!(metrics.get("7z.header_crc_mismatch_count"), Some(count));
+        assert_eq!(members.len(), 1);
+    }
+}
+
+/// A folder costs a few bytes of header and far more in memory, and an
+/// LZMA-encoded header packs millions of them into a few KiB. Past one per
+/// file the header could list, the count is refused.
+#[test]
+fn folder_count_over_cap_is_refused() {
+    let n = MAX_FILES + 1;
+    let mut header = vec![K_HEADER, K_MAIN_STREAMS_INFO, K_UNPACK_INFO, K_FOLDER];
+    header.extend(number(n as u64));
+    header.push(0);
+    // One simple coder with an empty method id per folder.
+    header.extend(std::iter::repeat_n([1u8, 0x00], n).flatten());
+    header.push(K_CODERS_UNPACK_SIZE);
+    header.extend(std::iter::repeat_n(0u8, n));
+    header.extend_from_slice(&[K_END, K_END, K_END]);
+    let len = header.len() as u64;
+    rejected_because(&archive_with(&header, len), "folder count over cap");
+}
+
+/// Packed-stream sizes are bounded the same way.
+#[test]
+fn pack_stream_count_over_cap_is_refused() {
+    let n = MAX_FILES + 1;
+    let mut header = vec![K_HEADER, K_MAIN_STREAMS_INFO, K_PACK_INFO];
+    header.extend(number(0));
+    header.extend(number(n as u64));
+    header.push(K_SIZE);
+    header.extend(std::iter::repeat_n(0u8, n));
+    header.extend_from_slice(&[K_END, K_END, K_END]);
+    let len = header.len() as u64;
+    rejected_because(&archive_with(&header, len), "pack stream count over cap");
+}
+
+/// An `EmptyFile` or `Anti` property flags only the files without a stream,
+/// and costs no more than those: an empty one, two bytes long, repeated for
+/// the whole header, must not rescan every file each time. Rescanning, this
+/// header is 2^37 steps; an LZMA-encoded one of 32 MiB is far more.
+#[test]
+fn repeated_empty_file_properties_do_not_rescan_the_files() {
+    let n = 1usize << 18;
+    let mut header = vec![K_HEADER, K_FILES_INFO];
+    header.extend(number(n as u64));
+    for _ in 0..n {
+        header.extend_from_slice(&[K_ANTI, 0x00, K_EMPTY_FILE, 0x00]);
+    }
+    header.push(K_END);
+    header.push(K_END);
+    let len = header.len() as u64;
+    rejected_because(
+        &archive_with(&header, len),
+        "more files with data than unpacked streams",
     );
 }

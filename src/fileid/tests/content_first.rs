@@ -498,3 +498,16 @@ fn prefixed_utf16_html_extension_uses_decoded_content() {
         Some(FileType::Html)
     );
 }
+
+/// Labels are snake_case identifiers, except those that are a canonical
+/// file name or suffix (`package-lock.json`, `tar.gz`), spelled as on disk.
+#[test]
+fn labels_are_snake_case_or_a_file_name() {
+    for ft in FileType::ALL {
+        let label = ft.label();
+        let snake = label
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+        assert!(snake || label.contains('.'), "{label}");
+    }
+}

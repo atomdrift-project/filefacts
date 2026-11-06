@@ -20,11 +20,8 @@
 //!   (interpreter-in-a-variable) but a useful gate when a whole tiny script
 //!   does nothing but expand-and-exec.
 //!
-//! The classifier dispatches on language. Only `bash` is implemented today;
-//! `python`, `ruby`, and `javascript` (computed/indirect callees, `getattr`/
-//! `send`/`Function` reconstruction) are the planned next arms — the trait
-//! layer already consumes the generic metric, so adding a language is purely
-//! additive here.
+//! The classifier dispatches on language. Only Bash command names are
+//! classified; every other language's calls count as clean.
 
 use crate::metric;
 use crate::output::{Metrics, Symbol};
@@ -76,8 +73,7 @@ pub(super) fn emit(calls: &[Symbol], lang: Lang, metrics: &mut Metrics) {
 fn classify(target: &str, lang: Lang) -> TargetKind {
     match lang {
         Lang::Bash => classify_shell(target),
-        // python / ruby / javascript arms land here next: computed member
-        // access, getattr/send reconstruction, Function()/eval indirection.
+        // No classifier: computed callees in other languages are not judged.
         _ => TargetKind::Clean,
     }
 }
@@ -96,7 +92,7 @@ fn classify_shell(target: &str) -> TargetKind {
     // distinguish adjacent single-char fragments from ordinary quoted strings
     // (error messages carry many quotes too — `"Failed to run 'foo'"`).
     let unquoted;
-    let target = if target.contains('"') || target.contains('\'') {
+    let target = if target.contains(['"', '\'']) {
         unquoted = target.replace(['"', '\''], "");
         unquoted.as_str()
     } else {

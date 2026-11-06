@@ -16,6 +16,7 @@ use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::io::Write;
 use std::ops::ControlFlow;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -86,7 +87,7 @@ thread_local! {
     /// Thread-local, not a global: parses run on the caller's thread, and a
     /// process-wide knob would let one test's shortened budget cut short a
     /// parse in another test running in parallel.
-    static PARSE_WORK_OVERRIDE: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static PARSE_WORK_OVERRIDE: Cell<u64> = const { Cell::new(0) };
 }
 
 fn parse_work_budget(bytes: usize) -> u64 {
@@ -125,6 +126,13 @@ const LEXER_CHUNK_BYTES: usize = 64;
 /// within half a second of re-scanning.
 const LEXER_FETCH_BASE: u64 = 64 << 20;
 const LEXER_FETCH_FACTOR: u64 = 16;
+
+#[cfg(test)]
+thread_local! {
+    /// Parses [`TreeCache::parse`] has run on this thread, so a test can
+    /// bound the work a caller does by its parse count.
+    pub(crate) static PARSES: Cell<usize> = const { Cell::new(0) };
+}
 
 #[cfg(test)]
 thread_local! {
@@ -320,9 +328,9 @@ const PYTHON_INDENT_BYTES_PER_LEVEL: usize = 2;
 /// not UTF-8. Each invalid byte becomes one `_`, so every byte offset in the
 /// tree still addresses the same byte of the input.
 ///
-/// Refusing such input outright, as filefacts once did, dropped every AST
-/// fact for a Latin-1 source file, and let anyone hide a script's calls and
-/// imports with one stray byte in a comment. `_` keeps an identifier spelled
+/// Refusing such input outright would drop every AST fact for a Latin-1
+/// source file, and let anyone hide a script's calls and imports with one
+/// stray byte in a comment. `_` keeps an identifier spelled
 /// with Latin-1 letters in one piece (PHP accepts bytes 0x80-0xff in names)
 /// and is inert in strings and comments; those keep the substitute, not the
 /// original byte.
@@ -349,6 +357,57 @@ thread_local! {
     static THREAD_PARSER: RefCell<tree_sitter::Parser> = RefCell::new(tree_sitter::Parser::new());
 }
 
+/// Literal sources one file's analyses may parse, such as `sh -c` bodies or
+/// code written to a temporary file: each is a full parse, so the count and
+/// the bytes are bounded per file, whatever the file repeats.
+const MAX_NESTED_PARSES: usize = 32;
+const MAX_NESTED_BYTES: usize = 256 * 1024;
+
+/// One file's allowance for parsing literal source found inside it, under
+/// the file's cancellation flag.
+pub(crate) struct NestedParses<'a> {
+    parses: usize,
+    bytes: usize,
+    cancel: Option<&'a AtomicBool>,
+    /// A parse was refused because the allowance ran out.
+    pub(crate) limited: bool,
+}
+
+impl<'a> NestedParses<'a> {
+    pub(crate) fn new(cancel: Option<&'a AtomicBool>) -> Self {
+        Self {
+            parses: MAX_NESTED_PARSES,
+            bytes: MAX_NESTED_BYTES,
+            cancel,
+            limited: false,
+        }
+    }
+
+    /// Parse `code` as `file_type`, or `None` when the allowance does not
+    /// cover it, which is recorded in [`Self::limited`].
+    pub(crate) fn parse<'s>(&mut self, code: &'s str, file_type: FileType) -> Option<TreeParse<'s>>
+    where
+        'a: 's,
+    {
+        if self.parses == 0 || code.len() > self.bytes {
+            if !self.limited {
+                tracing::debug!(
+                    target: "filefacts::source",
+                    len = code.len(),
+                    parses = MAX_NESTED_PARSES,
+                    bytes = MAX_NESTED_BYTES,
+                    "nested literal source parse budget spent; later bodies skipped"
+                );
+            }
+            self.limited = true;
+            return None;
+        }
+        self.parses -= 1;
+        self.bytes -= code.len();
+        Some(TreeCache::parse(code.as_bytes(), file_type, self.cancel))
+    }
+}
+
 /// A cached parse for a source file.
 pub(crate) struct TreeCache<'a> {
     /// The input as parsed: borrowed when it is UTF-8, otherwise repaired by
@@ -362,6 +421,9 @@ pub(crate) struct TreeCache<'a> {
     /// The symbol walk's state, collected by the extraction walk and taken
     /// by `build_symbols`, which runs after it.
     ast_walk: Mutex<Option<Box<ast_walk::State>>>,
+    /// The caller's cancellation flag, which nested parses of literal
+    /// source inside this one also poll.
+    cancel: Option<&'a AtomicBool>,
 }
 
 /// Source parsing outcome cached by [`crate::ParsedFile`].
@@ -405,118 +467,11 @@ impl TreeSitterDiagnostic {
         self.transient
     }
 
-    fn tree_sitter_guard(language: &'static str, bytes: usize, audit: ScannerAudit) -> Self {
-        Self {
-            metric: metric!("source.ast_unavailable.tree_sitter_guard"),
-            message: format!(
-                "tree-sitter parse skipped for {language}: {bytes} bytes exceeds source-size or scanner-state safety guard ({audit:?})"
-            ),
-            transient: false,
-        }
-    }
-
-    /// The tree parsed, but [`anonymous_run_cost`] puts it past
-    /// [`ANONYMOUS_RUN_COST_CAP`]: queries over it would take quadratic time.
-    /// Same metric as the up-front guards, which also refuse an AST that
-    /// would be unsafe to work with.
-    fn anonymous_run_guard(language: &'static str, bytes: usize, cost: u64) -> Self {
-        Self {
-            metric: metric!("source.ast_unavailable.tree_sitter_guard"),
-            message: format!(
-                "tree-sitter tree for {language} discarded: runs of anonymous tokens in {bytes} bytes cost over {cost} sibling checks per query (cap {ANONYMOUS_RUN_COST_CAP})"
-            ),
-            transient: false,
-        }
-    }
-
     pub(crate) fn parse_failed(message: impl Into<String>) -> Self {
         Self {
             metric: metric!("source.ast_unavailable.parse_failed"),
             message: message.into(),
             transient: false,
-        }
-    }
-
-    /// `source.ast_unavailable.parse_timeout` means the parse exhausted its
-    /// work budget or, for input that makes single operations expensive, hit
-    /// the wall-clock backstop. The metric is named for the backstop; the
-    /// message names the limit that fired. This message is
-    /// deterministic, so it carries the offset where the budget ran out.
-    fn parse_work_exhausted(language: &'static str, bytes: usize, budget: u64, at: usize) -> Self {
-        Self {
-            metric: metric!("source.ast_unavailable.parse_timeout"),
-            message: format!(
-                "tree-sitter parse for {language} exhausted its work budget of {budget} progress polls at byte {at} of {bytes}"
-            ),
-            transient: false,
-        }
-    }
-
-    /// Same metric as [`Self::parse_work_exhausted`]: the lexer exhausted its
-    /// fetch budget ([`lexer_fetch_budget`]), which is just as deterministic.
-    fn lexer_work_exhausted(language: &'static str, bytes: usize, budget: u64, at: usize) -> Self {
-        Self {
-            metric: metric!("source.ast_unavailable.parse_timeout"),
-            message: format!(
-                "tree-sitter parse for {language} exhausted its lexer budget of {budget} fetched bytes at byte {at} of {bytes}; a scanner kept re-reading the input"
-            ),
-            transient: false,
-        }
-    }
-
-    /// Same metric as [`Self::parse_work_exhausted`]: error recovery ran for
-    /// [`ERROR_RECOVERY_POLL_CAP`] polls without a healthy stack version.
-    fn error_recovery_exhausted(
-        language: &'static str,
-        bytes: usize,
-        polls: u64,
-        at: usize,
-    ) -> Self {
-        Self {
-            metric: metric!("source.ast_unavailable.parse_timeout"),
-            message: format!(
-                "tree-sitter parse for {language} abandoned at byte {at} of {bytes}: error recovery ran {polls} consecutive progress polls without recovering"
-            ),
-            transient: false,
-        }
-    }
-
-    fn eof_recovery_exhausted(
-        language: &'static str,
-        bytes: usize,
-        polls: u64,
-        allowed: u64,
-    ) -> Self {
-        Self {
-            metric: metric!("source.ast_unavailable.parse_timeout"),
-            message: format!(
-                "tree-sitter parse for {language} abandoned at the end of its {bytes} bytes: error recovery there ran {polls} progress polls, more than the {allowed} allowed"
-            ),
-            transient: false,
-        }
-    }
-
-    /// Same metric as [`Self::parse_work_exhausted`], for the
-    /// [`SOURCE_PARSE_WALL_BACKSTOP`]; whether this fires can depend on load.
-    fn parse_backstop(language: &'static str, bytes: usize) -> Self {
-        Self {
-            metric: metric!("source.ast_unavailable.parse_timeout"),
-            message: format!(
-                "tree-sitter parse for {language} hit the {SOURCE_PARSE_WALL_BACKSTOP:?} wall-clock backstop on {bytes} bytes"
-            ),
-            transient: true,
-        }
-    }
-
-    /// Kept distinct from the `parse_timeout` metric: a cancelled parse is
-    /// the caller shutting down and is expected, while a timed-out one means
-    /// the input exhausted a budget and is worth investigating. Folding them
-    /// into one metric would bury the second under the first on every Ctrl-C.
-    fn parse_cancelled(language: &'static str, bytes: usize) -> Self {
-        Self {
-            metric: metric!("source.ast_unavailable.parse_cancelled"),
-            message: format!("tree-sitter parse for {language} cancelled at {bytes} bytes"),
-            transient: true,
         }
     }
 }
@@ -560,8 +515,10 @@ impl<'a> TreeCache<'a> {
     pub(crate) fn parse(
         bytes: &'a [u8],
         file_type: FileType,
-        cancel: Option<&std::sync::atomic::AtomicBool>,
+        cancel: Option<&'a AtomicBool>,
     ) -> TreeParse<'a> {
+        #[cfg(test)]
+        PARSES.set(PARSES.get() + 1);
         let Some(config) = langs::config_for(file_type) else {
             return TreeParse::Unavailable(TreeSitterDiagnostic::parse_failed(
                 "no tree-sitter grammar registered for source file type",
@@ -596,28 +553,27 @@ impl<'a> TreeCache<'a> {
     fn parse_with_config(
         bytes: &'a [u8],
         file_type: FileType,
-        cancel: Option<&std::sync::atomic::AtomicBool>,
+        cancel: Option<&'a AtomicBool>,
         config: &'static LangConfig,
     ) -> TreeParse<'a> {
         let (text, invalid_utf8_bytes) = utf8_source(bytes);
         let source: &str = &text;
-        let audit = if config.lang == langs::Lang::Cpp {
-            // tree-sitter-cpp 0.23.4: a fixed 16-wchar raw-string
-            // delimiter, with a compile-time serialization-buffer bound.
-            ScannerAudit::Bounded
-        } else {
-            scanner_audit(file_type)
-        };
+        let audit = scanner_audit(file_type);
         if would_overflow_scanner_state_with_audit(file_type, source, audit) {
-            let diagnostic =
-                TreeSitterDiagnostic::tree_sitter_guard(config.name(), source.len(), audit);
+            let (language, bytes) = (config.name(), source.len());
             tracing::warn!(
-                language = config.name(),
-                bytes = source.len(),
+                language,
+                bytes,
                 audit = ?audit,
                 "skipping tree-sitter parse due to source-size or scanner-state safety guard"
             );
-            return TreeParse::Unavailable(diagnostic);
+            return TreeParse::Unavailable(TreeSitterDiagnostic {
+                metric: metric!("source.ast_unavailable.tree_sitter_guard"),
+                message: format!(
+                    "tree-sitter parse skipped for {language}: {bytes} bytes exceeds source-size or scanner-state safety guard ({audit:?})"
+                ),
+                transient: false,
+            });
         }
         let language = (config.language)();
         // Breadcrumb for sources large enough to plausibly overflow the
@@ -752,6 +708,7 @@ impl<'a> TreeCache<'a> {
                 file_type,
                 config,
                 ast_walk: Mutex::new(None),
+                cancel,
             }),
             Err(diagnostic) => TreeParse::Unavailable(diagnostic),
         }
@@ -777,6 +734,11 @@ impl<'a> TreeCache<'a> {
     /// The language configuration the tree was parsed with.
     pub(super) fn config(&self) -> &'static LangConfig {
         self.config
+    }
+
+    /// The cancellation flag the tree was parsed under.
+    pub(super) fn cancel(&self) -> Option<&'a AtomicBool> {
+        self.cancel
     }
 
     /// Keep the symbol walk's state for [`Self::take_ast_walk`].
@@ -834,7 +796,10 @@ fn anonymous_run_cost(root: tree_sitter::Node<'_>, cap: u64) -> u64 {
         return 0;
     }
     loop {
-        let run = runs.last_mut().expect("one run per open level");
+        // One run per open level; the loop returns once `runs` empties.
+        let Some(run) = runs.last_mut() else {
+            return cost;
+        };
         if cursor.node().is_named() {
             close(std::mem::take(run), &mut cost);
         } else {
@@ -887,7 +852,7 @@ fn normalize_bash_case_modification(source: &str) -> Option<String> {
     }
     let normalized = normalized?;
     // Replacements are ASCII and length-preserving, so valid UTF-8 stays valid.
-    Some(String::from_utf8(normalized).expect("ASCII replacement preserves UTF-8"))
+    String::from_utf8(normalized).ok()
 }
 
 /// Longest `name[subscript]` scanned for its closing `]`. Unbounded, a run of
@@ -1026,8 +991,8 @@ fn normalize_python_comment_runs(source: &str) -> Option<String> {
     }
     flush_run(run_start, run_last_nl, run_count, &mut normalized);
 
-    let normalized = normalized?;
-    Some(String::from_utf8(normalized).expect("ASCII newline replacement preserves UTF-8"))
+    // Replacements are ASCII and length-preserving, so valid UTF-8 stays valid.
+    String::from_utf8(normalized?).ok()
 }
 
 /// Pre-check input that could overflow a tree-sitter external scanner's
@@ -1046,10 +1011,11 @@ fn would_overflow_scanner_state_with_audit(
     if source.len() > parse_cap_bytes(audit) {
         return true;
     }
-    if matches!(audit, ScannerAudit::Modeled) && matches!(file_type, FileType::Python) {
-        if estimated_python_scanner_bytes(source) > PYTHON_SCANNER_BUDGET_BYTES {
-            return true;
-        }
+    if matches!(audit, ScannerAudit::Modeled)
+        && matches!(file_type, FileType::Python)
+        && estimated_python_scanner_bytes(source) > PYTHON_SCANNER_BUDGET_BYTES
+    {
+        return true;
     }
     false
 }
@@ -1091,9 +1057,14 @@ enum ScannerAudit {
 fn scanner_audit(file_type: FileType) -> ScannerAudit {
     use ScannerAudit::{Bounded, Modeled, SelfGuarded, Unaudited};
     match file_type {
+        // No external scanner in the locked C grammar crate. The C++ grammar
+        // that also parses this type (tree-sitter-cpp 0.23.4) has a fixed
+        // 16-wchar raw-string delimiter, with a compile-time
+        // serialization-buffer bound.
+        FileType::C => Bounded,
+
         // No external scanner in the locked grammar crate.
-        FileType::C
-        | FileType::Go
+        FileType::Go
         | FileType::Groovy
         | FileType::Java
         | FileType::Makefile
@@ -1129,8 +1100,6 @@ fn scanner_audit(file_type: FileType) -> ScannerAudit {
     }
 }
 
-/// Maximum source size we'll hand to the tree-sitter parser for a
-/// grammar with the given audit category.
 /// Why a parse produced no usable tree, as the parse reports it. The caller
 /// turns it into a [`TreeSitterDiagnostic`] and logs it.
 #[derive(Debug)]
@@ -1151,13 +1120,29 @@ impl ParseFailure {
     /// missing. Cancelling gets its own metric, or a Ctrl-C would look like a
     /// corrupt sample.
     fn diagnostic(self, language: &'static str, bytes: usize) -> TreeSitterDiagnostic {
-        match self {
-            Self::LanguageSetup(e) => TreeSitterDiagnostic::parse_failed(format!(
-                "malformed source: tree-sitter language setup failed: {e}"
-            )),
-            Self::Stopped(Some(ParseStop::Cancelled)) => {
-                TreeSitterDiagnostic::parse_cancelled(language, bytes)
+        // Every exhausted budget shares this metric, named for the backstop;
+        // the message names the limit that fired and, being deterministic,
+        // where.
+        const TIMEOUT: crate::MetricKey = metric!("source.ast_unavailable.parse_timeout");
+        let (metric, message, transient) = match self {
+            Self::LanguageSetup(e) => {
+                return TreeSitterDiagnostic::parse_failed(format!(
+                    "malformed source: tree-sitter language setup failed: {e}"
+                ));
             }
+            Self::Stopped(None) => {
+                return TreeSitterDiagnostic::parse_failed(
+                    "malformed source: tree-sitter parse returned None",
+                );
+            }
+            // Kept distinct from the timeout metric: a cancelled parse is the
+            // caller shutting down and is expected, while a timed-out one
+            // means the input exhausted a budget and is worth investigating.
+            Self::Stopped(Some(ParseStop::Cancelled)) => (
+                metric!("source.ast_unavailable.parse_cancelled"),
+                format!("tree-sitter parse for {language} cancelled at {bytes} bytes"),
+                true,
+            ),
             Self::Stopped(Some(ParseStop::Budget { budget, at })) => {
                 tracing::warn!(
                     language,
@@ -1166,7 +1151,13 @@ impl ParseFailure {
                     at,
                     "tree-sitter parse exhausted its work budget; AST facts dropped"
                 );
-                TreeSitterDiagnostic::parse_work_exhausted(language, bytes, budget, at)
+                (
+                    TIMEOUT,
+                    format!(
+                        "tree-sitter parse for {language} exhausted its work budget of {budget} progress polls at byte {at} of {bytes}"
+                    ),
+                    false,
+                )
             }
             Self::Stopped(Some(ParseStop::LexerBudget { budget, at })) => {
                 tracing::warn!(
@@ -1176,7 +1167,13 @@ impl ParseFailure {
                     at,
                     "tree-sitter parse exhausted its lexer budget; AST facts dropped"
                 );
-                TreeSitterDiagnostic::lexer_work_exhausted(language, bytes, budget, at)
+                (
+                    TIMEOUT,
+                    format!(
+                        "tree-sitter parse for {language} exhausted its lexer budget of {budget} fetched bytes at byte {at} of {bytes}; a scanner kept re-reading the input"
+                    ),
+                    false,
+                )
             }
             Self::Stopped(Some(ParseStop::ErrorRecovery { polls, at })) => {
                 tracing::warn!(
@@ -1186,7 +1183,13 @@ impl ParseFailure {
                     at,
                     "tree-sitter error recovery did not recover; AST facts dropped"
                 );
-                TreeSitterDiagnostic::error_recovery_exhausted(language, bytes, polls, at)
+                (
+                    TIMEOUT,
+                    format!(
+                        "tree-sitter parse for {language} abandoned at byte {at} of {bytes}: error recovery ran {polls} consecutive progress polls without recovering"
+                    ),
+                    false,
+                )
             }
             Self::Stopped(Some(ParseStop::EofRecovery { polls, allowed })) => {
                 tracing::warn!(
@@ -1196,8 +1199,15 @@ impl ParseFailure {
                     allowed,
                     "tree-sitter error recovery at end of input ran too long; AST facts dropped"
                 );
-                TreeSitterDiagnostic::eof_recovery_exhausted(language, bytes, polls, allowed)
+                (
+                    TIMEOUT,
+                    format!(
+                        "tree-sitter parse for {language} abandoned at the end of its {bytes} bytes: error recovery there ran {polls} progress polls, more than the {allowed} allowed"
+                    ),
+                    false,
+                )
             }
+            // Whether this fires can depend on load.
             Self::Stopped(Some(ParseStop::Backstop)) => {
                 tracing::warn!(
                     language,
@@ -1205,11 +1215,16 @@ impl ParseFailure {
                     backstop_s = SOURCE_PARSE_WALL_BACKSTOP.as_secs(),
                     "tree-sitter parse hit its wall-clock backstop; AST facts dropped"
                 );
-                TreeSitterDiagnostic::parse_backstop(language, bytes)
+                (
+                    TIMEOUT,
+                    format!(
+                        "tree-sitter parse for {language} hit the {SOURCE_PARSE_WALL_BACKSTOP:?} wall-clock backstop on {bytes} bytes"
+                    ),
+                    true,
+                )
             }
-            Self::Stopped(None) => TreeSitterDiagnostic::parse_failed(
-                "malformed source: tree-sitter parse returned None",
-            ),
+            // Same metric as the up-front guards, which also refuse an AST
+            // that would be unsafe to work with.
             Self::AnonymousRuns(cost) => {
                 tracing::warn!(
                     language,
@@ -1217,12 +1232,25 @@ impl ParseFailure {
                     cost,
                     "tree-sitter tree has anonymous-token runs too costly to query; AST facts dropped"
                 );
-                TreeSitterDiagnostic::anonymous_run_guard(language, bytes, cost)
+                (
+                    metric!("source.ast_unavailable.tree_sitter_guard"),
+                    format!(
+                        "tree-sitter tree for {language} discarded: runs of anonymous tokens in {bytes} bytes cost over {cost} sibling checks per query (cap {ANONYMOUS_RUN_COST_CAP})"
+                    ),
+                    false,
+                )
             }
+        };
+        TreeSitterDiagnostic {
+            metric,
+            message,
+            transient,
         }
     }
 }
 
+/// Maximum source size we'll hand to the tree-sitter parser for a
+/// grammar with the given audit category.
 fn parse_cap_bytes(audit: ScannerAudit) -> usize {
     match audit {
         ScannerAudit::Bounded | ScannerAudit::SelfGuarded => MAX_AST_FILE_BYTES,
@@ -1249,7 +1277,7 @@ fn estimated_python_scanner_bytes(source: &str) -> usize {
     // so the persisted indent count is `indent_levels.saturating_sub(1)`.
     let indent_bytes = indent_levels.saturating_sub(1) * PYTHON_INDENT_BYTES_PER_LEVEL;
     // Delimiter count is clamped to UINT8_MAX inside the serializer.
-    let delim_bytes = delim_levels.min(u8::MAX as usize) * PYTHON_DELIMITER_BYTES;
+    let delim_bytes = delim_levels.min(usize::from(u8::MAX)) * PYTHON_DELIMITER_BYTES;
     HEADER_BYTES + delim_bytes + indent_bytes
 }
 

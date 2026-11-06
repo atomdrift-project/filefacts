@@ -53,7 +53,7 @@ fn index_that_is_not_json_records_one_error_and_falls_through() {
 
 #[test]
 fn oversized_manifest_is_a_limit_not_an_error() {
-    let big = vec![b' '; MAX_MANIFEST as usize + 1];
+    let big = vec![b' '; MAX_MANIFEST_BYTES as usize + 1];
     let (v, e) = run(&bundle(&[("manifest.json", &big)]));
     assert!(e.is_empty(), "{e:?}");
     let limits = v.get("oci.limits").and_then(JsonValue::as_array).unwrap();
@@ -108,4 +108,68 @@ fn oci_index_emits_digest_and_ref() {
     assert_eq!(metrics.get("oci.manifest_count"), Some(1.0));
     let refs = values.get("oci.ref").and_then(JsonValue::as_array).unwrap();
     assert_eq!(refs[0].as_str(), Some("v1.0.0"));
+}
+
+#[test]
+fn manifest_exactly_at_the_cap_is_parsed() {
+    let mut body = br#"[{"RepoTags": ["a:1"]}]"#.to_vec();
+    body.resize(MAX_MANIFEST_BYTES as usize, b' ');
+    let (v, e) = run(&bundle(&[("manifest.json", &body)]));
+    assert!(e.is_empty(), "{e:?}");
+    assert!(v.get("oci.limits").is_none());
+    assert_eq!(
+        v.get("oci.kind").and_then(JsonValue::as_str),
+        Some("docker")
+    );
+}
+
+#[test]
+fn config_references_normalize_to_sha256_digests() {
+    let hex = "ab".repeat(32);
+    let digest = format!("sha256:{hex}");
+    for (config, want) in [
+        // Classic `docker save`: `<hex>.json` at the bundle root.
+        (format!("{hex}.json"), digest.as_str()),
+        // containerd-era bundles: the blob path itself.
+        (format!("blobs/sha256/{hex}"), digest.as_str()),
+        // Only the last path component names the digest.
+        (format!("nested/dir/{hex}.json"), digest.as_str()),
+    ] {
+        assert_eq!(normalize_digest(&config), want, "{config}");
+    }
+    // Anything that is not a 64-digit hex name passes through unchanged.
+    for config in [
+        "config.json".to_string(),
+        "blobs/sha256/abc".to_string(),
+        format!("{}.json", "ab".repeat(31)),
+        format!("{}zz.json", "ab".repeat(31)),
+        format!("{hex}.json.bak"),
+        String::new(),
+    ] {
+        assert_eq!(normalize_digest(&config), config, "{config}");
+    }
+}
+
+/// `docker load` and tar extraction keep the last of two members with one
+/// name, so the identity is the last manifest's, not a decoy's ahead of it.
+#[test]
+fn the_last_of_duplicate_manifests_is_the_bundles() {
+    let (v, e) = run(&bundle(&[
+        ("manifest.json", br#"[{"RepoTags": ["decoy:1"]}]"#),
+        ("manifest.json", br#"[{"RepoTags": ["real:1"]}]"#),
+    ]));
+    assert!(e.is_empty(), "{e:?}");
+    let refs = v.get("oci.ref").and_then(JsonValue::as_array).unwrap();
+    assert_eq!(refs, &[JsonValue::from("real:1")]);
+    let index = |name: &str| format!(r#"{{"manifests": [{{"digest": "{name}"}}]}}"#);
+    let (v, e) = run(&bundle(&[
+        ("index.json", index("decoy").as_bytes()),
+        ("./index.json", index("real").as_bytes()),
+    ]));
+    assert!(e.is_empty(), "{e:?}");
+    let digests = v
+        .get("oci.manifest.digest")
+        .and_then(JsonValue::as_array)
+        .unwrap();
+    assert_eq!(digests, &[JsonValue::from("real")]);
 }

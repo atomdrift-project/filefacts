@@ -4,6 +4,7 @@ use std::path::Path;
 
 use super::FileType;
 use super::file_type::Strength;
+use crate::bytes::ends_with_ci;
 
 /// What a path's name claims the file is, and how much that claim says.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -68,14 +69,28 @@ impl Claim {
 /// What `path` claims: a well-known filename, then an extension.
 pub(super) fn claim(path: &Path) -> Option<Claim> {
     if let Some(file_type) = detect_from_filename(path) {
+        // A well-known filename is believed against its content only as far
+        // as its own extension is: the language scorer may replace it unless
+        // that extension is a claim the scorer may not replace
+        // (`package.json`, `Cargo.toml`).
+        let strength = match detect_from_extension(path) {
+            Some(ext) if !ext.yields_to_scorer() => Strength::Named,
+            _ => Strength::Weak,
+        };
         return Some(Claim {
             file_type,
-            strength: filename_strength(path),
+            strength,
             by_name: true,
         });
     }
     let path_str = path.to_string_lossy();
-    if is_github_workflow(&path_str) {
+    // A GitHub Actions workflow: a `.yml`/`.yaml` under a `.github/workflows/`
+    // directory (either path separator).
+    let is_github_workflow = (path_str.contains(".github/workflows/")
+        || path_str.contains(".github\\workflows\\"))
+        && (ends_with_ci(path_str.as_bytes(), b".yml")
+            || ends_with_ci(path_str.as_bytes(), b".yaml"));
+    if is_github_workflow {
         return Some(Claim {
             file_type: FileType::GithubActions,
             strength: Strength::Named,
@@ -91,16 +106,6 @@ pub(super) fn claim(path: &Path) -> Option<Claim> {
     } else {
         claim
     })
-}
-
-/// How far a well-known filename is believed against its content: the
-/// language scorer may replace it unless its own extension is a claim the
-/// scorer may not replace (`package.json`, `Cargo.toml`).
-fn filename_strength(path: &Path) -> Strength {
-    match detect_from_extension(path) {
-        Some(ext) if !ext.yields_to_scorer() => Strength::Named,
-        _ => Strength::Weak,
-    }
 }
 
 /// An extension of one or two characters after a dotted family name
@@ -291,14 +296,6 @@ fn is_mysqltest_file(path_str: &str) -> bool {
             .any(|ext| ends_with_ci(path_str.as_bytes(), ext.as_bytes()))
 }
 
-/// `true` for a GitHub Actions workflow file: a `.yml`/`.yaml` under a
-/// `.github/workflows/` directory (either path separator).
-fn is_github_workflow(path_str: &str) -> bool {
-    (path_str.contains(".github/workflows/") || path_str.contains(".github\\workflows\\"))
-        && (ends_with_ci(path_str.as_bytes(), b".yml")
-            || ends_with_ci(path_str.as_bytes(), b".yaml"))
-}
-
 /// Detect from well-known filenames.
 fn detect_from_filename(path: &Path) -> Option<FileType> {
     let name = path.file_name()?.to_str()?;
@@ -393,20 +390,20 @@ fn detect_from_filename(path: &Path) -> Option<FileType> {
     if name.eq_ignore_ascii_case("meta.json") || name.eq_ignore_ascii_case("metadata.json") {
         return Some(FileType::PkgInfo);
     }
-    if name.eq_ignore_ascii_case("extension.vsixmanifest")
-        || name
-            .get(name.len().saturating_sub(13)..)
-            .is_some_and(|s| s.eq_ignore_ascii_case(".vsixmanifest"))
-    {
+    if ends_with_ci(name.as_bytes(), b".vsixmanifest") {
         return Some(FileType::VsixManifest);
     }
     if name.eq_ignore_ascii_case("action.yml") || name.eq_ignore_ascii_case("action.yaml") {
         return Some(FileType::GithubActions);
     }
-    if name == "Dockerfile" || name.starts_with("Dockerfile.") || name.starts_with("dockerfile.") {
-        return Some(FileType::Dockerfile);
-    }
-    if name == "Containerfile" || name.starts_with("Containerfile.") {
+    // `Dockerfile`, `Containerfile` and their `.<variant>` spellings.
+    if ["dockerfile", "containerfile"].iter().any(|base| {
+        name.get(..base.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(base))
+            && name
+                .get(base.len()..)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+    }) {
         return Some(FileType::Dockerfile);
     }
     // CPAN's MakeMaker entry point generates a Makefile; it is itself Perl.
@@ -486,8 +483,8 @@ fn detect_from_extension(path: &Path) -> Option<Claim> {
         // path patterns: .aws/credentials, /etc/hosts, ...). Treat as plain text.
         "vim" => return Some(Claim::text_language()),
         // Lisp family. No dedicated analyzer; parenthesized arithmetic like
-        // `(- a b)` otherwise scores as JavaScript and fires JS obfuscation
-        // rules on e.g. the GCL ANSI test suite. Treat as plain text.
+        // `(- a b)` otherwise scores as JavaScript and reads as arithmetic
+        // obfuscation. Treat as plain text.
         "lsp" | "lisp" | "el" | "cl" | "scm" => return Some(Claim::text_language()),
         // PatEL (`.ptl`) — Iosevka's Lisp-like glyph / OpenType-layout DSL,
         // compiled by the `patel` npm package. No dedicated analyzer; its
@@ -514,12 +511,12 @@ fn detect_from_extension(path: &Path) -> Option<Claim> {
         "cypher" | "cql" => return Some(Claim::text_language()),
         // Smali (Android/Dalvik bytecode disassembly). No dedicated analyzer;
         // its dense arithmetic/array literals otherwise score as JavaScript and
-        // fire JS arithmetic-obfuscation rules (e.g. jadx test .smali fixtures).
+        // read as arithmetic obfuscation.
         "smali" => return Some(Claim::text_language()),
         // Unified-diff patches. No dedicated analyzer; their `-`/`+` line
         // prefixes otherwise content-score as JavaScript, and the removed-line
-        // `-` markers parse as subtraction operators — tripping
-        // js-arithmetic-array-init on benign kernel/source patch sets. Text.
+        // `-` markers parse as subtraction operators, which read as arithmetic
+        // obfuscation in a benign patch set. Text.
         "patch" | "diff" => return Some(Claim::text_language()),
         // GNU M4 / Autoconf macro source. No dedicated parser; as text its
         // build-system behavior is still scanned.
@@ -591,13 +588,13 @@ fn detect_from_extension(path: &Path) -> Option<Claim> {
         | "storyboard" => FileType::Xml,
         // VS Code multi-root workspace files are JSONC (comments, trailing
         // commas) and can carry a `tasks` block with `runOn: folderOpen`, the
-        // same autorun surface as `.vscode/tasks.json`. Typed as text, they
-        // were invisible to every JSON rule; the generic JSON extractor's
-        // JSONC fallback parses them.
+        // same autorun surface as `.vscode/tasks.json`, so they are typed as
+        // JSON for the JSON rules; the generic JSON extractor's JSONC
+        // fallback parses them.
         "json" | "code-workspace" => FileType::Json,
         // Generic YAML. The specific manifests that happen to be YAML
         // (pnpm-lock.yaml, action.yml, .github/workflows/*) are matched by
-        // filename earlier in `detect_from_path`, so only the rest reach here.
+        // filename earlier in `claim`, so only the rest reach here.
         "yaml" | "yml" => FileType::Yaml,
         "gyp" | "gypi" => FileType::Gyp,
         "plist" | "resx" => FileType::Plist,
@@ -619,7 +616,7 @@ fn detect_from_extension(path: &Path) -> Option<Claim> {
         "sig" | "asc" | "sign" => FileType::PgpSignature,
         "docx" | "xlsx" | "pptx" | "docm" | "xlsm" | "pptm" | "dotx" | "dotm" | "xltx" | "xltm"
         | "xlam" | "ppam" | "potx" | "potm" | "ppsx" | "ppsm" | "sldx" | "sldm" => FileType::Ooxml,
-        ext if is_odf_extension(ext) => FileType::Odf,
+        ext if ODF_EXTENSIONS.contains(&ext) => FileType::Odf,
         "exe" | "dll" | "sys" | "scr" | "cpl" | "ocx" | "drv" | "efi" | "pyd" => FileType::Pe,
         "so" | "elf" | "ko" => FileType::Elf,
         "dylib" | "bundle" | "macho" => FileType::MachO,
@@ -725,7 +722,7 @@ fn detect_from_extension(path: &Path) -> Option<Claim> {
         }
         // Prose names. A body that is plainly a language is that language;
         // the name is the fallback when the body says nothing.
-        "txt" | "text" | "rst" | "adoc" | "csv" | "tsv" | "log" => FileType::Text,
+        "txt" | "text" | "rst" | "adoc" | "pod" | "csv" | "tsv" | "log" => FileType::Text,
         // Source maps are structured data sidecars. Keeping them as Data lets the
         // archive analyzer inspect both ordinary JSON maps and raw embedded
         // Base64 payloads instead of dropping them as unknown members.
@@ -752,11 +749,6 @@ const ODF_EXTENSIONS: &[&str] = &[
     "odt", "ods", "odp", "odg", "odf", "ott", "ots", "otp", "odm", "oth", "otg", "odb", "odc",
     "odi",
 ];
-
-/// Whether lowercase `ext` is an OpenDocument extension.
-fn is_odf_extension(ext: &str) -> bool {
-    ODF_EXTENSIONS.contains(&ext)
-}
 
 /// A path's extension, ASCII-lowercased into a stack buffer so that matching
 /// it against the tables here does not allocate.
@@ -812,13 +804,18 @@ fn has_versioned_so_suffix(path: &str) -> bool {
         && suffix.iter().all(|b| b.is_ascii_digit() || *b == b'.')
 }
 
-/// Case-insensitive suffix check on raw bytes (no allocation).
-pub(super) fn ends_with_ci(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack
-        .len()
-        .checked_sub(needle.len())
-        .and_then(|start| haystack.get(start..))
-        .is_some_and(|tail| tail.eq_ignore_ascii_case(needle))
+/// Whether `path`'s file name ends with `suffix`, ignoring ASCII case. A name
+/// that is not UTF-8 ends with nothing.
+pub(super) fn name_ends_with_ci(path: &Path, suffix: &str) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| ends_with_ci(name.as_bytes(), suffix.as_bytes()))
+}
+
+/// Whether `path` is named `.apk`, which names both Android's zip package and
+/// Alpine's gzip tar: the container decides which.
+pub(super) fn names_apk(path: &Path) -> bool {
+    name_ends_with_ci(path, ".apk")
 }
 
 #[cfg(test)]

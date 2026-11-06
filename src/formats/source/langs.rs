@@ -144,6 +144,8 @@ pub(super) struct LangConfig {
     // Surface-extraction queries
     // ------------------------------------------------------------------
     pub(super) string_kinds: &'static [&'static str],
+    /// How [`Self::string_kinds`] nodes spell their delimiters and escapes.
+    pub(super) strings: StringSyntax,
     pub(super) import_query: &'static str,
     pub(super) function_query: &'static str,
     pub(super) class_query: &'static str,
@@ -158,8 +160,10 @@ pub(super) struct LangConfig {
     /// Field name on a call-expression node that holds the callee.
     pub(super) callee_field: &'static str,
     /// Field name on a call-expression node that holds the argument
-    /// list.
+    /// list, or each argument under [`ArgumentSyntax::Repeated`].
     pub(super) arguments_field: &'static str,
+    /// Where a call's arguments sit; see [`LangConfig::arguments`].
+    pub(super) argument_syntax: ArgumentSyntax,
     /// Node-kind names for dotted member-access expressions.
     pub(super) member_kinds: &'static [&'static str],
     /// Field on a member-access node that holds the object (`a` in
@@ -190,6 +194,49 @@ pub(super) struct LangConfig {
     pub(super) template_kinds: &'static [&'static str],
     /// Node-kind names for binary-operator expressions.
     pub(super) binary_op_kinds: &'static [&'static str],
+    /// A function body's final expression is its return value (Rust), so
+    /// both flow analyses count it among the returns.
+    pub(super) tail_returns: bool,
+    /// A block's declarations end with it (`let`, `const`, `:=` and C-family
+    /// locals), so both flow analyses restore outer bindings after one.
+    pub(super) block_scoped: bool,
+}
+
+/// How a language spells string literals: which prefixes, quote runs and
+/// escapes [`super::literal::decode_string_literal`] resolves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum StringSyntax {
+    /// `"…"`, `'…'` or `` `…` ``, single or triple quoted, with optional
+    /// `b`/`r`/`f`/`u` prefixes; `r` or a raw node kind means raw.
+    Quoted,
+    /// Kotlin and Scala: triple quotes are raw; Scala interpolator prefixes.
+    RawTriple,
+    /// Swift: `#"…"#` raw literals and indentation-stripped `"""` blocks.
+    Hashed,
+    /// Rust: `b`/`c` prefixes and `r#"…"#` raw literals.
+    Rust,
+    /// C#: `@` verbatim, `$` interpolated, `"""` raw literals, `u8`.
+    CSharp,
+    /// C, C++ and Objective-C: encoding prefixes, `@`, `R"d(…)d"`.
+    C,
+    /// Lua: long brackets and decimal escapes.
+    Lua,
+    /// Elixir: heredocs with their closing-line margin.
+    Elixir,
+}
+
+/// Where a call's arguments sit in its syntax.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ArgumentSyntax {
+    /// One child, the [`LangConfig::arguments_field`] or the language's
+    /// argument-list node, whose named children are the arguments.
+    List,
+    /// The [`LangConfig::arguments_field`] repeated once per argument (a Bash
+    /// command's words).
+    Repeated,
+    /// Every named child of the call after its callee (Zig, whose grammar
+    /// has no argument-list node).
+    AfterCallee,
 }
 
 /// One of a language's surface-extraction queries.
@@ -247,12 +294,6 @@ impl LangConfig {
         }
     }
 
-    /// The compiled `kind` query, or `None` when the language has none.
-    ///
-    /// A query that fails to compile (typically after a grammar bump renamed
-    /// a node) is also `None`, so that language's imports, functions or
-    /// classes go missing. That is logged once here, and the
-    /// `every_language_query_compiles` test turns it into a build failure.
     /// Whether `node` is one of [`Self::function_kinds`]. Named only:
     /// Python's `lambda` keyword token shares its kind name with the
     /// expression it starts.
@@ -260,6 +301,12 @@ impl LangConfig {
         node.is_named() && self.function_kinds.contains(&node.kind())
     }
 
+    /// The compiled `kind` query, or `None` when the language has none.
+    ///
+    /// A query that fails to compile (typically after a grammar bump renamed
+    /// a node) is also `None`, so that language's imports, functions or
+    /// classes go missing. That is logged once here, and the
+    /// `every_language_query_compiles` test turns it into a build failure.
     pub(super) fn query(&'static self, kind: QueryKind) -> Option<&'static Query> {
         let slot = match kind {
             QueryKind::Imports => &self.compiled.imports,
@@ -350,12 +397,36 @@ impl LangConfig {
         call
     }
 
-    /// Whether the argument list [`Self::argument_list`] found is itself the
-    /// one argument rather than a wrapper with one named child per argument.
-    /// Perl's arguments field holds the expression; only a comma-separated
-    /// `list_expression` has children that are distinct arguments.
-    pub(super) fn is_single_argument(&self, args: tree_sitter::Node<'_>) -> bool {
-        self.lang == Lang::Perl && args.kind() != "list_expression"
+    /// The argument nodes of `call`, in source order, for both symbol and
+    /// value-flow extraction. Under [`ArgumentSyntax::List`], Perl's
+    /// arguments field holds the expression itself unless it is a
+    /// comma-separated `list_expression`, whose children are the arguments.
+    pub(super) fn arguments<'tree>(
+        &self,
+        call: tree_sitter::Node<'tree>,
+    ) -> Vec<tree_sitter::Node<'tree>> {
+        let mut cursor = call.walk();
+        match self.argument_syntax {
+            ArgumentSyntax::Repeated => call
+                .children_by_field_name(self.arguments_field, &mut cursor)
+                .collect(),
+            ArgumentSyntax::AfterCallee => {
+                let callee = self.callee(call).or_else(|| call.named_child(0));
+                call.named_children(&mut cursor)
+                    .filter(|arg| Some(arg.id()) != callee.map(|c| c.id()))
+                    .collect()
+            }
+            ArgumentSyntax::List => match self.argument_list(call) {
+                None => Vec::new(),
+                Some(list) if self.lang == Lang::Perl && list.kind() != "list_expression" => {
+                    vec![list]
+                }
+                Some(list) => list
+                    .named_children(&mut cursor)
+                    .filter(|arg| arg.kind() != "command_argument_sep" && !arg.is_extra())
+                    .collect(),
+            },
+        }
     }
 
     /// Locate a call's argument list for both symbol and value-flow extraction.
@@ -421,14 +492,13 @@ pub(super) fn config_named(name: &str) -> Option<&'static LangConfig> {
 /// The file type whose language is labelled `name` ([`Lang::name`]).
 #[cfg(test)]
 pub(super) fn file_type_named(name: &str) -> Option<FileType> {
-    ALL.into_iter()
-        .find(|config| config.name() == name)
-        .map(|config| config.lang.file_type())
+    config_named(name).map(|config| config.lang.file_type())
 }
 
 static JAVASCRIPT: LangConfig = LangConfig {
     lang: Lang::JavaScript,
     language: || tree_sitter_javascript::LANGUAGE.into(),
+    strings: StringSyntax::Quoted,
     string_kinds: &["string", "template_string"],
     import_query: r#"
         (import_statement source: (string) @import)
@@ -449,6 +519,7 @@ static JAVASCRIPT: LangConfig = LangConfig {
     call_kinds: &["call_expression", "new_expression"],
     callee_field: "function",
     arguments_field: "arguments",
+    argument_syntax: ArgumentSyntax::List,
     member_kinds: &["member_expression"],
     member_object_field: "object",
     member_property_field: "property",
@@ -472,11 +543,14 @@ static JAVASCRIPT: LangConfig = LangConfig {
     ],
     template_kinds: &["template_string"],
     binary_op_kinds: &["binary_expression"],
+    tail_returns: false,
+    block_scoped: true,
 };
 
 static TYPESCRIPT: LangConfig = LangConfig {
     lang: Lang::TypeScript,
     language: || tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+    strings: StringSyntax::Quoted,
     string_kinds: &["string", "template_string"],
     import_query: r#"
         (import_statement source: (string) @import)
@@ -497,6 +571,7 @@ static TYPESCRIPT: LangConfig = LangConfig {
     call_kinds: &["call_expression", "new_expression"],
     callee_field: "function",
     arguments_field: "arguments",
+    argument_syntax: ArgumentSyntax::List,
     member_kinds: &["member_expression"],
     member_object_field: "object",
     member_property_field: "property",
@@ -516,11 +591,14 @@ static TYPESCRIPT: LangConfig = LangConfig {
     ],
     template_kinds: &["template_string"],
     binary_op_kinds: &["binary_expression"],
+    tail_returns: false,
+    block_scoped: true,
 };
 
 static PYTHON: LangConfig = LangConfig {
     lang: Lang::Python,
     language: || tree_sitter_python::LANGUAGE.into(),
+    strings: StringSyntax::Quoted,
     string_kinds: &["string"],
     import_query: r"
         (import_statement name: (aliased_import) @import)
@@ -540,6 +618,7 @@ static PYTHON: LangConfig = LangConfig {
     call_kinds: &["call"],
     callee_field: "function",
     arguments_field: "arguments",
+    argument_syntax: ArgumentSyntax::List,
     member_kinds: &["attribute"],
     member_object_field: "object",
     member_property_field: "attribute",
@@ -552,11 +631,14 @@ static PYTHON: LangConfig = LangConfig {
     function_kinds: &["function_definition", "lambda"],
     template_kinds: &["string"],
     binary_op_kinds: &["binary_operator"],
+    tail_returns: false,
+    block_scoped: false,
 };
 
 static GO: LangConfig = LangConfig {
     lang: Lang::Go,
     language: || tree_sitter_go::LANGUAGE.into(),
+    strings: StringSyntax::Quoted,
     string_kinds: &["interpreted_string_literal", "raw_string_literal"],
     import_query: r"
         (import_spec path: (interpreted_string_literal) @import)
@@ -573,6 +655,7 @@ static GO: LangConfig = LangConfig {
     call_kinds: &["call_expression"],
     callee_field: "function",
     arguments_field: "arguments",
+    argument_syntax: ArgumentSyntax::List,
     member_kinds: &["selector_expression"],
     member_object_field: "operand",
     member_property_field: "field",
@@ -590,11 +673,14 @@ static GO: LangConfig = LangConfig {
     function_kinds: &["function_declaration", "method_declaration", "func_literal"],
     template_kinds: &[],
     binary_op_kinds: &["binary_expression"],
+    tail_returns: false,
+    block_scoped: true,
 };
 
 static RUST: LangConfig = LangConfig {
     lang: Lang::Rust,
     language: || tree_sitter_rust::LANGUAGE.into(),
+    strings: StringSyntax::Rust,
     string_kinds: &["string_literal", "raw_string_literal"],
     import_query: r"
         (use_declaration argument: (scoped_identifier path: (identifier) @import))
@@ -612,6 +698,7 @@ static RUST: LangConfig = LangConfig {
     call_kinds: &["call_expression"],
     callee_field: "function",
     arguments_field: "arguments",
+    argument_syntax: ArgumentSyntax::List,
     member_kinds: &["field_expression"],
     member_object_field: "value",
     member_property_field: "field",
@@ -624,11 +711,14 @@ static RUST: LangConfig = LangConfig {
     function_kinds: &["function_item", "closure_expression"],
     template_kinds: &[],
     binary_op_kinds: &["binary_expression"],
+    tail_returns: true,
+    block_scoped: true,
 };
 
 static JAVA: LangConfig = LangConfig {
     lang: Lang::Java,
     language: || tree_sitter_java::LANGUAGE.into(),
+    strings: StringSyntax::Quoted,
     string_kinds: &["string_literal"],
     import_query: r"
         (import_declaration (scoped_identifier) @import)
@@ -648,6 +738,7 @@ static JAVA: LangConfig = LangConfig {
     call_kinds: &["method_invocation", "object_creation_expression"],
     callee_field: "name",
     arguments_field: "arguments",
+    argument_syntax: ArgumentSyntax::List,
     member_kinds: &["field_access"],
     member_object_field: "object",
     member_property_field: "field",
@@ -669,11 +760,14 @@ static JAVA: LangConfig = LangConfig {
     ],
     template_kinds: &[],
     binary_op_kinds: &["binary_expression"],
+    tail_returns: false,
+    block_scoped: true,
 };
 
 static BASH: LangConfig = LangConfig {
     lang: Lang::Bash,
     language: || tree_sitter_bash::LANGUAGE.into(),
+    strings: StringSyntax::Quoted,
     string_kinds: &["string", "raw_string"],
     import_query: r#"
         (command
@@ -689,6 +783,7 @@ static BASH: LangConfig = LangConfig {
     call_kinds: &["command"],
     callee_field: "name",
     arguments_field: "argument",
+    argument_syntax: ArgumentSyntax::Repeated,
     member_kinds: &[],
     member_object_field: "",
     member_property_field: "",
@@ -701,11 +796,14 @@ static BASH: LangConfig = LangConfig {
     function_kinds: &["function_definition"],
     template_kinds: &[],
     binary_op_kinds: &[],
+    tail_returns: false,
+    block_scoped: false,
 };
 
 static RUBY: LangConfig = LangConfig {
     lang: Lang::Ruby,
     language: || tree_sitter_ruby::LANGUAGE.into(),
+    strings: StringSyntax::Quoted,
     string_kinds: &["string", "string_array", "symbol_array", "heredoc_body"],
     import_query: r#"
         (call
@@ -725,6 +823,7 @@ static RUBY: LangConfig = LangConfig {
     call_kinds: &["call"],
     callee_field: "method",
     arguments_field: "arguments",
+    argument_syntax: ArgumentSyntax::List,
     member_kinds: &["call"],
     member_object_field: "receiver",
     member_property_field: "method",
@@ -742,11 +841,14 @@ static RUBY: LangConfig = LangConfig {
     function_kinds: &["method", "singleton_method", "lambda", "block", "do_block"],
     template_kinds: &["string"],
     binary_op_kinds: &["binary"],
+    tail_returns: false,
+    block_scoped: false,
 };
 
 static LUA: LangConfig = LangConfig {
     lang: Lang::Lua,
     language: || tree_sitter_lua::LANGUAGE.into(),
+    strings: StringSyntax::Lua,
     string_kinds: &["string"],
     import_query: r#"
         (function_call
@@ -763,6 +865,7 @@ static LUA: LangConfig = LangConfig {
     call_kinds: &["function_call"],
     callee_field: "name",
     arguments_field: "arguments",
+    argument_syntax: ArgumentSyntax::List,
     member_kinds: &["dot_index_expression", "method_index_expression"],
     member_object_field: "table",
     member_property_field: "field",
@@ -775,11 +878,14 @@ static LUA: LangConfig = LangConfig {
     function_kinds: &["function_declaration", "function_definition"],
     template_kinds: &[],
     binary_op_kinds: &["binary_expression"],
+    tail_returns: false,
+    block_scoped: false,
 };
 
 static CSHARP: LangConfig = LangConfig {
     lang: Lang::CSharp,
     language: || tree_sitter_c_sharp::LANGUAGE.into(),
+    strings: StringSyntax::CSharp,
     string_kinds: &[
         "string_literal",
         "verbatim_string_literal",
@@ -806,6 +912,7 @@ static CSHARP: LangConfig = LangConfig {
     call_kinds: &["invocation_expression", "object_creation_expression"],
     callee_field: "function",
     arguments_field: "arguments",
+    argument_syntax: ArgumentSyntax::List,
     member_kinds: &["member_access_expression"],
     member_object_field: "expression",
     member_property_field: "name",
@@ -830,11 +937,14 @@ static CSHARP: LangConfig = LangConfig {
     ],
     template_kinds: &["interpolated_string_expression"],
     binary_op_kinds: &["binary_expression"],
+    tail_returns: false,
+    block_scoped: true,
 };
 
 static C: LangConfig = LangConfig {
     lang: Lang::C,
     language: || tree_sitter_c::LANGUAGE.into(),
+    strings: StringSyntax::C,
     string_kinds: &["string_literal"],
     import_query: r"
         (preproc_include path: (system_lib_string) @import)
@@ -856,6 +966,7 @@ static C: LangConfig = LangConfig {
     call_kinds: &["call_expression"],
     callee_field: "function",
     arguments_field: "arguments",
+    argument_syntax: ArgumentSyntax::List,
     // C has no `a.b` member-access node-kind separate from struct-field
     // dereferences (`field_expression`) but field-access is only one
     // dotted-form so we wire it up:
@@ -871,6 +982,8 @@ static C: LangConfig = LangConfig {
     function_kinds: &["function_definition"],
     template_kinds: &[],
     binary_op_kinds: &["binary_expression"],
+    tail_returns: false,
+    block_scoped: true,
 };
 
 /// C++ shares the external C-family file type while publishing its actual
@@ -878,6 +991,7 @@ static C: LangConfig = LangConfig {
 pub(super) static CPP: LangConfig = LangConfig {
     lang: Lang::Cpp,
     language: || tree_sitter_cpp::LANGUAGE.into(),
+    strings: StringSyntax::C,
     string_kinds: &["string_literal", "raw_string_literal"],
     function_query: r"
         (function_definition
@@ -897,12 +1011,14 @@ pub(super) static CPP: LangConfig = LangConfig {
     ",
     compiled: CompiledQueries::new(),
     function_kinds: &["function_definition", "lambda_expression"],
+    block_scoped: true,
     ..C
 };
 
 static SCALA: LangConfig = LangConfig {
     lang: Lang::Scala,
     language: || tree_sitter_scala::LANGUAGE.into(),
+    strings: StringSyntax::RawTriple,
     string_kinds: &["string", "interpolated_string_expression"],
     import_query: r"
         (import_declaration (identifier) @import)
@@ -919,6 +1035,7 @@ static SCALA: LangConfig = LangConfig {
     call_kinds: &["call_expression"],
     callee_field: "function",
     arguments_field: "arguments",
+    argument_syntax: ArgumentSyntax::List,
     member_kinds: &["field_expression"],
     member_object_field: "value",
     member_property_field: "field",
@@ -931,11 +1048,14 @@ static SCALA: LangConfig = LangConfig {
     function_kinds: &["function_definition", "lambda_expression"],
     template_kinds: &["interpolated_string_expression"],
     binary_op_kinds: &["infix_expression"],
+    tail_returns: false,
+    block_scoped: false,
 };
 
 static OBJC: LangConfig = LangConfig {
     lang: Lang::ObjC,
     language: || tree_sitter_objc::LANGUAGE.into(),
+    strings: StringSyntax::C,
     string_kinds: &["string_literal"],
     import_query: r"
         (preproc_include path: (system_lib_string) @import)
@@ -954,6 +1074,7 @@ static OBJC: LangConfig = LangConfig {
     call_kinds: &["call_expression", "message_expression"],
     callee_field: "function",
     arguments_field: "arguments",
+    argument_syntax: ArgumentSyntax::List,
     member_kinds: &["field_expression"],
     member_object_field: "argument",
     member_property_field: "field",
@@ -966,11 +1087,14 @@ static OBJC: LangConfig = LangConfig {
     function_kinds: &["function_definition", "method_definition", "block_literal"],
     template_kinds: &[],
     binary_op_kinds: &["binary_expression"],
+    tail_returns: false,
+    block_scoped: false,
 };
 
 static KOTLIN: LangConfig = LangConfig {
     lang: Lang::Kotlin,
     language: || tree_sitter_kotlin_ng::LANGUAGE.into(),
+    strings: StringSyntax::RawTriple,
     string_kinds: &[
         "string_literal",
         "multiline_string_literal",
@@ -990,6 +1114,7 @@ static KOTLIN: LangConfig = LangConfig {
     call_kinds: &["call_expression"],
     callee_field: "",
     arguments_field: "",
+    argument_syntax: ArgumentSyntax::List,
     member_kinds: &["navigation_expression"],
     member_object_field: "",
     member_property_field: "",
@@ -1007,11 +1132,14 @@ static KOTLIN: LangConfig = LangConfig {
     ],
     template_kinds: &["string_literal"],
     binary_op_kinds: &["binary_expression", "infix_expression"],
+    tail_returns: false,
+    block_scoped: false,
 };
 
 static SWIFT: LangConfig = LangConfig {
     lang: Lang::Swift,
     language: || tree_sitter_swift::LANGUAGE.into(),
+    strings: StringSyntax::Hashed,
     string_kinds: &[
         "line_string_literal",
         "multi_line_string_literal",
@@ -1032,6 +1160,7 @@ static SWIFT: LangConfig = LangConfig {
     call_kinds: &["call_expression"],
     callee_field: "",
     arguments_field: "",
+    argument_syntax: ArgumentSyntax::List,
     member_kinds: &["navigation_expression"],
     member_object_field: "target",
     member_property_field: "suffix",
@@ -1048,11 +1177,14 @@ static SWIFT: LangConfig = LangConfig {
         "multiplicative_expression",
         "comparison_expression",
     ],
+    tail_returns: false,
+    block_scoped: false,
 };
 
 static POWERSHELL: LangConfig = LangConfig {
     lang: Lang::PowerShell,
     language: || tree_sitter_powershell::LANGUAGE.into(),
+    strings: StringSyntax::Quoted,
     string_kinds: &[
         "string_literal",
         "expandable_string_literal",
@@ -1079,6 +1211,7 @@ static POWERSHELL: LangConfig = LangConfig {
     call_kinds: &["command"],
     callee_field: "command_name",
     arguments_field: "command_elements",
+    argument_syntax: ArgumentSyntax::List,
     member_kinds: &[],
     member_object_field: "",
     member_property_field: "",
@@ -1099,11 +1232,14 @@ static POWERSHELL: LangConfig = LangConfig {
         "multiplicative_expression",
         "comparison_expression",
     ],
+    tail_returns: false,
+    block_scoped: false,
 };
 
 static PHP: LangConfig = LangConfig {
     lang: Lang::Php,
     language: || tree_sitter_php::LANGUAGE_PHP.into(),
+    strings: StringSyntax::Quoted,
     string_kinds: &["string", "string_content", "heredoc_body"],
     import_query: r"
         (namespace_use_clause (qualified_name) @import)
@@ -1130,6 +1266,7 @@ static PHP: LangConfig = LangConfig {
     ],
     callee_field: "function",
     arguments_field: "arguments",
+    argument_syntax: ArgumentSyntax::List,
     member_kinds: &["member_access_expression"],
     member_object_field: "object",
     member_property_field: "name",
@@ -1147,11 +1284,14 @@ static PHP: LangConfig = LangConfig {
     ],
     template_kinds: &[],
     binary_op_kinds: &["binary_expression"],
+    tail_returns: false,
+    block_scoped: false,
 };
 
 static PERL: LangConfig = LangConfig {
     lang: Lang::Perl,
     language: || ts_parser_perl::LANGUAGE.into(),
+    strings: StringSyntax::Quoted,
     string_kinds: &[
         "string_literal",
         "interpolated_string_literal",
@@ -1178,6 +1318,7 @@ static PERL: LangConfig = LangConfig {
     ],
     callee_field: "function",
     arguments_field: "arguments",
+    argument_syntax: ArgumentSyntax::List,
     member_kinds: &["method_call_expression"],
     member_object_field: "invocant",
     member_property_field: "method",
@@ -1200,11 +1341,14 @@ static PERL: LangConfig = LangConfig {
     ],
     template_kinds: &["interpolated_string_literal"],
     binary_op_kinds: &["binary_expression"],
+    tail_returns: false,
+    block_scoped: false,
 };
 
 static GROOVY: LangConfig = LangConfig {
     lang: Lang::Groovy,
     language: || tree_sitter_groovy::LANGUAGE.into(),
+    strings: StringSyntax::Quoted,
     // This grammar retains Java's node name for Groovy single-quoted
     // strings. Their contents are string values, including multi-byte text.
     string_kinds: &["string_literal", "character_literal"],
@@ -1223,6 +1367,7 @@ static GROOVY: LangConfig = LangConfig {
     call_kinds: &["method_invocation", "juxt_function_call"],
     callee_field: "name",
     arguments_field: "arguments",
+    argument_syntax: ArgumentSyntax::List,
     member_kinds: &["method_invocation"],
     member_object_field: "object",
     member_property_field: "name",
@@ -1245,11 +1390,14 @@ static GROOVY: LangConfig = LangConfig {
     ],
     template_kinds: &["string_interpolation"],
     binary_op_kinds: &["binary_expression"],
+    tail_returns: false,
+    block_scoped: false,
 };
 
 static ZIG: LangConfig = LangConfig {
     lang: Lang::Zig,
     language: || tree_sitter_zig::LANGUAGE.into(),
+    strings: StringSyntax::Quoted,
     string_kinds: &["string", "multiline_string"],
     import_query: r#"
         (builtin_function
@@ -1265,6 +1413,7 @@ static ZIG: LangConfig = LangConfig {
     call_kinds: &["call_expression"],
     callee_field: "function",
     arguments_field: "arguments",
+    argument_syntax: ArgumentSyntax::AfterCallee,
     member_kinds: &["field_expression"],
     member_object_field: "object",
     // tree-sitter-zig names the right-hand side of a field expression
@@ -1282,11 +1431,14 @@ static ZIG: LangConfig = LangConfig {
     function_kinds: &["function_declaration"],
     template_kinds: &[],
     binary_op_kinds: &["binary_expression"],
+    tail_returns: false,
+    block_scoped: false,
 };
 
 static ELIXIR: LangConfig = LangConfig {
     lang: Lang::Elixir,
     language: || tree_sitter_elixir::LANGUAGE.into(),
+    strings: StringSyntax::Elixir,
     string_kinds: &["string", "charlist"],
     import_query: r#"
         (call
@@ -1310,6 +1462,7 @@ static ELIXIR: LangConfig = LangConfig {
     call_kinds: &["call"],
     callee_field: "target",
     arguments_field: "arguments",
+    argument_syntax: ArgumentSyntax::List,
     member_kinds: &["dot"],
     member_object_field: "left",
     member_property_field: "right",
@@ -1322,11 +1475,14 @@ static ELIXIR: LangConfig = LangConfig {
     function_kinds: &["anonymous_function"],
     template_kinds: &["interpolation"],
     binary_op_kinds: &["binary_operator"],
+    tail_returns: false,
+    block_scoped: false,
 };
 
 static MAKEFILE: LangConfig = LangConfig {
     lang: Lang::Makefile,
     language: || tree_sitter_make::LANGUAGE.into(),
+    strings: StringSyntax::Quoted,
     string_kinds: &["string"],
     import_query: r"
         (include_directive (list (word) @import))
@@ -1341,6 +1497,7 @@ static MAKEFILE: LangConfig = LangConfig {
     call_kinds: &["function_call", "shell_function"],
     callee_field: "function",
     arguments_field: "arguments",
+    argument_syntax: ArgumentSyntax::List,
     member_kinds: &[],
     member_object_field: "",
     member_property_field: "",
@@ -1353,6 +1510,8 @@ static MAKEFILE: LangConfig = LangConfig {
     function_kinds: &[],
     template_kinds: &[],
     binary_op_kinds: &[],
+    tail_returns: false,
+    block_scoped: false,
 };
 
 // Clojure / ClojureScript / EDN (Lisp). The grammar is S-expression based:
@@ -1363,6 +1522,7 @@ static MAKEFILE: LangConfig = LangConfig {
 static CLOJURE: LangConfig = LangConfig {
     lang: Lang::Clojure,
     language: || tree_sitter_clojure::LANGUAGE.into(),
+    strings: StringSyntax::Quoted,
     string_kinds: &["str_lit", "regex_lit"],
     import_query: "",
     function_query: "",
@@ -1371,6 +1531,7 @@ static CLOJURE: LangConfig = LangConfig {
     call_kinds: &["list_lit"],
     callee_field: "",
     arguments_field: "",
+    argument_syntax: ArgumentSyntax::List,
     member_kinds: &[],
     member_object_field: "",
     member_property_field: "",
@@ -1383,6 +1544,8 @@ static CLOJURE: LangConfig = LangConfig {
     function_kinds: &["anon_fn_lit"],
     template_kinds: &[],
     binary_op_kinds: &[],
+    tail_returns: false,
+    block_scoped: false,
 };
 
 // Windows Batch / CMD. Commands are `cmd` statements (no C-like callee/argument
@@ -1391,6 +1554,7 @@ static CLOJURE: LangConfig = LangConfig {
 static BATCH: LangConfig = LangConfig {
     lang: Lang::Batch,
     language: || tree_sitter_batch::LANGUAGE.into(),
+    strings: StringSyntax::Quoted,
     string_kinds: &["string"],
     import_query: "",
     function_query: "",
@@ -1399,6 +1563,7 @@ static BATCH: LangConfig = LangConfig {
     call_kinds: &["cmd", "call_stmt", "macro_invocation"],
     callee_field: "",
     arguments_field: "",
+    argument_syntax: ArgumentSyntax::List,
     member_kinds: &[],
     member_object_field: "",
     member_property_field: "",
@@ -1411,6 +1576,8 @@ static BATCH: LangConfig = LangConfig {
     function_kinds: &[],
     template_kinds: &[],
     binary_op_kinds: &[],
+    tail_returns: false,
+    block_scoped: false,
 };
 
 #[cfg(test)]

@@ -51,8 +51,26 @@ fn leaves_the_real_provider_forks_and_other_ecosystems_alone() {
         name_lookalike(&Ecosystem::Terraform, "hashicrop/dockerd"),
         Some(0.0)
     );
-    assert_eq!(name_lookalike(&Ecosystem::Terraform, "docker"), None);
     assert_eq!(name_lookalike(&Ecosystem::Npm, "kreuzwenker/docker"), None);
+}
+
+/// A Terraform name is checked whatever its shape: one without a namespace
+/// is not a lookalike, and that is a result, not "no list".
+#[test]
+fn a_name_without_a_namespace_is_checked_and_clean() {
+    assert_eq!(name_lookalike(&Ecosystem::Terraform, "docker"), Some(0.0));
+}
+
+/// The ecosystem is Terraform by its label, however the value was built.
+#[test]
+fn terraform_spelled_as_another_label_is_still_checked() {
+    for label in ["terraform", "Terraform"] {
+        assert_eq!(
+            name_lookalike(&Ecosystem::Other(label.into()), "kreuzwenker/docker"),
+            Some(1.0),
+            "{label}"
+        );
+    }
 }
 
 #[test]

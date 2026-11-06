@@ -38,7 +38,7 @@ impl<'g, V: Copy> Scope<'g, V> {
     }
 
     /// An empty layer over `parent`, which it reads through but never changes.
-    pub(super) fn under(parent: &'g Scope<'g, V>) -> Self {
+    pub(super) fn under(parent: &'g Self) -> Self {
         Self {
             parent: Some(parent),
             ..Self::default()
@@ -88,6 +88,30 @@ impl<'g, V: Copy> Scope<'g, V> {
     /// [`Self::names`], consuming the layer.
     pub(super) fn into_names(self) -> impl Iterator<Item = String> {
         self.local.into_keys()
+    }
+
+    /// The current bindings of `names`, for [`Self::restore`] to put back
+    /// once a block that declares them ends. Only the names a block declares
+    /// are saved: copying every binding per block is quadratic.
+    pub(super) fn save(&self, names: impl IntoIterator<Item = String>) -> Vec<(String, Option<V>)> {
+        names
+            .into_iter()
+            .map(|name| {
+                let value = self.get(&name);
+                (name, value)
+            })
+            .collect()
+    }
+
+    /// Rebind each name [`Self::save`] saw to its saved value, or unbind it
+    /// when it had none.
+    pub(super) fn restore(&mut self, saved: Vec<(String, Option<V>)>) {
+        for (name, value) in saved {
+            match value {
+                Some(value) => self.insert(name, value),
+                None => self.remove(&name),
+            }
+        }
     }
 
     /// The flattened bindings of a layer with no parent.

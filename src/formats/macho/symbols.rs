@@ -2,6 +2,7 @@
 //! spellings folded to their base symbol and imports anchored at their
 //! `LC_SYMTAB` names.
 
+use goblin::mach::load_command::CommandVariant;
 use goblin::mach::{self, MachO};
 
 use crate::bytes;
@@ -18,8 +19,11 @@ use crate::output::Symbols;
 /// `"libsystem.b"` rather than `"/usr/lib/libSystem.B.dylib"`. A flat
 /// namespace or flat-lookup import binds to no library in particular, and
 /// carries none.
+///
+/// Without goblin's `macho` the imports carry no name offset and the exports
+/// no offset, and a re-export's library stem stays as binform spells it.
 pub(super) fn extract(
-    macho: &MachO<'_>,
+    macho: Option<&MachO<'_>>,
     layout: Option<&binform::Binary<'_>>,
     bytes: &[u8],
     symbols_out: &mut Symbols,
@@ -31,7 +35,9 @@ pub(super) fn extract(
     // Every consumer anchors a symbol at its human-readable name — ELF
     // imports point into `.dynstr`, and the hex/context view expects to
     // render the name's ASCII — so Mach-O imports do too.
-    let name_offsets = import_name_offsets(macho, bytes);
+    let name_offsets = macho
+        .map(|macho| import_name_offsets(macho, bytes))
+        .unwrap_or_default();
     for imp in layout.imports() {
         symbols_out.push(crate::Symbol::Import {
             // Record the base symbol, not the Darwin `$VARIANT` spelling,
@@ -51,11 +57,13 @@ pub(super) fn extract(
     // forwarding to `libdyld`) have no address of their own; they carry
     // their target in `forward_to` as `<library stem>.<symbol>`, the shape
     // PE forwards take.
-    let base = macho
-        .segments
-        .iter()
-        .find(|segment| segment.name().is_ok_and(|name| name == "__TEXT"))
-        .map_or(0, |segment| segment.vmaddr);
+    let base = macho.map(|macho| {
+        macho
+            .segments
+            .iter()
+            .find(|segment| segment.name().is_ok_and(|name| name == "__TEXT"))
+            .map_or(0, |segment| segment.vmaddr)
+    });
     for exp in layout.exports() {
         symbols_out.push(crate::Symbol::Export {
             // Normalize the same Darwin `$VARIANT` suffix as imports: these
@@ -64,12 +72,14 @@ pub(super) fn extract(
             // `_OBJC_CLASS_$_…` exports intact.
             name: strip_darwin_symbol_variant(&exp.name).to_string(),
             // A re-export has no address of its own.
-            offset: exp.addr.and_then(|addr| addr.checked_sub(base)),
+            offset: exp
+                .addr
+                .zip(base)
+                .and_then(|(addr, base)| addr.checked_sub(base)),
             ordinal: None,
-            forward_to: exp
-                .forward
-                .as_deref()
-                .map(|forward| reexport_target(&macho.libs, forward)),
+            forward_to: exp.forward.as_deref().map(|forward| {
+                reexport_target(macho.map_or(&[][..], |macho| &macho.libs), forward)
+            }),
         });
     }
 }
@@ -81,13 +91,9 @@ pub(super) fn extract(
 fn reexport_target(libs: &[&str], forward: &str) -> String {
     libs.iter()
         .find_map(|lib| {
-            let base = lib.rsplit_once('/').map_or(*lib, |(_, base)| base);
-            let stem = base
-                .strip_suffix(".dylib")
-                .or_else(|| base.strip_suffix(".tbd"))
-                .unwrap_or(base);
+            let stem = dylib_stem(lib);
             let symbol = forward.strip_prefix(stem)?.strip_prefix('.')?;
-            Some(format!("{}.{symbol}", normalize_dylib_path(lib)))
+            Some(format!("{}.{symbol}", stem.to_ascii_lowercase()))
         })
         .unwrap_or_else(|| forward.to_owned())
 }
@@ -104,13 +110,9 @@ pub(super) fn import_name_offsets<'a>(
     macho: &MachO<'a>,
     bytes: &[u8],
 ) -> std::collections::HashMap<&'a str, u64> {
-    const N_EXT: u8 = 0x01;
-    const N_TYPE_MASK: u8 = 0x0e;
-    const N_UNDF: u8 = 0x00;
-
     let mut offsets = std::collections::HashMap::new();
     let Some(stroff) = macho.load_commands.iter().find_map(|lc| match lc.command {
-        mach::load_command::CommandVariant::Symtab(st) => Some(u64::from(st.stroff)),
+        CommandVariant::Symtab(st) => Some(u64::from(st.stroff)),
         _ => None,
     }) else {
         return offsets;
@@ -123,12 +125,8 @@ pub(super) fn import_name_offsets<'a>(
         .unwrap_or_default();
     for sym in symbols {
         let Ok((name, nlist)) = sym else { continue };
-        // External + undefined == imported symbol; `n_strx == 0` has no name.
-        if nlist.n_type & N_EXT == 0
-            || nlist.n_type & N_TYPE_MASK != N_UNDF
-            || nlist.n_strx == 0
-            || name.is_empty()
-        {
+        // `n_strx == 0` has no name.
+        if !is_undefined_external(nlist.n_type) || nlist.n_strx == 0 || name.is_empty() {
             continue;
         }
         // First occurrence wins; duplicate undefined entries are degenerate.
@@ -137,6 +135,15 @@ pub(super) fn import_name_offsets<'a>(
             .or_insert_with(|| stroff + nlist.n_strx as u64);
     }
     offsets
+}
+
+/// Whether an `nlist` `n_type` marks an imported symbol: external (`N_EXT`)
+/// and undefined (`N_UNDF`).
+pub(super) fn is_undefined_external(n_type: u8) -> bool {
+    const N_EXT: u8 = 0x01;
+    const N_TYPE_MASK: u8 = 0x0e;
+    const N_UNDF: u8 = 0x00;
+    n_type & N_EXT != 0 && n_type & N_TYPE_MASK == N_UNDF
 }
 
 /// The `LC_SYMTAB` entries whose `nlist` lies inside `bytes`, the buffer
@@ -156,7 +163,7 @@ pub(super) fn symtab_symbols<'a>(
         .load_commands
         .iter()
         .find_map(|lc| match lc.command {
-            mach::load_command::CommandVariant::Symtab(st) => {
+            CommandVariant::Symtab(st) => {
                 Some(bytes.len().saturating_sub(bytes::sat_usize(st.symoff)) / nlist_size)
             }
             _ => None,
@@ -207,10 +214,14 @@ pub(super) fn strip_darwin_symbol_variant(name: &str) -> &str {
 /// PE's `library` normalisation convention so trait matchers can
 /// share library names across formats.
 pub(super) fn normalize_dylib_path(path: &str) -> String {
-    let basename = path.rsplit_once('/').map(|(_, name)| name).unwrap_or(path);
-    let stem = basename
+    dylib_stem(path).to_ascii_lowercase()
+}
+
+/// A dylib path's basename without its `.dylib` / `.tbd` suffix, case kept.
+fn dylib_stem(path: &str) -> &str {
+    let basename = path.rsplit_once('/').map_or(path, |(_, name)| name);
+    basename
         .strip_suffix(".dylib")
         .or_else(|| basename.strip_suffix(".tbd"))
-        .unwrap_or(basename);
-    stem.to_ascii_lowercase()
+        .unwrap_or(basename)
 }

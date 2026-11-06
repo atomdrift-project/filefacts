@@ -9,8 +9,9 @@
 //!
 //! - `lnk.header.{file_size, icon_index, show_command, hotkey,
 //!   creation_time, access_time, write_time, flags[],
-//!   file_attributes[]}` — Pike-style flag arrays replace the
-//!   per-flag-bool sprawl.
+//!   file_attributes[]}` — the times as signed Unix seconds (UTC), a zero
+//!   FILETIME omitted; the flags and attributes as arrays of set-bit
+//!   names.
 //! - `lnk.description`, `lnk.relative_path`, `lnk.working_directory`,
 //!   `lnk.arguments`, `lnk.icon_location` — StringData entries
 //!   resolved through their length-prefixed UTF-16LE / ANSI
@@ -22,15 +23,13 @@
 //!   `lnk.darwin_data`, `lnk.shim_layer_name`,
 //!   `lnk.known_folder_id`, `lnk.special_folder_id` — single-field
 //!   ExtraData blocks.
-//! - `lnk.blocks[]` — Pike-style array of ExtraData block names
+//! - `lnk.blocks[]` — the ExtraData block names
 //!   present in the file.
 
 use crate::metric;
 use serde_json::{Value as JsonValue, json};
 
-use crate::formats::common::{
-    XorScan, bytes_at, extract_binary_strings, format_guid, put_str, put_u64,
-};
+use crate::formats::common::{XorScan, extract_binary_strings, format_guid, put_str, put_u64};
 use crate::output::{Metrics, Strings, ValueKey, Values};
 use crate::value_key;
 
@@ -85,15 +84,15 @@ pub(super) fn extract(
         return;
     }
 
-    let link_flags = bytes_at::u32_le(bytes, 20).unwrap_or(0);
-    let file_attributes = bytes_at::u32_le(bytes, 24).unwrap_or(0);
-    let creation_time = bytes_at::u64_le(bytes, 28).unwrap_or(0);
-    let access_time = bytes_at::u64_le(bytes, 36).unwrap_or(0);
-    let write_time = bytes_at::u64_le(bytes, 44).unwrap_or(0);
-    let file_size = bytes_at::u32_le(bytes, 52).unwrap_or(0);
-    let icon_index = bytes_at::u32_le(bytes, 56).map_or(0, u32::cast_signed);
-    let show_command = bytes_at::u32_le(bytes, SHOW_COMMAND_OFFSET).unwrap_or(0);
-    let hotkey = bytes_at::u16_le(bytes, 64).unwrap_or(0);
+    let link_flags = crate::bytes::u32_le(bytes, 20).unwrap_or(0);
+    let file_attributes = crate::bytes::u32_le(bytes, 24).unwrap_or(0);
+    let creation_time = crate::bytes::u64_le(bytes, 28).unwrap_or(0);
+    let access_time = crate::bytes::u64_le(bytes, 36).unwrap_or(0);
+    let write_time = crate::bytes::u64_le(bytes, 44).unwrap_or(0);
+    let file_size = crate::bytes::u32_le(bytes, 52).unwrap_or(0);
+    let icon_index = crate::bytes::u32_le(bytes, 56).map_or(0, u32::cast_signed);
+    let show_command = crate::bytes::u32_le(bytes, SHOW_COMMAND_OFFSET).unwrap_or(0);
+    let hotkey = crate::bytes::u16_le(bytes, 64).unwrap_or(0);
 
     // Header object.
     let mut header = serde_json::Map::new();
@@ -108,38 +107,25 @@ pub(super) fn extract(
     if hotkey != 0 {
         header.insert("hotkey".into(), JsonValue::String(format_hotkey(hotkey)));
     }
-    if creation_time != 0 {
-        header.insert("creation_time".into(), json!(creation_time));
+    for (key, filetime) in [
+        ("creation_time", creation_time),
+        ("access_time", access_time),
+        ("write_time", write_time),
+    ] {
+        if filetime != 0 {
+            header.insert(key.into(), json!(crate::time::filetime_to_unix(filetime)));
+        }
     }
-    if access_time != 0 {
-        header.insert("access_time".into(), json!(access_time));
-    }
-    if write_time != 0 {
-        header.insert("write_time".into(), json!(write_time));
-    }
-    let flags = decode_link_flags(link_flags);
-    if !flags.is_empty() {
-        header.insert(
-            "flags".into(),
-            JsonValue::Array(
-                flags
-                    .into_iter()
-                    .map(|s| JsonValue::String(s.into()))
-                    .collect(),
-            ),
-        );
-    }
-    let attrs = decode_file_attributes(file_attributes);
-    if !attrs.is_empty() {
-        header.insert(
-            "file_attributes".into(),
-            JsonValue::Array(
-                attrs
-                    .into_iter()
-                    .map(|s| JsonValue::String(s.into()))
-                    .collect(),
-            ),
-        );
+    for (key, names) in [
+        ("flags", bit_names(link_flags, LINK_FLAG_NAMES)),
+        (
+            "file_attributes",
+            bit_names(file_attributes, FILE_ATTRIBUTE_NAMES),
+        ),
+    ] {
+        if !names.is_empty() {
+            header.insert(key.into(), JsonValue::from(names));
+        }
     }
     values.insert_key(value_key!("lnk.header"), JsonValue::Object(header));
 
@@ -149,44 +135,44 @@ pub(super) fn extract(
     // Both sources carry the file offset of the bytes the path was read
     // from, so `lnk.target_path` anchors like every other fact.
     let mut id_list_path: Option<(String, usize)> = None;
-    if link_flags & FLAG_HAS_LINK_TARGET_ID_LIST != 0 {
-        if let Some(id_list_size) = bytes_at::u16_le(bytes, offset) {
-            let id_list_end = offset.saturating_add(2 + id_list_size as usize);
-            let body = offset + 2;
-            match bytes.get(body..id_list_end) {
-                Some(list) => id_list_path = walk_id_list(list).map(|(p, at)| (p, body + at)),
-                None => tracing::debug!(
-                    target: "filefacts::lnk",
-                    stage = "id-list",
-                    offset,
-                    len = id_list_size,
-                    "IDList runs past the end of the file"
-                ),
-            }
-            offset = id_list_end;
+    if link_flags & FLAG_HAS_LINK_TARGET_ID_LIST != 0
+        && let Some(id_list_size) = crate::bytes::u16_le(bytes, offset)
+    {
+        let id_list_end = offset.saturating_add(2 + usize::from(id_list_size));
+        let body = offset + 2;
+        match bytes.get(body..id_list_end) {
+            Some(list) => id_list_path = walk_id_list(list).map(|(p, at)| (p, body + at)),
+            None => tracing::debug!(
+                target: "filefacts::lnk",
+                stage = "id-list",
+                offset,
+                len = id_list_size,
+                "IDList runs past the end of the file"
+            ),
         }
+        offset = id_list_end;
     }
     let mut link_info_path: Option<(String, usize)> = None;
-    if link_flags & FLAG_HAS_LINK_INFO != 0 {
-        if let Some(link_info_size) = bytes_at::u32_le(bytes, offset) {
-            let link_info_size = link_info_size as usize;
-            let link_info_end = offset.saturating_add(link_info_size);
-            if link_info_size >= 0x1C {
-                if let Some(block) = bytes.get(offset..link_info_end) {
-                    link_info_path = parse_link_info(block, offset, values);
-                }
-            }
-            offset = link_info_end;
+    if link_flags & FLAG_HAS_LINK_INFO != 0
+        && let Some(link_info_size) = crate::bytes::u32_le(bytes, offset)
+    {
+        let link_info_size = crate::bytes::sat_usize(link_info_size);
+        let link_info_end = offset.saturating_add(link_info_size);
+        if link_info_size >= 0x1C
+            && let Some(block) = bytes.get(offset..link_info_end)
+        {
+            link_info_path = parse_link_info(block, offset, values);
         }
+        offset = link_info_end;
     }
     // Resolved target_path: the IDList walk is the canonical source;
     // LinkInfo's LocalBasePath + CommonPathSuffix is the documented
     // fallback when there's no IDList (per MS-SHLLINK §2.5).
-    if let Some((p, at)) = id_list_path.or(link_info_path) {
-        if !p.is_empty() {
-            put_str(values, value_key!("lnk.target_path"), p);
-            put_u64(values, value_key!("lnk.target_path_offset"), at as u64);
-        }
+    if let Some((p, at)) = id_list_path.or(link_info_path)
+        && !p.is_empty()
+    {
+        put_str(values, value_key!("lnk.target_path"), p);
+        put_u64(values, value_key!("lnk.target_path_offset"), at as u64);
     }
     // Each StringData field with the key of its `_offset` companion.
     let string_keys: &[(u32, ValueKey, ValueKey)] = &[
@@ -256,7 +242,8 @@ pub(super) fn extract(
     // ExtraData blocks.
     let mut blocks: Vec<&'static str> = Vec::new();
     while offset + 8 <= bytes.len() {
-        let Some(block_size) = bytes_at::u32_le(bytes, offset).map(|n| n as usize) else {
+        let Some(block_size) = crate::bytes::u32_le(bytes, offset).map(crate::bytes::sat_usize)
+        else {
             break;
         };
         // A size under 4 is the TerminalBlock that ends the list.
@@ -272,7 +259,10 @@ pub(super) fn extract(
             }
             break;
         }
-        let Some(block) = bytes.get(offset..offset + block_size) else {
+        let Some(block) = offset
+            .checked_add(block_size)
+            .and_then(|end| bytes.get(offset..end))
+        else {
             tracing::debug!(
                 target: "filefacts::lnk",
                 stage = "extra-data",
@@ -282,77 +272,73 @@ pub(super) fn extract(
             );
             break;
         };
-        let Some(signature) = bytes_at::u32_le(block, 4) else {
+        let Some(signature) = crate::bytes::u32_le(block, 4) else {
             break;
         };
+        // The shell finds a block by its signature and reads the first
+        // (`SHFindDataBlock`), so a later block of the same signature is
+        // never read: it must not replace the first one's facts, and it
+        // lists nothing new.
+        let Some(name) = block_name(signature).filter(|name| !blocks.contains(name)) else {
+            offset += block_size;
+            continue;
+        };
+        blocks.push(name);
         match signature {
             EXTRA_ENVIRONMENT_VARIABLE_DATA => {
-                blocks.push("environment_variable");
-                if let Some((s, at)) = read_ansi_or_unicode_pair(block, 8, 268, 260, 520) {
-                    put_str(values, value_key!("lnk.environment_target"), s);
-                    put_u64(
-                        values,
-                        value_key!("lnk.environment_target_offset"),
-                        (offset + at) as u64,
-                    );
-                }
+                put_target_string(
+                    block,
+                    offset,
+                    values,
+                    value_key!("lnk.environment_target"),
+                    value_key!("lnk.environment_target_offset"),
+                );
             }
-            EXTRA_CONSOLE_DATA => blocks.push("console"),
-            EXTRA_CONSOLE_FE_DATA => blocks.push("console_fe"),
             EXTRA_TRACKER_DATA => {
-                blocks.push("tracker");
                 let mut tr = serde_json::Map::new();
                 if let Some(s) = read_fixed_ansi(block, 16, 16) {
                     tr.insert("machine_id".into(), JsonValue::String(s));
                 }
-                let volume_droid = read_guid(block, 0x20);
-                let file_droid = read_guid(block, 0x30);
-                if let Some(g) = volume_droid.as_ref() {
-                    tr.insert("volume_droid".into(), JsonValue::String(g.clone()));
+                if let Some(g) = read_guid(block, 0x20) {
+                    tr.insert("volume_droid".into(), JsonValue::String(g));
                 }
-                if let Some(g) = file_droid.as_ref() {
-                    tr.insert("file_droid".into(), JsonValue::String(g.clone()));
+                if let Some(g) = read_guid(block, 0x30) {
                     // Last 6 bytes of the file Droid GUID are the
                     // node ID — the MAC address of the machine
                     // that created the link.
-                    if let Some(mac) = derive_mac(g) {
+                    if let Some(mac) = derive_mac(&g) {
                         tr.insert("mac_address".into(), JsonValue::String(mac));
                     }
+                    tr.insert("file_droid".into(), JsonValue::String(g));
                 }
                 if !tr.is_empty() {
                     values.insert_key(value_key!("lnk.tracker"), JsonValue::Object(tr));
                 }
             }
             EXTRA_SPECIAL_FOLDER_DATA => {
-                blocks.push("special_folder");
-                if let Some(id) = bytes_at::u32_le(block, 8) {
+                if let Some(id) = crate::bytes::u32_le(block, 8) {
                     put_u64(values, value_key!("lnk.special_folder_id"), u64::from(id));
                 }
             }
             EXTRA_DARWIN_DATA => {
-                blocks.push("darwin");
-                if let Some((s, at)) = read_ansi_or_unicode_pair(block, 8, 268, 260, 520) {
-                    put_str(values, value_key!("lnk.darwin_data"), s);
-                    put_u64(
-                        values,
-                        value_key!("lnk.darwin_data_offset"),
-                        (offset + at) as u64,
-                    );
-                }
+                put_target_string(
+                    block,
+                    offset,
+                    values,
+                    value_key!("lnk.darwin_data"),
+                    value_key!("lnk.darwin_data_offset"),
+                );
             }
             EXTRA_ICON_ENVIRONMENT_DATA => {
-                blocks.push("icon_environment");
-                if let Some((s, at)) = read_ansi_or_unicode_pair(block, 8, 268, 260, 520) {
-                    put_str(values, value_key!("lnk.icon_environment_target"), s);
-                    put_u64(
-                        values,
-                        value_key!("lnk.icon_environment_target_offset"),
-                        (offset + at) as u64,
-                    );
-                }
+                put_target_string(
+                    block,
+                    offset,
+                    values,
+                    value_key!("lnk.icon_environment_target"),
+                    value_key!("lnk.icon_environment_target_offset"),
+                );
             }
             EXTRA_SHIM_DATA => {
-                blocks.push("shim");
                 if let Some(s) = read_utf16le_string(block, 8, block_size.saturating_sub(8)) {
                     put_str(values, value_key!("lnk.shim_layer_name"), s);
                     put_u64(
@@ -362,30 +348,38 @@ pub(super) fn extract(
                     );
                 }
             }
-            EXTRA_PROPERTY_STORE_DATA => blocks.push("property_store"),
             EXTRA_KNOWN_FOLDER_DATA => {
-                blocks.push("known_folder");
                 if let Some(g) = read_guid(block, 8) {
                     put_str(values, value_key!("lnk.known_folder_id"), g);
                 }
             }
-            EXTRA_VISTA_AND_ABOVE_IDLIST_DATA => blocks.push("vista_idlist"),
             _ => {}
         }
         offset += block_size;
     }
     if !blocks.is_empty() {
-        values.insert_key(
-            value_key!("lnk.blocks"),
-            JsonValue::Array(
-                blocks
-                    .into_iter()
-                    .map(|s| JsonValue::String(s.into()))
-                    .collect(),
-            ),
-        );
+        values.insert_key(value_key!("lnk.blocks"), JsonValue::from(blocks));
     }
     metrics.insert(metric!("lnk.file_size"), f64::from(file_size));
+}
+
+/// The name `lnk.blocks` lists an ExtraData block under, by its signature;
+/// `None` for one MS-SHLLINK does not define.
+fn block_name(signature: u32) -> Option<&'static str> {
+    Some(match signature {
+        EXTRA_ENVIRONMENT_VARIABLE_DATA => "environment_variable",
+        EXTRA_CONSOLE_DATA => "console",
+        EXTRA_CONSOLE_FE_DATA => "console_fe",
+        EXTRA_TRACKER_DATA => "tracker",
+        EXTRA_SPECIAL_FOLDER_DATA => "special_folder",
+        EXTRA_DARWIN_DATA => "darwin",
+        EXTRA_ICON_ENVIRONMENT_DATA => "icon_environment",
+        EXTRA_SHIM_DATA => "shim",
+        EXTRA_PROPERTY_STORE_DATA => "property_store",
+        EXTRA_KNOWN_FOLDER_DATA => "known_folder",
+        EXTRA_VISTA_AND_ABOVE_IDLIST_DATA => "vista_idlist",
+        _ => return None,
+    })
 }
 
 /// Compute whitespace-obfuscation counts over an LNK argument
@@ -414,15 +408,11 @@ fn emit_argument_whitespace_metrics(metrics: &mut Metrics, args: &str) {
             }
         } else {
             in_leading = false;
-            if current_run > max_run {
-                max_run = current_run;
-            }
+            max_run = max_run.max(current_run);
             current_run = 0;
         }
     }
-    if current_run > max_run {
-        max_run = current_run;
-    }
+    max_run = max_run.max(current_run);
     metrics.insert(
         metric!("lnk.arguments_leading_spaces"),
         leading_spaces as f64,
@@ -458,8 +448,7 @@ fn show_command_name(v: u32) -> &'static str {
 
 /// Format a hotkey word as `Modifier+Key` (e.g. `"ctrl+alt+F1"`).
 fn format_hotkey(v: u16) -> String {
-    let key = (v & 0xFF) as u8;
-    let mods = (v >> 8) as u8;
+    let [key, mods] = v.to_le_bytes();
     let mut parts: Vec<&str> = Vec::new();
     if mods & 0x01 != 0 {
         parts.push("shift");
@@ -471,8 +460,8 @@ fn format_hotkey(v: u16) -> String {
         parts.push("alt");
     }
     let key_name = match key {
-        0x30..=0x39 => format!("{}", (key - 0x30) as char),
-        0x41..=0x5A => format!("{}", key as char),
+        // VK codes for digits and letters are their ASCII characters.
+        b'0'..=b'9' | b'A'..=b'Z' => char::from(key).to_string(),
         0x70..=0x87 => format!("F{}", key - 0x6F),
         _ => format!("0x{key:02x}"),
     };
@@ -480,135 +469,66 @@ fn format_hotkey(v: u16) -> String {
     parts.join("+")
 }
 
-fn decode_link_flags(v: u32) -> Vec<&'static str> {
-    let mut out = Vec::new();
-    if v & FLAG_HAS_LINK_TARGET_ID_LIST != 0 {
-        out.push("has_link_target_id_list");
-    }
-    if v & FLAG_HAS_LINK_INFO != 0 {
-        out.push("has_link_info");
-    }
-    if v & FLAG_HAS_NAME != 0 {
-        out.push("has_name");
-    }
-    if v & FLAG_HAS_RELATIVE_PATH != 0 {
-        out.push("has_relative_path");
-    }
-    if v & FLAG_HAS_WORKING_DIR != 0 {
-        out.push("has_working_dir");
-    }
-    if v & FLAG_HAS_ARGUMENTS != 0 {
-        out.push("has_arguments");
-    }
-    if v & FLAG_HAS_ICON_LOCATION != 0 {
-        out.push("has_icon_location");
-    }
-    if v & FLAG_IS_UNICODE != 0 {
-        out.push("is_unicode");
-    }
-    if v & 0x0000_0100 != 0 {
-        out.push("force_no_link_info");
-    }
-    if v & 0x0000_0200 != 0 {
-        out.push("has_exp_string");
-    }
-    if v & 0x0000_0400 != 0 {
-        out.push("run_in_separate_process");
-    }
-    if v & 0x0000_1000 != 0 {
-        out.push("has_darwin_id");
-    }
-    if v & 0x0000_2000 != 0 {
-        out.push("run_as_user");
-    }
-    if v & 0x0000_4000 != 0 {
-        out.push("has_exp_icon");
-    }
-    if v & 0x0000_8000 != 0 {
-        out.push("no_pidl_alias");
-    }
-    if v & 0x0002_0000 != 0 {
-        out.push("run_with_shim_layer");
-    }
-    if v & 0x0004_0000 != 0 {
-        out.push("force_no_link_track");
-    }
-    if v & 0x0008_0000 != 0 {
-        out.push("enable_target_metadata");
-    }
-    if v & 0x0010_0000 != 0 {
-        out.push("disable_link_path_tracking");
-    }
-    if v & 0x0020_0000 != 0 {
-        out.push("disable_known_folder_tracking");
-    }
-    if v & 0x0040_0000 != 0 {
-        out.push("disable_known_folder_alias");
-    }
-    if v & 0x0080_0000 != 0 {
-        out.push("allow_link_to_link");
-    }
-    if v & 0x0100_0000 != 0 {
-        out.push("unalias_on_save");
-    }
-    if v & 0x0200_0000 != 0 {
-        out.push("prefer_environment_path");
-    }
-    if v & 0x0400_0000 != 0 {
-        out.push("keep_local_id_list_for_unc_target");
-    }
-    out
-}
+/// `LinkFlags` bits and their names.
+const LINK_FLAG_NAMES: &[(u32, &str)] = &[
+    (FLAG_HAS_LINK_TARGET_ID_LIST, "has_link_target_id_list"),
+    (FLAG_HAS_LINK_INFO, "has_link_info"),
+    (FLAG_HAS_NAME, "has_name"),
+    (FLAG_HAS_RELATIVE_PATH, "has_relative_path"),
+    (FLAG_HAS_WORKING_DIR, "has_working_dir"),
+    (FLAG_HAS_ARGUMENTS, "has_arguments"),
+    (FLAG_HAS_ICON_LOCATION, "has_icon_location"),
+    (FLAG_IS_UNICODE, "is_unicode"),
+    (0x0000_0100, "force_no_link_info"),
+    (0x0000_0200, "has_exp_string"),
+    (0x0000_0400, "run_in_separate_process"),
+    (0x0000_1000, "has_darwin_id"),
+    (0x0000_2000, "run_as_user"),
+    (0x0000_4000, "has_exp_icon"),
+    (0x0000_8000, "no_pidl_alias"),
+    (0x0002_0000, "run_with_shim_layer"),
+    (0x0004_0000, "force_no_link_track"),
+    (0x0008_0000, "enable_target_metadata"),
+    (0x0010_0000, "disable_link_path_tracking"),
+    (0x0020_0000, "disable_known_folder_tracking"),
+    (0x0040_0000, "disable_known_folder_alias"),
+    (0x0080_0000, "allow_link_to_link"),
+    (0x0100_0000, "unalias_on_save"),
+    (0x0200_0000, "prefer_environment_path"),
+    (0x0400_0000, "keep_local_id_list_for_unc_target"),
+];
 
-fn decode_file_attributes(v: u32) -> Vec<&'static str> {
-    let mut out = Vec::new();
-    if v & 0x0001 != 0 {
-        out.push("readonly");
-    }
-    if v & 0x0002 != 0 {
-        out.push("hidden");
-    }
-    if v & 0x0004 != 0 {
-        out.push("system");
-    }
-    if v & 0x0010 != 0 {
-        out.push("directory");
-    }
-    if v & 0x0020 != 0 {
-        out.push("archive");
-    }
-    if v & 0x0080 != 0 {
-        out.push("normal");
-    }
-    if v & 0x0100 != 0 {
-        out.push("temporary");
-    }
-    if v & 0x0200 != 0 {
-        out.push("sparse");
-    }
-    if v & 0x0400 != 0 {
-        out.push("reparse_point");
-    }
-    if v & 0x0800 != 0 {
-        out.push("compressed");
-    }
-    if v & 0x1000 != 0 {
-        out.push("offline");
-    }
-    if v & 0x2000 != 0 {
-        out.push("not_content_indexed");
-    }
-    if v & 0x4000 != 0 {
-        out.push("encrypted");
-    }
-    out
+/// `FileAttributes` bits and their names.
+const FILE_ATTRIBUTE_NAMES: &[(u32, &str)] = &[
+    (0x0001, "readonly"),
+    (0x0002, "hidden"),
+    (0x0004, "system"),
+    (0x0010, "directory"),
+    (0x0020, "archive"),
+    (0x0080, "normal"),
+    (0x0100, "temporary"),
+    (0x0200, "sparse"),
+    (0x0400, "reparse_point"),
+    (0x0800, "compressed"),
+    (0x1000, "offline"),
+    (0x2000, "not_content_indexed"),
+    (0x4000, "encrypted"),
+];
+
+/// The names of the bits of `v` set in `names`, in table order.
+fn bit_names(v: u32, names: &[(u32, &'static str)]) -> Vec<&'static str> {
+    names
+        .iter()
+        .filter(|&&(bit, _)| v & bit != 0)
+        .map(|&(_, name)| name)
+        .collect()
 }
 
 /// Read a SHLLINK StringData (`u16 length` + N×byte content).
 /// Returns `(decoded, next_offset)`. The length is in characters,
 /// not bytes — multiply by 2 for the unicode case.
 fn read_stringdata(bytes: &[u8], offset: usize, is_unicode: bool) -> Option<(String, usize)> {
-    let len_chars = bytes_at::u16_le(bytes, offset)? as usize;
+    let len_chars = usize::from(crate::bytes::u16_le(bytes, offset)?);
     let body_start = offset + 2;
     let byte_len = if is_unicode { len_chars * 2 } else { len_chars };
     let body_end = body_start.checked_add(byte_len)?;
@@ -617,7 +537,7 @@ fn read_stringdata(bytes: &[u8], offset: usize, is_unicode: bool) -> Option<(Str
     // CVE-2025-9491-style argument-padding obfuscation, which the
     // whitespace metrics are specifically designed to catch.
     let decoded = if is_unicode {
-        bytes_at::utf16_lossy(body, bytes_at::Endian::Little)
+        crate::bytes::utf16_lossy(body, crate::bytes::Endian::Little)
     } else {
         String::from_utf8_lossy(body).into_owned()
     };
@@ -628,33 +548,44 @@ fn read_stringdata(bytes: &[u8], offset: usize, is_unicode: bool) -> Option<(Str
 /// at `offset`. Stops at the first 0-word.
 fn read_utf16le_string(bytes: &[u8], offset: usize, len: usize) -> Option<String> {
     let slice = bytes.get(offset..offset.checked_add(len)?)?;
-    let s = bytes_at::utf16_lossy(bytes_at::utf16_until_nul(slice), bytes_at::Endian::Little)
-        .trim()
-        .to_string();
+    let s = crate::bytes::utf16_lossy(
+        crate::bytes::utf16_until_nul(slice),
+        crate::bytes::Endian::Little,
+    )
+    .trim()
+    .to_string();
     (!s.is_empty()).then_some(s)
 }
 
 /// Read a fixed-length ANSI NUL-terminated string.
 fn read_fixed_ansi(bytes: &[u8], offset: usize, len: usize) -> Option<String> {
-    let slice = bytes.get(offset..offset + len)?;
+    let slice = bytes.get(offset..offset.checked_add(len)?)?;
     let text = slice.split(|b| *b == 0).next().unwrap_or_default();
     let s = String::from_utf8_lossy(text).trim().to_string();
     (!s.is_empty()).then_some(s)
 }
 
-/// Read either an ANSI field or its Unicode counterpart that
-/// occupies higher offsets in the same block. Prefer the Unicode
-/// version when present.
-fn read_ansi_or_unicode_pair(
+/// Publish the target an EnvironmentVariable, Darwin or IconEnvironment
+/// block at file offset `block_offset` carries: a 260-byte ANSI field at +8
+/// and its 520-byte Unicode counterpart at +268, the Unicode one preferred
+/// when present. Its file offset goes to `offset_key`.
+fn put_target_string(
     block: &[u8],
-    ansi_off: usize,
-    uni_off: usize,
-    ansi_len: usize,
-    uni_len: usize,
-) -> Option<(String, usize)> {
-    read_utf16le_string(block, uni_off, uni_len)
-        .map(|s| (s, uni_off))
-        .or_else(|| read_fixed_ansi(block, ansi_off, ansi_len).map(|s| (s, ansi_off)))
+    block_offset: usize,
+    values: &mut Values,
+    key: ValueKey,
+    offset_key: ValueKey,
+) {
+    const ANSI: (usize, usize) = (8, 260);
+    const UNICODE: (usize, usize) = (268, 520);
+    let Some((s, at)) = read_utf16le_string(block, UNICODE.0, UNICODE.1)
+        .map(|s| (s, UNICODE.0))
+        .or_else(|| read_fixed_ansi(block, ANSI.0, ANSI.1).map(|s| (s, ANSI.0)))
+    else {
+        return;
+    };
+    put_str(values, key, s);
+    put_u64(values, offset_key, (block_offset + at) as u64);
 }
 
 /// Decode a GUID stored as little-endian Data1/Data2/Data3 + raw
@@ -675,7 +606,7 @@ fn derive_mac(guid: &str) -> Option<String> {
     let bytes: Vec<String> = tail
         .as_bytes()
         .chunks(2)
-        .map(|c| String::from_utf8_lossy(c).to_string())
+        .map(|c| String::from_utf8_lossy(c).into_owned())
         .collect();
     Some(bytes.join(":"))
 }
@@ -696,86 +627,79 @@ fn parse_link_info(
     if block.len() < 0x1C {
         return None;
     }
-    let header_size = bytes_at::u32_le(block, 4)? as usize;
-    let link_info_flags = bytes_at::u32_le(block, 8)?;
-    let volume_id_off = bytes_at::u32_le(block, 12)? as usize;
-    let local_base_off = bytes_at::u32_le(block, 16)? as usize;
-    let net_link_off = bytes_at::u32_le(block, 20)? as usize;
-    let common_suffix_off = bytes_at::u32_le(block, 24)? as usize;
+    let field = |at: usize| crate::bytes::u32_le(block, at).map(crate::bytes::sat_usize);
+    let header_size = field(4)?;
+    let link_info_flags = crate::bytes::u32_le(block, 8)?;
+    let volume_id_off = field(12)?;
+    let local_base_off = field(16)?;
+    let net_link_off = field(20)?;
+    let common_suffix_off = field(24)?;
     let (local_base_off_u, common_suffix_off_u) = if header_size >= 0x24 {
-        (
-            bytes_at::u32_le(block, 28).map(|n| n as usize).unwrap_or(0),
-            bytes_at::u32_le(block, 32).map(|n| n as usize).unwrap_or(0),
-        )
+        (field(28).unwrap_or(0), field(32).unwrap_or(0))
     } else {
         (0, 0)
     };
 
     // VolumeIDAndLocalBasePath flag (bit 0).
     let vol = block.get(volume_id_off..).unwrap_or_default();
-    if (link_info_flags & 0x1) != 0 && volume_id_off > 0 && !vol.is_empty() {
-        if vol.len() >= 16 {
-            let drive_type = bytes_at::u32_le(vol, 4).unwrap_or(0);
-            let serial = bytes_at::u32_le(vol, 8).unwrap_or(0);
-            let label_off = bytes_at::u32_le(vol, 12).unwrap_or(0) as usize;
-            let mut volume = serde_json::Map::new();
-            volume.insert(
-                "drive_type".into(),
-                JsonValue::String(drive_type_name(drive_type).to_string()),
-            );
-            volume.insert("serial".into(), json!(serial));
-            // When label_off == 0x14, a Unicode label offset follows
-            // at +0x10 and the ASCII label is empty.
-            let name = if label_off == 0x14 && vol.len() >= 20 {
-                let unicode_off = bytes_at::u32_le(vol, 16).unwrap_or(0) as usize;
-                read_utf16le_cstring(vol, unicode_off).map(|s| (s, unicode_off))
-            } else {
-                read_ansi_cstring(vol, label_off).map(|s| (s, label_off))
-            };
-            if let Some((name, at)) = name.filter(|(s, _)| !s.is_empty()) {
-                volume.insert("name".into(), JsonValue::String(name));
-                volume.insert("name_offset".into(), json!(block_base + volume_id_off + at));
-            }
-            values.insert_key(value_key!("lnk.volume"), JsonValue::Object(volume));
+    if (link_info_flags & 0x1) != 0 && volume_id_off > 0 && vol.len() >= 16 {
+        let drive_type = crate::bytes::u32_le(vol, 4).unwrap_or(0);
+        let serial = crate::bytes::u32_le(vol, 8).unwrap_or(0);
+        let label_off = crate::bytes::sat_usize(crate::bytes::u32_le(vol, 12).unwrap_or(0));
+        let mut volume = serde_json::Map::new();
+        volume.insert(
+            "drive_type".into(),
+            JsonValue::String(drive_type_name(drive_type).to_string()),
+        );
+        volume.insert("serial".into(), json!(serial));
+        // When label_off == 0x14, a Unicode label offset follows
+        // at +0x10 and the ASCII label is empty.
+        let name = if label_off == 0x14 && vol.len() >= 20 {
+            let unicode_off = crate::bytes::sat_usize(crate::bytes::u32_le(vol, 16).unwrap_or(0));
+            read_utf16le_cstring(vol, unicode_off).map(|s| (s, unicode_off))
+        } else {
+            read_ansi_cstring(vol, label_off).map(|s| (s, label_off))
+        };
+        if let Some((name, at)) = name.filter(|(s, _)| !s.is_empty()) {
+            volume.insert("name".into(), JsonValue::String(name));
+            volume.insert("name_offset".into(), json!(block_base + volume_id_off + at));
         }
+        values.insert_key(value_key!("lnk.volume"), JsonValue::Object(volume));
     }
 
     // CommonNetworkRelativeLinkAndPathSuffix flag (bit 1).
     let net = block.get(net_link_off..).unwrap_or_default();
-    if (link_info_flags & 0x2) != 0 && net_link_off > 0 && !net.is_empty() {
-        if net.len() >= 20 {
-            let net_flags = bytes_at::u32_le(net, 4).unwrap_or(0);
-            let net_name_off = bytes_at::u32_le(net, 8).unwrap_or(0) as usize;
-            let device_name_off = bytes_at::u32_le(net, 12).unwrap_or(0) as usize;
-            let provider = bytes_at::u32_le(net, 16).unwrap_or(0);
-            let mut network = serde_json::Map::new();
-            if let Some(name) = read_ansi_cstring(net, net_name_off) {
-                if !name.is_empty() {
-                    network.insert("share".into(), JsonValue::String(name));
-                    network.insert(
-                        "share_offset".into(),
-                        json!(block_base + net_link_off + net_name_off),
-                    );
-                }
-            }
-            // ValidDevice bit (0x1) → DeviceNameOffset is meaningful.
-            if (net_flags & 0x1) != 0 {
-                if let Some(name) = read_ansi_cstring(net, device_name_off) {
-                    if !name.is_empty() {
-                        network.insert("device".into(), JsonValue::String(name));
-                        network.insert(
-                            "device_offset".into(),
-                            json!(block_base + net_link_off + device_name_off),
-                        );
-                    }
-                }
-            }
-            if provider != 0 {
-                network.insert("provider".into(), json!(provider));
-            }
-            if !network.is_empty() {
-                values.insert_key(value_key!("lnk.network"), JsonValue::Object(network));
-            }
+    if (link_info_flags & 0x2) != 0 && net_link_off > 0 && net.len() >= 20 {
+        let net_flags = crate::bytes::u32_le(net, 4).unwrap_or(0);
+        let net_name_off = crate::bytes::sat_usize(crate::bytes::u32_le(net, 8).unwrap_or(0));
+        let device_name_off = crate::bytes::sat_usize(crate::bytes::u32_le(net, 12).unwrap_or(0));
+        let provider = crate::bytes::u32_le(net, 16).unwrap_or(0);
+        let mut network = serde_json::Map::new();
+        if let Some(name) = read_ansi_cstring(net, net_name_off)
+            && !name.is_empty()
+        {
+            network.insert("share".into(), JsonValue::String(name));
+            network.insert(
+                "share_offset".into(),
+                json!(block_base + net_link_off + net_name_off),
+            );
+        }
+        // ValidDevice bit (0x1) → DeviceNameOffset is meaningful.
+        if (net_flags & 0x1) != 0
+            && let Some(name) = read_ansi_cstring(net, device_name_off)
+            && !name.is_empty()
+        {
+            network.insert("device".into(), JsonValue::String(name));
+            network.insert(
+                "device_offset".into(),
+                json!(block_base + net_link_off + device_name_off),
+            );
+        }
+        if provider != 0 {
+            network.insert("provider".into(), json!(provider));
+        }
+        if !network.is_empty() {
+            values.insert_key(value_key!("lnk.network"), JsonValue::Object(network));
         }
     }
 
@@ -828,7 +752,10 @@ fn read_utf16le_cstring(buf: &[u8], offset: usize) -> Option<String> {
         return None;
     }
     let rest = buf.get(offset..).filter(|r| r.len() >= 2)?;
-    bytes_at::utf16_strict(bytes_at::utf16_until_nul(rest), bytes_at::Endian::Little)
+    crate::bytes::utf16_strict(
+        crate::bytes::utf16_until_nul(rest),
+        crate::bytes::Endian::Little,
+    )
 }
 
 /// Minimal IDList walker (MS-SHLLINK §2.2 + MS-SHLLINK Item ID Lists).
@@ -848,8 +775,8 @@ fn walk_id_list(buf: &[u8]) -> Option<(String, usize)> {
     let mut components: Vec<String> = Vec::new();
     let mut drive: Option<(String, usize)> = None;
     let mut anchor: Option<usize> = None;
-    while let Some(size) = bytes_at::u16_le(buf, i) {
-        let size = size as usize;
+    while let Some(size) = crate::bytes::u16_le(buf, i) {
+        let size = usize::from(size);
         if size == 0 {
             break;
         }
@@ -857,11 +784,11 @@ fn walk_id_list(buf: &[u8]) -> Option<(String, usize)> {
             return None;
         }
         let item = buf.get(i + 2..i + size)?;
-        if let Some((c, at)) = parse_id_item(item, i + 2, &mut drive) {
-            if !c.is_empty() {
-                components.push(c);
-                anchor = Some(at);
-            }
+        if let Some((c, at)) = parse_id_item(item, i + 2, &mut drive)
+            && !c.is_empty()
+        {
+            components.push(c);
+            anchor = Some(at);
         }
         i += size;
     }
@@ -933,18 +860,15 @@ fn parse_filesystem_item(item: &[u8]) -> Option<(String, usize)> {
     // Walk past padding to a possible extension block containing the
     // Unicode LongName. The extension chain starts at the first
     // word-aligned offset after the ANSI name terminator.
-    let mut probe = ansi_end + 1;
-    if probe % 2 != 0 {
-        probe += 1;
-    }
+    let mut probe = (ansi_end + 1).next_multiple_of(2);
     while probe + 6 <= item.len() {
         let (Some(ext_size), Some(ext_sig)) = (
-            bytes_at::u16_le(item, probe),
-            bytes_at::u16_le(item, probe + 4),
+            crate::bytes::u16_le(item, probe),
+            crate::bytes::u16_le(item, probe + 4),
         ) else {
             break;
         };
-        let ext_size = ext_size as usize;
+        let ext_size = usize::from(ext_size);
         if ext_size < 6 {
             break;
         }
@@ -962,20 +886,16 @@ fn parse_filesystem_item(item: &[u8]) -> Option<(String, usize)> {
                 if probe + sub + 2 > probe + ext_size {
                     continue;
                 }
-                if let Some(name) = read_utf16le_cstring(ext, sub) {
-                    if !name.is_empty() {
-                        return Some((name, probe + sub));
-                    }
+                if let Some(name) = read_utf16le_cstring(ext, sub)
+                    && !name.is_empty()
+                {
+                    return Some((name, probe + sub));
                 }
             }
         }
         probe += ext_size;
     }
-    if short.is_empty() {
-        None
-    } else {
-        Some((short, name_start))
-    }
+    (!short.is_empty()).then_some((short, name_start))
 }
 
 #[cfg(test)]

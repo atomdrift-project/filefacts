@@ -36,7 +36,8 @@ In scope is anything a hostile input can cause in the library or the
   filefacts itself, such as file hashes, identity or registry data, rather
   than to the file's contents.
 - **Disk cache corruption**: a cache entry that makes a later open return
-  another file's facts.
+  another file's facts, or a cache sweep that deletes a file the cache did
+  not create.
 
 Out of scope:
 

@@ -31,7 +31,9 @@
 use serde_json::Value as JsonValue;
 use std::io::{Read, sink};
 
-use crate::formats::common::bytes_at::u32_le;
+use memchr::memmem;
+
+use crate::bytes::u32_le;
 use crate::metric;
 use crate::output::{Metrics, Values};
 use crate::scan::{classify, entropy};
@@ -45,12 +47,32 @@ const ALIGNMENT_SLACK: u64 = 3;
 /// Unaccounted-for bytes below this are not treated as concealment.
 ///
 /// Formats keep gaining chunk and box types, and a walker will always be a
-/// little behind: PNG's `cICP` is a real, standardised chunk that was simply
-/// missing from the known-types list, and leaving it unclaimed marked shipped
-/// application icons invalid over 16 bytes. Nothing is hidden in 16 bytes, so
-/// a floor here buys resilience to that drift at no detection cost — every
-/// rule that consumes these facts sets its own threshold far above it.
+/// little behind: a newly standardised chunk (PNG's 16-byte `cICP`) that a
+/// walker does not know would otherwise mark ordinary files invalid. Nothing
+/// is hidden in a few dozen bytes, so a floor here buys resilience to that
+/// drift at no detection cost — every rule that consumes these facts sets its
+/// own threshold far above it.
 const CONCEALMENT_FLOOR: u64 = 64;
+
+/// Inflate work, compressed bytes read plus bytes produced, the gzip check
+/// may spend per byte classified. A candidate costs up to its 64 KiB output
+/// cap however few bytes back it, and stored deflate blocks let every
+/// header in a region inflate up to the same far-off error, so per-candidate
+/// caps alone would leave the work quadratic in the region and a thousand
+/// times its size. Real media hold no gzip headers outside a gzip member.
+const GZIP_PROBE_PASSES: u64 = 2;
+
+/// Inflate work the gzip check may spend however short the input: enough
+/// for several whole candidates.
+const GZIP_PROBE_FLOOR: u64 = 1 << 20;
+
+/// The inflate work [`classify_region_within`] may spend on `len` bytes of
+/// regions.
+pub(crate) fn gzip_probe_budget(len: usize) -> u64 {
+    (len as u64)
+        .saturating_mul(GZIP_PROBE_PASSES)
+        .saturating_add(GZIP_PROBE_FLOOR)
+}
 
 /// A region the container's own structure accounts for.
 pub(crate) struct Claim {
@@ -62,24 +84,6 @@ pub(crate) struct Claim {
     /// signatures, but its size is not counted as concealed and readable
     /// text in it is expected rather than reported.
     pub(crate) freeform: bool,
-}
-
-impl Claim {
-    pub(crate) fn new(start: u64, end: u64) -> Self {
-        Self {
-            start,
-            end,
-            freeform: false,
-        }
-    }
-
-    pub(crate) fn freeform(start: u64, end: u64) -> Self {
-        Self {
-            start,
-            end,
-            freeform: true,
-        }
-    }
 }
 
 /// What a container walker found: which format, whether it parsed, and the
@@ -118,11 +122,19 @@ impl Coverage {
     }
 
     pub(crate) fn claim(&mut self, start: u64, end: u64) {
-        self.claims.push(Claim::new(start, end));
+        self.claims.push(Claim {
+            start,
+            end,
+            freeform: false,
+        });
     }
 
     pub(crate) fn claim_freeform(&mut self, start: u64, end: u64) {
-        self.claims.push(Claim::freeform(start, end));
+        self.claims.push(Claim {
+            start,
+            end,
+            freeform: true,
+        });
     }
 
     pub(crate) fn problem(&mut self, what: impl Into<String>) {
@@ -142,8 +154,11 @@ pub(crate) fn emit(bytes: &[u8], coverage: &Coverage, values: &mut Values, metri
     let mut stowaway_entropy: f64 = 0.0;
     let mut trailing_content_kind = None;
     let mut problems = coverage.problems.clone();
+    // One budget across every region: freeform claims can number one per
+    // few bytes of the file.
+    let mut gzip_budget = gzip_probe_budget(bytes.len());
 
-    let mut note = |region: &[u8], counted: bool, allow_text: bool, out: &mut Vec<&'static str>| {
+    let mut note = |region: &[u8], counted: bool, allow_text: bool| {
         if region.is_empty() {
             return None;
         }
@@ -151,11 +166,11 @@ pub(crate) fn emit(bytes: &[u8], coverage: &Coverage, values: &mut Values, metri
             stowaway_bytes = stowaway_bytes.saturating_add(region.len() as u64);
             stowaway_entropy = stowaway_entropy.max(entropy::shannon(region));
         }
-        let kind = classify_region(region);
+        let kind = classify_region_within(region, &mut gzip_budget);
         if let Some(kind) = kind {
             let expected_text = !allow_text && matches!(kind, "text" | "base64" | "high_entropy");
-            if !expected_text && !out.contains(&kind) {
-                out.push(kind);
+            if !expected_text && !stowaway.contains(&kind) {
+                stowaway.push(kind);
             }
         }
         kind
@@ -171,7 +186,7 @@ pub(crate) fn emit(bytes: &[u8], coverage: &Coverage, values: &mut Values, metri
             continue;
         };
         if let Some(region) = bytes.get(a..b.min(bytes.len())) {
-            note(region, false, false, &mut stowaway);
+            note(region, false, false);
         }
     }
 
@@ -208,7 +223,7 @@ pub(crate) fn emit(bytes: &[u8], coverage: &Coverage, values: &mut Values, metri
             };
             if let Some(region) = bytes.get(a..b.min(bytes.len())) {
                 gap_bytes = gap_bytes.saturating_add(region.len() as u64);
-                note(region, true, true, &mut stowaway);
+                note(region, true, true);
             }
         }
         covered_to = covered_to.max(end);
@@ -226,7 +241,7 @@ pub(crate) fn emit(bytes: &[u8], coverage: &Coverage, values: &mut Values, metri
             return;
         };
         if let Some(region) = bytes.get(a..b.min(bytes.len())) {
-            trailing_content_kind = note(region, true, true, &mut stowaway);
+            trailing_content_kind = note(region, true, true);
         }
         // `logical_end` is the extent accounted for by the parser. A
         // failed walk does not establish that a real trailer was reached.
@@ -268,12 +283,7 @@ pub(crate) fn emit(bytes: &[u8], coverage: &Coverage, values: &mut Values, metri
     if !stowaway.is_empty() {
         values.insert_key(
             value_key!("media.stowaway"),
-            JsonValue::Array(
-                stowaway
-                    .iter()
-                    .map(|s| JsonValue::String((*s).to_string()))
-                    .collect(),
-            ),
+            JsonValue::Array(stowaway.iter().map(|&s| JsonValue::from(s)).collect()),
         );
     }
     if !problems.is_empty() {
@@ -291,6 +301,14 @@ pub(crate) fn emit(bytes: &[u8], coverage: &Coverage, values: &mut Values, metri
 /// Identify what a run of bytes is, for regions a container does not account
 /// for. Returns the most specific label that fits, or `None` for bytes with no
 /// recognisable structure.
+pub(crate) fn classify_region(region: &[u8]) -> Option<&'static str> {
+    classify_region_within(region, &mut gzip_probe_budget(region.len()))
+}
+
+/// [`classify_region`], its gzip check spending `gzip_budget`: a caller
+/// classifying many regions of one file shares one budget between them, so
+/// the file's regions together cost what [`gzip_probe_budget`] allows for
+/// the file.
 ///
 /// Signatures are matched anywhere in the region, not only at its start: a
 /// payload is written at whatever offset the appender happened to be at, and
@@ -298,20 +316,20 @@ pub(crate) fn emit(bytes: &[u8], coverage: &Coverage, values: &mut Values, metri
 /// check is anchored enough not to fire on compressed pixel or sample data —
 /// `MZ` alone is two bytes and appears constantly in binary noise, so the DOS
 /// header must also resolve to a real `PE\0\0`, exactly as a loader does.
-pub(crate) fn classify_region(region: &[u8]) -> Option<&'static str> {
+pub(crate) fn classify_region_within(region: &[u8], gzip_budget: &mut u64) -> Option<&'static str> {
     if region.len() < 4 {
         return None;
     }
     if find_pe(region) {
         return Some("pe");
     }
-    // bzip2's `BZh` is three bytes and occurs freely in base64 text (it read a
-    // base64 blob as a bzip2 stream). Require the full stream header: `BZh`,
-    // the block-size digit, and the compressed-block magic.
+    // bzip2's `BZh` is three bytes and occurs freely in base64 text. Require
+    // the full stream header: `BZh`, the block-size digit, and the
+    // compressed-block magic.
     if find_bzip2(region) {
         return Some("bzip2");
     }
-    if find_gzip(region) {
+    if find_gzip(region, gzip_budget) {
         return Some("gzip");
     }
     if find_cab(region) {
@@ -319,7 +337,9 @@ pub(crate) fn classify_region(region: &[u8]) -> Option<&'static str> {
     }
     // `#!/` is likewise short. A shebang only means anything at the start of a
     // line, which is also the only place an interpreter honours it.
-    if starts_line_with(region, b"#!/") {
+    if memmem::find_iter(region, b"#!/")
+        .any(|at| at == 0 || matches!(region.get(at - 1), Some(b'\n' | b'\r')))
+    {
         return Some("shebang");
     }
     for (magic, label) in [
@@ -333,7 +353,7 @@ pub(crate) fn classify_region(region: &[u8]) -> Option<&'static str> {
         (&b"Rar!\x1a\x07"[..], "rar"),
         (&b"\x28\xb5\x2f\xfd"[..], "zstd"),
     ] {
-        if memchr::memmem::find(region, magic).is_some() {
+        if memmem::find(region, magic).is_some() {
             return Some(label);
         }
     }
@@ -356,123 +376,81 @@ pub(crate) fn classify_region(region: &[u8]) -> Option<&'static str> {
 /// Require a fixed header with supported version and bounded container/file
 /// offsets; this identifies a candidate, without claiming full CAB validity.
 fn find_cab(region: &[u8]) -> bool {
-    let mut from = 0usize;
-    while let Some(rel) = region
-        .get(from..)
-        .and_then(|rest| memchr::memmem::find(rest, b"MSCF"))
-    {
-        let at = from + rel;
-        if let Some(rest) = region.get(at..)
-            && let Some(header) = rest.first_chunk::<36>()
-            && header[24..26] == [3, 1]
-            && let Some(size) = u32_le(header, 8)
-            && let Some(files) = u32_le(header, 16)
+    memmem::find_iter(region, b"MSCF").any(|at| {
+        let Some(rest) = region.get(at..) else {
+            return false;
+        };
+        let Some(header) = rest.first_chunk::<36>() else {
+            return false;
+        };
+        let (Some(size), Some(files)) = (u32_le(header, 8), u32_le(header, 16)) else {
+            return false;
+        };
+        header[24..26] == [3, 1]
             && size >= 36
-            && size as usize <= rest.len()
+            && crate::bytes::sat_usize(size) <= rest.len()
             && files >= 36
             && files <= size
-        {
-            return true;
-        }
-        from = at + 4;
-    }
-    false
+    })
 }
 
 /// A DOS header whose `e_lfanew` resolves to the `PE\0\0` signature. This is
 /// the same two-step a Windows loader performs, and it is what separates a
 /// real embedded image from the `MZ` byte pair occurring in media data.
 fn find_pe(region: &[u8]) -> bool {
-    let mut from = 0usize;
-    while let Some(rel) = region
-        .get(from..)
-        .and_then(|rest| memchr::memmem::find(rest, b"MZ"))
-    {
-        let mz = from + rel;
-        if let Some(off) = u32_le(region, mz + 0x3c)
-            && let Some(sig) = mz
-                .checked_add(off as usize)
-                .and_then(|at| region.get(at..at + 4))
-            && sig == b"PE\0\0"
-        {
-            return true;
-        }
-        from = mz + 2;
-    }
-    false
+    memmem::find_iter(region, b"MZ").any(|mz| {
+        u32_le(region, mz + 0x3c)
+            .and_then(|off| mz.checked_add(crate::bytes::sat_usize(off)))
+            .and_then(|at| region.get(at..)?.first_chunk::<4>())
+            == Some(b"PE\0\0")
+    })
 }
 
 /// A complete bzip2 stream header: `BZh` + block size 1-9 + the
 /// `1AY&SY` compressed-block magic that follows it.
 fn find_bzip2(region: &[u8]) -> bool {
-    let mut from = 0usize;
-    while let Some(rel) = region
-        .get(from..)
-        .and_then(|rest| memchr::memmem::find(rest, b"BZh"))
-    {
-        let at = from + rel;
-        if let Some([level, magic @ ..]) = region.get(at + 3..).and_then(<[u8]>::first_chunk::<7>)
-            && level.is_ascii_digit()
-            && *level != b'0'
-            && magic == b"\x31\x41\x59\x26\x53\x59"
-        {
-            return true;
-        }
-        from = at + 3;
-    }
-    false
+    memmem::find_iter(region, b"BZh").any(|at| {
+        matches!(
+            region.get(at + 3..).and_then(<[u8]>::first_chunk::<7>),
+            Some([b'1'..=b'9', magic @ ..]) if magic == b"\x31\x41\x59\x26\x53\x59"
+        )
+    })
 }
 
 /// Validate a gzip member rather than treating its three magic bytes as an
 /// archive. Compressed PNG metadata can contain that triplet by chance. Both
 /// compressed input and produced output are bounded; reaching the output cap
-/// proves a coherent deflate prefix, not a complete member/checksum.
-fn find_gzip(region: &[u8]) -> bool {
+/// proves a coherent deflate prefix, not a complete member/checksum. Each
+/// candidate's input read and output produced are charged to `budget`; once
+/// it is spent, the remaining candidates are not inflated.
+fn find_gzip(region: &[u8], budget: &mut u64) -> bool {
     const INPUT_CAP: usize = 256 * 1024;
     const OUTPUT_CAP: u64 = 64 * 1024;
-    let mut from = 0usize;
-    while let Some(rel) = region
-        .get(from..)
-        .and_then(|rest| memchr::memmem::find(rest, b"\x1f\x8b\x08"))
-    {
-        let at = from + rel;
-        if let Some(rest) = region.get(at..)
-            && let Some([_, _, _, flags, ..]) = rest.first_chunk::<10>()
-            && flags & 0xe0 == 0
-            && let Some(probe) = rest.get(..rest.len().min(INPUT_CAP))
-        {
-            let mut decoded = flate2::read::GzDecoder::new(probe).take(OUTPUT_CAP);
-            if std::io::copy(&mut decoded, &mut sink()).is_ok() {
-                return true;
-            }
+    memmem::find_iter(region, b"\x1f\x8b\x08").any(|at| {
+        let Some(rest) = region.get(at..) else {
+            return false;
+        };
+        let Some([_, _, _, flags, ..]) = rest.first_chunk::<10>() else {
+            return false;
+        };
+        if flags & 0xe0 != 0 {
+            return false;
         }
-        from = at + 3;
-    }
-    false
-}
-
-/// True when `needle` sits at the very start of `region` or immediately after
-/// a newline — the only positions where a shebang is meaningful.
-fn starts_line_with(region: &[u8], needle: &[u8]) -> bool {
-    if region.starts_with(needle) {
-        return true;
-    }
-    let mut from = 0usize;
-    while let Some(rel) = region
-        .get(from..)
-        .and_then(|rest| memchr::memmem::find(rest, needle))
-    {
-        let at = from + rel;
-        if at
-            .checked_sub(1)
-            .and_then(|prev| region.get(prev))
-            .is_some_and(|b| matches!(b, b'\n' | b'\r'))
-        {
-            return true;
+        if *budget == 0 {
+            return false;
         }
-        from = at + 1;
-    }
-    false
+        let probe = rest.get(..rest.len().min(INPUT_CAP)).unwrap_or_default();
+        let mut input = probe;
+        let mut decoded = flate2::read::GzDecoder::new(&mut input).take(OUTPUT_CAP);
+        let valid = std::io::copy(&mut decoded, &mut sink()).is_ok();
+        let produced = OUTPUT_CAP - decoded.limit();
+        let read = (probe.len() - input.len()) as u64;
+        *budget = budget.saturating_sub(read.saturating_add(produced));
+        if *budget == 0 {
+            tracing::debug!(target: "filefacts::carrier", stage = "gzip-probe", offset = at, "gzip probe budget spent; later candidates not inflated");
+        }
+        valid
+    })
 }
 
 /// Fraction of bytes that are printable ASCII or ordinary whitespace.

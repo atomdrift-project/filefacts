@@ -14,7 +14,7 @@
 //!   version words.
 //! - `class.java_version` — derived release label
 //!   (`"1.4"` … `"21"`) for analyst readability.
-//! - `class.access_flags[]` — Pike-style array of class-level
+//! - `class.access_flags[]` — the class-level
 //!   `ACC_*` names (`public`, `final`, `super`, `interface`,
 //!   `abstract`, `synthetic`, `annotation`, `enum`, `module`).
 //! - `class.this_class`, `class.super_class` — fully-qualified
@@ -30,7 +30,7 @@
 use crate::metric;
 use crate::value_key;
 use serde_json::Value as JsonValue;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::bytes::Reader;
 use crate::formats::common::{XorScan, extract_binary_strings, put_str, put_u64};
@@ -118,7 +118,7 @@ pub(super) fn extract(
     }
     let minor_version = u16::from_be_bytes([n0, n1]);
     let major_version = u16::from_be_bytes([j0, j1]);
-    let cp_count = u16::from_be_bytes([c0, c1]) as usize;
+    let cp_count = usize::from(u16::from_be_bytes([c0, c1]));
 
     let mut r = Reader::at(bytes, 10);
     let Some(cp) = parse_constant_pool(&mut r, cp_count) else {
@@ -171,13 +171,11 @@ pub(super) fn extract(
     // Consumers run constant-pool class/string heuristics directly off
     // these facts rather than re-parsing the class. Both are bounded so a
     // hostile constant pool can't bloat the output unboundedly.
-    let mut class_refs: Vec<&str> = cp
+    let class_refs: BTreeSet<&str> = cp
         .class
         .keys()
         .filter_map(|idx| cp.class_name(*idx))
         .collect();
-    class_refs.sort_unstable();
-    class_refs.dedup();
     if !class_refs.is_empty() {
         values.insert_key(
             value_key!("class.class_refs"),
@@ -185,21 +183,19 @@ pub(super) fn extract(
                 class_refs
                     .into_iter()
                     .take(MAX_CP_FACTS)
-                    .map(|s| JsonValue::String(s.to_string()))
+                    .map(JsonValue::from)
                     .collect(),
             ),
         );
     }
-    let mut utf8: Vec<&str> = cp.utf8.values().map(String::as_str).collect();
-    utf8.sort_unstable();
-    utf8.dedup();
+    let utf8: BTreeSet<&str> = cp.utf8.values().map(String::as_str).collect();
     if !utf8.is_empty() {
         values.insert_key(
             value_key!("class.strings"),
             JsonValue::Array(
                 utf8.into_iter()
                     .take(MAX_CP_FACTS)
-                    .map(|s| JsonValue::String(s.to_string()))
+                    .map(JsonValue::from)
                     .collect(),
             ),
         );
@@ -222,23 +218,18 @@ pub(super) fn extract(
     if !flags.is_empty() {
         values.insert_key(
             value_key!("class.access_flags"),
-            JsonValue::Array(
-                flags
-                    .into_iter()
-                    .map(|s| JsonValue::String(s.into()))
-                    .collect(),
-            ),
+            JsonValue::Array(flags.into_iter().map(JsonValue::from).collect()),
         );
     }
     if let Some(name) = cp.class_name(this_idx) {
-        put_str(values, value_key!("class.this_class"), name.to_string());
+        put_str(values, value_key!("class.this_class"), name);
     }
     if let Some(name) = cp.class_name(super_idx) {
-        put_str(values, value_key!("class.super_class"), name.to_string());
+        put_str(values, value_key!("class.super_class"), name);
     }
     let interfaces: Vec<JsonValue> = interface_idx
         .iter()
-        .filter_map(|i| cp.class_name(*i).map(|s| JsonValue::String(s.to_string())))
+        .filter_map(|&i| cp.class_name(i).map(JsonValue::from))
         .collect();
     if !interfaces.is_empty() {
         values.insert_key(value_key!("class.interfaces"), JsonValue::Array(interfaces));
@@ -311,35 +302,22 @@ fn java_version(major: u16) -> Option<&'static str> {
 /// Decompose a class-level `access_flags` field per JVM Spec §4.1
 /// Table 4.1-B.
 fn decode_access_flags(flags: u16) -> Vec<&'static str> {
-    let mut out = Vec::new();
-    if flags & 0x0001 != 0 {
-        out.push("public");
-    }
-    if flags & 0x0010 != 0 {
-        out.push("final");
-    }
-    if flags & 0x0020 != 0 {
-        out.push("super");
-    }
-    if flags & 0x0200 != 0 {
-        out.push("interface");
-    }
-    if flags & 0x0400 != 0 {
-        out.push("abstract");
-    }
-    if flags & 0x1000 != 0 {
-        out.push("synthetic");
-    }
-    if flags & 0x2000 != 0 {
-        out.push("annotation");
-    }
-    if flags & 0x4000 != 0 {
-        out.push("enum");
-    }
-    if flags & 0x8000 != 0 {
-        out.push("module");
-    }
-    out
+    const NAMES: &[(u16, &str)] = &[
+        (0x0001, "public"),
+        (0x0010, "final"),
+        (0x0020, "super"),
+        (0x0200, "interface"),
+        (0x0400, "abstract"),
+        (0x1000, "synthetic"),
+        (0x2000, "annotation"),
+        (0x4000, "enum"),
+        (0x8000, "module"),
+    ];
+    NAMES
+        .iter()
+        .filter(|&&(bit, _)| flags & bit != 0)
+        .map(|&(_, name)| name)
+        .collect()
 }
 
 #[derive(Default)]
@@ -362,7 +340,7 @@ fn parse_attributes(r: &mut Reader<'_>, cp: &ConstantPool) -> ClassAttributes {
         let Some(name_idx) = r.u16_be() else {
             return out;
         };
-        let Some(length) = r.u32_be().map(|v| v as usize) else {
+        let Some(length) = r.u32_be().map(crate::bytes::sat_usize) else {
             return out;
         };
         let Some(body) = r.bytes(length) else {
@@ -468,27 +446,23 @@ fn populate_imports(
     // import; tooling matching against superclass-of-X queries gets
     // the data through the same view.
     let mut class_count: u32 = 0;
-    let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-    for (&idx, _) in &cp.class {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for (&idx, name_idx) in &cp.class {
         if idx == this_idx {
             continue;
         }
-        let Some(name) = cp.class_name(idx) else {
+        let Some(name) = cp.utf8.get(name_idx) else {
             continue;
         };
         if !seen.insert(name) {
             continue;
         }
         symbols_out.push(crate::Symbol::Import {
-            name: name.to_string(),
+            name: name.clone(),
             alias: None,
             library: None,
             // Anchored at the class name's string in the constant pool.
-            offset: cp
-                .class
-                .get(&idx)
-                .and_then(|n| cp.utf8_offset.get(n))
-                .copied(),
+            offset: cp.utf8_offset.get(name_idx).copied(),
             ordinal: None,
         });
         class_count = class_count.saturating_add(1);
@@ -538,7 +512,7 @@ fn skip_attributes(r: &mut Reader<'_>) -> Option<()> {
     let count = r.u16_be()?;
     for _ in 0..count {
         r.skip(2)?;
-        let len = r.u32_be()? as usize;
+        let len = crate::bytes::sat_usize(r.u32_be()?);
         r.skip(len)?;
     }
     Some(())
@@ -553,7 +527,7 @@ fn parse_constant_pool(r: &mut Reader<'_>, count: usize) -> Option<ConstantPool>
         let tag = r.u8()?;
         match tag {
             CP_UTF8 => {
-                let len = r.u16_be()? as usize;
+                let len = usize::from(r.u16_be()?);
                 let offset = r.pos();
                 let s = String::from_utf8_lossy(r.bytes(len)?).into_owned();
                 cp.utf8.insert(slot, s);

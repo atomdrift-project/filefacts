@@ -23,7 +23,7 @@ pub(super) fn vbs_line(line: &[u8]) -> Grade {
         _ => {}
     }
     let mut best = Grade::None;
-    for stmt in vbs_statements(line) {
+    for stmt in (VbsStatements { rest: Some(line) }) {
         best = best.max(vbs_statement(stmt.trim_ascii()));
         if best == Grade::Strong {
             break;
@@ -32,11 +32,8 @@ pub(super) fn vbs_line(line: &[u8]) -> Grade {
     best
 }
 
-/// Split on the `:` statement separator, outside strings, up to a `'` comment.
-fn vbs_statements(line: &[u8]) -> VbsStatements<'_> {
-    VbsStatements { rest: Some(line) }
-}
-
+/// The statements of a line: split on the `:` separator, outside strings, up
+/// to a `'` comment.
 struct VbsStatements<'a> {
     rest: Option<&'a [u8]>,
 }

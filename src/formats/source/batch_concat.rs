@@ -15,8 +15,8 @@ struct Stats {
     limited: bool,
 }
 
-pub(super) fn emit(source: &str, metrics: &mut Metrics) {
-    let stats = analyze(source);
+pub(super) fn emit(lines: &Result<Lines<'_>, Unmodelled>, metrics: &mut Metrics) {
+    let stats = analyze(lines);
     metrics.insert(
         metric!("source.batch.unbounded_snapshot_concat_loops"),
         stats.loops as f64,
@@ -34,19 +34,12 @@ pub(super) fn emit(source: &str, metrics: &mut Metrics) {
     }
 }
 
-fn analyze(source: &str) -> Stats {
-    let lines = match Lines::new(source) {
+fn analyze(lines: &Result<Lines<'_>, Unmodelled>) -> Stats {
+    let lines = match lines {
         Ok(lines) => lines,
         Err(why) => {
-            tracing::debug!(
-                target: "filefacts::source",
-                format = "batch",
-                len = source.len(),
-                reason = ?why,
-                "batch concat: file not modelled"
-            );
             return Stats {
-                limited: why == Unmodelled::TooLarge,
+                limited: *why == Unmodelled::TooLarge,
                 ..Stats::default()
             };
         }
@@ -71,6 +64,12 @@ fn analyze(source: &str) -> Stats {
     stats
 }
 
+/// Longest command line cmd.exe runs, in characters after expansion; a
+/// longer one fails with "The input line is too long".
+const MAX_COMMAND_LINE: usize = 8191;
+
+/// `text` with its `%name%` references expanded from `env`, or `None` when
+/// one is unset or the result is longer than [`MAX_COMMAND_LINE`].
 fn expand(text: &str, env: &HashMap<String, String>) -> Option<String> {
     let mut result = String::new();
     let mut rest = text;
@@ -80,9 +79,12 @@ fn expand(text: &str, env: &HashMap<String, String>) -> Option<String> {
         let end = rest.find('%')?;
         result.push_str(env.get(&rest[..end].to_ascii_lowercase())?);
         rest = &rest[end + 1..];
+        if result.len() > MAX_COMMAND_LINE {
+            return None;
+        }
     }
     result.push_str(rest);
-    Some(result)
+    (result.len() <= MAX_COMMAND_LINE).then_some(result)
 }
 
 fn path(text: &str) -> Option<String> {
@@ -103,9 +105,8 @@ fn path(text: &str) -> Option<String> {
     if unc {
         text.insert(0, '\\');
     }
-    while let Some(rest) = text.strip_prefix(".\\") {
-        text = rest.to_string();
-    }
+    let current_dir = text.len() - text.trim_start_matches(".\\").len();
+    text.drain(..current_dir);
     Some(text)
 }
 

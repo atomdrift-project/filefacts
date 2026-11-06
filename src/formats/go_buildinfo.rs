@@ -47,7 +47,7 @@
 
 use serde_json::{Map, Value as JsonValue};
 
-use crate::formats::common::bytes_at::u32_le;
+use crate::bytes::u32_le;
 use crate::formats::common::read_uleb128;
 use crate::output::{ValueKey, Values};
 
@@ -57,6 +57,10 @@ const MAGIC: &[u8] = b"\xff Go buildinf:";
 /// linker writes them and `debug/buildinfo` reads them.
 const ALIGN: usize = 16;
 const HEADER_LEN: usize = 32;
+
+/// Header flag: the version and modinfo strings follow the header inline
+/// (Go 1.18+) rather than behind pointers.
+const FLAG_INLINE_STRINGS: u8 = 0x2;
 
 /// `dep` / `=>` records kept from one modinfo blob. Real binaries list a
 /// few hundred (Kubernetes about a thousand); each six-byte `dep\tA` line
@@ -80,52 +84,6 @@ pub(super) struct GoSections<'a> {
     /// Read-only data section bytes (`.rodata` / `__const` / `.rdata`),
     /// scanned for the `Go build ID: "…"` linker marker as a fallback.
     pub rodata: Option<&'a [u8]>,
-}
-
-/// Go `pclntab` header magics across releases, little- and big-endian.
-/// Go 1.2/1.16/1.18/1.20 use `0xfffffffb/fa/f0/f1`; the table is laid out in
-/// target byte order, so both orientations are accepted (LE covers
-/// amd64/arm64/386/arm; BE covers s390x/mips/ppc64).
-pub(super) const PCLNTAB_MAGICS: [[u8; 4]; 8] = [
-    [0xfb, 0xff, 0xff, 0xff],
-    [0xfa, 0xff, 0xff, 0xff],
-    [0xf0, 0xff, 0xff, 0xff],
-    [0xf1, 0xff, 0xff, 0xff],
-    [0xff, 0xff, 0xff, 0xfb],
-    [0xff, 0xff, 0xff, 0xfa],
-    [0xff, 0xff, 0xff, 0xf0],
-    [0xff, 0xff, 0xff, 0xf1],
-];
-
-/// True when `data` begins with a recognized Go pclntab magic — proof the
-/// section is a genuine Go function table, not a same-named decoy. A Go
-/// binary skips binform's recovery: its pclntab already provides a complete
-/// function inventory. Validating the magic, not just the section name,
-/// stops a hand-added empty `.gopclntab`/`__gopclntab` from making a stripped
-/// payload look like a Go binary and suppressing deep recovery.
-pub(super) fn has_pclntab_magic(data: &[u8]) -> bool {
-    data.get(..4)
-        .and_then(|m| <[u8; 4]>::try_from(m).ok())
-        .is_some_and(|magic| PCLNTAB_MAGICS.contains(&magic))
-}
-
-/// The PE section Go's `debug/buildinfo` searches: the first one with an
-/// address and a size whose characteristics, alignment aside, are exactly
-/// initialized, readable, writable data.
-pub(super) fn pe_region<'a>(pe: &goblin::pe::PE<'_>, bytes: &'a [u8]) -> Option<&'a [u8]> {
-    const IMAGE_SCN_CNT_INITIALIZED_DATA: u32 = 0x40;
-    const IMAGE_SCN_ALIGN_32BYTES: u32 = 0x60_0000;
-    const IMAGE_SCN_MEM_READ: u32 = 0x4000_0000;
-    const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
-    const DATA: u32 = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE;
-    let section = pe.sections.iter().find(|s| {
-        s.virtual_address != 0
-            && s.size_of_raw_data != 0
-            && s.characteristics & !IMAGE_SCN_ALIGN_32BYTES == DATA
-    })?;
-    let start = crate::bytes::sat_usize(section.pointer_to_raw_data);
-    let end = start.saturating_add(crate::bytes::sat_usize(section.size_of_raw_data));
-    bytes.get(start..end.min(bytes.len()))
 }
 
 /// Decode the build-info blob in `sections.buildinfo` into one object at
@@ -153,7 +111,7 @@ pub(super) fn detect(
     let flags = header[15];
 
     let mut obj = Map::new();
-    if flags & 0x2 != 0 {
+    if flags & FLAG_INLINE_STRINGS != 0 {
         let Some((version, rest)) = read_uvarint_string(payload) else {
             tracing::debug!(
                 target: "filefacts::go_buildinfo",
@@ -306,9 +264,6 @@ fn scan_go_main_root(pclntab: &[u8], go_root: Option<&str>) -> Option<String> {
         }
         candidates.push(s);
     }
-    if candidates.is_empty() {
-        return None;
-    }
     let prefix = longest_common_dir_prefix(&candidates)?;
     (!prefix.is_empty() && prefix != "/").then_some(prefix)
 }
@@ -328,11 +283,11 @@ fn longest_common_dir_prefix(paths: &[&str]) -> Option<String> {
             return None;
         }
     }
-    let cut = first[..max].rfind('/')?;
+    let cut = first.get(..max)?.rfind('/')?;
     Some(if cut == 0 {
         "/".to_string()
     } else {
-        first[..cut].to_string()
+        first.get(..cut)?.to_string()
     })
 }
 
@@ -360,42 +315,41 @@ fn decode_old_format(
     let m_ptr = read_uint(header, 16 + ptr_size, ptr_size, big_endian);
 
     let mut got_version = false;
-    if let Some(version) = read_go_string(bytes, v_ptr, ptr_size, big_endian, resolve_va) {
-        if let Ok(s) = std::str::from_utf8(&version) {
-            out.insert("version".into(), JsonValue::String(s.to_string()));
-            got_version = true;
-        }
+    if let Some(version) = read_go_string(bytes, v_ptr, ptr_size, big_endian, resolve_va)
+        && let Ok(s) = std::str::from_utf8(version)
+    {
+        out.insert("version".into(), JsonValue::String(s.to_string()));
+        got_version = true;
     }
     if let Some(modinfo) = read_go_string(bytes, m_ptr, ptr_size, big_endian, resolve_va) {
-        parse_modinfo(&modinfo, out);
+        parse_modinfo(modinfo, out);
     }
     got_version
 }
 
 /// Follow a Go `string` header at VA `header_va`. Layout:
 /// `{ data: pointer; len: int }`. Returns the string body bytes.
-fn read_go_string(
-    bytes: &[u8],
+fn read_go_string<'a>(
+    bytes: &'a [u8],
     header_va: u64,
     ptr_size: usize,
     big_endian: bool,
     resolve_va: &dyn Fn(u64) -> Option<usize>,
-) -> Option<Vec<u8>> {
+) -> Option<&'a [u8]> {
     let hdr_off = resolve_va(header_va)?;
     if hdr_off.checked_add(2 * ptr_size)? > bytes.len() {
         return None;
     }
     let data_va = read_uint(bytes, hdr_off, ptr_size, big_endian);
     let len = read_uint(bytes, hdr_off + ptr_size, ptr_size, big_endian);
-    // A forged length must not allocate gigabytes; real modinfo blobs are a
-    // few KiB, far under 4 MiB.
+    // At most 4 MiB is read: real modinfo blobs are a few KiB.
     let len = usize::try_from(len).ok()?.min(4 * 1024 * 1024);
     if len == 0 {
-        return Some(Vec::new());
+        return Some(&[]);
     }
     let data_off = resolve_va(data_va)?;
     let end = data_off.checked_add(len)?;
-    Some(bytes.get(data_off..end)?.to_vec())
+    bytes.get(data_off..end)
 }
 
 /// Unsigned read of a `width`-byte (4 or 8) target pointer or `int`; 0 past
@@ -413,17 +367,27 @@ fn read_uint(bytes: &[u8], off: usize, width: usize, big_endian: bool) -> u64 {
 }
 
 /// Parse the modinfo text and fold its records into `out`. Records
-/// are tab-separated; the leading byte sequence written by the Go
-/// runtime to mark the blob in memory is stripped first.
+/// are tab-separated; the byte sequences written by the Go runtime to
+/// mark the blob in memory are stripped first.
 fn parse_modinfo(blob: &[u8], out: &mut Map<String, JsonValue>) {
-    // Trim the 16-byte sentinels the runtime brackets the modinfo
-    // with. Locating the first ASCII `path\t` line is more
-    // forgiving than reproducing the exact sentinel bytes.
-    let start = memchr::memmem::find(blob, b"path\t").unwrap_or(0);
-    let end = blob
-        .iter()
-        .rposition(|&b| b == b'\n')
-        .map_or(blob.len(), |p| p + 1);
+    // The linker brackets the modinfo with 16-byte sentinels, and Go's
+    // `debug/buildinfo` strips them by position: when the byte before the
+    // closing one is a newline, the records are what lies between. Lines
+    // hidden in the sentinels are not records, and a `path` line there
+    // must not replace the real one. Anything else was not written by the
+    // linker; its records run from the first `path\t` line to the last
+    // newline.
+    let framed = blob.len() >= 33 && blob.get(blob.len() - 17) == Some(&b'\n');
+    let (start, end) = if framed {
+        (16, blob.len() - 16)
+    } else {
+        let start = memchr::memmem::find(blob, b"path\t").unwrap_or(0);
+        let end = blob
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(blob.len(), |p| p + 1);
+        (start, end)
+    };
     let text = std::str::from_utf8(blob.get(start..end).unwrap_or(&[]))
         .unwrap_or("")
         .trim_end_matches('\n');
@@ -443,35 +407,12 @@ fn parse_modinfo(blob: &[u8], out: &mut Map<String, JsonValue>) {
                 }
             }
             "mod" => {
-                let mut m = Map::new();
-                if let Some(p) = parts.next() {
-                    m.insert("path".into(), JsonValue::String(p.to_string()));
-                }
-                if let Some(v) = parts.next() {
-                    m.insert("version".into(), JsonValue::String(v.to_string()));
-                }
-                if let Some(s) = parts.next() {
-                    if !s.is_empty() {
-                        m.insert("sum".into(), JsonValue::String(s.to_string()));
-                    }
-                }
-                out.insert("module".into(), JsonValue::Object(m));
+                out.insert("module".into(), JsonValue::Object(module_record(parts)));
             }
             "dep" | "=>" if deps.len() < MAX_DEPS => {
                 // Both `dep\t…` and `=>\t…` (replace directive
                 // target) flow into the same dependency list.
-                let mut d = Map::new();
-                if let Some(p) = parts.next() {
-                    d.insert("path".into(), JsonValue::String(p.to_string()));
-                }
-                if let Some(v) = parts.next() {
-                    d.insert("version".into(), JsonValue::String(v.to_string()));
-                }
-                if let Some(s) = parts.next() {
-                    if !s.is_empty() {
-                        d.insert("sum".into(), JsonValue::String(s.to_string()));
-                    }
-                }
+                let mut d = module_record(parts);
                 if tag == "=>" {
                     d.insert("kind".into(), JsonValue::String("replace".into()));
                 }
@@ -514,18 +455,33 @@ fn parse_modinfo(blob: &[u8], out: &mut Map<String, JsonValue>) {
     }
 }
 
+/// The `path`, `version` and non-empty `sum` fields of a `mod`, `dep` or
+/// `=>` record, as far as the record goes.
+fn module_record<'a>(mut fields: impl Iterator<Item = &'a str>) -> Map<String, JsonValue> {
+    let mut record = Map::new();
+    for key in ["path", "version", "sum"] {
+        let Some(field) = fields.next() else {
+            break;
+        };
+        if key != "sum" || !field.is_empty() {
+            record.insert(key.into(), JsonValue::String(field.to_string()));
+        }
+    }
+    record
+}
+
 /// Tally dependency provenance. A `=>` (replace-directive target) entry
 /// immediately follows the dep it replaces, so a dep with a trailing
 /// replace entry is counted as `replaced`; the replace entry itself is
 /// not counted as its own dependency. Mirrors the buildinfo dep model.
 fn classify_deps(deps: &[JsonValue]) -> (u32, u32, u32, u32) {
     let (mut std, mut thirdparty, mut replaced, mut vendored) = (0u32, 0u32, 0u32, 0u32);
-    let is_replace = |d: &JsonValue| d.get("kind").and_then(|k| k.as_str()) == Some("replace");
+    let is_replace = |d: &JsonValue| d.get("kind").and_then(JsonValue::as_str) == Some("replace");
     for (i, dep) in deps.iter().enumerate() {
         if is_replace(dep) {
             continue; // replacement target — accounted for by its base dep
         }
-        let path = dep.get("path").and_then(|p| p.as_str()).unwrap_or("");
+        let path = dep.get("path").and_then(JsonValue::as_str).unwrap_or("");
         if deps.get(i + 1).is_some_and(is_replace) {
             replaced += 1;
         } else if path.contains("/vendor/") {

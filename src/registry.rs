@@ -232,8 +232,8 @@ pub struct Registry {
     pub maintainers: Option<u32>,
 
     // ── Release history (package-level cadence, derived from the full version
-    // timeline the registry exposes; npm carries it in the packument we already
-    // fetch, PyPI in the package-level `releases` map). Counts and measures are
+    // timeline the registry exposes; npm carries it in the packument, PyPI in
+    // the package-level `releases` map). Counts and measures are
     // projected as metrics so traits can threshold them. ────────────────────
     /// Publish time of the package's *first-ever* release, Unix seconds — the
     /// package's birth, distinct from this version's [`published_at`](Self::published_at). `None`

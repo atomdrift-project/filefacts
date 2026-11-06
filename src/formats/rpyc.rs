@@ -1,11 +1,11 @@
 //! Ren'Py compiled scripts: bounded RPC2 slot and inert pickle inspection.
 use std::collections::HashSet;
-use std::io::{Cursor, Read};
 
 use flate2::bufread::ZlibDecoder;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use super::bounded::{OnError, inflate_capped};
 use crate::error::Error;
 use crate::output::{Metrics, Values};
 use crate::{metric, value_key};
@@ -25,12 +25,6 @@ struct Slot {
 
 fn hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
-}
-
-fn set_fact(fact: &mut Value, key: &str, value: Value) {
-    if let Some(object) = fact.as_object_mut() {
-        object.insert(key.to_owned(), value);
-    }
 }
 
 fn u32_at(bytes: &[u8], pos: usize) -> Result<u32, Error> {
@@ -90,20 +84,24 @@ fn slots(bytes: &[u8]) -> Result<(u8, Vec<Slot>, usize), Error> {
     Ok((2, out, pos))
 }
 
-fn decompress(bytes: &[u8]) -> Result<Vec<u8>, String> {
+/// Inflate one slot to at most `cap` bytes. `Err` carries why it was not
+/// read and the inflated bytes the attempt may have cost, which count toward
+/// the file's total as much as a decoded slot does.
+fn decompress(bytes: &[u8], cap: usize) -> Result<Vec<u8>, (String, usize)> {
     if bytes.len() > MAX_SLOT_BYTES {
-        return Err("compressed slot limit exceeded".into());
+        return Err(("compressed slot limit exceeded".into(), 0));
     }
-    let decoder = ZlibDecoder::new(Cursor::new(bytes));
-    let mut bounded = decoder.take((MAX_SLOT_BYTES + 1) as u64);
-    let mut output = Vec::new();
-    bounded
-        .read_to_end(&mut output)
-        .map_err(|error| format!("zlib decode failed: {error}"))?;
-    if output.len() > MAX_SLOT_BYTES {
-        return Err("decompressed slot limit exceeded".into());
+    let output = inflate_capped(ZlibDecoder::new(bytes), cap as u64, OnError::Discard)
+        .map_err(|error| (format!("zlib decode failed: {error}"), cap))?;
+    if output.truncated {
+        let why = if cap < MAX_SLOT_BYTES {
+            "total decompressed slot limit exceeded"
+        } else {
+            "decompressed slot limit exceeded"
+        };
+        return Err((why.into(), cap));
     }
-    Ok(output)
+    Ok(output.bytes)
 }
 
 pub(super) fn extract(
@@ -116,41 +114,44 @@ pub(super) fn extract(
     let mut selected_sources = Vec::new();
     let mut selected_slot = None;
     let mut total_decoded = 0usize;
+    // Bytes inflated, decoded or refused: what the total cap bounds.
+    let mut total_spent = 0usize;
     let mut source_bytes = 0usize;
     let mut decoded_slots = Vec::new();
     for slot in &slots {
         let raw = bytes
             .get(slot.offset..slot.offset + slot.length)
             .ok_or_else(|| Error::malformed("rpyc", "slot extent outside payload"))?;
-        let mut fact = json!({
-            "number": slot.number,
-            "offset": slot.offset,
-            "compressed_size": slot.length,
-            "compressed_sha256": hash(raw),
-            "compression": "zlib",
-        });
-        match decompress(raw) {
-            Ok(decoded) if decoded.len() <= MAX_TOTAL_DECODED_BYTES - total_decoded => {
+        let mut fact = serde_json::Map::new();
+        fact.insert("number".into(), json!(slot.number));
+        fact.insert("offset".into(), json!(slot.offset));
+        fact.insert("compressed_size".into(), json!(slot.length));
+        fact.insert("compressed_sha256".into(), json!(hash(raw)));
+        fact.insert("compression".into(), json!("zlib"));
+        // Slots may overlap, so every one may name the same small stream
+        // that inflates past the cap: refused slots spend the budget too.
+        let cap = MAX_SLOT_BYTES.min(MAX_TOTAL_DECODED_BYTES - total_spent);
+        match decompress(raw, cap) {
+            Ok(decoded) => {
                 total_decoded += decoded.len();
-                set_fact(&mut fact, "decompressed_size", json!(decoded.len()));
-                set_fact(&mut fact, "decompressed_sha256", json!(hash(&decoded)));
+                total_spent += decoded.len();
+                fact.insert("decompressed_size".into(), json!(decoded.len()));
+                fact.insert("decompressed_sha256".into(), json!(hash(&decoded)));
                 if decoded.starts_with(&[0x80])
                     && let Some(protocol) = decoded.get(1)
                 {
-                    set_fact(&mut fact, "pickle_protocol", json!(protocol));
+                    fact.insert("pickle_protocol".into(), json!(protocol));
                 }
                 let sources = super::pickle::renpy_pycode_sources(&decoded);
-                set_fact(&mut fact, "python_source_count", json!(sources.len()));
+                fact.insert("python_source_count".into(), json!(sources.len()));
                 decoded_slots.push((slot.number, sources));
             }
-            Ok(_) => set_fact(
-                &mut fact,
-                "error",
-                json!("total decompressed slot limit exceeded"),
-            ),
-            Err(error) => set_fact(&mut fact, "error", json!(error)),
+            Err((error, spent)) => {
+                total_spent += spent;
+                fact.insert("error".into(), json!(error));
+            }
         }
-        slot_facts.push(fact);
+        slot_facts.push(Value::Object(fact));
     }
     // Ren'Py loads transformed slot 2 first and falls back to slot 1 only
     // when slot 2 is absent or unreadable. An empty source list in a valid
@@ -181,16 +182,8 @@ pub(super) fn extract(
         .unwrap_or(table_size);
     let trailer = bytes.get(max_end..).unwrap_or_default();
     let trailing = trailer.len();
-    let source_digest_md5_hex = if version == 2 && trailing == 16 {
-        Some(
-            trailer
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>(),
-        )
-    } else {
-        None
-    };
+    let source_digest_md5_hex =
+        (version == 2 && trailing == 16).then(|| super::common::hex_encode(trailer));
     let slot_decode_complete = slot_facts.iter().all(|slot| slot.get("error").is_none());
     let source_count = selected_sources.len();
     values.insert_key(
@@ -206,7 +199,7 @@ pub(super) fn extract(
             "python_source_bytes": source_bytes,
             "python_sources": selected_sources,
             "trailing_bytes": trailing,
-            "trailing_sha256": if trailing == 0 { None } else { Some(hash(trailer)) },
+            "trailing_sha256": (trailing != 0).then(|| hash(trailer)),
             "source_digest_md5_hex": source_digest_md5_hex,
         }),
     );
@@ -217,3 +210,6 @@ pub(super) fn extract(
     metrics.insert(metric!("rpyc.trailing_bytes"), trailing as f64);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

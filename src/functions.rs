@@ -1,12 +1,13 @@
 //! Functions recovered from machine code, and the symbols and metrics they
 //! yield on a binary whose format parser found no function inventory.
 //!
-//! [`binform`] recovers them in-process (its layout tables, the section,
-//! import and export views, each format extractor reads itself; see
-//! `formats::common::layout`). Everything downstream — the `binary.*` metrics, the typed
-//! function and call views, the PE API-hash correlation — reads one
-//! [`Functions`] value.
+//! [`binform`] recovers them in-process from the layout each format
+//! extractor reads once (`formats::common::read_layout`), the same layout
+//! its section, import and export views come from. Everything downstream —
+//! the `binary.*` metrics, the typed function and call views, the PE
+//! API-hash correlation — reads one [`Functions`] value.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -16,7 +17,7 @@ use crate::output::Metrics;
 /// The disk-cache key's part for function recovery. Bump it whenever the
 /// binform commit in Cargo.lock, or what filefacts takes from it, changes:
 /// either changes what a cached extraction holds.
-pub(crate) const POLICY: &str = "binform=v8";
+pub(crate) const POLICY: &str = "binform=v10";
 
 /// Recovered functions, and names for the call targets that are no
 /// recovered function (an import's slot or stub).
@@ -61,7 +62,17 @@ pub(crate) fn recover(image: Option<&binform::Binary<'_>>) -> Option<Native> {
         count(&STATS.unreadable);
         return None;
     };
-    let recovery = binform::recover(image, &binform::Limits::DEFAULT);
+    // A panic here would otherwise discard every other fact about the file.
+    let recovery = match crate::panic_guard::catch_infallible(|| {
+        binform::recover(image, &binform::Limits::DEFAULT)
+    }) {
+        Ok(recovery) => recovery,
+        Err(panic) => {
+            tracing::warn!(%panic, "binform function recovery panicked; functions skipped");
+            count(&STATS.panicked);
+            return None;
+        }
+    };
     if image.arch().is_none() {
         count(&STATS.layout_only);
     } else if recovery.truncated {
@@ -93,14 +104,23 @@ pub(crate) fn recover(image: Option<&binform::Binary<'_>>) -> Option<Native> {
 /// call to the libc `syscall()` wrapper whose number argument is constant.
 fn syscall_facts(image: &binform::Binary<'_>, recovery: &binform::Recovery) -> Vec<SyscallFact> {
     use binform::{Target, Value};
-    let calls = binform::calls(image, recovery);
+    let calls = binform::calls(image, &walkable(recovery));
     // Statically linked binaries reach `connect` through a thin libc wrapper
     // (`mov eax, 42; syscall`), so the sockaddr the program built is at the
     // *caller's* `call`, not at the syscall. Find those wrapper functions —
     // small ones that issue the connect syscall — so a call to one projects as
     // a connect with the caller's arguments, the same as a direct one.
     let connect = image.syscall_number("connect");
-    let wrappers = connect_wrappers(recovery, &calls, connect);
+    let wrappers = match connect {
+        Some(connect) => connect_wrappers(
+            recovery,
+            calls
+                .iter()
+                .filter(|call| call.target == Target::Syscall(Some(connect)))
+                .map(|call| call.addr),
+        ),
+        None => HashSet::new(),
+    };
     let mut facts = Vec::new();
     for call in calls {
         let import = |index: usize| image.imports().get(index).map(|i| i.name.as_str());
@@ -127,10 +147,12 @@ fn syscall_facts(image: &binform::Binary<'_>, recovery: &binform::Recovery) -> V
             // A libc `connect(fd, sockaddr, len)` call: the socket syscall it
             // issues, so its `sockaddr` argument decodes the same as a direct
             // `connect`. The number is the arch's, for a uniform record.
-            Target::Import(index) if import(index) == Some("connect") => {
-                let number = image.syscall_number("connect").unwrap_or_default();
-                (number, Some("connect"), Some("connect"), call.args)
-            }
+            Target::Import(index) if import(index) == Some("connect") => (
+                connect.unwrap_or_default(),
+                Some("connect"),
+                Some("connect"),
+                call.args,
+            ),
             _ => continue,
         };
         facts.push(SyscallFact {
@@ -144,31 +166,68 @@ fn syscall_facts(image: &binform::Binary<'_>, recovery: &binform::Recovery) -> V
     facts
 }
 
+/// Past this many times the code, recovered function extents are clipped
+/// for the call walk; see [`walkable`].
+const MAX_WALK_FACTOR: u64 = 2;
+
+/// `recovery` as binform's call walk should see it. The walk reads each
+/// function linearly over its whole extent, and extents that run on through
+/// tails other functions share can sum to a thousand times the code (an x86
+/// ELF), costing that sum in time and in call records. Past
+/// [`MAX_WALK_FACTOR`], each function is walked only up to the next one's
+/// entry, whose own walk covers the code that follows.
+fn walkable(recovery: &binform::Recovery) -> Cow<'_, binform::Recovery> {
+    let extent = recovery
+        .functions
+        .iter()
+        .fold(0_u64, |sum, function| sum.saturating_add(function.size));
+    if extent <= recovery.code.saturating_mul(MAX_WALK_FACTOR) {
+        return Cow::Borrowed(recovery);
+    }
+    tracing::debug!(
+        target: "filefacts::functions",
+        extent,
+        code = recovery.code,
+        "function extents overlap; call walk clipped at each next entry"
+    );
+    let mut clipped = recovery.clone();
+    let nexts: Vec<Option<u64>> = clipped
+        .functions
+        .iter()
+        .skip(1)
+        .map(|function| Some(function.entry))
+        .chain([None])
+        .collect();
+    for (function, next) in clipped.functions.iter_mut().zip(nexts) {
+        if let Some(gap) = next.and_then(|next| next.checked_sub(function.entry)) {
+            function.size = function.size.min(gap);
+        }
+    }
+    Cow::Owned(clipped)
+}
+
 /// The entries of functions that are thin `connect` syscall wrappers: small
-/// functions that issue the connect syscall. A direct call to one is a connect
-/// call carrying the caller's arguments. The size bound keeps a large function
-/// that merely contains a connect from claiming all its callers.
+/// functions holding one of the connect syscall `sites`. A direct call to one
+/// is a connect call carrying the caller's arguments. The size bound keeps a
+/// large function that merely contains a connect from claiming all its
+/// callers.
 fn connect_wrappers(
     recovery: &binform::Recovery,
-    calls: &[binform::Call],
-    connect: Option<u64>,
+    sites: impl IntoIterator<Item = u64>,
 ) -> HashSet<u64> {
     /// A libc syscall wrapper is a handful of instructions; glibc's `connect`
     /// is ~150 bytes with its cancellation path.
     const MAX_WRAPPER_SIZE: u64 = 512;
-    let Some(connect) = connect else {
-        return HashSet::new();
-    };
+    let functions = &recovery.functions;
     let mut wrappers = HashSet::new();
-    for call in calls {
-        if call.target != binform::Target::Syscall(Some(connect)) {
-            continue;
-        }
-        // The connect syscall sits inside its wrapper, so find the small
-        // function that contains the site (`function()` matches entries only).
-        for function in &recovery.functions {
-            let end = function.entry.wrapping_add(function.size);
-            if (function.entry..end).contains(&call.addr) && function.size <= MAX_WRAPPER_SIZE {
+    for site in sites {
+        // The connect syscall sits inside its wrapper, which starts less
+        // than `MAX_WRAPPER_SIZE` bytes before it; functions are in entry
+        // order, so only those entries are candidates.
+        let first = functions.partition_point(|f| f.entry.saturating_add(MAX_WRAPPER_SIZE) <= site);
+        let last = functions.partition_point(|f| f.entry <= site);
+        for function in functions.get(first..last).unwrap_or_default() {
+            if function.size <= MAX_WRAPPER_SIZE && site - function.entry < function.size {
                 wrappers.insert(function.entry);
             }
         }
@@ -183,8 +242,8 @@ fn connect_wrappers(
 /// past the budget stay unnamed.
 pub(crate) const MAX_RESOLVED_NAME_BYTES: usize = 64 * 1024 * 1024;
 
-/// The name a function without a symbol goes by: rizin's spelling
-/// (`fcn.<hex>`), which cached reports and traits already use.
+/// The name a function without a symbol goes by: `fcn.<entry in hex>`, a
+/// stable spelling traits match on.
 fn anonymous(entry: u64) -> String {
     format!("fcn.{entry:08x}")
 }
@@ -229,8 +288,8 @@ impl Functions {
     /// empty. Returns how many functions it added.
     pub(crate) fn apply(&self, symbols: &mut crate::Symbols, metrics: &mut Metrics) -> u32 {
         use crate::output::{Symbol, SymbolKind};
-        let had_functions = symbols.iter().any(|s| s.kind() == SymbolKind::Function);
-        let had_calls = symbols.iter().any(|s| s.kind() == SymbolKind::Call);
+        let had_functions = crate::formats::common::has_functions(symbols);
+        let had_calls = symbols.iter_kind(SymbolKind::Call).next().is_some();
         let functions = &self.recovery.functions;
         let mut budget = MAX_RESOLVED_NAME_BYTES;
         let mut resolve = |to: u64| -> Option<String> {
@@ -311,12 +370,13 @@ fn emit_metrics(functions: &[binform::Function], metrics: &mut Metrics) {
 }
 
 /// How each recovery ended, process-wide.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Counters {
     recovered: AtomicU64,
     truncated: AtomicU64,
     layout_only: AtomicU64,
     unreadable: AtomicU64,
+    panicked: AtomicU64,
 }
 
 static STATS: Counters = Counters {
@@ -324,92 +384,42 @@ static STATS: Counters = Counters {
     truncated: AtomicU64::new(0),
     layout_only: AtomicU64::new(0),
     unreadable: AtomicU64::new(0),
+    panicked: AtomicU64::new(0),
 };
 
 fn count(counter: &AtomicU64) {
     counter.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Log how each binform recovery ended.
-pub(crate) fn log_stats() {
-    tracing::info!(
-        recovered = STATS.recovered.load(Ordering::Relaxed),
-        truncated = STATS.truncated.load(Ordering::Relaxed),
-        layout_only = STATS.layout_only.load(Ordering::Relaxed),
-        unreadable = STATS.unreadable.load(Ordering::Relaxed),
-        "binform recovery stats"
-    );
+/// How the function recoveries in this process have ended, counted since it
+/// started: for a host's telemetry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RecoveryStats {
+    /// Recoveries that decoded the image's instruction set to completion.
+    pub recovered: u64,
+    /// Recoveries cut short by a work limit.
+    pub truncated: u64,
+    /// Images whose layout was read but whose instruction set is not decoded.
+    pub layout_only: u64,
+    /// Images whose layout could not be read.
+    pub unreadable: u64,
+    /// Recoveries abandoned because binform panicked.
+    pub panicked: u64,
+}
+
+/// How the binform function recoveries in this process have ended so far,
+/// for a host's telemetry.
+#[must_use]
+pub fn recovery_stats() -> RecoveryStats {
+    RecoveryStats {
+        recovered: STATS.recovered.load(Ordering::Relaxed),
+        truncated: STATS.truncated.load(Ordering::Relaxed),
+        layout_only: STATS.layout_only.load(Ordering::Relaxed),
+        unreadable: STATS.unreadable.load(Ordering::Relaxed),
+        panicked: STATS.panicked.load(Ordering::Relaxed),
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn function(entry: u64, blocks: u32, refs: Vec<binform::Ref>) -> binform::Function {
-        let mut function = binform::Function::default();
-        function.entry = entry;
-        function.size = 16;
-        function.blocks = blocks;
-        function.complexity = 1;
-        function.refs = refs;
-        function
-    }
-
-    fn recovery(functions: Vec<binform::Function>) -> binform::Recovery {
-        let mut recovery = binform::Recovery::default();
-        recovery.functions = functions;
-        recovery.code = 100;
-        recovery.covered = 100;
-        recovery
-    }
-
-    #[test]
-    fn calls_are_named_by_import_symbol_or_address() {
-        let call =
-            |from, to| binform::Ref::new(from, binform::Dest::Code(to), binform::RefKind::Call);
-        let mut named = function(0x2000, 1, Vec::new());
-        named.name = Some("helper".into());
-        let caller = function(
-            0x1000,
-            2,
-            vec![
-                call(0x1004, 0x2000),
-                call(0x1008, 0x3000),
-                call(0x100c, 0x9000),
-                call(0x1010, 0x7777),
-            ],
-        );
-        let functions = Functions {
-            recovery: recovery(vec![caller, named, function(0x3000, 1, Vec::new())]),
-            targets: HashMap::from([(0x9000, "connect".to_string())]),
-        };
-        let mut symbols = crate::Symbols::default();
-        let mut metrics = Metrics::default();
-        assert_eq!(functions.apply(&mut symbols, &mut metrics), 3);
-        let first = symbols.iter().next().and_then(|s| match s {
-            crate::output::Symbol::Function { name, callees, .. } => {
-                Some((name.clone(), callees.clone()))
-            }
-            _ => None,
-        });
-        assert_eq!(
-            first,
-            Some((
-                "fcn.00001000".to_string(),
-                vec![
-                    "helper".to_string(),
-                    "fcn.00003000".to_string(),
-                    "connect".to_string()
-                ]
-            ))
-        );
-        assert_eq!(
-            metrics.get_key(&metric!("binary.leaf_function_count")),
-            Some(2.0)
-        );
-        assert_eq!(
-            metrics.get_key(&metric!("binary.tiny_function_count")),
-            Some(2.0)
-        );
-    }
-}
+mod tests;

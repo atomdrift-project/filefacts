@@ -291,10 +291,12 @@ fn entries_out_of_order_are_refused() {
             "{layout:?}"
         );
     }
-    // An end before the last entry is out of order too.
+    // An end before the last entry is out of order too. The span it claims
+    // must cover most of the code to get as far as the walk.
     let table = build(GO120, &FUNCTIONS, TEXT + 0x80);
+    let code = Code::of([(TEXT, 0x100)]).unwrap();
     assert_eq!(
-        read(&table, code(), TEXT).unwrap_err(),
+        read(&table, code, TEXT).unwrap_err(),
         "functab end precedes its last entry"
     );
 }
@@ -475,4 +477,49 @@ fn a_stripped_go_macho_reads_its_functions_from_the_pclntab() {
     let names = go_inventory(&fixture("go-macho-arm64.zst"));
     assert_eq!(names.len(), 1435);
     assert!(names.iter().any(|n| n == "main.main"));
+}
+
+#[test]
+fn pclntab_magic_recognizes_known_versions() {
+    // Go 1.18 (LE) and Go 1.20 (BE) headers, with a plausible tail.
+    assert!(has_magic(&[0xf0, 0xff, 0xff, 0xff, 0, 0, 1, 8]));
+    assert!(has_magic(&[0xff, 0xff, 0xff, 0xf1, 0, 0, 1, 8]));
+    // Go 1.2 / 1.16 little-endian.
+    assert!(has_magic(&[0xfb, 0xff, 0xff, 0xff]));
+    assert!(has_magic(&[0xfa, 0xff, 0xff, 0xff]));
+}
+
+#[test]
+fn pclntab_magic_rejects_decoys_and_short_input() {
+    // A section named like pclntab but without a real magic must NOT pass —
+    // otherwise a decoy could downgrade analysis and hide functions.
+    assert!(!has_magic(b"not a pclntab"));
+    assert!(!has_magic(&[0x00, 0x00, 0x00, 0x00]));
+    assert!(!has_magic(&[0xf0, 0xff, 0xff])); // too short
+    assert!(!has_magic(&[])); // empty
+}
+
+/// The span the functab claims is checked against the code before a single
+/// record is walked: a table whose functions lie outside the code costs no
+/// walk of its records, however many it claims.
+#[test]
+fn the_span_is_checked_before_the_records_are_walked() {
+    let mut table = build(GO120, &FUNCTIONS, END);
+    // Break the first record, which only the walk reads.
+    let record = table.len() - 3 * 8;
+    table[record] ^= 0xff;
+    assert_eq!(
+        read(&table, code(), TEXT).unwrap_err(),
+        "function record disagrees with the functab"
+    );
+    let elsewhere = Code::of([(TEXT + 0x10_0000, 0x1000)]).unwrap();
+    assert_eq!(
+        read(&table, elsewhere, TEXT).unwrap_err(),
+        "functions lie outside the executable code"
+    );
+    let payload = Code::of([(TEXT, 0x10_0000)]).unwrap();
+    assert_eq!(
+        read(&table, payload, TEXT).unwrap_err(),
+        "functions cover too little of the executable code"
+    );
 }

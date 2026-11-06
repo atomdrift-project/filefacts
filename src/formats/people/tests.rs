@@ -1,4 +1,5 @@
 use super::*;
+use crate::value_key;
 
 fn person(name: Option<&str>, email: Option<&str>, url: Option<&str>) -> Person {
     Person {
@@ -77,4 +78,18 @@ fn published_people_drop_empties_and_repeats_and_read_back() {
     let mut empty = Values::new();
     put(&mut empty, key, [Person::default()]);
     assert!(empty.get("npm.maintainers").is_none());
+}
+
+#[test]
+fn put_caps_the_list() {
+    let mut values = Values::new();
+    let crowd = (0..1024).map(|i| Person::parse(&format!("p{i} <p{i}@example.com>")));
+    assert!(put(&mut values, value_key!("npm.maintainers"), crowd));
+    let kept = values
+        .get("npm.maintainers")
+        .and_then(JsonValue::as_array)
+        .map(Vec::len);
+    assert_eq!(kept, Some(MAX_PEOPLE));
+    let repeats = std::iter::repeat_n(Person::parse("a <a@example.com>"), 1024);
+    assert!(!put(&mut values, value_key!("npm.authors"), repeats));
 }

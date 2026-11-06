@@ -26,13 +26,14 @@
 //!   is recorded in `errors` instead.
 
 use super::people::{self, Person};
+use crate::formats::ExtractCtx;
 use crate::metric;
 use serde_json::{Value as JsonValue, json};
 
+use crate::bytes::{sat_usize, u32_be};
 use crate::error::Error;
-use crate::formats::common::bytes_at::u32_be;
 use crate::formats::common::{XorScan, extract_binary_strings, put_str};
-use crate::output::{Errors, Metrics, Stage, Strings, ValueKey, Values};
+use crate::output::{Errors, Metrics, Stage, ValueKey, Values};
 use crate::value_key;
 
 const RPM_LEAD_MAGIC: [u8; 4] = [0xed, 0xab, 0xee, 0xdb];
@@ -68,6 +69,14 @@ mod main_tag {
     pub(super) const PLATFORM: u32 = 1132;
 }
 
+/// Index-entry data types.
+mod data_type {
+    pub(super) const INT32: u32 = 4;
+    pub(super) const STRING: u32 = 6;
+    pub(super) const STRING_ARRAY: u32 = 8;
+    pub(super) const I18NSTRING: u32 = 9;
+}
+
 mod sig_tag {
     pub(super) const DSA: u32 = 267;
     pub(super) const RSA: u32 = 268;
@@ -75,13 +84,14 @@ mod sig_tag {
     pub(super) const GPG: u32 = 1005;
 }
 
-pub(super) fn extract(
-    bytes: &[u8],
-    values: &mut Values,
-    strings: &mut Strings,
-    metrics: &mut Metrics,
-    errors: &mut Errors,
-) -> Result<(), Error> {
+pub(super) fn extract(bytes: &[u8], ctx: ExtractCtx<'_>) -> Result<(), Error> {
+    let ExtractCtx {
+        values,
+        strings,
+        metrics,
+        errors,
+        ..
+    } = ctx;
     extract_binary_strings(bytes, strings, XorScan::No);
 
     if !bytes.starts_with(&RPM_LEAD_MAGIC) {
@@ -92,16 +102,15 @@ pub(super) fn extract(
     // Signature header — record which cryptographic algorithms
     // signed the package. Presence of the array is the "signed"
     // signal.
-    let (sig_entries, _sig_data, sig_total) =
-        match read_header(bytes.get(pos..).unwrap_or_default()) {
-            Ok(header) => header,
-            Err(e) => {
-                e.report("signature-header", values, errors);
-                return Ok(());
-            }
-        };
+    let signature = match read_header(bytes.get(pos..).unwrap_or_default()) {
+        Ok(header) => header,
+        Err(e) => {
+            e.report("signature-header", values, errors);
+            return Ok(());
+        }
+    };
     let mut algos: Vec<&'static str> = Vec::new();
-    for entry in &sig_entries {
+    for entry in &signature.entries {
         if entry.count == 0 {
             continue;
         }
@@ -117,27 +126,17 @@ pub(super) fn extract(
         }
     }
     if !algos.is_empty() {
-        let mut sig = serde_json::Map::new();
-        sig.insert(
-            "algorithms".into(),
-            JsonValue::Array(
-                algos
-                    .into_iter()
-                    .map(|s| JsonValue::String(s.into()))
-                    .collect(),
-            ),
-        );
-        values.insert_key(value_key!("rpm.signature"), JsonValue::Object(sig));
+        values.insert_key(value_key!("rpm.signature"), json!({ "algorithms": algos }));
     }
     // Advance past the signature header and round up to the 8-byte
     // alignment boundary the main header is expected to sit at.
-    // `read_header` bounded `sig_total` by the buffer, so neither step
-    // can overflow.
-    let after_sig = pos + sig_total;
+    // `read_header` bounded the header's length by the buffer, so neither
+    // step can overflow.
+    let after_sig = pos + signature.len;
     pos = after_sig + (8 - (after_sig % 8)) % 8;
 
     // Main header.
-    let (main_entries, main_data, _) = match read_header(bytes.get(pos..).unwrap_or_default()) {
+    let main = match read_header(bytes.get(pos..).unwrap_or_default()) {
         Ok(header) => header,
         Err(e) => {
             e.report("main-header", values, errors);
@@ -148,12 +147,12 @@ pub(super) fn extract(
     // from its last entry: up to a million repeats of a tag pointing into a
     // 16 MiB data store with no terminator otherwise each rescanned it.
     let mut applied = std::collections::HashSet::new();
-    for entry in main_entries.iter().rev() {
+    for entry in main.entries.iter().rev() {
         if applied.insert(entry.tag) {
-            apply_main_tag(entry, main_data, values, metrics);
+            apply_main_tag(entry, main.data, values, metrics);
         }
     }
-    extract_scriptlets(&main_entries, main_data, values)
+    extract_scriptlets(&main.entries, main.data, values)
 }
 
 // RPM tag triplets: body, interpreter argv, processing flags. Triggers use
@@ -192,10 +191,10 @@ fn unique_tag(entries: &[IndexEntry], tag: u32) -> Tag<'_> {
 }
 
 fn script_body<'a>(entry: &IndexEntry, data: &'a [u8]) -> Option<&'a str> {
-    if entry.typ != 6 || entry.count != 1 {
+    if entry.typ != data_type::STRING || entry.count != 1 {
         return None;
     }
-    let bytes = data.get(entry.offset as usize..)?;
+    let bytes = data.get(sat_usize(entry.offset)..)?;
     let end = bytes
         .iter()
         .take(MAX_SCRIPT_BYTES + 1)
@@ -206,16 +205,16 @@ fn script_body<'a>(entry: &IndexEntry, data: &'a [u8]) -> Option<&'a str> {
 fn program_args(entry: &IndexEntry, data: &[u8]) -> Option<Vec<String>> {
     // rpmbuild preserves STRING for a single interpreter for legacy compatibility;
     // STRING_ARRAY is used for interpreter argv. Normalize both to the same view.
-    if !matches!(entry.typ, 6 | 8)
-        || (entry.typ == 6 && entry.count != 1)
+    if !matches!(entry.typ, data_type::STRING | data_type::STRING_ARRAY)
+        || (entry.typ == data_type::STRING && entry.count != 1)
         || entry.count == 0
         || entry.count > MAX_PROGRAM_ARGS
     {
         return None;
     }
-    let rest = data.get(entry.offset as usize..)?;
+    let rest = data.get(sat_usize(entry.offset)..)?;
     let mut rest = rest.get(..MAX_PROGRAM_BYTES).unwrap_or(rest);
-    let mut result = Vec::with_capacity(entry.count as usize);
+    let mut result = Vec::with_capacity(sat_usize(entry.count));
     for _ in 0..entry.count {
         let end = rest.iter().position(|&b| b == 0)?;
         result.push(std::str::from_utf8(rest.get(..end)?).ok()?.to_owned());
@@ -281,11 +280,34 @@ fn extract_scriptlets(
     }
 }
 
+/// Main-header string tags and the value each lands in.
+const STRING_TAGS: [(u32, ValueKey); 19] = [
+    (main_tag::NAME, value_key!("rpm.name")),
+    (main_tag::VERSION, value_key!("rpm.version")),
+    (main_tag::RELEASE, value_key!("rpm.release")),
+    (main_tag::SUMMARY, value_key!("rpm.description")),
+    (main_tag::BUILDHOST, value_key!("rpm.buildhost")),
+    (main_tag::DISTRIBUTION, value_key!("rpm.distribution")),
+    (main_tag::VENDOR, value_key!("rpm.vendor")),
+    (main_tag::LICENSE, value_key!("rpm.license")),
+    (main_tag::GROUP, value_key!("rpm.group")),
+    (main_tag::URL, value_key!("rpm.homepage")),
+    (main_tag::OS, value_key!("rpm.os")),
+    (main_tag::ARCH, value_key!("rpm.arch")),
+    (main_tag::RPMVERSION, value_key!("rpm.rpmversion")),
+    (main_tag::COOKIE, value_key!("rpm.cookie")),
+    (main_tag::SOURCERPM, value_key!("rpm.sourcerpm")),
+    (main_tag::PLATFORM, value_key!("rpm.platform")),
+    (main_tag::PAYLOADFORMAT, value_key!("rpm.payload_format")),
+    (
+        main_tag::PAYLOADCOMPRESSOR,
+        value_key!("rpm.payload_compressor"),
+    ),
+    (main_tag::PAYLOADFLAGS, value_key!("rpm.payload_flags")),
+];
+
 fn apply_main_tag(entry: &IndexEntry, data: &[u8], values: &mut Values, metrics: &mut Metrics) {
     match entry.tag {
-        main_tag::NAME => set_string(values, value_key!("rpm.name"), entry, data),
-        main_tag::VERSION => set_string(values, value_key!("rpm.version"), entry, data),
-        main_tag::RELEASE => set_string(values, value_key!("rpm.release"), entry, data),
         main_tag::EPOCH => set_u32(
             values,
             metrics,
@@ -294,7 +316,6 @@ fn apply_main_tag(entry: &IndexEntry, data: &[u8], values: &mut Values, metrics:
             entry,
             data,
         ),
-        main_tag::SUMMARY => set_string(values, value_key!("rpm.description"), entry, data),
         main_tag::BUILDTIME => set_u32(
             values,
             metrics,
@@ -303,37 +324,18 @@ fn apply_main_tag(entry: &IndexEntry, data: &[u8], values: &mut Values, metrics:
             entry,
             data,
         ),
-        main_tag::BUILDHOST => set_string(values, value_key!("rpm.buildhost"), entry, data),
-        main_tag::DISTRIBUTION => set_string(values, value_key!("rpm.distribution"), entry, data),
-        main_tag::VENDOR => set_string(values, value_key!("rpm.vendor"), entry, data),
-        main_tag::LICENSE => set_string(values, value_key!("rpm.license"), entry, data),
         // `"Name <email>"`, as RPM's own `%packager` macro writes it.
         main_tag::PACKAGER => {
-            let packager = decode_string(entry, data).map(|p| Person::parse(&p));
+            let packager = decode_string(entry, data).map(Person::parse);
             people::put(values, value_key!("rpm.packagers"), packager);
         }
-        main_tag::GROUP => set_string(values, value_key!("rpm.group"), entry, data),
-        main_tag::URL => set_string(values, value_key!("rpm.homepage"), entry, data),
-        main_tag::OS => set_string(values, value_key!("rpm.os"), entry, data),
-        main_tag::ARCH => set_string(values, value_key!("rpm.arch"), entry, data),
-        main_tag::RPMVERSION => set_string(values, value_key!("rpm.rpmversion"), entry, data),
-        main_tag::COOKIE => set_string(values, value_key!("rpm.cookie"), entry, data),
-        main_tag::SOURCERPM => set_string(values, value_key!("rpm.sourcerpm"), entry, data),
-        main_tag::PLATFORM => set_string(values, value_key!("rpm.platform"), entry, data),
-        main_tag::PAYLOADFORMAT => {
-            set_string(values, value_key!("rpm.payload_format"), entry, data)
+        tag => {
+            if let Some(&(_, key)) = STRING_TAGS.iter().find(|(t, _)| *t == tag)
+                && let Some(v) = decode_string(entry, data)
+            {
+                put_str(values, key, v);
+            }
         }
-        main_tag::PAYLOADCOMPRESSOR => {
-            set_string(values, value_key!("rpm.payload_compressor"), entry, data)
-        }
-        main_tag::PAYLOADFLAGS => set_string(values, value_key!("rpm.payload_flags"), entry, data),
-        _ => {}
-    }
-}
-
-fn set_string(values: &mut Values, key: ValueKey, entry: &IndexEntry, data: &[u8]) {
-    if let Some(v) = decode_string(entry, data) {
-        put_str(values, key, v);
     }
 }
 
@@ -355,22 +357,21 @@ fn set_u32(
 /// STRING (type 6) and I18NSTRING (type 9) decode the same way:
 /// NUL-terminated UTF-8 starting at `entry.offset`. Returns `None`
 /// on missing / empty / non-UTF-8 values.
-fn decode_string(entry: &IndexEntry, data: &[u8]) -> Option<String> {
-    if !matches!(entry.typ, 6 | 9) {
+fn decode_string<'a>(entry: &IndexEntry, data: &'a [u8]) -> Option<&'a str> {
+    if !matches!(entry.typ, data_type::STRING | data_type::I18NSTRING) {
         return None;
     }
-    let off = entry.offset as usize;
-    let rest = data.get(off..)?;
+    let rest = data.get(sat_usize(entry.offset)..)?;
     let nul = rest.iter().position(|&b| b == 0)?;
     let s = std::str::from_utf8(rest.get(..nul)?).ok()?;
-    (!s.is_empty()).then(|| s.to_string())
+    (!s.is_empty()).then_some(s)
 }
 
 fn decode_u32(entry: &IndexEntry, data: &[u8]) -> Option<u32> {
-    if entry.typ != 4 || entry.count != 1 {
+    if entry.typ != data_type::INT32 || entry.count != 1 {
         return None;
     }
-    u32_be(data, entry.offset as usize)
+    u32_be(data, sat_usize(entry.offset))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -410,9 +411,14 @@ impl HeaderError {
     }
 }
 
-/// One parsed RPM header: index entries, data store, and the header's
-/// total size in bytes (preamble + index + data store).
-type Header<'a> = (Vec<IndexEntry>, &'a [u8], usize);
+/// One parsed RPM header.
+struct Header<'a> {
+    entries: Vec<IndexEntry>,
+    /// The data store the entries' offsets index.
+    data: &'a [u8],
+    /// Total size in bytes: preamble, index and data store.
+    len: usize,
+}
 
 /// Parse one RPM header (magic + entries + data store).
 fn read_header(slice: &[u8]) -> Result<Header<'_>, HeaderError> {
@@ -446,9 +452,9 @@ fn read_header(slice: &[u8]) -> Result<Header<'_>, HeaderError> {
         )));
     }
     // Within the slice, so the conversions below are lossless.
-    let entries_end = 16 + crate::bytes::sat_usize(index_size);
-    let data_end = crate::bytes::sat_usize(total);
-    let mut entries = Vec::with_capacity(nindex as usize);
+    let entries_end = 16 + sat_usize(index_size);
+    let data_end = sat_usize(total);
+    let mut entries = Vec::with_capacity(sat_usize(nindex));
     for raw in slice
         .get(16..entries_end)
         .unwrap_or_default()
@@ -464,11 +470,11 @@ fn read_header(slice: &[u8]) -> Result<Header<'_>, HeaderError> {
             count: field(12),
         });
     }
-    Ok((
+    Ok(Header {
         entries,
-        slice.get(entries_end..data_end).unwrap_or_default(),
-        data_end,
-    ))
+        data: slice.get(entries_end..data_end).unwrap_or_default(),
+        len: data_end,
+    })
 }
 
 #[cfg(test)]

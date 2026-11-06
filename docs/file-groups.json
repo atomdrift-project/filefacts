@@ -152,7 +152,7 @@
       "elf",
       "pe",
       "ne",
-      "static-lib"
+      "static_lib"
     ],
     "scripts": [
       "shell",

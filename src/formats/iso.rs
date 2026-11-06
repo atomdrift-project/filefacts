@@ -58,15 +58,15 @@ use crate::metric;
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 use std::collections::{HashSet, VecDeque};
 
-use crate::formats::common::bytes_at::{u16_le, u32_be, u32_le};
+use crate::bytes::{u16_le, u32_be, u32_le};
 use crate::output::{ArchiveMember, ArchiveOffsets, ArchiveOwnership, EntryType, Metrics, Values};
-use crate::scan::days_from_civil;
+use crate::time::days_from_civil;
 use crate::value_key;
 
 use super::archive_stats::{
     Agg, ArchiveStats, Reading, Scope, is_executable_extension, is_script_extension, member_value,
 };
-use super::bounded::{MAX_ARCHIVE_MEMBERS, MAX_PATH_BYTES};
+use super::bounded::{MAX_ARCHIVE_MEMBERS, MAX_DIR_BYTES_TOTAL, MAX_DIR_EXTENT, MAX_PATH_BYTES};
 use super::udf;
 
 mod boot;
@@ -93,14 +93,6 @@ const MAX_DEPTH: u32 = 64;
 /// Cap on members surfaced in `iso.files[]`. `iso.file_count` carries the
 /// true count.
 const MAX_SURFACED_FILES: usize = 512;
-/// Cap on a single directory extent read.
-const MAX_DIR_EXTENT: usize = 32 << 20;
-/// Directory-extent bytes read across the whole walk. `visited` keys an
-/// extent on its start and declared length, so records naming one extent
-/// with ever-different lengths, or extents overlapping a sector apart, each
-/// re-read up to `MAX_DIR_EXTENT`: `MAX_DIRS` times the image. Real trees
-/// spend a few hundred bytes per record, far below this for `MAX_ARCHIVE_MEMBERS`.
-const MAX_DIR_BYTES_TOTAL: usize = 128 << 20;
 /// Cap on SUSP continuation-area hops per record.
 const MAX_CE_HOPS: usize = 8;
 /// Continuation-area bytes read for one directory record, across its `CE`
@@ -112,6 +104,8 @@ const MAX_SUSP_BYTES_PER_ENTRY: usize = 64 << 10;
 const MAX_SUSP_BYTES_TOTAL: usize = 64 << 20;
 /// Bytes kept from a Rock Ridge `NM` name, across its continuation entries.
 const MAX_ALT_NAME_LEN: usize = 4096;
+/// Cap on distinct extensions listed in `iso.file_extensions`.
+const MAX_FILE_EXTENSIONS: usize = 128;
 /// Cap on El Torito catalog entries.
 const MAX_BOOT_ENTRIES: usize = 64;
 /// Cap on symlink component bytes reassembled from an `SL` entry.
@@ -336,13 +330,8 @@ fn walk_image(
             .count() as u64;
         if udf_facts.file_count > iso_files {
             anomalies.push("udf-tree-has-extra-files");
-            // A set, not a Vec: both trees can hold MAX_ARCHIVE_MEMBERS entries.
-            let known: std::collections::HashSet<String> =
-                archive_members.iter().map(|m| m.path.clone()).collect();
-            for m in udf_facts.members.drain(..) {
-                if !known.contains(&m.path) {
-                    archive_members.push(m);
-                }
+            if !union_members(archive_members, std::mem::take(&mut udf_facts.members)) {
+                anomalies.push("tree-walk-truncated");
             }
         }
     }
@@ -355,6 +344,24 @@ fn walk_image(
         bytes,
         Some(&pvd),
     );
+}
+
+/// Add the `udf` members whose paths `members` lacks, keeping the whole list
+/// within [`MAX_ARCHIVE_MEMBERS`]. False when the cap left some out.
+fn union_members(members: &mut Vec<ArchiveMember>, udf: Vec<ArchiveMember>) -> bool {
+    // A set, not a Vec: both trees can hold MAX_ARCHIVE_MEMBERS entries.
+    let known: std::collections::HashSet<String> = members.iter().map(|m| m.path.clone()).collect();
+    for m in udf {
+        if known.contains(&m.path) {
+            continue;
+        }
+        if members.len() >= MAX_ARCHIVE_MEMBERS {
+            tracing::debug!(target: "filefacts::iso", stage = "udf-union", cap = MAX_ARCHIVE_MEMBERS, "UDF members past the cap not listed");
+            return false;
+        }
+        members.push(m);
+    }
+    true
 }
 
 /// Emit the facts that don't depend on a successful tree walk, so a
@@ -445,7 +452,7 @@ fn scan_descriptors(bytes: &[u8]) -> Vec<Descriptor<'_>> {
     };
     let read = |sector: usize| -> Option<(Descriptor<'_>, [u8; 5])> {
         let body = sector_at(bytes, sector)?;
-        let ident = body.get(1..6).and_then(|s| <[u8; 5]>::try_from(s).ok())?;
+        let ident = *body.get(1..)?.first_chunk::<5>()?;
         let kind = *body.first()?;
         Some((
             Descriptor {
@@ -616,20 +623,13 @@ fn field(body: &[u8], off: usize, len: usize) -> Vec<u8> {
 /// Decode an identifier field. Joliet descriptors store them as UCS-2BE;
 /// the primary descriptor stores a-characters. Both land as UTF-8 here.
 fn decode_field(raw: &[u8], ucs2: bool) -> String {
-    if raw.is_empty() {
-        return String::new();
-    }
     if ucs2 {
-        decode_ucs2be(raw)
+        crate::bytes::utf16_lossy(raw, crate::bytes::Endian::Big)
+            .trim_end_matches(['\u{0}', ' '])
+            .to_string()
     } else {
         raw.iter().map(|b| char::from(*b)).collect()
     }
-}
-
-fn decode_ucs2be(raw: &[u8]) -> String {
-    crate::bytes::utf16_lossy(raw, crate::bytes::Endian::Big)
-        .trim_end_matches(['\u{0}', ' '])
-        .to_string()
 }
 
 /// Joliet escape sequences select a UCS-2 collection level (ECMA-119
@@ -856,21 +856,21 @@ impl IsoTime {
     /// ECMA-119 §9.1.5 "binary" form used by directory records: years since
     /// 1900 and a quarter-hour GMT offset, seven bytes total.
     fn parse_bin(raw: Option<&[u8]>) -> Option<Self> {
-        let raw = raw?;
-        let b = raw.first_chunk::<7>()?;
-        if b.iter().all(|x| *x == 0) {
+        let raw = raw?.first_chunk::<7>()?;
+        if raw.iter().all(|x| *x == 0) {
             return None;
         }
+        let &[year, month, day, hour, minute, second, offset] = raw;
         Self::assemble(
             [
-                1900 + i64::from(b[0]),
-                i64::from(b[1]),
-                i64::from(b[2]),
-                i64::from(b[3]),
-                i64::from(b[4]),
-                i64::from(b[5]),
+                1900 + i64::from(year),
+                i64::from(month),
+                i64::from(day),
+                i64::from(hour),
+                i64::from(minute),
+                i64::from(second),
             ],
-            i16::from(b[6].cast_signed()),
+            i16::from(offset.cast_signed()),
         )
     }
 
@@ -940,11 +940,9 @@ fn emit_system_area(
 
     if kind == "mbr" || kind == "gpt" {
         let mut parts = Vec::new();
-        for i in 0..4 {
-            let off = 446 + i * 16;
-            let Some(e) = area.get(off..off + 16) else {
-                break;
-            };
+        // The four MBR partition entries; the boot signature check above
+        // means the table is all there.
+        for e in area.get(446..510).unwrap_or_default().as_chunks::<16>().0 {
             let ptype = e.get(4).copied().unwrap_or(0);
             let start = u32_le(e, 8).unwrap_or(0);
             let count = u32_le(e, 12).unwrap_or(0);
@@ -1085,8 +1083,8 @@ impl Walk {
             }
             self.dirs_walked += 1;
 
-            let start = (lba as usize).saturating_mul(SECTOR);
-            let want = (len as usize).min(MAX_DIR_EXTENT);
+            let start = crate::bytes::sat_usize(lba).saturating_mul(SECTOR);
+            let want = crate::bytes::sat_usize(len).min(MAX_DIR_EXTENT);
             if want > self.dir_budget {
                 self.truncated = true;
                 return;
@@ -1116,7 +1114,7 @@ impl Walk {
         let mut out = Vec::new();
         let mut pos = 0_usize;
         while pos < extent.len() {
-            let len = extent.get(pos).copied().unwrap_or(0) as usize;
+            let len = extent.get(pos).copied().map_or(0, usize::from);
             if len == 0 {
                 // Records never straddle a sector; a zero length is the
                 // pad to the next sector boundary.
@@ -1135,7 +1133,7 @@ impl Walk {
             };
             pos += len;
 
-            let name_len = rec.get(32).copied().unwrap_or(0) as usize;
+            let name_len = rec.get(32).copied().map_or(0, usize::from);
             let Some(raw_name) = rec.get(33..33usize.saturating_add(name_len)) else {
                 continue;
             };
@@ -1253,15 +1251,10 @@ impl Walk {
             // SUSP entries have a four-byte header: two-byte signature,
             // length, and version. Record-specific payload begins at byte 4.
             // NM and SL then carry their own flags byte at payload[0]; their
-            // decoders skip that byte themselves. Starting every payload at
-            // byte 5 dropped the first Rock Ridge filename character and also
-            // shifted PX ownership, CE continuation, and SL component fields.
+            // decoders skip that byte themselves.
             let data = rec.get(4..).unwrap_or_default();
             match &sig {
-                b"SP" | b"RR" => self.rock_ridge = true,
-                b"ER" => {
-                    self.rock_ridge = true;
-                }
+                b"SP" | b"RR" | b"ER" => self.rock_ridge = true,
                 b"PX" => {
                     self.rock_ridge = true;
                     // Both-endian fields: LSB first.
@@ -1288,10 +1281,10 @@ impl Walk {
                     else {
                         continue;
                     };
-                    let start = (block as usize)
+                    let start = crate::bytes::sat_usize(block)
                         .saturating_mul(SECTOR)
-                        .saturating_add(off as usize);
-                    let end = start.saturating_add((len as usize).min(SECTOR * 4));
+                        .saturating_add(crate::bytes::sat_usize(off));
+                    let end = start.saturating_add(crate::bytes::sat_usize(len).min(SECTOR * 4));
                     continuation = Some((start, end));
                 }
                 b"ST" => break,
@@ -1347,11 +1340,7 @@ fn decode_symlink(data: &[u8], out: &mut String) {
 /// The version is stripped — it is an artefact of the standard, never part
 /// of the name a user or a loader sees.
 fn decode_name(raw: &[u8], ucs2: bool) -> String {
-    let decoded = if ucs2 {
-        decode_ucs2be(raw)
-    } else {
-        raw.iter().map(|b| char::from(*b)).collect::<String>()
-    };
+    let decoded = decode_field(raw, ucs2);
     let stripped = decoded
         .rsplit_once(';')
         .filter(|(_, ver)| !ver.is_empty() && ver.chars().all(|c| c.is_ascii_digit()))
@@ -1404,8 +1393,8 @@ fn merge_namespaces(entries: Vec<Entry>, anomalies: &mut Vec<&'static str>) -> V
     // How many entries each tree has had on each extent so far.
     let mut links: std::collections::HashMap<(u32, u32, &'static str), usize> =
         std::collections::HashMap::new();
-    // Zero-length files by path. A linear search per file made a tree of
-    // tens of thousands of empty files quadratic.
+    // Zero-length files by path, so a tree of tens of thousands of empty
+    // files is not a linear search per file.
     let mut empty: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
     for e in entries {
@@ -1576,7 +1565,7 @@ fn emit_tree(
         }
         // The distinct extensions present, so a rule can ask about any file
         // kind without this module having to anticipate which ones matter.
-        if !ext.is_empty() && !extensions.iter().any(|e| *e == ext) && extensions.len() < 128 {
+        if !ext.is_empty() && !extensions.contains(&ext) && extensions.len() < MAX_FILE_EXTENSIONS {
             extensions.push(ext);
         }
 
@@ -1699,13 +1688,13 @@ fn file_json(f: &File) -> JsonValue {
 /// than the 8.3 mangle. `INSTALL0` vs `Installer_v1836_x64.exe` is expected;
 /// `readme` vs `invoice.exe` is not.
 fn divergent_names(names: &[(&'static str, String)]) -> bool {
+    // The 8.3 form is a truncation of the long name, optionally with a
+    // generated tail digit; compare on the shared prefix.
     let mut stems = names.iter().map(|(_, n)| {
-        let lower = n.to_ascii_lowercase();
-        let stem = lower
-            .split_once('.')
-            .map_or(lower.clone(), |(s, _)| s.to_string());
-        // The 8.3 form is a truncation of the long name, optionally with a
-        // generated tail digit; compare on the shared prefix.
+        let mut stem = n.to_ascii_lowercase();
+        if let Some(dot) = stem.find('.') {
+            stem.truncate(dot);
+        }
         stem
     });
     let Some(first) = stems.next() else {

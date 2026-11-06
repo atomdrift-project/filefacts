@@ -135,3 +135,74 @@ fn build_constraints_select_members_as_go_build_does() {
             .all(|p| !p.members.iter().any(|m| m == "p/_skip.go"))
     );
 }
+
+/// Each member is parsed once however many variants include it, every
+/// variant's payload flow is reported, and all of them share one step
+/// budget.
+#[test]
+fn members_are_parsed_once_and_flow_shares_one_budget() {
+    let members = [
+        file(
+            "p/a.go",
+            "package p\nimport \"net/http\"\nfunc send(d string){http.Post(u,\"t\",d)}\n",
+        ),
+        file(
+            "p/b.go",
+            "package p\nimport \"os\"\nfunc init(){send(os.Getenv(\"GITHUB_TOKEN\"))}\n",
+        ),
+        file("p/c_linux.go", "package p\nfunc L(){}\n"),
+        file("p/c_windows.go", "package p\nfunc W(){}\n"),
+        file("p/c_darwin.go", "package p\nfunc D(){}\n"),
+        file("p/a_test.go", "package p\nfunc T(){}\n"),
+    ];
+    let parses = crate::formats::source::parse::PARSES.get();
+    let result = context(&members);
+    assert_eq!(
+        crate::formats::source::parse::PARSES.get() - parses,
+        members.len()
+    );
+    assert!(result.packages.len() > 4, "{:?}", result.packages);
+    assert!(!result.truncated);
+    for package in &result.packages {
+        assert_eq!(
+            package
+                .files
+                .iter()
+                .map(|f| f.path.as_str())
+                .collect::<Vec<_>>(),
+            package.members
+        );
+        let b = package.files.iter().find(|f| f.path == "p/b.go").unwrap();
+        assert_eq!(
+            b.facts.get("source.go.initialization_http"),
+            Some(&serde_json::json!(true)),
+            "{package:?}"
+        );
+    }
+    let mut tight = ContextLimits::default();
+    tight.max_flow_steps = 50;
+    let result = go_source_context(&members, Coverage::Complete, &tight, None);
+    assert!(result.truncated);
+    assert!(result.packages.iter().all(|p| p.truncated));
+}
+
+/// Each `// +build` line is one more condition the file must meet, and a
+/// member under the size budget can hold a couple of hundred thousand of
+/// them. Evaluating and dropping the combined constraint must not recurse
+/// once per line.
+#[test]
+fn many_plus_build_lines_do_not_overflow_the_stack() {
+    let lines = 130_000;
+    let source = format!(
+        "{}\npackage p\nfunc F(){{}}\n",
+        "//+build linux\n".repeat(lines)
+    );
+    assert!(source.len() <= ContextLimits::default().max_go_member_bytes);
+    let context = context(&[file("p/a.go", &source)]);
+    assert!(context.unselected.is_empty());
+    let [package] = context.packages.as_slice() else {
+        panic!("one package variant expected: {:?}", context.packages);
+    };
+    assert_eq!(package.members, ["p/a.go"]);
+    assert_eq!(package.platforms, ports(&["linux", "android"]));
+}

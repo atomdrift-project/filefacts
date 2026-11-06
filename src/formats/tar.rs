@@ -75,12 +75,22 @@ pub(super) fn extract(
     // JSON member and an `ArchiveMember`, and a tar of empty files holds one
     // per 512 bytes.
     let mut unlisted: u64 = 0;
+    // A damaged header ends the walk, but the members before it are still
+    // reported; the error is returned after them.
+    let mut walk_error = None;
 
     for entry in archive
         .entries()
         .map_err(|e| Error::malformed_caused_by("tar", e))?
     {
-        let entry = entry.map_err(|e| Error::malformed_caused_by("tar", e))?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                tracing::debug!(target: "filefacts::tar", stage = "entries", listed = members.len(), error = %e, "tar walk stopped at a damaged header");
+                walk_error = Some(Error::malformed_caused_by("tar", e));
+                break;
+            }
+        };
         if members.len() >= MAX_ARCHIVE_MEMBERS {
             unlisted += 1;
             continue;
@@ -150,7 +160,7 @@ pub(super) fn extract(
         limits.push("member-cap", format!("listed {listed} of {total} members"));
         limits.emit(values, value_key!("tar.limits"));
     }
-    Ok(())
+    walk_error.map_or(Ok(()), Err)
 }
 
 fn format_label(file_type: FileType) -> &'static str {

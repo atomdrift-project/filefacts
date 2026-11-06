@@ -1,7 +1,7 @@
 //! Go dependency ownership over supplied members, without filesystem access.
 //! This reconciles declarations, replacements and exact checksums. It does not
 //! compute MVS or assert that a declared minimum is the version actually built.
-use crate::formats::references::go::{source, words};
+use crate::formats::references::go::source;
 use crate::package_context::{ContextLimits, join_relative, member_directory};
 use crate::{RefKind, RefLocator, Reference, Resolution, UnresolvedReason};
 use std::collections::BTreeMap;
@@ -88,18 +88,18 @@ fn reconcile(
             .iter()
             .filter(|r| r.source == source::MOD_REPLACE || r.source == source::WORK_REPLACE)
         {
-            let Some(words) = words(&r.evidence) else {
+            let Some(replaced) = &r.replaces else {
                 return unresolved(reference, UnresolvedReason::Replacement);
             };
-            let Some(split) = words.iter().position(|w| w == "=>") else {
-                return unresolved(reference, UnresolvedReason::Replacement);
-            };
-            if words.first().map(String::as_str) != Some(module)
-                || split == 2 && words.get(1).map(String::as_str) != Some(version)
+            if replaced.module != module
+                || replaced
+                    .version
+                    .as_ref()
+                    .is_some_and(|replaced| replaced != version)
             {
                 continue;
             }
-            matches.push(((*workspace, split == 2), owner.path, r));
+            matches.push(((*workspace, replaced.version.is_some()), owner.path, r));
         }
     }
     matches.sort_by_key(|(priority, _, _)| *priority);

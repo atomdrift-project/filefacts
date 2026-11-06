@@ -52,6 +52,16 @@ use super::visit::{self, NodeIds, Visit};
 /// a usable "pathologically nested" signal.
 pub(super) const MAX_AST_DEPTH: u32 = 1000;
 
+/// Bytes of member paths a file may record: four per source byte, and at
+/// least 1 MiB. Every prefix of a chain is a member of its own, so a chain
+/// of `n` links records about `n / 2` copies of itself; real chains are a
+/// few links deep and stay far below this, while one hundreds of links deep
+/// would otherwise multiply the source a hundredfold. Past the budget no
+/// new member is recorded and `ast.members_capped` is set.
+fn member_byte_budget(source_len: usize) -> usize {
+    source_len.saturating_mul(4).max(1 << 20)
+}
+
 /// Walk `root` for this module alone and emit its symbols and metrics. The
 /// extraction walk in `super::extract` normally collects the [`State`] along
 /// with everything else; this is the path when it did not.
@@ -96,23 +106,24 @@ pub(super) fn finish(
     // CommonJS members: set on `exports`/`module.exports` directly, or
     // through a local alias of either.
     let mut exports = state.exports;
-    let commonjs = matches!(config.lang, Lang::JavaScript | Lang::TypeScript);
-    for bind in state.binds.iter().filter(|_| commonjs) {
-        let Symbol::Bind { target, offset, .. } = bind else {
-            continue;
-        };
-        let member = ["module.exports.", "exports."]
-            .iter()
-            .find_map(|root| target.strip_prefix(root))
-            .or_else(|| {
-                let (root, member) = target.split_once('.')?;
-                state.export_aliases.contains(root).then_some(member)
-            });
-        if let Some(member) = member
-            && !member.is_empty()
-            && !member.contains('.')
-        {
-            exports.entry(member.to_owned()).or_insert(*offset);
+    if config.lang.is_ecmascript() {
+        for bind in &state.binds {
+            let Symbol::Bind { target, offset, .. } = bind else {
+                continue;
+            };
+            let member = ["module.exports.", "exports."]
+                .iter()
+                .find_map(|root| target.strip_prefix(root))
+                .or_else(|| {
+                    let (root, member) = target.split_once('.')?;
+                    state.export_aliases.contains(root).then_some(member)
+                });
+            if let Some(member) = member
+                && !member.is_empty()
+                && !member.contains('.')
+            {
+                exports.entry(member.to_owned()).or_insert(*offset);
+            }
         }
     }
     for b in state.binds {
@@ -139,6 +150,16 @@ pub(super) fn finish(
         });
     }
 
+    if state.members_capped {
+        metrics.insert(metric!("ast.members_capped"), 1.0);
+        tracing::debug!(
+            target: "filefacts::source",
+            lang = config.name(),
+            members = member_count,
+            len = state.member_bytes,
+            "member path budget spent; later member paths omitted"
+        );
+    }
     metrics.insert(metric!("ast.node_count"), state.node_count as f64);
     metrics.insert(metric!("ast.max_depth"), f64::from(state.max_depth));
     // Reaching the recursion cap means the tree (and any member/concat/subscript
@@ -158,33 +179,59 @@ pub(super) fn finish(
         );
     }
     metrics.insert(metric!("ast.call_count"), call_count as f64);
-    if state.max_member_chain_depth > 0 {
-        metrics.insert(
-            metric!("ast.max_member_depth"),
-            f64::from(state.max_member_chain_depth),
-        );
+    if member_count > 0 {
+        metrics.insert(metric!("ast.member_count"), member_count as f64);
     }
+    // A concatenation chain of one term is no chain.
     if state.max_string_concat_chain > 1 {
         metrics.insert(
             metric!("ast.max_concat_chain"),
             f64::from(state.max_string_concat_chain),
         );
     }
-    if state.max_array_literal_length > 0 {
-        metrics.insert(
+    // Counts and maxima, each emitted only when nonzero. `ast.sequence_count`
+    // follows the node-kind-count convention (cf. `ast.member_count` from
+    // `member_expression`).
+    for (key, value) in [
+        (
+            metric!("ast.max_member_depth"),
+            state.max_member_chain_depth,
+        ),
+        (
             metric!("ast.max_array_length"),
-            f64::from(state.max_array_literal_length),
-        );
-    }
-    if state.max_numeric_array_length > 0 {
-        metrics.insert(
+            state.max_array_literal_length,
+        ),
+        (
             metric!("ast.max_numeric_array"),
-            f64::from(state.max_numeric_array_length),
-        );
-    }
-
-    if member_count > 0 {
-        metrics.insert(metric!("ast.member_count"), member_count as f64);
+            state.max_numeric_array_length,
+        ),
+        (metric!("ast.sequence_count"), state.sequence_expr_count),
+        (
+            metric!("ast.identity_function_count"),
+            state.identity_fn_count,
+        ),
+        (
+            metric!("ast.string_return_function_count"),
+            state.string_return_fn_count,
+        ),
+        (metric!("ast.xor_mod_loop_count"), state.xor_mod_loop_count),
+        (
+            metric!("ast.max_numeric_sequence"),
+            state.max_numeric_sequence_length,
+        ),
+        (
+            metric!("ast.const_return_function_count"),
+            state.const_return_fn_count,
+        ),
+        (metric!("ast.self_compare_count"), state.self_compare_count),
+        (
+            metric!("ast.infinite_loop_count"),
+            state.infinite_loop_count,
+        ),
+    ] {
+        if value > 0 {
+            metrics.insert(key, f64::from(value));
+        }
     }
 
     // Per-operator counts: `ast.op.<name>` (e.g. `ast.op.xor`). Raw integer
@@ -204,77 +251,27 @@ pub(super) fn finish(
             metrics.insert(crate::ast_op_density(op), f64::from(*count) / nodes);
         }
     }
-    // `ast.sequence_count` follows the node-kind-count convention (cf.
-    // `ast.member_count` from `member_expression`).
-    if state.sequence_expr_count > 0 {
-        metrics.insert(
-            metric!("ast.sequence_count"),
-            f64::from(state.sequence_expr_count),
-        );
-    }
-    if state.identity_fn_count > 0 {
-        metrics.insert(
-            metric!("ast.identity_function_count"),
-            f64::from(state.identity_fn_count),
-        );
-    }
-    if state.string_return_fn_count > 0 {
-        metrics.insert(
-            metric!("ast.string_return_function_count"),
-            f64::from(state.string_return_fn_count),
-        );
-    }
-    // Scale-invariant companion to `ast.string_return_function_count`: the
-    // fraction of all functions whose body is a single `return "<literal>"`.
-    // A substitution-table decoder is almost entirely such functions; a large
-    // hand-written module has a handful, so the ratio separates them where the
-    // raw count cannot.
-    if state.function_count > 0 && state.string_return_fn_count > 0 {
-        metrics.insert(
+
+    // Scale-invariant companions to the string-return and const-return
+    // counts: the fraction of all functions with that shape. A
+    // substitution-table decoder is almost entirely single
+    // `return "<literal>"` functions, and opaque-padding obfuscation makes
+    // most functions parameterless constant returns; a large hand-written
+    // module has a handful of each, diluted by many real functions, so the
+    // ratio separates them where the raw count cannot.
+    for (key, count) in [
+        (
             metric!("ast.string_return_function_ratio"),
-            f64::from(state.string_return_fn_count) / f64::from(state.function_count),
-        );
-    }
-    if state.xor_mod_loop_count > 0 {
-        metrics.insert(
-            metric!("ast.xor_mod_loop_count"),
-            f64::from(state.xor_mod_loop_count),
-        );
-    }
-    if state.max_numeric_sequence_length > 0 {
-        metrics.insert(
-            metric!("ast.max_numeric_sequence"),
-            f64::from(state.max_numeric_sequence_length),
-        );
-    }
-    if state.const_return_fn_count > 0 {
-        metrics.insert(
-            metric!("ast.const_return_function_count"),
-            f64::from(state.const_return_fn_count),
-        );
-    }
-    // Scale-invariant companion to `ast.const_return_function_count`: the
-    // fraction of all functions that are parameterless constant-return padding.
-    // Opaque-padding obfuscation makes most functions this shape; a normal
-    // large module has many real functions diluting them, so gate on the ratio
-    // (with a count floor) rather than the size-scaling raw count.
-    if state.function_count > 0 && state.const_return_fn_count > 0 {
-        metrics.insert(
+            state.string_return_fn_count,
+        ),
+        (
             metric!("ast.const_return_function_ratio"),
-            f64::from(state.const_return_fn_count) / f64::from(state.function_count),
-        );
-    }
-    if state.self_compare_count > 0 {
-        metrics.insert(
-            metric!("ast.self_compare_count"),
-            f64::from(state.self_compare_count),
-        );
-    }
-    if state.infinite_loop_count > 0 {
-        metrics.insert(
-            metric!("ast.infinite_loop_count"),
-            f64::from(state.infinite_loop_count),
-        );
+            state.const_return_fn_count,
+        ),
+    ] {
+        if state.function_count > 0 && count > 0 {
+            metrics.insert(key, f64::from(count) / f64::from(state.function_count));
+        }
     }
 }
 
@@ -332,20 +329,15 @@ fn subtree_has_mod(node: Node<'_>, source: &str, depth: u32) -> bool {
     if depth == 0 {
         return false;
     }
-    if let Some(op) = node.child_by_field_name("operator") {
-        if let Ok(t) = op.utf8_text(source.as_bytes()) {
-            if canonical_op(t) == Some("mod") {
-                return true;
-            }
-        }
+    if let Some(op) = node.child_by_field_name("operator")
+        && let Ok(t) = op.utf8_text(source.as_bytes())
+        && canonical_op(t) == Some("mod")
+    {
+        return true;
     }
     let mut cur = node.walk();
-    for child in node.named_children(&mut cur) {
-        if subtree_has_mod(child, source, depth - 1) {
-            return true;
-        }
-    }
-    false
+    node.named_children(&mut cur)
+        .any(|child| subtree_has_mod(child, source, depth - 1))
 }
 
 /// The only kinds [`is_infinite_loop`] can accept.
@@ -374,7 +366,7 @@ fn is_identity_function(node: Node<'_>, source: &str) -> bool {
             let id = if p.kind() == "identifier" {
                 p
             } else {
-                first_named_child(p)?
+                p.named_child(0)?
             };
             id.utf8_text(bytes)
                 .ok()
@@ -527,11 +519,13 @@ fn is_infinite_loop(node: Node<'_>, source: &str) -> bool {
     {
         // Only C-style fors have these fields; for-in/for-of lack them too, so
         // require the literal `for (;;)`/`for(;;)` spelling to avoid those.
-        if let Ok(t) = node.utf8_text(bytes) {
-            let head: String = t.chars().take(12).filter(|c| !c.is_whitespace()).collect();
-            return head.starts_with("for(;;)");
-        }
-        return false;
+        return node.utf8_text(bytes).is_ok_and(|t| {
+            t.chars()
+                .take(12)
+                .filter(|c| !c.is_whitespace())
+                .take(7)
+                .eq("for(;;)".chars())
+        });
     }
     if !matches!(
         kind,
@@ -541,7 +535,7 @@ fn is_infinite_loop(node: Node<'_>, source: &str) -> bool {
     }
     let cond = node
         .child_by_field_name("condition")
-        .or_else(|| first_named_child(node));
+        .or_else(|| node.named_child(0));
     let Some(cond) = cond else { return false };
     let Ok(text) = cond.utf8_text(bytes) else {
         return false;
@@ -567,6 +561,10 @@ pub(super) struct State {
     /// `module.exports = api`), so `es.flatmap = …` reads as the export it is.
     export_aliases: HashSet<String>,
     members: BTreeMap<String, u64>,
+    /// Bytes of the paths in `members`; see [`member_byte_budget`].
+    member_bytes: usize,
+    /// A member was left out because `member_bytes` reached its budget.
+    members_capped: bool,
     /// Ids of member/subscript nodes inside a chain whose outermost node
     /// already recorded their paths; the walk skips each as it passes.
     resolved_links: HashSet<usize>,
@@ -639,9 +637,10 @@ impl State {
     /// Record the leaf identifiers a walk found, in source order.
     pub(super) fn add_identifiers(&mut self, found: &[(&str, usize)]) {
         for &(name, offset) in found {
-            self.identifiers
-                .entry(name.to_string())
-                .or_insert(offset as u64);
+            // Most names repeat; copy only the first sighting.
+            if !self.identifiers.contains_key(name) {
+                self.identifiers.insert(name.to_owned(), offset as u64);
+            }
         }
     }
 
@@ -717,33 +716,33 @@ impl State {
         let op_node = ids
             .operator_field
             .and_then(|field| node.child_by_field_id(field));
-        if let Some(op_node) = op_node {
-            if let Ok(op) = op_node.utf8_text(source.as_bytes()) {
-                if let Some(name) = canonical_op(op) {
-                    *self.op_counts.entry(name).or_insert(0) += 1;
-                    // Rolling-XOR decode shape: an `^` whose operand subtree
-                    // contains a `%` (cyclic key index, `data[i] ^ key[i % n]`).
-                    // Recognized across JS / Python / Go without a per-language
-                    // query; emitted as `ast.xor_mod_loop_count`.
-                    if name == "xor" && subtree_has_mod(node, source, 6) {
-                        self.xor_mod_loop_count += 1;
-                    }
+        if let Some(op_node) = op_node
+            && let Ok(op) = op_node.utf8_text(source.as_bytes())
+        {
+            if let Some(name) = canonical_op(op) {
+                *self.op_counts.entry(name).or_insert(0) += 1;
+                // Rolling-XOR decode shape: an `^` whose operand subtree
+                // contains a `%` (cyclic key index, `data[i] ^ key[i % n]`).
+                // Recognized across JS / Python / Go without a per-language
+                // query; emitted as `ast.xor_mod_loop_count`.
+                if name == "xor" && subtree_has_mod(node, source, 6) {
+                    self.xor_mod_loop_count += 1;
                 }
-                // Self-compare: identical left/right operands (`5 - 5`,
-                // `x === x`) — useless arithmetic / opaque predicate. Skip the
-                // NaN idiom `x !== x` (`ne` maps inequality ops to one name).
-                if !matches!(op, "!=" | "!==" | "<>") {
-                    let field = |id: Option<u16>| id.and_then(|id| node.child_by_field_id(id));
-                    if let (Some(l), Some(r)) = (field(ids.left_field), field(ids.right_field)) {
-                        if let (Ok(lt), Ok(rt)) = (
-                            l.utf8_text(source.as_bytes()),
-                            r.utf8_text(source.as_bytes()),
-                        ) {
-                            if lt == rt && !lt.is_empty() {
-                                self.self_compare_count += 1;
-                            }
-                        }
-                    }
+            }
+            // Self-compare: identical left/right operands (`5 - 5`,
+            // `x === x`) — useless arithmetic / opaque predicate. Skip the
+            // NaN idiom `x !== x` (`ne` maps inequality ops to one name).
+            if !matches!(op, "!=" | "!==" | "<>") {
+                let field = |id: Option<u16>| id.and_then(|id| node.child_by_field_id(id));
+                if let (Some(l), Some(r)) = (field(ids.left_field), field(ids.right_field))
+                    && let (Ok(lt), Ok(rt)) = (
+                        l.utf8_text(source.as_bytes()),
+                        r.utf8_text(source.as_bytes()),
+                    )
+                    && lt == rt
+                    && !lt.is_empty()
+                {
+                    self.self_compare_count += 1;
                 }
             }
         }
@@ -868,7 +867,7 @@ impl State {
             self.max_member_chain_depth = depth_n;
         }
         for (level, link) in spine.joints.iter().skip(first).enumerate() {
-            let (true, Some(len)) = (link.link, link.len) else {
+            let Some(len) = link.member_len else {
                 continue;
             };
             let level = u32::try_from(level).unwrap_or(u32::MAX);
@@ -880,6 +879,9 @@ impl State {
             if level > 0 {
                 self.resolved_links.insert(link.id);
             }
+            if self.members_capped {
+                continue;
+            }
             // A path seen more than once keeps its first offset in source
             // order, whichever chain reached it first.
             let Some(prefix) = spine.path.get(..len) else {
@@ -887,7 +889,13 @@ impl State {
             };
             match self.members.get_mut(prefix) {
                 Some(offset) => *offset = (*offset).min(link.offset),
+                None if self.member_bytes.saturating_add(prefix.len())
+                    > member_byte_budget(source.len()) =>
+                {
+                    self.members_capped = true;
+                }
                 None => {
+                    self.member_bytes += prefix.len();
                     self.members.insert(prefix.to_string(), link.offset);
                 }
             }
@@ -910,8 +918,7 @@ impl State {
             // The outer trailing-lambda call records these arguments once.
             return;
         }
-        let callee = config.callee(node).or_else(|| first_named_child(node));
-        let args_node = config.argument_list(node);
+        let callee = config.callee(node).or_else(|| node.named_child(0));
 
         // Ruby stores the receiver beside the method name, rather than inside
         // the callee field. Preserve it: logger.system is not Kernel.system,
@@ -928,36 +935,11 @@ impl State {
             return;
         }
 
-        let mut args: Vec<Arg> = Vec::new();
-        if config.lang == Lang::Zig {
-            // Zig's call_expression grammar exposes the callee as a named
-            // `function` field, but positional arguments are anonymous
-            // expression children (there is no named `arguments` wrapper).
-            // The first named child is the callee; the remaining named
-            // children are the arguments in source order.
-            let callee_start = callee.map(|c| c.start_byte());
-            for arg in node.named_children(scratch) {
-                if Some(arg.start_byte()) == callee_start {
-                    continue;
-                }
-                args.push(build_arg(arg, source, config));
-            }
-        } else if config.arguments_field == "argument" {
-            for arg in node.children_by_field_name(config.arguments_field, scratch) {
-                args.push(build_arg(arg, source, config));
-            }
-        } else if let Some(args_root) = args_node {
-            if config.is_single_argument(args_root) {
-                args.push(build_arg(args_root, source, config));
-            } else {
-                for arg in args_root.named_children(scratch) {
-                    if arg.kind() == "command_argument_sep" || arg.is_extra() {
-                        continue;
-                    }
-                    args.push(build_arg(arg, source, config));
-                }
-            }
-        }
+        let mut args: Vec<Arg> = config
+            .arguments(node)
+            .into_iter()
+            .map(|arg| build_arg(arg, source, config))
+            .collect();
         if config.lang == Lang::Kotlin {
             // A trailing lambda is an additional argument owned by this call,
             // not the value_arguments of a nested call in the lambda body.
@@ -986,7 +968,7 @@ impl State {
             return;
         };
         let offset = target_node.start_byte() as u64;
-        if matches!(config.lang, Lang::JavaScript | Lang::TypeScript) {
+        if config.lang.is_ecmascript() {
             self.record_commonjs_export(&target, value_node, source, offset);
         }
         self.binds.push(Symbol::Bind {
@@ -1146,21 +1128,19 @@ pub(super) fn build_arg(node: Node<'_>, source: &str, config: &LangConfig) -> Ar
     // static values; expansions and unsupported escapes stay expressions.
     if config.lang == Lang::Bash && node.kind() == "concatenation" {
         return static_shell_word(node, source, 0)
-            .map(|value| Arg::String { value })
-            .unwrap_or(Arg::Expression);
+            .map_or(Arg::Expression, |value| Arg::String { value });
     }
     // Constant JS/TS string additions have an exact argument value too.
     // Never coerce numbers, evaluate calls, resolve names or retain a prefix
     // when any part is unknown. This is an iterative, bounded data transform.
-    if matches!(config.lang, Lang::JavaScript | Lang::TypeScript)
+    if config.lang.is_ecmascript()
         && matches!(
             node.kind(),
             "binary_expression" | "parenthesized_expression"
         )
     {
         return static_js_string(node, source, config)
-            .map(|value| Arg::String { value })
-            .unwrap_or(Arg::Expression);
+            .map_or(Arg::Expression, |value| Arg::String { value });
     }
     // PHP (and a few other grammars) wrap each call argument in an `argument`
     // node whose child is the real expression, and PHP double-quoted strings
@@ -1169,27 +1149,21 @@ pub(super) fn build_arg(node: Node<'_>, source: &str, config: &LangConfig) -> Ar
     // would be lost — so `arg: { kind: string, ... }` rules could never match.
     // Descend through these wrappers to the inner value before shaping.
     let mut node = node;
-    while node.kind() == "argument"
-        || (config.lang == Lang::Rust && node.kind() == "reference_expression")
+    while (node.kind() == "argument"
+        || (config.lang == Lang::Rust && node.kind() == "reference_expression"))
+        && let Some(inner) = node.named_child(0)
     {
-        match first_named_child(node) {
-            Some(inner) => node = inner,
-            None => break,
-        }
+        node = inner;
     }
     // PHP double-quoted strings are `encapsed_string` (quoted, so `decode`
     // works) but aren't in `string_kinds`, so shape them as String directly.
     if node.kind() == "encapsed_string" {
-        return match decode_string_literal(node, source, config) {
-            Some(value) => Arg::String { value },
-            None => Arg::Expression,
-        };
+        return decode_string_literal(node, source, config)
+            .map_or(Arg::Expression, |value| Arg::String { value });
     }
     match arg_shape(node, config) {
-        ArgShape::String => match decode_string_literal(node, source, config) {
-            Some(value) => Arg::String { value },
-            None => Arg::Expression,
-        },
+        ArgShape::String => decode_string_literal(node, source, config)
+            .map_or(Arg::Expression, |value| Arg::String { value }),
         ArgShape::Number => match parse_numeric_literal_node(node, source, config) {
             Some((text, value, radix)) => Arg::Number { text, value, radix },
             None => Arg::Expression,
@@ -1356,7 +1330,7 @@ fn parse_numeric_literal_node(
     source: &str,
     config: &LangConfig,
 ) -> Option<(String, i64, u32)> {
-    let text = node.utf8_text(source.as_bytes()).ok()?.to_string();
+    let text = node.utf8_text(source.as_bytes()).ok()?;
     if text.contains('.') {
         return None;
     }
@@ -1373,9 +1347,9 @@ fn parse_numeric_literal_node(
     {
         // Go retains the leading-zero octal spelling (0755), alongside 0o755.
         // Other languages, including Rust, give leading zeroes different semantics.
-        (text.as_str(), 8u32)
+        (text, 8u32)
     } else {
-        (text.as_str(), 10u32)
+        (text, 10u32)
     };
     if config.lang == Lang::Go && !rest.chars().all(|c| c.is_digit(radix) || c == '_') {
         return None;
@@ -1389,7 +1363,7 @@ fn parse_numeric_literal_node(
         return None;
     }
     let value = i64::from_str_radix(&cleaned, radix).ok()?;
-    Some((text, value, radix))
+    Some((text.to_owned(), value, radix))
 }
 
 /// Resolve a callee or member-access node into its static dotted path,
@@ -1462,7 +1436,7 @@ fn part<'t>(
     };
     let text = || node.utf8_text(source.as_bytes()).ok();
     let kind = node.kind();
-    if matches!(config.lang, Lang::JavaScript | Lang::TypeScript)
+    if config.lang.is_ecmascript()
         && matches!(kind, "parenthesized_expression" | "sequence_expression")
     {
         let mut children = super::named_children(node).filter(|child| !child.is_extra());
@@ -1487,7 +1461,7 @@ fn part<'t>(
                 && prefix.kind() == "number"
                 && (config.identifier_kinds.contains(&callee.kind())
                     || config.member_kinds.contains(&callee.kind())
-                    || is_subscript_kind(callee.kind()))
+                    || SUBSCRIPT_KINDS.contains(&callee.kind()))
             {
                 return (Part::Transparent, Some(callee), 1);
             }
@@ -1572,7 +1546,7 @@ fn part<'t>(
         });
         return (part, Some(object), 1);
     }
-    if is_subscript_kind(kind) {
+    if SUBSCRIPT_KINDS.contains(&kind) {
         // First named child is the object; second is the index expression.
         let (Some(object), Some(index)) = (node.named_child(0), node.named_child(1)) else {
             return DYNAMIC;
@@ -1597,7 +1571,7 @@ fn part<'t>(
     if config.call_kinds.contains(&kind) {
         let callee = node
             .child_by_field_name(config.callee_field)
-            .or_else(|| first_named_child(node));
+            .or_else(|| node.named_child(0));
         return match callee {
             Some(callee) => (Part::Call, Some(callee), 1),
             None => DYNAMIC,
@@ -1633,11 +1607,10 @@ enum Fate {
 struct Joint {
     id: usize,
     offset: u64,
-    /// A member access or folded subscript, whose path is a member prefix.
-    link: bool,
-    /// The path length once this joint's part is appended, when every part
-    /// from the root up to it is static: a prefix of [`Spine::path`].
-    len: Option<usize>,
+    /// The path length once this joint's part is appended, a prefix of
+    /// [`Spine::path`], when the joint is a member access or folded subscript
+    /// and every part from the root up to it is static.
+    member_len: Option<usize>,
     fate: Fate,
 }
 
@@ -1710,8 +1683,7 @@ impl Spine {
             joints.push(Joint {
                 id: node.id(),
                 offset: node.start_byte() as u64,
-                link,
-                len: ok.then_some(path.len()),
+                member_len: (link && ok).then_some(path.len()),
                 fate,
             });
         }
@@ -1732,12 +1704,6 @@ impl Spine {
 /// grammars. Generic enough to avoid per-language config: every
 /// supported source language uses one of these stem names for
 /// `obj[idx]`-style access.
-#[inline]
-fn is_subscript_kind(kind: &str) -> bool {
-    SUBSCRIPT_KINDS.contains(&kind)
-}
-
-/// The kinds [`is_subscript_kind`] accepts.
 pub(super) const SUBSCRIPT_KINDS: &[&str] = &[
     "subscript_expression",
     "subscript",
@@ -1768,10 +1734,6 @@ fn assignment_target(node: Node<'_>) -> Option<Node<'_>> {
 fn assignment_value(node: Node<'_>) -> Option<Node<'_>> {
     node.child_by_field_name("right")
         .or_else(|| node.child_by_field_name("value"))
-}
-
-fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
-    node.named_child(0)
 }
 
 fn string_concat_chain_length(node: Node<'_>, config: &LangConfig) -> u32 {

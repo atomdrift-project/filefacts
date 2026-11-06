@@ -1,54 +1,3 @@
-mod filename_tests {
-    use super::super::split_name_version;
-
-    #[test]
-    fn era_conventions_split() {
-        // (filename, name, version) — real release names spanning the eras.
-        for (base, name, version) in [
-            ("wuftpd-10.9.2.tgz", "wuftpd", "10.9.2"),
-            ("sendmail-8.9.1.tgz", "sendmail", "8.9.1"),
-            ("sendmail.8.9.1.tar.gz", "sendmail", "8.9.1"),
-            ("apache_1.3.9.tar.gz", "apache", "1.3.9"),
-            ("bind-4.9.5-P1.tar.gz", "bind", "4.9.5-P1"),
-            ("ncompress-4.2.4.tar.Z", "ncompress", "4.2.4"),
-            ("elm-2.5.8.tar.gz", "elm", "2.5.8"),
-            ("R-4.0.0.tar.gz", "R", "4.0.0"),
-            ("Template-Toolkit-3.102.tar.gz", "Template-Toolkit", "3.102"),
-            ("lodash-4.17.21.tgz", "lodash", "4.17.21"),
-            (
-                "github.com-gorilla-mux-v1.8.1.zip",
-                "github.com-gorilla-mux",
-                "v1.8.1",
-            ),
-            ("2020-vision-1.0.0.tgz", "2020-vision", "1.0.0"),
-        ] {
-            let got = split_name_version(base);
-            assert_eq!(got, Some((name, version)), "split_name_version({base:?})");
-        }
-    }
-
-    #[test]
-    fn date_stamped_dataset_names_shed_the_stamp() {
-        assert_eq!(
-            split_name_version("2026-03-18-big-nunber-v5.0.5.zip"),
-            Some(("big-nunber", "v5.0.5")),
-        );
-    }
-
-    #[test]
-    fn non_conforming_names_yield_nothing() {
-        for base in [
-            "evil.exe",        // not an archive extension
-            "MetaStealer.zip", // no version tail
-            "notes.tar",       // no separator+digit boundary
-            "60d11b7004c80ae17a900094bbddd0a92273167af2b15f7597b9749d1b5edaa2",
-            "backup.tar.gz", // versionless
-        ] {
-            assert_eq!(split_name_version(base), None, "{base:?} must not split");
-        }
-    }
-}
-
 mod go_module_identity_tests {
     use super::super::{Claim, Identity, Values, go_module};
     use crate::value_key;
@@ -394,7 +343,8 @@ mod trust_tests {
     }
 
     /// A code-signing leaf's published signature: its EKU names
-    /// `codeSigning`, as every vendor code-signing certificate's does.
+    /// `codeSigning`, as every vendor code-signing certificate's does, and
+    /// its issuing CA's key verifiably signed it.
     fn signature(o: &str, cn: &str, verified: bool, anchor: Option<&str>) -> JsonValue {
         let mut sig = json!({
             "subject": format!("CN={cn},O={o}"),
@@ -402,11 +352,49 @@ mod trust_tests {
             "verified": verified,
             "digest_matches": true,
             "eku_code_signing": true,
+            "chain_sha256": ["11", "22"],
         });
         if let Some(anchor) = anchor {
             sig["chain_anchor"] = json!(anchor);
         }
         sig
+    }
+
+    /// Thumbprints of the real chain over macOS system binaries: the
+    /// `macOS Software Signing` leaf, `Apple Code Signing Certification
+    /// Authority`, and `Apple Root CA`.
+    const APPLE_SYSTEM_CHAIN: [&str; 3] = [
+        "1ee9d45f25111c924aa3ad69f3fffe5da5ac3691bbb2a1a48d85fad1863eade1",
+        "76843e4c6e3acb216134a57ba8aff512e394672b3966b996da80f009ee7b4645",
+        "b0b1730ecbc7ff4505142c49f1295e6eda6bcaed7e2c68c5be91b5a11001f024",
+    ];
+
+    /// Apple's own signature, as on a system binary: the leaf under Apple's
+    /// code-signing CA.
+    fn apple_platform(verified: bool, anchor: Option<&str>) -> JsonValue {
+        let mut sig = signature("Apple Inc.", "Software Signing", verified, anchor);
+        sig["chain_sha256"] = json!(APPLE_SYSTEM_CHAIN);
+        sig
+    }
+
+    /// A certificate names its issuer, and anyone minting one chooses that
+    /// name. Only a verified link to an issuer's key (`chain_sha256` past the
+    /// leaf) makes a signature CA-signed; a leaf naming a CA that never
+    /// signed it vouches for itself.
+    #[test]
+    fn an_issuer_name_without_a_verified_link_is_self_signed() {
+        for o in ["Example", "Microsoft Corporation"] {
+            let mut sig = signature(o, "x", true, None);
+            sig["issuer"] = json!("CN=DigiCert Trusted G4 Code Signing CA");
+            sig["chain_sha256"] = json!(["11"]);
+            assert_eq!(pe_trust(sig.clone()), Trust::SelfSigned, "{o}");
+            sig.as_object_mut().unwrap().remove("chain_sha256");
+            assert_eq!(pe_trust(sig), Trust::SelfSigned, "{o} without a chain");
+        }
+        assert_eq!(
+            pe_trust(signature("Example", "x", true, None)),
+            Trust::CaSigned
+        );
     }
 
     /// Names in a certificate are the signer's to choose; without a
@@ -447,14 +435,39 @@ mod trust_tests {
             Trust::Platform
         );
         assert_eq!(
-            pe_trust(signature(
-                "Apple Inc.",
-                "Software Signing",
-                true,
-                Some("apple")
-            )),
+            pe_trust(apple_platform(true, Some("apple"))),
             Trust::Platform
         );
+    }
+
+    /// Apple's root also issues the developer CAs, whose leaves carry the
+    /// organization the account holder registered, and the Mac App Store
+    /// CA, whose `Apple Inc.` leaf re-signs every store app. Only a chain
+    /// through Apple's own code-signing CA is Apple's platform signature;
+    /// `O=Apple Inc.` under any other intermediate is a CA's customer.
+    #[test]
+    fn apple_platform_needs_apples_code_signing_ca() {
+        let wwdr_g5 = "53fd008278e5a595fe1e908ae9c5e5675f26243264a5a6438c023e3ce2870760";
+        for (cn, chain) in [
+            (
+                "Apple Development: Apple Inc. (TEAM123)",
+                ["11", "22", APPLE_SYSTEM_CHAIN[2]],
+            ),
+            (
+                "Apple Mac OS Application Signing",
+                ["11", wwdr_g5, APPLE_SYSTEM_CHAIN[2]],
+            ),
+        ] {
+            let mut sig = signature("Apple Inc.", cn, true, Some("apple"));
+            sig["chain_sha256"] = json!(chain);
+            assert_eq!(pe_trust(sig.clone()), Trust::CaSigned, "{cn}");
+            assert_eq!(macho_trust(0xe, Some(sig)), Trust::CaSigned, "{cn}");
+        }
+        // The code-signing CA must be the leaf's own issuer, not a
+        // certificate further up.
+        let mut sig = apple_platform(true, Some("apple"));
+        sig["chain_sha256"] = json!(["11", "22", APPLE_SYSTEM_CHAIN[1], APPLE_SYSTEM_CHAIN[2]]);
+        assert_eq!(pe_trust(sig), Trust::CaSigned);
     }
 
     /// A vendor root also issues TLS, mail and timestamping certificates; a
@@ -528,6 +541,60 @@ mod trust_tests {
         assert_eq!(derive(FileType::Cab, &[], &values).trust, Trust::Unverified);
     }
 
+    /// An APK's v1 signature block signs only its `.SF` file. A block and
+    /// `.SF` copied out of another app verify perfectly over an archive they
+    /// say nothing about; only `digest_matches` — the `.SF` binding the
+    /// manifest and the manifest every member — ties them to this one.
+    #[test]
+    fn apk_v1_signatures_stay_unverified() {
+        let mut grafted = signature("Google Inc.", "Android", true, None);
+        grafted["digest_matches"] = json!(false);
+        let mut unchecked = grafted.clone();
+        unchecked.as_object_mut().unwrap().remove("digest_matches");
+        let mut published = grafted.clone();
+        published["verified"] = json!(false);
+        for sig in [grafted, unchecked, published] {
+            let mut values = Values::default();
+            values.insert("android.signatures", JsonValue::Array(vec![sig]));
+            let id = derive(FileType::ApkAndroid, &[], &values);
+            assert_eq!(id.trust, Trust::Unverified);
+            assert_eq!(id.organization.map(|o| o.verified), Some(false));
+            assert_eq!(
+                id.signer.and_then(|s| s.organization).as_deref(),
+                Some("Google Inc.")
+            );
+        }
+    }
+
+    /// An Alpine package's `.SIGN.*` member is a name in a tarball: nothing
+    /// checks the signature, so it vouches for no one.
+    #[test]
+    fn alpine_signing_members_are_not_verification() {
+        let mut values = Values::default();
+        values.insert("apk.name", json!("musl"));
+        values.insert(
+            "apk.signing_keys",
+            json!([".SIGN.RSA.alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub"]),
+        );
+        let id = derive(FileType::ApkAlpine, &[], &values);
+        assert_eq!(id.trust, Trust::Unsigned);
+        assert!(id.signer.is_none() && id.organization.is_none());
+    }
+
+    /// A v1 signature whose `.SF` binds the manifest and whose manifest
+    /// binds every member vouches for this archive.
+    #[test]
+    fn a_bound_apk_v1_signature_verifies_its_signer() {
+        let mut values = Values::default();
+        values.insert(
+            "android.signatures",
+            JsonValue::Array(vec![signature("Example Corp", "Android", true, None)]),
+        );
+        let id = derive(FileType::ApkAndroid, &[], &values);
+        assert_eq!(id.trust, Trust::CaSigned);
+        assert_eq!(id.organization.map(|o| o.verified), Some(true));
+    }
+
     fn macho_trust(platform: u64, cms: Option<JsonValue>) -> Trust {
         let mut values = Values::default();
         values.insert("macho.code_signature.cdhash", json!("00"));
@@ -543,8 +610,7 @@ mod trust_tests {
     /// verified signature over that CodeDirectory makes it a system binary.
     #[test]
     fn platform_byte_alone_is_not_system() {
-        let apple =
-            |verified, anchor| signature("Apple Inc.", "Software Signing", verified, anchor);
+        let apple = apple_platform;
         assert_eq!(macho_trust(0xe, None), Trust::Unverified);
         assert_eq!(
             macho_trust(0xe, Some(apple(false, Some("apple")))),
@@ -585,7 +651,7 @@ mod trust_tests {
     /// identity let the signature vouch for the file.
     #[test]
     fn code_directory_must_hash_to_this_files_code() {
-        let apple = signature("Apple Inc.", "Software Signing", true, Some("apple"));
+        let apple = apple_platform(true, Some("apple"));
         let trust = |edit: &dyn Fn(&mut Values)| {
             let mut values = Values::default();
             values.insert("macho.code_signature.cdhash", json!("00"));

@@ -177,14 +177,14 @@ impl Strength {
 struct Flags(u8);
 
 impl Flags {
-    /// A compiled native binary or bytecode: [`FileType::is_binary`].
+    /// One unit of executable code: [`FileType::is_executable_code`].
     const BINARY: Self = Self(1);
     /// Source code with AST support: [`FileType::is_source_code`].
     const SOURCE_CODE: Self = Self(1 << 1);
     /// A manifest parsed whole into the `values` tree:
     /// [`FileType::is_structured_data`].
     const STRUCTURED_DATA: Self = Self(1 << 2);
-    /// Not analyzed, so [`FileType::is_program`] is false.
+    /// Not analyzed, so [`FileType::is_analyzed`] is false.
     const UNSUPPORTED: Self = Self(1 << 3);
 
     const fn contains(self, flag: Self) -> bool {
@@ -202,7 +202,7 @@ impl Flags {
 /// The table generates the enum, [`FileType::label`], [`FileType::from_label`]
 /// (a repeated label is an unreachable-pattern warning),
 /// [`FileType::archive_format`], the `group`, `strength`, `flags` and
-/// `declared_compression` lookups, and, for tests, `FileType::ALL` in
+/// `declared_compression` lookups, and `FileType::ALL`, every type in
 /// declaration order.
 macro_rules! file_types {
     (@archive) => { None };
@@ -507,7 +507,7 @@ file_types! {
         /// Unix static library (.a) — an `ar` archive of relocatable object files.
         /// Shares the `!<arch>` magic with `.deb`; distinguished by the first `ar`
         /// member (`.deb` leads with `debian-binary`, a static library does not).
-        StaticLib => "static-lib", Native, MagicDefined;
+        StaticLib => "static_lib", Native, MagicDefined;
         /// RPM package (.rpm)
         Rpm => "rpm", Archives, Named;
         /// macOS installer package (.pkg, XAR format). Named `PkgMacos` (not bare
@@ -772,13 +772,12 @@ file_types! {
 }
 
 impl FileType {
-    /// Returns true for every type except `Unknown`, `Markdown` and `Odf`.
-    ///
-    /// Despite the name this is not limited to executable code: binaries,
-    /// scripts, manifests and archives count, and so do images, media, fonts,
-    /// plain text and opaque data.
+    /// Returns true when an analyzer reads files of this type: every type
+    /// except `Unknown`, `Markdown` and `Odf`. Binaries, scripts, manifests
+    /// and archives count, and so do images, media, fonts, plain text and
+    /// opaque data.
     #[must_use]
-    pub fn is_program(&self) -> bool {
+    pub fn is_analyzed(&self) -> bool {
         !self.flags().contains(Flags::UNSUPPORTED)
     }
 
@@ -795,9 +794,14 @@ impl FileType {
             && !matches!(self, Self::Flatpak | Self::Msi)
     }
 
-    /// Returns true if this file type is a compiled native binary.
+    /// Returns true if this file type is one unit of executable code: a
+    /// native executable or library image (Mach-O, ELF, PE, NE), a bytecode
+    /// module (Java class, Dex, Python, Ren'Py, BEAM, WebAssembly), or raw
+    /// machine code (a DOS COM program, shellcode, a FAT boot sector).
+    ///
+    /// A static library is not one: it is an archive of object files.
     #[must_use]
-    pub fn is_binary(&self) -> bool {
+    pub fn is_executable_code(&self) -> bool {
         self.flags().contains(Flags::BINARY)
     }
 

@@ -6,34 +6,22 @@
 //! formats want the same numerical surface — only the decode front
 //! end differs.
 
-/// Shannon entropy in bits-per-byte for a 256-bin byte histogram.
-/// Returns `0.0` for an empty population.
-#[must_use]
-pub(super) fn entropy_from_histogram(freq: &[u32; 256], total: u32) -> f32 {
-    if total == 0 {
-        return 0.0;
-    }
-    let total = total as f32;
-    freq.iter().filter(|&&c| c > 0).fold(0.0f32, |e, &c| {
-        let p = c as f32 / total;
-        e - p * p.log2()
-    })
-}
+use crate::scan::entropy::shannon_from_histogram;
 
 /// Per-channel Shannon entropy of an interleaved RGB(A) pixel buffer.
 /// Returns `(r, g, b, a)`; `a` is `0.0` when fewer than four channels
 /// are present. Returns all zeros when `channels < 3`.
 #[must_use]
-pub(super) fn channel_entropy(pixels: &[u8], channels: usize) -> (f32, f32, f32, f32) {
+pub(super) fn channel_entropy(pixels: &[u8], channels: usize) -> (f64, f64, f64, f64) {
     if channels < 3 {
         return (0.0, 0.0, 0.0, 0.0);
     }
-    let mut hr = [0u32; 256];
-    let mut hg = [0u32; 256];
-    let mut hb = [0u32; 256];
-    let mut ha = [0u32; 256];
-    let mut rgb_count: u32 = 0;
-    let mut a_count: u32 = 0;
+    let mut hr = [0u64; 256];
+    let mut hg = [0u64; 256];
+    let mut hb = [0u64; 256];
+    let mut ha = [0u64; 256];
+    let mut rgb_count = 0usize;
+    let mut a_count = 0usize;
     for pixel in pixels.chunks_exact(channels) {
         // `channels >= 3`, so every pixel has red, green and blue.
         let [r, g, b, rest @ ..] = pixel else {
@@ -48,20 +36,18 @@ pub(super) fn channel_entropy(pixels: &[u8], channels: usize) -> (f32, f32, f32,
             a_count += 1;
         }
     }
-    let r = entropy_from_histogram(&hr, rgb_count);
-    let g = entropy_from_histogram(&hg, rgb_count);
-    let b = entropy_from_histogram(&hb, rgb_count);
-    let a = if a_count > 0 {
-        entropy_from_histogram(&ha, a_count)
-    } else {
-        0.0
-    };
-    (r, g, b, a)
+    let entropy = shannon_from_histogram;
+    (
+        entropy(&hr, rgb_count),
+        entropy(&hg, rgb_count),
+        entropy(&hb, rgb_count),
+        entropy(&ha, a_count),
+    )
 }
 
 /// Count one occurrence of `value` in a byte histogram. A `u8` always lands
 /// inside the 256 bins.
-fn tally(histogram: &mut [u32; 256], value: u8) {
+fn tally(histogram: &mut [u64; 256], value: u8) {
     if let Some(bin) = histogram.get_mut(usize::from(value)) {
         *bin += 1;
     }

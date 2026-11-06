@@ -1,4 +1,4 @@
-use super::Values;
+use super::{Values, split_index};
 use serde_json::json;
 
 #[test]
@@ -76,25 +76,25 @@ fn checked_accessors_match_string_paths() {
     v.insert("office.compobj.user_type", json!("Microsoft Word"));
 
     let sigs = crate::value_key!("pe.signatures");
-    assert_eq!(v.get_key(sigs), v.get("pe.signatures"));
+    assert_eq!(v.lookup(sigs), v.get("pe.signatures"));
     for rest in ["[0]", "[0].thumbprint_sha256", "[1]", "[0].missing", ""] {
         let joined = if rest.is_empty() || rest.starts_with('[') {
             format!("pe.signatures{rest}")
         } else {
             format!("pe.signatures.{rest}")
         };
-        assert_eq!(v.get_key_at(sigs, rest), v.get(&joined), "{rest:?}");
+        assert_eq!(v.lookup_at(sigs, rest), v.get(&joined), "{rest:?}");
     }
     let compobj = crate::value_key!("office.compobj");
     assert_eq!(
-        v.get_key_at(compobj, "prog_id"),
+        v.lookup_at(compobj, "prog_id"),
         Some(&json!("Word.Document.8"))
     );
     assert_eq!(
-        v.get_key_at(compobj, "user_type"),
+        v.lookup_at(compobj, "user_type"),
         v.get("office.compobj.user_type")
     );
-    assert!(v.get_key(crate::value_key!("pe.go")).is_none());
+    assert!(v.lookup(crate::value_key!("pe.go")).is_none());
 }
 
 #[test]
@@ -103,4 +103,36 @@ fn serializes_as_json_object() {
     v.insert("pe.coff.machine", json!("x86_64"));
     let s = serde_json::to_string(&v).unwrap();
     assert_eq!(s, r#"{"pe":{"coff":{"machine":"x86_64"}}}"#);
+}
+
+#[test]
+fn a_path_from_data_cannot_nest_the_tree_without_bound() {
+    // A data tail of dots must not become a million nested objects: the
+    // tree is dropped and serialized recursively.
+    let mut v = Values::new();
+    let tail = ".".repeat(1_000_000);
+    v.insert(&format!("wasm.producers.{tail}"), json!("x"));
+    assert!(serde_json::to_string(&v).is_ok());
+    assert!(v.get("wasm.producers").unwrap().is_object());
+    drop(v);
+}
+
+#[test]
+fn split_index_plain_key() {
+    assert_eq!(split_index("plain"), ("plain", None));
+}
+
+#[test]
+fn split_index_indexed_key() {
+    assert_eq!(split_index("members[0]"), ("members", Some(0)));
+    assert_eq!(split_index("a[42]"), ("a", Some(42)));
+}
+
+#[test]
+fn split_index_malformed_falls_through() {
+    // Strict parsing here would force every caller to handle the
+    // "malformed input" case. Returning the segment unchanged lets
+    // `navigate` fail naturally on the subsequent object lookup.
+    assert_eq!(split_index("members["), ("members[", None));
+    assert_eq!(split_index("members[a]"), ("members[a]", None));
 }

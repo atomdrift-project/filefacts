@@ -162,3 +162,51 @@ fn limitation_names_match_serde() {
         );
     }
 }
+
+/// Each call into a helper binds its parameters in a fresh frame. Thousands
+/// of calls into a helper with hundreds of parameters, each with different
+/// arguments, would build a frame per call, millions of entries in all,
+/// within the step budget: the frames' total size has a budget of its own.
+#[test]
+fn helper_frames_have_a_size_budget() {
+    const PARAMETERS: usize = 200;
+    const CALLS: usize = 8000;
+    let value = |kind, inputs: Vec<usize>, target: Option<&str>| FlowValue {
+        kind,
+        offset: 0,
+        literal: (kind == FlowKind::Literal).then_some(Arg::Null),
+        target: target.map(String::from),
+        inputs,
+        receiver: None,
+        fields: BTreeMap::new(),
+        module_level: false,
+    };
+    let mut values: Vec<FlowValue> = (0..PARAMETERS)
+        .map(|_| value(FlowKind::Parameter, Vec::new(), None))
+        .collect();
+    let returned = values.len();
+    values.push(value(FlowKind::Literal, Vec::new(), None));
+    let mut calls = Vec::new();
+    for _ in 0..CALLS {
+        // A distinct argument per call, so no two frames are equal.
+        let argument = values.len();
+        values.push(value(FlowKind::Literal, Vec::new(), None));
+        calls.push(values.len());
+        values.push(value(FlowKind::Call, vec![argument; PARAMETERS], Some("f")));
+    }
+    let start = values.len();
+    values.push(value(FlowKind::Merge, calls, None));
+    let flow = Flow {
+        values,
+        functions: BTreeMap::from([(
+            "f".to_string(),
+            FlowFunction {
+                parameters: (0..PARAMETERS).collect(),
+                returns: vec![returned],
+            },
+        )]),
+        ..Flow::default()
+    };
+    let walked = flow.origins(start, &[], STEP_LIMIT);
+    assert!(walked.incomplete);
+}

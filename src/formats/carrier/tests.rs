@@ -292,3 +292,39 @@ fn no_trailer_kind_is_invented_for_covered_or_opaque_unrecognized_data() {
         Some(&serde_json::json!("high_entropy"))
     );
 }
+
+/// `periods` 16-byte gzip headers, each followed by a stored deflate block
+/// whose 11 data bytes reach the next one's stored-block header, so every
+/// header starts a chain that inflates to the next forced error, placed
+/// every `window` periods.
+fn chained_gzip_decoys(periods: usize, window: usize) -> Vec<u8> {
+    let mut region = Vec::with_capacity(periods * 16);
+    for i in 0..periods {
+        region.extend_from_slice(b"\x1f\x8b\x08\0\0\0\0\0\0\xff");
+        // A stored block (`BTYPE` 00) of 11 bytes, or a reserved block type
+        // (`BTYPE` 11) that ends every chain running into it.
+        let block = if i % window == window - 1 { 0x06 } else { 0x00 };
+        region.extend_from_slice(&[block, 11, 0, !11, 0xff, 0]);
+    }
+    region
+}
+
+/// Every decoy header inflates thousands of bytes before its chain errors,
+/// so probing each in turn cost a thousand times the region: 1 MiB took
+/// seconds. The probes together spend the region's budget and stop.
+#[test]
+fn chained_gzip_decoys_spend_one_budget() {
+    let region = chained_gzip_decoys(1 << 16, 4096);
+    // One decoy alone inflates up to the window's error.
+    let mut one = u64::MAX;
+    assert!(!find_gzip(region.get(..16 * 4096).unwrap(), &mut one));
+    assert!(u64::MAX - one > 16 * 4096);
+    let mut budget = gzip_probe_budget(region.len());
+    assert_eq!(classify_region_within(&region, &mut budget), None);
+    assert_eq!(budget, 0);
+    // A real member is still found while the budget lasts.
+    let gzip = compressed_gzip(b"payload");
+    let mut budget = gzip_probe_budget(gzip.len());
+    assert_eq!(classify_region_within(&gzip, &mut budget), Some("gzip"));
+    assert!(budget > 0);
+}

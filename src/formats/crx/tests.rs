@@ -246,7 +246,7 @@ fn crx3_last_signed_header_data_wins() {
     let mut header = pb(10_000, &decoy);
     header.extend(pb(10_000, &real));
     assert_eq!(signed_header_data(&header), Some(real.as_slice()));
-    assert_eq!(signed_crx_id(&real), Some([0x11; 16].as_slice()));
+    assert_eq!(last_field(&real, 1), Some([0x11; 16].as_slice()));
 }
 
 /// CRX2 signs the archive with RSA-SHA1 under the header's key.
@@ -290,12 +290,9 @@ fn crx_with(members: &[(&str, &[u8])]) -> Vec<u8> {
 }
 
 fn run(bytes: &[u8]) -> (Values, Errors) {
-    let mut values = Values::new();
-    let mut metrics = Metrics::new();
-    let mut members = Vec::new();
-    let mut errors = Errors::new();
-    extract(bytes, &mut values, &mut metrics, &mut members, &mut errors).unwrap();
-    (values, errors)
+    let mut sinks = crate::formats::Sinks::default();
+    extract(bytes, sinks.ctx()).unwrap();
+    (sinks.values, sinks.errors)
 }
 
 #[test]
@@ -344,4 +341,100 @@ fn non_crx_bytes_emit_nothing() {
     let mut values = Values::new();
     header(b"PK\x03\x04not a crx", &mut values);
     assert!(values.get("crx.format_version").is_none());
+}
+
+/// Chrome verifies every proof in the header and refuses the file when
+/// any fails, so a valid developer proof beside a broken one is not a
+/// verified CRX — whether the broken proof is junk or a well-formed key
+/// with a signature over other bytes.
+#[test]
+fn crx3_every_proof_must_verify() {
+    let key = test_rsa_key();
+    let spki = rsa_spki(&key);
+    let crx_id = Sha256::digest(&spki)[..16].to_vec();
+    let signed_data = pb(1, &crx_id);
+    let archive = b"PK\x05\x06 archive bytes";
+    let sign = |digest: &[u8]| {
+        key.sign(rsa::Pkcs1v15Sign::new::<Sha256>(), digest)
+            .unwrap()
+    };
+    let good = sign(&crx3_message_digest(&signed_data, archive));
+    let other = sign(&crx3_message_digest(&signed_data, b"other archive"));
+
+    let alone = crx3(&[(2, &spki, &good)], &signed_data, archive);
+    assert_eq!(verified(&alone), Some(true));
+    for broken in [
+        (2, b"some other key".as_slice(), b"junk".as_slice()),
+        (2, &spki, &other),
+        (3, &spki, &good),
+        (2, &spki, b""),
+    ] {
+        let bytes = crx3(&[(2, &spki, &good), broken], &signed_data, archive);
+        assert_eq!(verified(&bytes), Some(false), "{broken:?}");
+    }
+    // More proofs than are checked cannot all be confirmed.
+    let many = vec![(2, spki.as_slice(), good.as_slice()); MAX_PROOF_CHECKS + 1];
+    assert_eq!(verified(&crx3(&many, &signed_data, archive)), Some(false));
+}
+
+/// Chrome parses the whole `CrxFileHeader` as protobuf and refuses a file
+/// whose header, a proof in it, or its signed data does not parse. A
+/// malformed field after a good proof must not hide what follows it — here
+/// a second proof Chrome would have checked and failed.
+#[test]
+fn crx3_malformed_header_does_not_verify() {
+    use p256::ecdsa::signature::hazmat::PrehashSigner;
+    use p256::ecdsa::{Signature, SigningKey};
+    use p256::pkcs8::EncodePublicKey;
+
+    let key = SigningKey::from_slice(&[7; 32]).unwrap();
+    let spki = key.verifying_key().to_public_key_der().unwrap().into_vec();
+    let crx_id = Sha256::digest(&spki)[..16].to_vec();
+    let archive = b"PK\x05\x06 archive bytes";
+    let file = |header: &[u8]| {
+        let mut bytes = b"Cr24".to_vec();
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&(header.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(header);
+        bytes.extend_from_slice(archive);
+        bytes
+    };
+    let header_with = |signed_data: &[u8], proof_tail: &[u8], header_tail: &[u8]| {
+        let digest = crx3_message_digest(signed_data, archive);
+        let signature: Signature = key.sign_prehash(&digest).unwrap();
+        let mut proof = pb(1, &spki);
+        proof.extend(pb(2, signature.to_der().as_bytes()));
+        proof.extend_from_slice(proof_tail);
+        let mut header = pb(3, &proof);
+        header.extend(pb(10_000, signed_data));
+        header.extend_from_slice(header_tail);
+        header
+    };
+    let signed_data = pb(1, &crx_id);
+    assert_eq!(
+        verified(&file(&header_with(&signed_data, &[], &[]))),
+        Some(true)
+    );
+    // A truncated length-delimited field, then a failing proof.
+    let mut hidden = vec![0x1a, 0x7f, 0x00];
+    hidden.extend(pb(3, &[pb(1, b"other key"), pb(2, b"junk")].concat()));
+    for (signed_data, proof_tail, header_tail) in [
+        (signed_data.clone(), &[][..], &hidden[..]),
+        // A group wire type, which nothing here reads past.
+        (signed_data.clone(), &[][..], &[0x0b][..]),
+        // A fixed64 cut off by the end of the header.
+        (signed_data.clone(), &[][..], &[0x09, 0x01][..]),
+        // Field number zero.
+        (signed_data.clone(), &[][..], &[0x02, 0x00][..]),
+        // Damage inside the proof, and inside the signed data.
+        (signed_data.clone(), &[0x12, 0x05][..], &[][..]),
+        (
+            [signed_data.clone(), vec![0x0a, 0x09]].concat(),
+            &[][..],
+            &[][..],
+        ),
+    ] {
+        let header = header_with(&signed_data, proof_tail, header_tail);
+        assert_eq!(verified(&file(&header)), Some(false), "{header_tail:02x?}");
+    }
 }

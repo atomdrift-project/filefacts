@@ -541,11 +541,10 @@ fn cache_setting_belongs_to_each_parsed_file() {
 /// content/extension mismatch, the host namespace, the basename.
 #[test]
 fn cache_key_tracks_every_output_affecting_input() {
-    let base = OpenOptions::new();
     let key = |file_type, mismatch, basename| {
         extraction_cache_variant(None, file_type, mismatch, None, basename)
     };
-    assert!(key(FileType::Elf, false, None).starts_with(&base.recovery_fingerprint()));
+    assert!(key(FileType::Elf, false, None).starts_with(RECOVERY_FINGERPRINT));
 
     let distinct: std::collections::HashSet<String> = [
         key(FileType::Elf, false, None),
@@ -620,4 +619,41 @@ fn open_options_identify_by_path_forced_type_or_precomputed_fileid() {
         .fileid(fileid)
         .open(bytes);
     assert_eq!(precomputed.fileid().file_type(), FileType::PackageJson);
+}
+
+/// A source query stopped by its time budget is returned but not cached. The
+/// work budget and the wall-clock backstop share that limit, and the backstop
+/// stops at a point that depends on load, so the facts of a run on a busy
+/// machine must not stand in for every later open of the same bytes. A match
+/// or output limit follows from the bytes alone and is cached as usual.
+#[test]
+fn source_query_timeout_is_not_cached() {
+    let fresh = || open(b"import os\nos.system('id')\n").run_pipeline();
+    let limited = |which| {
+        let mut extracted = fresh();
+        extracted
+            .metrics
+            .insert(source_query_limited("imports", which), 1.0);
+        cache_outcome(extracted, false)
+    };
+    assert!(matches!(
+        limited(QueryLimit::Timeout),
+        cache::Computed::Transient(_)
+    ));
+    assert!(matches!(
+        limited(QueryLimit::Match),
+        cache::Computed::Cacheable(_)
+    ));
+    assert!(matches!(
+        limited(QueryLimit::Output),
+        cache::Computed::Cacheable(_)
+    ));
+    assert!(matches!(
+        cache_outcome(fresh(), false),
+        cache::Computed::Cacheable(_)
+    ));
+    assert!(matches!(
+        cache_outcome(fresh(), true),
+        cache::Computed::Transient(_)
+    ));
 }

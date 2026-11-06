@@ -77,15 +77,6 @@ struct Args {
     no_cache: bool,
 }
 
-impl Args {
-    /// The open options these arguments ask for. The CLI rescans the same
-    /// files, so `main` turns the extraction cache on unless `--no-cache` or
-    /// `FILEFACTS_CACHE` turns it off.
-    fn options(cache: bool) -> OpenOptions<'static> {
-        OpenOptions::new().cache(cache)
-    }
-}
-
 /// Exit status when a file could not be analysed or output failed.
 const EXIT_FAILURE: u8 = 1;
 /// Exit status for a command line that could not be parsed.
@@ -121,7 +112,9 @@ fn main() -> ExitCode {
     };
 
     let cache = !args.no_cache && filefacts::cache::env_override().unwrap_or(true);
-    let options = Args::options(cache);
+    // The CLI rescans the same files, so the extraction cache is on unless
+    // `--no-cache` or `FILEFACTS_CACHE` turns it off.
+    let options = OpenOptions::new().cache(cache);
     // Drops superseded schema versions and bounds the cache on a background
     // thread, without blocking: a short run may exit before it finishes and
     // the next run resumes. A run told to leave the cache alone must not
@@ -148,7 +141,7 @@ fn main() -> ExitCode {
         }
     }
     if debug {
-        filefacts::log_stats();
+        tracing::info!(stats = ?filefacts::recovery_stats(), "binform recovery stats");
     }
     exit_code(result)
 }
@@ -236,9 +229,9 @@ fn sorted_entries(dir: &Path, ok: &mut bool) -> std::vec::IntoIter<(PathBuf, std
     listed.into_iter()
 }
 
-// analyze_one parses one file and writes its rendered output. A file that
-// cannot be read, parsed or serialised is reported on stderr and yields
-// `Ok(false)` so a directory walk carries on; an `Err` means `out` failed.
+/// Parse one file and write its rendered output. A file that cannot be
+/// read, parsed or serialised is reported on stderr and yields `Ok(false)`
+/// so a directory walk carries on; an `Err` means `out` failed.
 fn analyze_one(
     out: &mut impl Write,
     path: &Path,
@@ -312,44 +305,36 @@ fn write_json(
     out.write_all(b"\n").map_err(serde_json::Error::io)
 }
 
-/// Rewrites DEL, C1 controls and Unicode bidirectional formatting characters
-/// as JSON escapes. JSON permits them raw and serde_json leaves them so, but a
-/// terminal may act on them, and these strings come from the file under
-/// analysis. Every matched byte sequence in JSON output lies inside a string,
-/// and serde_json writes whole UTF-8 fragments, so the rewrite is safe per
-/// write.
+/// Rewrites the characters the terminal renderer escapes (see
+/// [`render::is_unsafe_char`]) as JSON `\u` escapes, which decode to the same
+/// text. JSON permits them raw and serde_json leaves them so, but a terminal
+/// may act on them, and these strings come from the file under analysis.
+/// serde_json has already escaped the C0 controls, so any left (the newlines
+/// of pretty-printing) are JSON's own. Every other match lies inside a
+/// string, and serde_json writes whole UTF-8 fragments, so the rewrite is
+/// safe per write.
 struct EscapeJsonTerminalControls<W>(W);
 
 impl<W: Write> Write for EscapeJsonTerminalControls<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let mut start = 0;
-        let mut i = 0;
-        while let Some(&b) = buf.get(i) {
-            let escape = match (b, buf.get(i + 1), buf.get(i + 2)) {
-                (0x7f, _, _) => Some((0x7f_u32, 1)),
-                (0xc2, Some(&c1 @ 0x80..=0x9f), _) => Some((u32::from(c1), 2)),
-                // U+061C ARABIC LETTER MARK.
-                (0xd8, Some(0x9c), _) => Some((0x061c, 2)),
-                // U+200E/U+200F and U+202A..U+202E.
-                (0xe2, Some(0x80), Some(&tail @ (0x8e..=0x8f | 0xaa..=0xae))) => {
-                    Some((0x2000 + u32::from(tail - 0x80), 3))
+        for chunk in buf.utf8_chunks() {
+            let text = chunk.valid();
+            let mut start = 0;
+            for (i, c) in text.char_indices() {
+                if c < ' ' || !render::is_unsafe_char(c) {
+                    continue;
                 }
-                // U+2066..U+2069.
-                (0xe2, Some(0x81), Some(&tail @ 0xa6..=0xa9)) => {
-                    Some((0x2040 + u32::from(tail - 0x80), 3))
+                self.0
+                    .write_all(text.get(start..i).unwrap_or_default().as_bytes())?;
+                for unit in c.encode_utf16(&mut [0; 2]) {
+                    write!(self.0, "\\u{unit:04x}")?;
                 }
-                _ => None,
-            };
-            if let Some((code, len)) = escape {
-                self.0.write_all(buf.get(start..i).unwrap_or_default())?;
-                write!(self.0, "\\u{code:04x}")?;
-                i += len;
-                start = i;
-            } else {
-                i += 1;
+                start = i + c.len_utf8();
             }
+            self.0
+                .write_all(text.get(start..).unwrap_or_default().as_bytes())?;
+            self.0.write_all(chunk.invalid())?;
         }
-        self.0.write_all(buf.get(start..).unwrap_or_default())?;
         Ok(buf.len())
     }
 
@@ -397,8 +382,8 @@ fn parse_args(
                 parsed.format = parse_format(&value.to_string_lossy())?;
             }
             "--" => parsed.paths.extend(iter.by_ref().map(PathBuf::from)),
-            s if s.starts_with("--format=") => {
-                parsed.format = parse_format(&s["--format=".len()..])?;
+            s if let Some(value) = s.strip_prefix("--format=") => {
+                parsed.format = parse_format(value)?;
             }
             s if s.starts_with('-') => {
                 let view = s.strip_prefix("--").and_then(View::from_name);
@@ -446,6 +431,7 @@ fn parse_format(value: &str) -> Result<Format, String> {
 }
 
 fn usage() -> String {
+    use std::fmt::Write as _;
     let mut msg = String::from(
         "\
 usage: filefacts [options] [view] <path>...
@@ -460,8 +446,9 @@ views (select one by name, or with the --<view> flag; a name that is also
 an existing file is read as that file):
 ",
     );
-    for view in View::ALL {
-        msg.push_str(&format!("  {:<17}  {}\n", view.name(), view.description()));
+    for &view in View::ALL {
+        // Writing to a `String` cannot fail.
+        let _ = writeln!(msg, "  {:<17}  {}", view.name(), view.description());
     }
     msg.push_str(
         "
@@ -493,207 +480,4 @@ exit status:
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::BTreeSet;
-
-    /// Parse `words` as a command line on which only `existing` names files.
-    fn parse(words: &[&str], existing: &[&str]) -> Result<Args, String> {
-        let words = words.iter().map(OsString::from);
-        match parse_args(words, |p| existing.iter().any(|e| Path::new(e) == p))? {
-            ParseOutcome::Run(args) => Ok(args),
-            other => panic!("expected a run, got {other:?}"),
-        }
-    }
-
-    fn paths(args: &Args) -> Vec<&str> {
-        args.paths.iter().map(|p| p.to_str().unwrap()).collect()
-    }
-
-    #[test]
-    fn every_view_is_reachable_by_name_and_flag() {
-        let help = usage();
-        let mut names = BTreeSet::new();
-        for view in View::ALL {
-            let name = view.name();
-            assert!(names.insert(name), "{name} is listed twice");
-            assert!(
-                help.contains(&format!("\n  {name} ")),
-                "{name} not in usage"
-            );
-            let flag = format!("--{name}");
-            for words in [[name, "x"], ["x", name], [flag.as_str(), "x"]] {
-                let args = parse(&words, &[]).unwrap();
-                assert_eq!(args.view, Some(view), "{words:?}");
-                assert_eq!(paths(&args), ["x"], "{words:?}");
-            }
-        }
-    }
-
-    #[test]
-    fn usage_documents_every_environment_variable_and_exit_status() {
-        let help = usage();
-        for name in [
-            "FILEFACTS_CACHE",
-            "FILEFACTS_DEBUG",
-            "NO_COLOR",
-            "COLUMNS",
-            "--no-cache",
-        ] {
-            assert!(help.contains(name), "{name} not in usage");
-        }
-        for code in [EXIT_FAILURE, EXIT_USAGE] {
-            assert!(
-                help.contains(&format!("\n  {code} ")),
-                "exit {code} not in usage"
-            );
-        }
-        assert!(!help.contains("--pretty"));
-    }
-
-    #[test]
-    fn only_explicit_on_values_enable_debug_output() {
-        assert!(debug_requested(Some(OsStr::new("1"))));
-        assert!(debug_requested(Some(OsStr::new("yes"))));
-        for off in ["", "0", "false", "FALSE"] {
-            assert!(!debug_requested(Some(OsStr::new(off))), "{off:?}");
-        }
-        assert!(!debug_requested(None));
-    }
-
-    #[test]
-    fn several_paths_are_analysed_in_order() {
-        let args = parse(&["a", "metrics", "b", "c"], &[]).unwrap();
-        assert_eq!(args.view, Some(View::Metrics));
-        assert_eq!(paths(&args), ["a", "b", "c"]);
-        // After `--` a view name is a path, so it shadows nothing.
-        let args = parse(&["--", "metrics", "b"], &["metrics"]).unwrap();
-        assert_eq!(args.view, None);
-        assert_eq!(paths(&args), ["metrics", "b"]);
-        assert!(parse(&[], &[]).unwrap_err().contains("no path"));
-    }
-
-    #[test]
-    fn options_flags_parse_and_reach_the_open_options() {
-        let args = parse(&["--no-cache", "x"], &[]).unwrap();
-        assert!(args.no_cache);
-        // rizin's flags went with rizin.
-        assert!(parse(&["--no-rizin", "x"], &[]).is_err());
-        assert!(parse(&["--rizin-timeout", "30", "x"], &[]).is_err());
-        assert!(parse(&["--pretty", "x"], &[]).is_err());
-    }
-
-    #[test]
-    fn existing_file_wins_over_a_positional_view_name() {
-        let args = parse(&["metrics", "x"], &[]).unwrap();
-        assert_eq!(args.view, Some(View::Metrics));
-        assert_eq!(paths(&args), ["x"]);
-
-        let args = parse(&["metrics"], &["metrics"]).unwrap();
-        assert_eq!(args.view, None);
-        assert_eq!(paths(&args), ["metrics"]);
-
-        let args = parse(&["--metrics", "metrics"], &["metrics"]).unwrap();
-        assert_eq!(args.view, Some(View::Metrics));
-        assert_eq!(paths(&args), ["metrics"]);
-
-        let err = parse(&["metrics", "x"], &["metrics"]).unwrap_err();
-        assert!(err.contains("--metrics"), "{err}");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn non_utf8_argument_is_a_path() {
-        use std::os::unix::ffi::OsStrExt;
-        let raw = OsStr::from_bytes(b"sample-\xff.py").to_os_string();
-        let words = ["--format".into(), "json".into(), raw.clone()];
-        let Ok(ParseOutcome::Run(args)) = parse_args(words, |_| false) else {
-            panic!("non-UTF-8 path rejected");
-        };
-        assert_eq!(args.paths, [PathBuf::from(raw)]);
-        assert_eq!(args.format, Format::Json);
-    }
-
-    #[test]
-    fn serialisation_failure_is_reported_and_output_failure_ends_the_run() {
-        let path = Path::new("x");
-        let data = serde_json::to_value(std::collections::HashMap::from([((1, 2), 3)]));
-        assert!(!report_serialisation(path, data.map(drop)).unwrap());
-
-        let closed = serde_json::Error::io(io::ErrorKind::BrokenPipe.into());
-        let err = report_serialisation(path, Err(closed)).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
-        assert_eq!(exit_code(Err(err)), ExitCode::SUCCESS);
-        let full = io::Error::from(io::ErrorKind::StorageFull);
-        assert_eq!(exit_code(Err(full)), ExitCode::from(EXIT_FAILURE));
-    }
-
-    /// Output that the reader has stopped consuming.
-    struct ClosedPipe;
-
-    impl Write for ClosedPipe {
-        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
-            Err(io::ErrorKind::BrokenPipe.into())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    fn hermetic() -> OpenOptions<'static> {
-        OpenOptions::new().cache(false)
-    }
-
-    const PLAIN: Style = Style {
-        color: false,
-        width: 100,
-    };
-
-    #[test]
-    fn closed_output_ends_the_run_in_every_format() {
-        let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/markdown"));
-        for format in [Format::Terminal, Format::Json] {
-            let args = Args {
-                format,
-                ..Args::default()
-            };
-            let err = run(&mut ClosedPipe, dir, &args, PLAIN, &hermetic()).unwrap_err();
-            assert_eq!(err.kind(), io::ErrorKind::BrokenPipe, "{format:?}");
-        }
-    }
-
-    /// A walk visits files in path order, descending into each directory at
-    /// its place in that order, and skips symlinks.
-    #[test]
-    fn directory_walk_is_sorted_and_skips_symlinks() {
-        let dir = std::env::temp_dir().join(format!("filefacts-walk-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        for sub in ["b", "a/z", "c"] {
-            std::fs::create_dir_all(dir.join(sub)).unwrap();
-        }
-        for file in ["b/2.txt", "a/z/1.txt", "a/0.txt", "c/3.txt", "d.txt"] {
-            std::fs::write(dir.join(file), b"x\n").unwrap();
-        }
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(dir.join("d.txt"), dir.join("a/link.txt")).unwrap();
-        let args = Args {
-            view: Some(View::Fileid),
-            ..Args::default()
-        };
-        let mut out = Vec::new();
-        assert!(run(&mut out, &dir, &args, PLAIN, &hermetic()).unwrap());
-        // Each file's terminal output opens with its path.
-        let out = String::from_utf8(out).unwrap();
-        let root = format!("{}{}", dir.display(), std::path::MAIN_SEPARATOR);
-        let visited: Vec<String> = out
-            .lines()
-            .filter_map(|line| line.strip_prefix(&root))
-            .map(|rest| rest.split("  ").next().unwrap().replace('\\', "/"))
-            .collect();
-        assert_eq!(
-            visited,
-            ["a/0.txt", "a/z/1.txt", "b/2.txt", "c/3.txt", "d.txt"]
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}
+mod tests;

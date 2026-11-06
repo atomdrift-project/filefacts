@@ -1,4 +1,4 @@
-use super::to_der;
+use super::{COPIED, to_der};
 
 #[test]
 fn definite_der_passes_through_unchanged() {
@@ -60,4 +60,24 @@ fn nesting_beyond_the_cap_is_rejected() {
         ber.extend([0x00, 0x00]);
     }
     assert!(to_der(&ber).is_none());
+}
+
+#[test]
+fn deep_nesting_copies_each_content_byte_once() {
+    // 60 indefinite SEQUENCEs around a 4 KiB OCTET STRING: normalizing must
+    // copy the string once, not once per enclosing level.
+    let mut ber = Vec::new();
+    for _ in 0..60 {
+        ber.extend([0x30, 0x80]);
+    }
+    ber.extend([0x04, 0x82, 0x10, 0x00]);
+    ber.extend([0xAB; 4096]);
+    for _ in 0..60 {
+        ber.extend([0x00, 0x00]);
+    }
+    COPIED.with(|copied| copied.set(0));
+    let der = to_der(&ber).unwrap();
+    // Every SEQUENCE gets a four-byte header: tag, 0x82, two length octets.
+    assert_eq!(der.len(), 4100 + 60 * 4);
+    assert_eq!(COPIED.with(std::cell::Cell::get), 4096);
 }

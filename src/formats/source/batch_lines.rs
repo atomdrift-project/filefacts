@@ -85,10 +85,10 @@ impl<'s> Lines<'s> {
                 .strip_prefix(':')
                 .filter(|rest| !rest.starts_with(':'))
                 .and_then(|rest| label_name(rest.split_whitespace().next()?));
-            if let Some(name) = name {
-                if labels.insert(name, i).is_some() {
-                    return Err(Unmodelled::DuplicateLabel);
-                }
+            if let Some(name) = name
+                && labels.insert(name, i).is_some()
+            {
+                return Err(Unmodelled::DuplicateLabel);
             }
         }
         let mut model = Self {

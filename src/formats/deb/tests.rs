@@ -305,3 +305,91 @@ fn maintainer_and_uploaders_are_maintainers() {
         ]))
     );
 }
+
+/// A gzip `control.tar` of the given `(path, contents)` regular members.
+fn control_tar_gz_of(members: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut tar = Vec::new();
+    {
+        let mut b = tar::Builder::new(&mut tar);
+        for (path, data) in members {
+            let mut h = tar::Header::new_gnu();
+            h.set_path(path).unwrap();
+            h.set_size(data.len() as u64);
+            h.set_mode(0o644);
+            h.set_entry_type(tar::EntryType::Regular);
+            h.set_cksum();
+            b.append(&h, *data).unwrap();
+        }
+        b.finish().unwrap();
+    }
+    let mut gz = Vec::new();
+    let mut enc = flate2::write::GzEncoder::new(&mut gz, flate2::Compression::fast());
+    enc.write_all(&tar).unwrap();
+    enc.finish().unwrap();
+    gz
+}
+
+/// `dpkg` extracts `control.tar` with tar, so a second `control` replaces
+/// the first: a decoy ahead of the real file must not name the package.
+#[test]
+fn the_last_control_member_names_the_package() {
+    let decoy = "Package: openssl\nVersion: 3.0.13-1\nArchitecture: amd64\n";
+    let gz = control_tar_gz_of(&[
+        ("./control", decoy.as_bytes()),
+        ("./md5sums", b""),
+        ("control", CONTROL.as_bytes()),
+    ]);
+    let (v, _, e) = run(&deb_with_control_member("control.tar.gz", &gz));
+    assert!(e.is_empty(), "{e:?}");
+    assert_eq!(v.get("deb.name").and_then(|x| x.as_str()), Some("demo-pkg"));
+    assert_eq!(
+        v.get("deb.version").and_then(|x| x.as_str()),
+        Some("1.2.3-1")
+    );
+}
+
+/// Past the inflate cap a later `control` could still replace the one
+/// read, so a `control` seen before the cap names nothing.
+#[test]
+fn a_control_member_before_the_inflate_cap_is_not_trusted() {
+    let decoy = "Package: openssl\nVersion: 3.0.13-1\n";
+    let pad = vec![0u8; usize::try_from(MAX_CONTROL_TAR).unwrap()];
+    let gz = control_tar_gz_of(&[
+        ("./control", decoy.as_bytes()),
+        ("./md5sums", &pad),
+        ("./control", CONTROL.as_bytes()),
+    ]);
+    let (v, _, e) = run(&deb_with_control_member("control.tar.gz", &gz));
+    assert!(e.is_empty(), "{e:?}");
+    assert!(v.get("deb.name").is_none());
+    let limits = v.get("deb.limits").and_then(|x| x.as_array()).unwrap();
+    assert_eq!(limits[0]["stage"], "control-archive");
+}
+
+/// Field names are case-insensitive to `dpkg`; a lower-case `package:` is
+/// the package's name, not an unknown field.
+#[test]
+fn control_field_names_are_case_insensitive() {
+    let (v, _, _) = run(&build_deb(
+        "package: demo-pkg\nVERSION: 1.0\nArchitecture: all\n",
+    ));
+    assert_eq!(v.get("deb.name").and_then(|x| x.as_str()), Some("demo-pkg"));
+    assert_eq!(v.get("deb.version").and_then(|x| x.as_str()), Some("1.0"));
+}
+
+#[test]
+fn control_paths_resolve_as_tar_extracts_them() {
+    use std::path::Path;
+    for path in [
+        "control",
+        "./control",
+        "././control",
+        ".//control",
+        "/control",
+    ] {
+        assert!(is_control_path(Path::new(path)), "{path}");
+    }
+    for path in ["control/x", "../control", "x/control", "controls", "./"] {
+        assert!(!is_control_path(Path::new(path)), "{path}");
+    }
+}

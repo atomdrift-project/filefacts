@@ -128,8 +128,7 @@ fn manifest(path: &str, body: &[u8]) -> Option<FileType> {
             let release = doc.get("version")?;
             let release = release
                 .as_str()
-                .map(str::to_owned)
-                .unwrap_or_else(|| release.to_string());
+                .map_or_else(|| release.to_string(), str::to_owned);
             (!name.is_empty()
                 && root == format!("{name}-{release}")
                 && version(&release)
@@ -178,8 +177,10 @@ const DEEP_MEMBERS: usize = 512;
 const SHALLOW_MEMBERS: usize = 8;
 
 /// The top-level directory a tar's members share.
+#[derive(Default)]
 enum Root {
     /// No member observed yet.
+    #[default]
     Unseen,
     /// Every member so far sits under this one.
     One(String),
@@ -189,6 +190,7 @@ enum Root {
 
 /// A tar's members, observed one at a time, and the package layout they
 /// name. See the module documentation for the standard every marker meets.
+#[derive(Default)]
 pub(super) struct TarProbe {
     /// Members observed, not counting metadata headers and AppleDouble
     /// sidecars.
@@ -215,27 +217,6 @@ pub(super) struct TarProbe {
 }
 
 impl TarProbe {
-    pub(super) fn new() -> Self {
-        Self {
-            members: 0,
-            root: Root::Unseen,
-            candidate: None,
-            pkginfo: false,
-            arch_meta: false,
-            gem_metadata: false,
-            gem_data: false,
-            oci_layout: false,
-            oci_index: false,
-            docker_manifest: false,
-            docker_layers: false,
-            pub_hint: false,
-            hex_version: false,
-            hex_checksum: false,
-            hex_metadata: false,
-            hex_contents: false,
-        }
-    }
-
     /// Members observed so far.
     pub(super) fn members(&self) -> usize {
         self.members
@@ -349,8 +330,8 @@ impl TarProbe {
         match path {
             "VERSION" => self.hex_version = body.trim_ascii() == b"3",
             "CHECKSUM" => {
-                self.hex_checksum = body.trim_ascii().len() == 64
-                    && body.trim_ascii().iter().all(u8::is_ascii_hexdigit);
+                let digest = body.trim_ascii();
+                self.hex_checksum = digest.len() == 64 && digest.iter().all(u8::is_ascii_hexdigit);
             }
             "metadata.config" => {
                 self.hex_metadata = memchr::memmem::find(&body, b"<<\"name\">>").is_some()

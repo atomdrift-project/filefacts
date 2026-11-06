@@ -1,5 +1,5 @@
 use super::actions::MAX_JS_TOTAL;
-use super::filters::{DecodeError, decode_stream, inflate_capped};
+use super::filters::{DecodeError, StageBudget, decode_stream};
 use super::lex::{
     decode_hex, dict_names, find_token_between, has_name, read_hex_string, read_literal_string,
 };
@@ -1018,10 +1018,19 @@ fn truncated_flate_stream_keeps_its_prefix() {
     enc.write_all(&vec![b'x'; 64 << 10]).unwrap();
     let full = enc.finish().unwrap();
     let cut = &full[..full.len() - 8];
-    let partial = inflate_capped(cut, MAX_INFLATED).unwrap();
+    let flate = ["FlateDecode".to_string()];
+    let partial = decode_stream(cut, &flate, MAX_INFLATED, &mut StageBudget::default()).unwrap();
     assert!(!partial.is_empty());
     assert!(partial.iter().all(|&b| b == b'x'));
-    assert!(inflate_capped(b"not zlib at all", MAX_INFLATED).is_none());
+    assert_eq!(
+        decode_stream(
+            b"not zlib at all",
+            &flate,
+            MAX_INFLATED,
+            &mut StageBudget::default()
+        ),
+        Err(DecodeError::Corrupt)
+    );
 }
 
 /// Objects that open a `stream` but never close with `endobj` (or never
@@ -1200,29 +1209,102 @@ fn undecodable_object_stream_is_recorded() {
 #[test]
 fn decode_stream_follows_the_chain() {
     let chain = |names: &[&str]| names.iter().map(ToString::to_string).collect::<Vec<_>>();
-    assert_eq!(decode_stream(b"plain", &[], 3).unwrap(), b"pla");
     assert_eq!(
-        decode_stream(b"48 69>", &chain(&["ASCIIHexDecode"]), 16).unwrap(),
+        decode_stream(b"plain", &[], 3, &mut StageBudget::default()).unwrap(),
+        b"pla"
+    );
+    assert_eq!(
+        decode_stream(
+            b"48 69>",
+            &chain(&["ASCIIHexDecode"]),
+            16,
+            &mut StageBudget::default()
+        )
+        .unwrap(),
         b"Hi"
     );
     assert_eq!(
-        decode_stream(b"87cURD]j7BEbo7~>", &chain(&["A85"]), 64).unwrap(),
+        decode_stream(
+            b"87cURD]j7BEbo7~>",
+            &chain(&["A85"]),
+            64,
+            &mut StageBudget::default()
+        )
+        .unwrap(),
         b"Hello world"
     );
     assert_eq!(
-        decode_stream(b"<~z@:B~>", &chain(&["ASCII85Decode"]), 64).unwrap(),
+        decode_stream(
+            b"<~z@:B~>",
+            &chain(&["ASCII85Decode"]),
+            64,
+            &mut StageBudget::default()
+        )
+        .unwrap(),
         b"\0\0\0\0ab"
     );
     assert_eq!(
-        decode_stream(&zlib(b"deflated"), &chain(&["Fl"]), 64).unwrap(),
+        decode_stream(
+            &zlib(b"deflated"),
+            &chain(&["Fl"]),
+            64,
+            &mut StageBudget::default()
+        )
+        .unwrap(),
         b"deflated"
     );
     assert_eq!(
-        decode_stream(b"x", &chain(&["RunLengthDecode"]), 64),
+        decode_stream(
+            b"x",
+            &chain(&["RunLengthDecode"]),
+            64,
+            &mut StageBudget::default()
+        ),
         Err(DecodeError::Unsupported("RunLengthDecode".into()))
     );
     assert_eq!(
-        decode_stream(b"x", &chain(&["FlateDecode"]), 64),
+        decode_stream(
+            b"x",
+            &chain(&["FlateDecode"]),
+            64,
+            &mut StageBudget::default()
+        ),
         Err(DecodeError::Corrupt)
     );
+}
+
+/// Every stage of a filter chain before the last may decode up to
+/// [`MAX_INFLATED`], whatever the last keeps. Streams whose first stage
+/// inflates a few hundred bytes to a megabyte, over and over, have a
+/// document-wide budget on those stages, and what it leaves undecoded is a
+/// recorded limit.
+#[test]
+fn intermediate_filter_stages_share_a_document_budget() {
+    // A megabyte of hex digits, compressed; its hex decode is what is kept.
+    let raw = zlib(&b"41".repeat(MAX_INFLATED / 2));
+    let streams = 80;
+    let mut pdf = b"%PDF-1.7\n".to_vec();
+    for id in 1..=streams {
+        pdf.extend_from_slice(
+            format!(
+                "{id} 0 obj << /Filter [/FlateDecode /ASCIIHexDecode] /Length {} >> stream\n",
+                raw.len()
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(&raw);
+        pdf.extend_from_slice(b"\nendstream endobj\n");
+    }
+    pdf.extend_from_slice(b"%%EOF\n");
+    let (v, _) = extract_pdf(&pdf);
+    let limits = v.get("pdf.limits").and_then(JsonValue::as_array).unwrap();
+    assert!(
+        limits.iter().any(|l| l["stage"] == "filter-stage-budget"),
+        "{limits:?}"
+    );
+    // The budget runs out partway: earlier streams still decoded.
+    let entries = v.get("pdf.streams").and_then(JsonValue::as_array).unwrap();
+    assert_eq!(entries.len(), streams);
+    assert!(entries[0].get("decoded_text").is_some());
+    assert!(entries[streams - 1].get("decoded_text").is_none());
 }

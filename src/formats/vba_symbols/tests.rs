@@ -3,7 +3,8 @@ use crate::output::{SymbolKind, Symbols};
 
 fn run(src: &str) -> (Symbols, VbaSymbolStats) {
     let mut symbols = Symbols::new();
-    let stats = extract(src, &mut symbols);
+    let mut stats = VbaSymbolStats::default();
+    extract(src, &mut symbols, &mut stats);
     (symbols, stats)
 }
 

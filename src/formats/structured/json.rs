@@ -7,27 +7,17 @@ use serde_json::{Map, Value as JsonValue};
 /// enough that a hostile nest cannot overflow the stack or the `Value` drop.
 const MAX_GYP_DEPTH: usize = 64;
 
-/// Tolerant parse of the Python-literal subset gyp uses, into a JSON value.
-///
-/// Returns `None` on anything it cannot parse, so the caller falls back exactly
-/// as before — never a partial or guessed tree.
-pub(super) fn parse_gyp(content: &[u8]) -> Option<JsonValue> {
-    parse_lenient(content, CommentStyle::Python)
-}
-
-/// Tolerant parse of JSON with comments (JSONC): `//` and `/* */` comments
-/// and trailing commas, on top of strict JSON. Same parser as gyp with the
-/// comment syntax swapped; single-quoted strings and hex numbers are accepted
-/// as well, which only ever widens what a file can say and never changes the
-/// tree of a document strict JSON already accepted (strict runs first).
+/// Tolerant parse of a JSON-like document into a JSON value: the
+/// Python-literal subset gyp uses, or JSON with comments (JSONC), as
+/// `comments` says. JSONC is the same parser with the comment syntax
+/// swapped; its single-quoted strings and hex numbers only ever widen what a
+/// file can say, and never change the tree of a document strict JSON already
+/// accepted (strict runs first).
 ///
 /// Returns `None` on anything it cannot parse, so the caller reports the
-/// malformed document exactly as before -- never a partial or guessed tree.
-pub(super) fn parse_jsonc(content: &[u8]) -> Option<JsonValue> {
-    parse_lenient(content, CommentStyle::Jsonc)
-}
-
-fn parse_lenient(content: &[u8], comments: CommentStyle) -> Option<JsonValue> {
+/// document as it would without this parse -- never a partial or guessed
+/// tree.
+pub(super) fn parse_lenient(content: &[u8], comments: CommentStyle) -> Option<JsonValue> {
     let mut parser = GypParser {
         bytes: content,
         pos: 0,
@@ -52,7 +42,7 @@ struct GypParser<'a> {
 
 /// Which comment syntax the tolerant parser skips as whitespace.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum CommentStyle {
+pub(super) enum CommentStyle {
     /// gyp (Python literal): `#` to end of line.
     Python,
     /// JSON with comments: `//` to end of line and `/* ... */` blocks.
@@ -215,7 +205,7 @@ impl<'a> GypParser<'a> {
                         // `\\`, `\"`, `\'`, `\/`, and any other escape: the
                         // escaped byte stands for itself (Python leaves unknown
                         // escapes literal; the leading backslash is dropped).
-                        other => out.push(other as char),
+                        other => out.push(char::from(other)),
                     }
                 }
                 // Multi-byte UTF-8: re-attach the continuation bytes of the
@@ -226,7 +216,7 @@ impl<'a> GypParser<'a> {
                     out.push_str(std::str::from_utf8(self.bytes.get(start..end)?).ok()?);
                     self.pos = end;
                 }
-                _ => out.push(c as char),
+                _ => out.push(char::from(c)),
             }
         }
     }
@@ -236,7 +226,7 @@ impl<'a> GypParser<'a> {
     fn parse_hex_escape(&mut self, digits: usize) -> Option<char> {
         let mut code: u32 = 0;
         for _ in 0..digits {
-            let nibble = (self.peek()? as char).to_digit(16)?;
+            let nibble = char::from(self.peek()?).to_digit(16)?;
             code = code.checked_mul(16)?.checked_add(nibble)?;
             self.pos += 1;
         }
@@ -266,7 +256,7 @@ impl<'a> GypParser<'a> {
         if self.rest().starts_with(b"0x") || self.rest().starts_with(b"0X") {
             self.pos += 2;
             let hex_start = self.pos;
-            while matches!(self.peek(), Some(c) if (c as char).is_ascii_hexdigit()) {
+            while self.peek().is_some_and(|c| c.is_ascii_hexdigit()) {
                 self.pos += 1;
             }
             let hex = std::str::from_utf8(self.bytes.get(hex_start..self.pos)?).ok()?;
@@ -278,7 +268,9 @@ impl<'a> GypParser<'a> {
             };
             return Some(JsonValue::Number(signed.into()));
         }
-        while matches!(self.peek(), Some(c) if (c as char).is_ascii_digit() || matches!(c, b'.' | b'e' | b'E' | b'+' | b'-'))
+        while self
+            .peek()
+            .is_some_and(|c| c.is_ascii_digit() || matches!(c, b'.' | b'e' | b'E' | b'+' | b'-'))
         {
             self.pos += 1;
         }

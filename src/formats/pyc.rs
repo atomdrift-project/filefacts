@@ -18,12 +18,13 @@
 //! - `pyc.source_files[]` — recovered source paths from
 //!   `co_filename` strings.
 
+use crate::formats::ExtractCtx;
 use crate::metric;
 use crate::value_key;
 use serde_json::Value as JsonValue;
 
 use crate::formats::common::{XorScan, extract_binary_strings, hex_encode, put_str};
-use crate::output::{Errors, Metrics, Stage, Strings, Symbols, Values};
+use crate::output::Stage;
 
 mod names;
 
@@ -34,14 +35,15 @@ const MAX_BODY_SCAN: usize = 256 * 1024;
 /// Cap on distinct source filenames surfaced.
 const MAX_SOURCE_FILES: usize = 32;
 
-pub(super) fn extract(
-    bytes: &[u8],
-    values: &mut Values,
-    strings: &mut Strings,
-    metrics: &mut Metrics,
-    symbols: &mut Symbols,
-    errors: &mut Errors,
-) {
+pub(super) fn extract(bytes: &[u8], ctx: ExtractCtx<'_>) {
+    let ExtractCtx {
+        values,
+        strings,
+        metrics,
+        symbols,
+        errors,
+        ..
+    } = ctx;
     extract_binary_strings(bytes, strings, XorScan::No);
 
     // PEP 3147+ magic ends in `0x0d 0x0a`.
@@ -70,10 +72,13 @@ pub(super) fn extract(
             u32::from_le_bytes([header[0], header[1], header[2], header[3]])
         ),
     );
-    if let Some(ver) = python_version_for_magic(magic_word) {
-        put_str(values, value_key!("pyc.python_version"), ver);
-        if let Some(minor) = ver.strip_prefix("3.").and_then(|s| s.parse::<u8>().ok())
-            && (8..=14).contains(&minor)
+    if let Some(minor) = python3_minor_for_magic(magic_word) {
+        put_str(
+            values,
+            value_key!("pyc.python_version"),
+            format!("3.{minor}"),
+        );
+        if (8..=14).contains(&minor)
             && let Err(message) = names::extract(rest, minor, symbols)
         {
             errors.record_malformed(Stage::FormatExtract, format!("Python marshal: {message}"));
@@ -107,23 +112,23 @@ pub(super) fn extract(
     }
 }
 
-/// Map a Python bytecode magic word to its release name. Values
-/// from CPython's `importlib._bootstrap_external` (canonical
-/// table). Unknown magics omit `pyc.python_version` rather than
+/// Map a Python bytecode magic word to the minor version of its Python 3
+/// release. Values from CPython's `importlib._bootstrap_external`
+/// (canonical table). Unknown magics omit `pyc.python_version` rather than
 /// emit a stale label.
-fn python_version_for_magic(magic: u16) -> Option<&'static str> {
-    match magic {
-        3379 => Some("3.6"),
-        3390..=3394 => Some("3.7"),
-        3400..=3413 => Some("3.8"),
-        3420..=3425 => Some("3.9"),
-        3430..=3439 => Some("3.10"),
-        3450..=3495 => Some("3.11"),
-        3500..=3531 => Some("3.12"),
-        3550..=3571 => Some("3.13"),
-        3627 => Some("3.14"),
-        _ => None,
-    }
+pub(super) fn python3_minor_for_magic(magic: u16) -> Option<u8> {
+    Some(match magic {
+        3379 => 6,
+        3390..=3394 => 7,
+        3400..=3413 => 8,
+        3420..=3425 => 9,
+        3430..=3439 => 10,
+        3450..=3495 => 11,
+        3500..=3531 => 12,
+        3550..=3571 => 13,
+        3627 => 14,
+        _ => return None,
+    })
 }
 
 /// Walk the body looking for ASCII byte runs that end in `.py`
@@ -161,12 +166,13 @@ fn scan_source_files(body: &[u8]) -> Vec<String> {
             i += 1;
             continue;
         }
-        if let Some(Ok(s)) = body.get(start..after).map(std::str::from_utf8) {
-            if !s.is_empty() && !found.iter().any(|x| x == s) {
-                found.push(s.to_string());
-                if found.len() >= MAX_SOURCE_FILES {
-                    return found;
-                }
+        if let Some(Ok(s)) = body.get(start..after).map(std::str::from_utf8)
+            && !s.is_empty()
+            && !found.iter().any(|x| x == s)
+        {
+            found.push(s.to_string());
+            if found.len() >= MAX_SOURCE_FILES {
+                return found;
             }
         }
         i = after;

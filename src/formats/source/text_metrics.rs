@@ -65,9 +65,7 @@ fn emit_byte_metrics(bytes: &[u8], metrics: &mut Metrics) {
         .max_by_key(|&(&count, _)| count)
         .map(|(&count, b)| (b, count));
 
-    let most_common_ratio = most_common
-        .map(|(_, count)| count as f64 / total as f64)
-        .unwrap_or(0.0);
+    let most_common_ratio = most_common.map_or(0.0, |(_, count)| count as f64 / total as f64);
 
     if entropy > 0.0 {
         metrics.insert(metric!("text.char_entropy"), entropy);
@@ -185,11 +183,9 @@ fn emit_line_metrics(content: &str, metrics: &mut Metrics) {
         ),
         None => metrics.insert(metric!("text.max_line_length"), f64::from(max_line_length)),
     }
-    if total_lines > 0 {
-        let stddev = (m2 / f64::from(total_lines)).sqrt();
-        if stddev > 0.0 {
-            metrics.insert(metric!("text.line_length_stddev"), stddev);
-        }
+    let stddev = (m2 / f64::from(total_lines)).sqrt();
+    if stddev > 0.0 {
+        metrics.insert(metric!("text.line_length_stddev"), stddev);
     }
     if lines_over_200 > 0 {
         metrics.insert(metric!("text.lines_over_200"), f64::from(lines_over_200));
@@ -477,19 +473,24 @@ fn is_unusual_whitespace(c: char) -> bool {
 }
 
 fn is_invisible_char(c: char, is_first_char: bool) -> bool {
-    let cp = c as u32;
-    if is_first_char && cp == 0xFEFF {
+    // A leading U+FEFF is a byte-order mark, not hidden text.
+    if is_first_char && c == '\u{FEFF}' {
         return false;
     }
-
-    (0xFE00..=0xFE0F).contains(&cp)
-        || (0xE0100..=0xE01EF).contains(&cp)
-        || (0xE0001..=0xE007F).contains(&cp)
-        || matches!(cp, 0x200B | 0x200C | 0x200D | 0x2060 | 0xFEFF)
+    matches!(
+        c,
+        '\u{FE00}'..='\u{FE0F}'
+            | '\u{E0100}'..='\u{E01EF}'
+            | '\u{E0001}'..='\u{E007F}'
+            | '\u{200B}'
+            | '\u{200C}'
+            | '\u{200D}'
+            | '\u{2060}'
+            | '\u{FEFF}'
+    )
 }
 
 fn is_ascii_art_line(line: &str) -> bool {
-    let art_chars = ['=', '-', '*', '#', '+', '|', '/', '\\', '_', '.'];
     let trimmed = line.trim();
     if trimmed.len() < 20 {
         return false;
@@ -497,7 +498,7 @@ fn is_ascii_art_line(line: &str) -> bool {
 
     let art_count = trimmed
         .bytes()
-        .filter(|b| art_chars.contains(&(*b as char)))
+        .filter(|b| b"=-*#+|/\\_.".contains(b))
         .count();
     art_count as f64 / trimmed.len() as f64 > 0.7
 }

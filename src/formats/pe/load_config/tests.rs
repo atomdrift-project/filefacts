@@ -71,7 +71,7 @@ fn tls_callback_records_are_capped() {
         let prepared = goblin_safe::prepare_pe(&bytes);
         let pe = goblin_safe::parse_pe(&prepared).ok().expect("parses");
         let (mut values, mut metrics) = (Values::new(), Metrics::new());
-        tls_callbacks(&pe, &mut values, &mut metrics);
+        tls_callbacks(&pe, None, &mut values, &mut metrics);
         assert_eq!(metrics.get("pe.tls_callback_count"), Some(callbacks as f64));
         let recorded = values.get("pe.tls_callbacks").and_then(JsonValue::as_array);
         assert_eq!(recorded.map(Vec::len), Some(records));

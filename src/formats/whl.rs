@@ -30,7 +30,7 @@ use crate::value_key;
 use serde_json::Value as JsonValue;
 use std::io::{Read, Seek};
 
-use super::bounded::MemberFailure;
+use super::bounded::{Limits, MAX_MANIFEST_BYTES, MemberFailure};
 use crate::output::{Errors, Metrics, Stage, Values};
 
 pub(super) fn extract_from_archive<R: Read + Seek>(
@@ -45,7 +45,7 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     // the dist-info directory inside the archive. When they disagree,
     // it's an impersonation/repack signal.
     if let Some(basename) = values
-        .get_key(value_key!("file.basename"))
+        .lookup(value_key!("file.basename"))
         .and_then(JsonValue::as_str)
         .map(str::to_string)
     {
@@ -69,42 +69,30 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         // several; the first in central-directory order is kept, which is
         // deterministic for a given file. Layout names match exactly, as
         // installers match them.
-        if let Some(first) = name.split('/').next() {
-            if first.ends_with(".dist-info") && dist_info_dir.as_deref() != Some(first) {
-                if dist_info_dir.is_none() {
-                    dist_info_dir = Some(first.to_string());
-                }
-            } else if first.rsplit_once('.').is_some_and(|(_, ext)| ext == "data")
-                && data_dir.as_deref() != Some(first)
-            {
-                if data_dir.is_none() {
-                    data_dir = Some(first.to_string());
-                }
-            } else if !first.is_empty()
-                && !first.ends_with(".dist-info")
-                && first.rsplit_once('.').is_none_or(|(_, ext)| ext != "data")
-            {
-                // Only record root-level *directories* — bare files at
-                // the archive root are unusual in wheels but not signal.
-                if name.contains('/') {
-                    top_level.insert(first.to_string());
-                }
-            }
+        let first = name.split('/').next().unwrap_or(name);
+        if first.ends_with(".dist-info") {
+            dist_info_dir.get_or_insert_with(|| first.to_string());
+        } else if first.rsplit_once('.').is_some_and(|(_, ext)| ext == "data") {
+            data_dir.get_or_insert_with(|| first.to_string());
+        } else if !first.is_empty() && name.contains('/') {
+            // Only record root-level *directories* — bare files at
+            // the archive root are unusual in wheels but not signal.
+            top_level.insert(first.to_string());
         }
 
         // Per-name dist-info member checks. Match against any
         // `.dist-info/` prefix so a malformed wheel with multiple
         // dist-info dirs still surfaces the canonical-shape facts.
-        if let Some((dir, rest)) = name.split_once('/') {
-            if dir.ends_with(".dist-info") {
-                match rest {
-                    "METADATA" => has_metadata = true,
-                    "WHEEL" => has_wheel = true,
-                    "RECORD" => has_record = true,
-                    "RECORD.jws" => has_record_jws = true,
-                    "RECORD.p7s" => has_record_p7s = true,
-                    _ => {}
-                }
+        if let Some((dir, rest)) = name.split_once('/')
+            && dir.ends_with(".dist-info")
+        {
+            match rest {
+                "METADATA" => has_metadata = true,
+                "WHEEL" => has_wheel = true,
+                "RECORD" => has_record = true,
+                "RECORD.jws" => has_record_jws = true,
+                "RECORD.p7s" => has_record_p7s = true,
+                _ => {}
             }
         }
 
@@ -114,10 +102,10 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         // tree; pure-python wheels never do.
         let basename = name.rsplit('/').next().unwrap_or(name);
         // Case-insensitive: Windows loads `FOO.PYD` as readily as `foo.pyd`.
-        if super::common::ends_with_ci(basename, ".pyd")
-            || super::common::ends_with_ci(basename, ".so")
+        if crate::bytes::ends_with_ci(basename, ".pyd")
+            || crate::bytes::ends_with_ci(basename, ".so")
             || ends_with_so_versioned(basename)
-            || super::common::ends_with_ci(basename, ".dylib")
+            || crate::bytes::ends_with_ci(basename, ".dylib")
         {
             native_extension_count += 1;
         }
@@ -136,19 +124,19 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
     // Parse `{distribution}-{version}.dist-info/` → (distribution, version).
     // Wheel spec: the distribution name is a PEP 503-normalized identifier;
     // version is a PEP 440 version string. Both are non-empty.
-    if let Some(stem) = dist_info.strip_suffix(".dist-info") {
-        if let Some((dist, ver)) = stem.rsplit_once('-') {
-            if !dist.is_empty() && !ver.is_empty() {
-                values.insert_key(
-                    value_key!("whl.distribution"),
-                    JsonValue::String(dist.to_string()),
-                );
-                values.insert_key(
-                    value_key!("whl.version"),
-                    JsonValue::String(ver.to_string()),
-                );
-            }
-        }
+    if let Some(stem) = dist_info.strip_suffix(".dist-info")
+        && let Some((dist, ver)) = stem.rsplit_once('-')
+        && !dist.is_empty()
+        && !ver.is_empty()
+    {
+        values.insert_key(
+            value_key!("whl.distribution"),
+            JsonValue::String(dist.to_string()),
+        );
+        values.insert_key(
+            value_key!("whl.version"),
+            JsonValue::String(ver.to_string()),
+        );
     }
 
     if has_metadata {
@@ -157,7 +145,7 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         // Pull the authorship fields — the publisher identity a wheel
         // carries that the filename and dir name don't.
         let name = format!("{dist_info}/METADATA");
-        match read_text_member(zip, &name) {
+        match read_text_member(zip, &name, values) {
             Ok(Some(meta)) => emit_metadata_identity(&meta, values),
             // `has_metadata` can come from a second dist-info directory;
             // the chosen one having none is an absence, not a failure.
@@ -165,23 +153,15 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
             Err(failure) => failure.record(errors),
         }
     }
-    if has_wheel {
-        values.insert_key(value_key!("whl.has_wheel"), JsonValue::Bool(true));
-    }
-    if has_record {
-        values.insert_key(value_key!("whl.has_record"), JsonValue::Bool(true));
-    }
-    if has_record_jws {
-        values.insert_key(
-            value_key!("whl.signing.has_record_jws"),
-            JsonValue::Bool(true),
-        );
-    }
-    if has_record_p7s {
-        values.insert_key(
-            value_key!("whl.signing.has_record_p7s"),
-            JsonValue::Bool(true),
-        );
+    for (present, key) in [
+        (has_wheel, value_key!("whl.has_wheel")),
+        (has_record, value_key!("whl.has_record")),
+        (has_record_jws, value_key!("whl.signing.has_record_jws")),
+        (has_record_p7s, value_key!("whl.signing.has_record_p7s")),
+    ] {
+        if present {
+            values.insert_key(key, JsonValue::Bool(true));
+        }
     }
     if let Some(d) = data_dir {
         values.insert_key(value_key!("whl.has_data_dir"), JsonValue::Bool(true));
@@ -218,9 +198,8 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
 /// `dist-info/METADATA::Name` (from the metadata blob) to flag
 /// repackaging.
 fn parse_wheel_filename(basename: &str, values: &mut Values) {
-    let stem = match basename.strip_suffix(".whl") {
-        Some(s) => s,
-        None => return,
+    let Some(stem) = basename.strip_suffix(".whl") else {
+        return;
     };
     let parts: Vec<&str> = stem.split('-').collect();
     // 5 fields: name, version, python, abi, platform.
@@ -235,32 +214,18 @@ fn parse_wheel_filename(basename: &str, values: &mut Values) {
     if name.is_empty() || version.is_empty() {
         return;
     }
-    values.insert_key(
-        value_key!("whl.filename.name_prefix"),
-        JsonValue::String(name.to_string()),
-    );
-    values.insert_key(
-        value_key!("whl.filename.version"),
-        JsonValue::String(version.to_string()),
-    );
-    if let Some(b) = build {
-        values.insert_key(
-            value_key!("whl.filename.build"),
-            JsonValue::String(b.to_string()),
-        );
+    for (key, value) in [
+        (value_key!("whl.filename.name_prefix"), Some(name)),
+        (value_key!("whl.filename.version"), Some(version)),
+        (value_key!("whl.filename.build"), build),
+        (value_key!("whl.filename.python_tag"), Some(python)),
+        (value_key!("whl.filename.abi_tag"), Some(abi)),
+        (value_key!("whl.filename.platform_tag"), Some(platform)),
+    ] {
+        if let Some(value) = value {
+            values.insert_key(key, JsonValue::String(value.to_string()));
+        }
     }
-    values.insert_key(
-        value_key!("whl.filename.python_tag"),
-        JsonValue::String(python.to_string()),
-    );
-    values.insert_key(
-        value_key!("whl.filename.abi_tag"),
-        JsonValue::String(abi.to_string()),
-    );
-    values.insert_key(
-        value_key!("whl.filename.platform_tag"),
-        JsonValue::String(platform.to_string()),
-    );
 }
 
 /// Linux shared libraries also appear as `libfoo.so.1`, `libfoo.so.1.2.3`.
@@ -271,29 +236,38 @@ fn ends_with_so_versioned(basename: &str) -> bool {
     let after_so = chars.next().unwrap_or("");
     // The suffix after `.so` must be empty (handled above) or only
     // digits and dots — `.1`, `.1.2.3`, etc.
-    !after_so.is_empty()
-        && after_so.starts_with('.')
-        && after_so[1..]
-            .chars()
-            .all(|c| c.is_ascii_digit() || c == '.')
+    after_so
+        .strip_prefix('.')
+        .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit() || c == '.'))
         && chars.next().is_some()
 }
 
-/// Read a zip member as UTF-8 text, capped so a hostile member can't
-/// balloon memory; `Ok(None)` when there is no such member. Only the
-/// leading header block is used, so a member past the cap is read as its
-/// first `MAX` bytes (to the last whole character) rather than refused. Fails
-/// when the member would not decompress, or is not UTF-8.
+/// Read the Core Metadata member `name` as UTF-8 text, capped so a hostile
+/// member can't balloon memory; `Ok(None)` when there is no such member.
+/// Only the leading header block is used, so a member past the cap is read
+/// as its first [`MAX_MANIFEST_BYTES`] bytes (to the last whole character),
+/// with a `whl.limits` entry, rather than refused. Fails when the member
+/// would not decompress, or is not UTF-8.
 fn read_text_member<R: Read + Seek>(
     zip: &mut ::zip::ZipArchive<R>,
     name: &str,
+    values: &mut Values,
 ) -> Result<Option<String>, MemberFailure> {
-    const MAX: u64 = 256 * 1024;
-    let prefix = match super::zip::read_member_prefix(zip, name, MAX) {
+    let prefix = match super::zip::read_member_prefix(zip, name, MAX_MANIFEST_BYTES) {
         Ok(Some(prefix)) => prefix,
         Ok(None) => return Ok(None),
         Err(e) => return Err(MemberFailure::new(Stage::ZipParse, name, e)),
     };
+    if prefix.truncated {
+        let mut limits = Limits::default();
+        limits.push(
+            "metadata",
+            format!(
+                "{name} over the {MAX_MANIFEST_BYTES}-byte cap; header block read from its prefix"
+            ),
+        );
+        limits.emit(values, value_key!("whl.limits"));
+    }
     super::bounded::utf8_prefix(prefix)
         .map(Some)
         .map_err(|e| MemberFailure::new(Stage::FormatExtract, format!("{name}: not UTF-8"), e))
@@ -304,12 +278,13 @@ fn read_text_member<R: Read + Seek>(
 /// first occurrence of each field is taken, and `UNKNOWN` placeholders are
 /// skipped.
 fn emit_metadata_identity(meta: &str, values: &mut Values) {
-    let headers = super::python_sdist::CoreMetadata::parse(meta);
-    super::python_sdist::emit_people(
+    let headers = super::core_metadata::CoreMetadata::parse(meta);
+    super::core_metadata::emit_people(
         &headers,
         values,
         value_key!("whl.authors"),
         value_key!("whl.maintainers"),
+        value_key!("whl.limits"),
     );
     for (field, key) in [
         ("home-page", value_key!("whl.homepage")),

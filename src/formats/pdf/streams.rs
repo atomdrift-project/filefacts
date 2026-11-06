@@ -3,7 +3,7 @@
 
 use serde_json::{Value as JsonValue, json};
 
-use super::filters::{decode_stream, find_filters};
+use super::filters::{StageBudget, decode_stream, find_filters};
 use super::lex::truncate;
 use super::objects::{DictRegion, LengthValue, classify_stream_length};
 use crate::metric;
@@ -13,8 +13,13 @@ use crate::output::Metrics;
 /// records the carrier `object_id`, the filter chain, a short
 /// hex `magic` of the raw stream bytes (8 bytes — enough for the
 /// usual file-format signatures), and — when the stream is filtered
-/// and its chain decodes — the first ~4 KB of the decoded text.
-pub(super) fn scan_streams(bytes: &[u8], dict_regions: &[DictRegion]) -> Vec<JsonValue> {
+/// and its chain decodes — the first ~4 KB of the decoded text. Chains of
+/// more than one filter spend `stages`.
+pub(super) fn scan_streams(
+    bytes: &[u8],
+    dict_regions: &[DictRegion],
+    stages: &mut StageBudget,
+) -> Vec<JsonValue> {
     const MAGIC_BYTES: usize = 8;
     const MAX_DECODED_TEXT: usize = 4096;
     let mut out = Vec::new();
@@ -26,11 +31,7 @@ pub(super) fn scan_streams(bytes: &[u8], dict_regions: &[DictRegion]) -> Vec<Jso
             continue;
         };
         let filters = find_filters(region.dict(bytes)).unwrap_or_default();
-        let magic_hex: String = raw
-            .iter()
-            .take(MAGIC_BYTES)
-            .map(|b| format!("{b:02x}"))
-            .collect();
+        let magic_hex = crate::formats::common::hex_encode(raw.get(..MAGIC_BYTES).unwrap_or(raw));
 
         let mut entry = serde_json::Map::new();
         if let Some(id) = region.obj_id {
@@ -44,7 +45,7 @@ pub(super) fn scan_streams(bytes: &[u8], dict_regions: &[DictRegion]) -> Vec<Jso
         // bytes are kept, so decoding more would only burn time on every
         // stream in the file.
         if !filters.is_empty()
-            && let Ok(decoded) = decode_stream(raw, &filters, MAX_DECODED_TEXT)
+            && let Ok(decoded) = decode_stream(raw, &filters, MAX_DECODED_TEXT, stages)
         {
             // Decoded streams are roughly text-shaped (content streams,
             // JavaScript, metadata XML) or binary-shaped (image / font /

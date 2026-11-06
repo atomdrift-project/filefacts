@@ -77,4 +77,58 @@ mod documents;
 mod languages;
 mod names;
 mod packages;
+mod polyglots;
 mod scripts_and_bitmaps;
+
+/// Nothing identified is not a heuristic verdict: the source says so.
+#[test]
+fn an_unidentified_file_has_no_detection_source() {
+    let id = FileId::from_path_and_bytes(Path::new("opaque"), b"\x01\x02\x03\x04\x05\x06\x07");
+    assert_eq!(id.file_type(), FileType::Unknown);
+    assert_eq!(id.source(), DetectionSource::Unidentified);
+    assert!(!id.extension_mismatch());
+    assert_eq!(
+        serde_json::to_value(id).unwrap()["source"],
+        serde_json::json!("unidentified")
+    );
+}
+
+/// A Chrome extension manifest is named by its rule after the signatures,
+/// which the bytes alone cannot claim.
+#[test]
+fn chrome_manifest() {
+    let data = br#"{"manifest_version": 3, "permissions": ["storage"]}"#;
+    assert_detect("manifest.json", data, FileType::ChromeManifest);
+    assert_eq!(
+        detect(Path::new("manifest.json"), data).map(|d| d.source),
+        Some(DetectionSource::Filename)
+    );
+}
+
+/// Content alone sees the structural signatures identification sees: a FAT
+/// boot sector, a DOS COM program and shellcode need no name.
+#[test]
+fn detect_content_sees_structural_signatures() {
+    let mut boot = [0u8; 512];
+    boot[..3].copy_from_slice(&[0xEB, 0x3C, 0x90]);
+    boot[11..13].copy_from_slice(&512u16.to_le_bytes());
+    boot[13] = 1;
+    boot[14..16].copy_from_slice(&1u16.to_le_bytes());
+    boot[16] = 2;
+    boot[19..21].copy_from_slice(&2880u16.to_le_bytes());
+    boot[21] = 0xF0;
+    boot[22..24].copy_from_slice(&9u16.to_le_bytes());
+    boot[24..26].copy_from_slice(&18u16.to_le_bytes());
+    boot[26..28].copy_from_slice(&2u16.to_le_bytes());
+    boot[510..].copy_from_slice(&[0x55, 0xAA]);
+    assert_eq!(
+        detect_content(&boot).map(|d| d.file_type),
+        Some(FileType::FatBootSector)
+    );
+    // mov ah, 9; mov dx, msg; int 21h; int 20h; then the message.
+    let com = b"\xb4\x09\xba\x09\x01\xcd\x21\xcd\x20Hello$\0\0\0\0\0\0\0\0\0\0\0";
+    assert_eq!(
+        detect_content(com).map(|d| d.file_type),
+        Some(FileType::DosCom)
+    );
+}

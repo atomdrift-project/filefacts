@@ -30,8 +30,9 @@ use std::io::{Read, Seek};
 
 use serde_json::Value as JsonValue;
 
+use crate::bytes::ends_with_ci;
 use crate::formats::bounded::Limits;
-use crate::formats::common::{bytes_at, ends_with_ci, put_str};
+use crate::formats::common::put_str;
 use crate::output::{DiagnosticKind, Errors, Metrics, Stage, ValueKey, Values};
 use crate::value_key;
 
@@ -46,12 +47,14 @@ const MAX_PART_BYTES: u64 = 4 << 20;
 /// every part rather than a named few.
 const MAX_SCAN_PART_BYTES: u64 = 1 << 20;
 
-/// Inflated bytes the DDE / customUI scan reads across every part.
+/// Inflated bytes the DDE / customUI scan reads across every part, a part
+/// refused at its cap counting as the cap.
 const MAX_SCAN_TOTAL_BYTES: u64 = 32 << 20;
 
-/// Inflated `.rels` bytes read across the package. Every relationship part
-/// is read, and each may be a 4 MiB deflate bomb: thousands of them took
-/// minutes to inflate and parse.
+/// Inflated `.rels` bytes read across the package, a part refused at its
+/// cap counting as the cap. Every relationship part is read, and each may
+/// be a 4 MiB deflate bomb: thousands of them took minutes to inflate and
+/// parse.
 const MAX_RELS_TOTAL_BYTES: u64 = 16 << 20;
 
 /// Relationships kept per package. A 4 MiB part holds 150,000 of them, each
@@ -84,11 +87,10 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         return;
     };
 
-    if let Some(kind) = detect_kind(&index) {
-        put_str(values, value_key!("office.kind"), kind);
-    } else {
+    let Some(kind) = detect_kind(&index) else {
         return;
-    }
+    };
+    put_str(values, value_key!("office.kind"), kind);
 
     if let Some(core) = parse_core_props(zip, errors) {
         for (key, value) in core {
@@ -96,13 +98,12 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         }
     }
 
-    if let Some((app, company)) = parse_app_props(zip, errors) {
-        if let Some(app) = app {
-            put_str(values, value_key!("office.application"), app);
-        }
-        if let Some(company) = company {
-            put_str(values, value_key!("office.company"), company);
-        }
+    let (app, company) = parse_app_props(zip, errors).unwrap_or_default();
+    if let Some(app) = app {
+        put_str(values, value_key!("office.application"), app);
+    }
+    if let Some(company) = company {
+        put_str(values, value_key!("office.company"), company);
     }
 
     let mut features: Vec<&'static str> = Vec::new();
@@ -161,28 +162,20 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
 
     for rel in &index.relationships {
         match rel.short_type.as_str() {
-            "oleObject" => {
-                push_feature(&mut features, "ole_objects");
+            short_type @ ("oleObject" | "package") => {
+                let feature = if short_type == "package" {
+                    "embedded_packages"
+                } else {
+                    "ole_objects"
+                };
+                push_feature(&mut features, feature);
                 if let Some(target) = rel.target_part.as_deref() {
                     push_embedded(
                         zip,
                         &mut embedded_seen,
                         &mut embedded,
                         target,
-                        Some("oleObject"),
-                        Some(&rel.source),
-                    );
-                }
-            }
-            "package" => {
-                push_feature(&mut features, "embedded_packages");
-                if let Some(target) = rel.target_part.as_deref() {
-                    push_embedded(
-                        zip,
-                        &mut embedded_seen,
-                        &mut embedded,
-                        target,
-                        Some("package"),
+                        Some(short_type),
                         Some(&rel.source),
                     );
                 }
@@ -288,12 +281,15 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         let text = match read_part(zip, name, MAX_SCAN_PART_BYTES) {
             Ok(Some(text)) => text,
             Ok(None) => continue,
-            Err(PartError::TooLarge) => {
-                oversized_parts += 1;
-                continue;
-            }
-            Err(PartError::Unreadable(why)) => {
-                errors.record_malformed(Stage::OoxmlParse, format!("{name}: {why}"));
+            Err(e) => {
+                // A refused part may have been inflated up to the cap first.
+                scan_budget = scan_budget.saturating_sub(MAX_SCAN_PART_BYTES);
+                match e {
+                    PartError::TooLarge => oversized_parts += 1,
+                    PartError::Unreadable(why) => {
+                        errors.record_malformed(Stage::OoxmlParse, format!("{name}: {why}"));
+                    }
+                }
                 continue;
             }
         };
@@ -407,12 +403,13 @@ impl OoxmlIndex {
             .map(String::as_str)
     }
 
+    /// The content type of this part: its `Override`, else the `Default`
+    /// for its extension.
     fn content_type_for(&self, name: &str) -> Option<&str> {
-        let normalized = name.trim_start_matches('/');
-        if let Some(content_type) = self.overrides.get(normalized) {
+        if let Some(content_type) = self.override_for(name) {
             return Some(content_type);
         }
-        let ext = normalized.rsplit_once('.')?.1.to_ascii_lowercase();
+        let ext = name.rsplit_once('.')?.1.to_ascii_lowercase();
         self.defaults.get(&ext).map(String::as_str)
     }
 }
@@ -438,8 +435,15 @@ fn build_ooxml_index<R: Read + std::io::Seek>(
             index.unread_rels += 1;
             continue;
         }
-        let Some(text) = read_named_part(zip, name, errors) else {
-            continue;
+        let text = match read_part(zip, name, MAX_PART_BYTES) {
+            Ok(Some(text)) => text,
+            Ok(None) => continue,
+            Err(e) => {
+                // A refused part may have been inflated up to the cap first.
+                budget = budget.saturating_sub(MAX_PART_BYTES);
+                record_part_error(errors, name, e);
+                continue;
+            }
         };
         budget = budget.saturating_sub(text.len() as u64);
         match parse_relationships(&text, name) {
@@ -570,11 +574,7 @@ fn normalize_part_name(path: &str) -> Option<String> {
             _ => parts.push(part),
         }
     }
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join("/"))
-    }
+    (!parts.is_empty()).then(|| parts.join("/"))
 }
 
 fn push_feature(features: &mut Vec<&'static str>, feature: &'static str) {
@@ -620,23 +620,36 @@ fn push_embedded<R: Read + std::io::Seek>(
     relationship_type: Option<&str>,
     source: Option<&str>,
 ) {
-    if let Some(&at) = seen.get(filename) {
-        if let Some(obj) = out.get_mut(at).and_then(JsonValue::as_object_mut) {
-            if let Some(relationship_type) = relationship_type {
-                obj.insert(
-                    "relationship_type".into(),
-                    JsonValue::String(relationship_type.to_string()),
-                );
+    let at = match seen.get(filename) {
+        Some(&at) => at,
+        None => {
+            let mut obj = serde_json::Map::new();
+            obj.insert("filename".into(), JsonValue::String(filename.to_string()));
+            if let Ok(mut entry) = zip.by_name(filename) {
+                obj.insert("size_bytes".into(), JsonValue::Number(entry.size().into()));
+                let mut header = [0u8; 8];
+                let n = entry.read(&mut header).unwrap_or_else(|e| {
+                    tracing::debug!(
+                        target: "filefacts::ooxml",
+                        stage = "embedded",
+                        part = filename,
+                        error = %e,
+                        "embedded part unreadable; kind not classified"
+                    );
+                    0
+                });
+                if let Some(kind) = embedded_kind(header.get(..n).unwrap_or_default()) {
+                    obj.insert("kind".into(), JsonValue::String(kind.into()));
+                }
             }
-            if let Some(source) = source {
-                obj.insert("source".into(), JsonValue::String(source.to_string()));
-            }
+            seen.insert(filename.to_string(), out.len());
+            out.push(JsonValue::Object(obj));
+            out.len() - 1
         }
+    };
+    let Some(obj) = out.get_mut(at).and_then(JsonValue::as_object_mut) else {
         return;
-    }
-    seen.insert(filename.to_string(), out.len());
-    let mut obj = serde_json::Map::new();
-    obj.insert("filename".into(), JsonValue::String(filename.to_string()));
+    };
     if let Some(relationship_type) = relationship_type {
         obj.insert(
             "relationship_type".into(),
@@ -646,24 +659,6 @@ fn push_embedded<R: Read + std::io::Seek>(
     if let Some(source) = source {
         obj.insert("source".into(), JsonValue::String(source.to_string()));
     }
-    if let Ok(mut entry) = zip.by_name(filename) {
-        obj.insert("size_bytes".into(), JsonValue::Number(entry.size().into()));
-        let mut header = [0u8; 8];
-        let n = entry.read(&mut header).unwrap_or_else(|e| {
-            tracing::debug!(
-                target: "filefacts::ooxml",
-                stage = "embedded",
-                part = filename,
-                error = %e,
-                "embedded part unreadable; kind not classified"
-            );
-            0
-        });
-        if let Some(kind) = embedded_kind(header.get(..n).unwrap_or_default()) {
-            obj.insert("kind".into(), JsonValue::String(kind.into()));
-        }
-    }
-    out.push(JsonValue::Object(obj));
 }
 
 fn is_macro_relationship(short_type: &str) -> bool {
@@ -705,7 +700,7 @@ fn embedded_kind(bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(b"\x7fELF") {
         return Some("elf");
     }
-    if let Some(m) = bytes_at::u32_le(bytes, 0) {
+    if let Some(m) = crate::bytes::u32_le(bytes, 0) {
         // MH_MAGIC / MH_CIGAM / MH_MAGIC_64 / MH_CIGAM_64
         if matches!(m, 0xFEED_FACE | 0xCEFA_EDFE | 0xFEED_FACF | 0xCFFA_EDFE) {
             return Some("macho");
@@ -867,13 +862,13 @@ fn extract_dde_links(doc: &roxmltree::Document<'_>, source: &str) -> Vec<JsonVal
             "fldSimple" => {
                 for attr in node.attributes() {
                     if attr.name() == "instr" {
-                        push_dde_field(&mut out, source, "field", attr.value());
+                        push_dde_field(&mut out, source, attr.value());
                     }
                 }
             }
             "instrText" => {
                 if let Some(text) = node.text() {
-                    push_dde_field(&mut out, source, "field", text);
+                    push_dde_field(&mut out, source, text);
                 }
             }
             "ddeLink" => {
@@ -902,7 +897,7 @@ fn extract_dde_links(doc: &roxmltree::Document<'_>, source: &str) -> Vec<JsonVal
     out
 }
 
-fn push_dde_field(out: &mut Vec<JsonValue>, source: &str, kind: &str, text: &str) {
+fn push_dde_field(out: &mut Vec<JsonValue>, source: &str, text: &str) {
     let trimmed = text.trim();
     let lower = trimmed.to_ascii_lowercase();
     if !(lower.starts_with("dde ")
@@ -914,7 +909,7 @@ fn push_dde_field(out: &mut Vec<JsonValue>, source: &str, kind: &str, text: &str
     }
     let mut obj = serde_json::Map::new();
     obj.insert("source".into(), JsonValue::String(source.to_string()));
-    obj.insert("kind".into(), JsonValue::String(kind.to_string()));
+    obj.insert("kind".into(), JsonValue::String("field".into()));
     obj.insert("text".into(), JsonValue::String(trimmed.to_string()));
     out.push(JsonValue::Object(obj));
 }
@@ -962,7 +957,7 @@ fn read_part<R: Read + std::io::Seek>(
         Err(super::zip::MemberError::TooLarge { .. }) => return Err(PartError::TooLarge),
         Err(e) => return Err(PartError::Unreadable(e.to_string())),
     };
-    decode_xml_bytes(&buf)
+    decode_xml_bytes(buf)
         .map(Some)
         .ok_or_else(|| PartError::Unreadable("not UTF-8 or UTF-16 text".into()))
 }
@@ -974,38 +969,41 @@ fn read_named_part<R: Read + std::io::Seek>(
     name: &str,
     errors: &mut Errors,
 ) -> Option<String> {
-    match read_part(zip, name, MAX_PART_BYTES) {
-        Ok(text) => text,
-        Err(PartError::TooLarge) => {
-            errors.record(
-                DiagnosticKind::Truncated,
-                Stage::OoxmlParse,
-                format!("{name}: over the {MAX_PART_BYTES}-byte read cap; not parsed"),
-            );
-            None
-        }
-        Err(PartError::Unreadable(why)) => {
+    read_part(zip, name, MAX_PART_BYTES)
+        .map_err(|e| record_part_error(errors, name, e))
+        .ok()
+        .flatten()
+}
+
+/// Record why the named part `name` was not read.
+fn record_part_error(errors: &mut Errors, name: &str, e: PartError) {
+    match e {
+        PartError::TooLarge => errors.record(
+            DiagnosticKind::Truncated,
+            Stage::OoxmlParse,
+            format!("{name}: over the {MAX_PART_BYTES}-byte read cap; not parsed"),
+        ),
+        PartError::Unreadable(why) => {
             errors.record_malformed(Stage::OoxmlParse, format!("{name}: {why}"));
-            None
         }
     }
 }
 
-fn decode_xml_bytes(buf: &[u8]) -> Option<String> {
+fn decode_xml_bytes(buf: Vec<u8>) -> Option<String> {
     if let Some(rest) = buf.strip_prefix(&[0xFF, 0xFE]) {
-        return bytes_at::utf16_strict(rest, bytes_at::Endian::Little);
+        return crate::bytes::utf16_strict(rest, crate::bytes::Endian::Little);
     }
     if let Some(rest) = buf.strip_prefix(&[0xFE, 0xFF]) {
-        return bytes_at::utf16_strict(rest, bytes_at::Endian::Big);
+        return crate::bytes::utf16_strict(rest, crate::bytes::Endian::Big);
     }
     // No BOM: an XML declaration spelled in UTF-16 still gives it away.
     if buf.len() >= 8 && buf.starts_with(&[b'<', 0, b'?', 0]) {
-        return bytes_at::utf16_strict(buf, bytes_at::Endian::Little);
+        return crate::bytes::utf16_strict(&buf, crate::bytes::Endian::Little);
     }
     if buf.len() >= 8 && buf.starts_with(&[0, b'<', 0, b'?']) {
-        return bytes_at::utf16_strict(buf, bytes_at::Endian::Big);
+        return crate::bytes::utf16_strict(&buf, crate::bytes::Endian::Big);
     }
-    String::from_utf8(buf.to_vec()).ok()
+    String::from_utf8(buf).ok()
 }
 
 #[cfg(test)]

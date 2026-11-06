@@ -50,7 +50,7 @@ const READER_MODULES: &[&str] = &[
 ];
 
 /// Functions and methods that read the key passed directly to them.
-const READ_CALLS: &[&str] = &["get_key", "get_key_at"];
+const READ_CALLS: &[&str] = &["lookup", "lookup_at"];
 
 /// `ValueKey` methods that read when called on a `value_key!(…)`.
 const READ_METHODS: &[&str] = &["get_in"];
@@ -70,7 +70,7 @@ const KEY_HELPERS: &[&str] = &["put_i64", "put_str", "put_u64"];
 /// contents and `#[cfg(test)]` / `#[test]` items are skipped, and an
 /// invocation split across lines is still found. A use counts as a read
 /// when it is in a reader module, when it is the direct argument of a read
-/// call (`values.get_key(value_key!(…))`), or when a read method is called
+/// call (`values.lookup(value_key!(…))`), or when a read method is called
 /// on it. Any other use counts as a write: an argument to `insert_key` or
 /// a format helper, or an entry in a writer's key table.
 #[test]
@@ -236,8 +236,8 @@ fn scan_skips_comments_strings_and_test_items() {
                 );
                 put_str(values, value_key!("helper.write"), "x");
                 for (k, v) in [(value_key!("table.write"), 1)] {}
-                let _ = values.get_key(value_key!("direct.read"));
-                let _ = values.get_key_at(value_key!("suffix.read"), "[0]");
+                let _ = values.lookup(value_key!("direct.read"));
+                let _ = values.lookup_at(value_key!("suffix.read"), "[0]");
                 let _ = value_key!("method.read").get_in(&root);
                 let _ = value_key!("label.only").as_str();
                 let _ = r#type;
@@ -331,59 +331,6 @@ fn later(m: &mut HashMap<&str, u8>) {
     );
 }
 
-/// Family templates are sorted, unique and well formed, and none sits
-/// below a cataloged key, where the catalog already covers it.
-#[test]
-fn families_are_templates_the_catalog_does_not_cover() {
-    for pair in VALUE_FAMILIES.windows(2) {
-        assert!(
-            pair[0] < pair[1],
-            "VALUE_FAMILIES must be sorted and free of duplicates: {:?} then {:?}",
-            pair[0],
-            pair[1]
-        );
-    }
-    for family in VALUE_FAMILIES {
-        let mut placeholders = 0;
-        for seg in family.split('.') {
-            let mut rest = seg;
-            while !rest.is_empty() {
-                if let Some(open) = rest.strip_prefix('<') {
-                    let (name, tail) = open.split_once('>').unwrap_or_default();
-                    assert!(
-                        !name.is_empty()
-                            && name.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'),
-                        "malformed placeholder in {family}"
-                    );
-                    placeholders += 1;
-                    rest = tail;
-                } else {
-                    let plain = rest.find('<').unwrap_or(rest.len());
-                    let (lit, tail) = rest.split_at(plain);
-                    assert!(
-                        lit.bytes()
-                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
-                        "not a value path template: {family}"
-                    );
-                    rest = tail;
-                }
-            }
-            assert!(!seg.is_empty(), "empty segment in {family}");
-        }
-        assert!(
-            placeholders > 0,
-            "{family} is fixed; list it in VALUE_CATALOG"
-        );
-        let covering = VALUE_CATALOG
-            .iter()
-            .find(|key| family.starts_with(&format!("{key}.")));
-        assert!(
-            covering.is_none(),
-            "{family} sits below the cataloged key {covering:?}"
-        );
-    }
-}
-
 /// A small Rust tokenizer, just enough to find `value_key!` invocations
 /// and unchecked `values` writes in real code, and to tell reads from
 /// writes.
@@ -431,7 +378,7 @@ mod scan {
         // Names a `Values` goes by, from the production code read so far.
         let mut receivers = BTreeSet::from(["values".to_string()]);
         // Open delimiters, each with the identifier that names the call
-        // it opens (`get_key` in `values.get_key(`), if any.
+        // it opens (`lookup` in `values.lookup(`), if any.
         let mut stack: Vec<(char, Option<&str>)> = Vec::new();
         let mut i = 0;
         while let Some(tok) = toks.get(i) {

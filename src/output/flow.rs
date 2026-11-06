@@ -3,8 +3,23 @@
 use crate::Arg;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
+/// Most values one walk visits.
 const STEP_LIMIT: usize = 100_000;
+
+/// Deepest a walk follows a chain of values from its start.
+const DEPTH_LIMIT: usize = 64;
+
+/// Parameter bindings one helper-call frame may hold, its caller's included.
+const FRAME_BINDING_LIMIT: usize = 256;
+
+/// Parameter bindings one walk may create across all its helper-call
+/// frames. Each frame copies its caller's bindings, up to
+/// [`FRAME_BINDING_LIMIT`] of them, so within [`STEP_LIMIT`] steps a walk
+/// could otherwise build tens of millions of entries; real walks bind a few
+/// parameters per call.
+const FRAME_ENTRY_LIMIT: usize = 1 << 20;
 
 /// What a [`FlowValue`] is. Serialized as the lowercase name (`"call"`).
 ///
@@ -360,7 +375,8 @@ pub struct FlowOrigin {
     /// Index into the graph's values.
     pub value: usize,
     // Preserve parameter substitutions for subsequent argument inspection.
-    bindings: BTreeMap<usize, usize>,
+    // Shared: every value a walk reaches in one frame holds the same map.
+    bindings: Arc<BTreeMap<usize, usize>>,
 }
 
 /// Origin observations and whether traversal exhausted its budget.
@@ -385,7 +401,7 @@ impl Flow {
         let mut seen = BTreeSet::new();
         let mut left = budget.min(STEP_LIMIT);
         while let Some((id, field, depth)) = pending.pop() {
-            if left == 0 || depth > 64 {
+            if left == 0 || depth > DEPTH_LIMIT {
                 out.incomplete = true;
                 break;
             }
@@ -405,7 +421,7 @@ impl Flow {
             {
                 out.values.insert(FlowOrigin {
                     value: id,
-                    bindings: BTreeMap::new(),
+                    bindings: Arc::default(),
                 });
             } else if value.kind == FlowKind::Alternative {
                 if value.inputs.len().saturating_add(pending.len()) > left {
@@ -432,7 +448,7 @@ impl Flow {
     /// identity helper from contaminating each other's return values.
     #[must_use]
     pub fn origins(&self, start: usize, transfers: &[FlowTransfer], budget: usize) -> FlowOrigins {
-        self.walk(start, BTreeMap::new(), transfers, budget, None)
+        self.walk(start, Arc::default(), transfers, budget, None)
     }
 
     /// Project a named object field through local helper calls, parameters and
@@ -446,7 +462,7 @@ impl Flow {
         transfers: &[FlowTransfer],
         budget: usize,
     ) -> FlowOrigins {
-        self.walk(start, BTreeMap::new(), transfers, budget, Some(field))
+        self.walk(start, Arc::default(), transfers, budget, Some(field))
     }
 
     /// Inspect a call's argument in the same invocation that reached the sink.
@@ -469,13 +485,19 @@ impl Flow {
                 ..Default::default()
             };
         };
-        self.walk(*start, origin.bindings.clone(), transfers, budget, None)
+        self.walk(
+            *start,
+            Arc::clone(&origin.bindings),
+            transfers,
+            budget,
+            None,
+        )
     }
 
     fn walk(
         &self,
         start: usize,
-        bindings: BTreeMap<usize, usize>,
+        bindings: Arc<BTreeMap<usize, usize>>,
         transfers: &[FlowTransfer],
         budget: usize,
         field: Option<&str>,
@@ -484,13 +506,14 @@ impl Flow {
         let mut pending = vec![(start, bindings, 0usize, field)];
         let mut seen = BTreeSet::new();
         let mut left = budget.min(STEP_LIMIT);
+        let mut frame_entries = FRAME_ENTRY_LIMIT;
         while let Some((id, bindings, depth, field)) = pending.pop() {
-            if left == 0 || depth > 64 {
+            if left == 0 || depth > DEPTH_LIMIT {
                 out.incomplete = true;
                 break;
             }
             left -= 1;
-            if !seen.insert((id, bindings.clone(), field)) {
+            if !seen.insert((id, Arc::clone(&bindings), field)) {
                 continue;
             }
             let Some(value) = self.values.get(id) else {
@@ -510,7 +533,7 @@ impl Flow {
             } else {
                 out.values.insert(FlowOrigin {
                     value: id,
-                    bindings: bindings.clone(),
+                    bindings: Arc::clone(&bindings),
                 });
             }
             let mut next = Vec::new();
@@ -560,19 +583,31 @@ impl Flow {
                     if let Some(function) =
                         value.target.as_ref().and_then(|t| self.functions.get(t))
                     {
-                        let mut frame = bindings.clone();
-                        if frame.len() + function.parameters.len() > 256 {
+                        if bindings.len() + function.parameters.len() > FRAME_BINDING_LIMIT {
                             out.incomplete = true;
                             continue;
                         }
+                        let mut frame = BTreeMap::clone(&bindings);
                         for (param, actual) in function.parameters.iter().zip(&value.inputs) {
                             frame.insert(*param, bindings.get(actual).copied().unwrap_or(*actual));
                         }
+                        let Some(remaining) = frame_entries.checked_sub(frame.len()) else {
+                            tracing::debug!(
+                                target: "filefacts::flow",
+                                stage = "walk",
+                                cap = FRAME_ENTRY_LIMIT,
+                                "helper-call frames past the binding budget; walk stopped"
+                            );
+                            out.incomplete = true;
+                            return out;
+                        };
+                        frame_entries = remaining;
+                        let frame = Arc::new(frame);
                         pending.extend(
                             function
                                 .returns
                                 .iter()
-                                .map(|r| (*r, frame.clone(), depth + 1, field)),
+                                .map(|r| (*r, Arc::clone(&frame), depth + 1, field)),
                         );
                     } else {
                         if field.is_some() {
@@ -607,7 +642,7 @@ impl Flow {
             }
             pending.extend(
                 next.into_iter()
-                    .map(|id| (id, bindings.clone(), depth + 1, field)),
+                    .map(|id| (id, Arc::clone(&bindings), depth + 1, field)),
             );
         }
         out

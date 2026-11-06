@@ -1,7 +1,11 @@
-use super::{
-    DigestAlg, Scheme, Signs, TimeSource, TstInfo, der_element, oid_to_label,
-    parse_generalized_time, read_tlv, signature_algorithm, signature_algorithm_name,
+use super::chain::{MAX_LINK_ATTEMPTS, PINNED_ROOTS, PinnedRoot, walk_chain};
+use super::timestamp::{
+    COUNTERSIGNATURE_OID, MS_TIMESTAMP_TOKEN_OID, TST_INFO_OID_DER, TstInfo,
+    countersignature_times, decode_signed_data_lenient, gen_time_from_token,
+    parse_generalized_time,
 };
+use super::verify::{CONTENT_TYPE_OID, MESSAGE_DIGEST_OID, check_binding};
+use super::{DigestAlg, Scheme, Signs, TimeSource, der_element, oid_to_label, signature_algorithm};
 use der::oid::ObjectIdentifier;
 
 mod plist_envelopes {
@@ -82,8 +86,9 @@ mod plist_envelopes {
         value.to_writer_binary(&mut binary).unwrap();
         assert!(super::super::encapsulated_plist(&wrap(&binary)).is_some());
         let der = wrap(XML);
-        let (tag, body, _) = super::super::read_tlv(&der).unwrap();
-        assert_eq!(tag, 0x30);
+        let sequence = der::asn1::AnyRef::from_der(&der).unwrap();
+        assert_eq!(der::Tagged::tag(&sequence), der::Tag::Sequence);
+        let body = sequence.value();
         let mut ber = vec![0x30, 0x80];
         ber.extend_from_slice(body);
         ber.extend_from_slice(&[0, 0]);
@@ -146,7 +151,7 @@ const DIGICERT_CODE_SIGNING_CA: &str =
     "51044706bd237b91b89b781337e6d62656c69f0fcffbe8e43741367948127862";
 
 fn parse(blob: &[u8]) -> serde_json::Value {
-    super::parse_pkcs7(der_element(blob).unwrap(), Signs::Encapsulated)
+    super::parse_pkcs7(der_element(blob).unwrap(), Signs::PeImage)
         .unwrap()
         .to_json()
 }
@@ -526,60 +531,33 @@ fn signature_oids_fix_their_digest() {
     assert_eq!(digest("1.2.840.113549.1.1.1"), None);
 }
 
-/// `signature_algorithm_name` returns the canonical RFC label for
-/// every signature-algorithm OID we recognise, and the dotted-OID
-/// fallback for the long tail. Trait authors match against these
+/// A certificate's signature algorithm is published by its canonical RFC
+/// label for every OID we recognise. Trait authors match against these
 /// strings.
 #[test]
-fn signature_algorithm_name_maps_known_oids() {
-    let oid = ObjectIdentifier::new("1.2.840.113549.1.1.11").unwrap();
-    assert_eq!(signature_algorithm_name(&oid), "sha256WithRSAEncryption");
-    let oid = ObjectIdentifier::new("1.2.840.10045.4.3.2").unwrap();
-    assert_eq!(signature_algorithm_name(&oid), "ecdsa-with-SHA256");
+fn signature_algorithm_names_known_oids() {
+    let name = |oid| signature_algorithm(&ObjectIdentifier::new(oid).unwrap()).map(|a| a.name);
+    assert_eq!(
+        name("1.2.840.113549.1.1.11"),
+        Some("sha256WithRSAEncryption")
+    );
+    assert_eq!(name("1.2.840.10045.4.3.2"), Some("ecdsa-with-SHA256"));
 }
 
-/// Unknown / exotic OIDs fall through to the dotted-OID string
-/// itself. A generic `"other"` would throw away the only piece of
-/// forensically useful information; the dotted form lets an analyst
-/// look the algorithm up directly.
+/// Unknown / exotic OIDs are published as the dotted OID itself. A generic
+/// `"other"` would throw away the only piece of forensically useful
+/// information; the dotted form lets an analyst look the algorithm up.
 #[test]
-fn signature_algorithm_name_falls_back_to_dotted_oid() {
-    let oid = ObjectIdentifier::new("1.3.6.1.4.1.99999").unwrap();
-    assert_eq!(signature_algorithm_name(&oid), "1.3.6.1.4.1.99999");
-    // RSASSA-PSS (1.2.840.113549.1.1.10) — not in our friendly
-    // table yet but still emitted as a usable identifier.
-    let oid = ObjectIdentifier::new("1.2.840.113549.1.1.10").unwrap();
-    assert_eq!(signature_algorithm_name(&oid), "1.2.840.113549.1.1.10");
-}
-
-/// A short-form TLV: tag, one length byte, contents.
-#[test]
-fn tlv_short_form_splits_tag_body_and_remainder() {
-    let (tag, body, rest) = read_tlv(&[0x04, 0x03, 1, 2, 3, 0xFF]).unwrap();
-    assert_eq!(tag, 0x04);
-    assert_eq!(body, &[1, 2, 3]);
-    assert_eq!(rest, &[0xFF]);
-}
-
-/// Long-form lengths are what real certificates use; a token is far larger
-/// than 127 bytes, so getting this wrong would fail on every real input.
-#[test]
-fn tlv_long_form_length_is_decoded() {
-    let mut input = vec![0x30, 0x82, 0x01, 0x02];
-    input.extend(std::iter::repeat_n(0xAA, 258));
-    let (tag, body, rest) = read_tlv(&input).unwrap();
-    assert_eq!(tag, 0x30);
-    assert_eq!(body.len(), 258);
-    assert!(rest.is_empty());
-}
-
-/// A length running past the buffer must be refused, not panic — these
-/// bytes come from untrusted files.
-#[test]
-fn tlv_rejects_length_beyond_input() {
-    assert!(read_tlv(&[0x04, 0x7F, 1, 2, 3]).is_none());
-    assert!(read_tlv(&[0x04]).is_none());
-    assert!(read_tlv(&[]).is_none());
+fn unknown_signature_algorithm_is_published_as_its_dotted_oid() {
+    let bag = bags::Bag::load(BAG_SHA1);
+    // RSASSA-PSS (1.2.840.113549.1.1.10) is not in the friendly table.
+    for oid in ["1.3.6.1.4.1.99999", "1.2.840.113549.1.1.10"] {
+        let mut cert = bag.certs()[0].clone();
+        cert.signature_algorithm.oid = ObjectIdentifier::new(oid).unwrap();
+        let mut sig = super::Signature::default();
+        super::certificate_fields(&cert, &mut sig);
+        assert_eq!(sig.signature_algorithm.as_deref(), Some(oid));
+    }
 }
 
 #[test]
@@ -742,7 +720,7 @@ fn octets(bytes: &[u8]) -> der::Any {
 /// Each way the binding can be missing or ambiguous is its own failure.
 #[test]
 fn binding_requires_exactly_one_matching_digest_and_content_type() {
-    use super::{CONTENT_TYPE_OID, Failure, MESSAGE_DIGEST_OID, check_binding};
+    use super::Failure;
     let content = b"signed content";
     let data_oid = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.1");
     let other_oid = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.2");
@@ -847,7 +825,7 @@ fn countersigned(tamper: bool) -> cms::signed_data::SignedData {
     let mut signers = outer.signer_infos.0.into_vec();
     signers[0].unsigned_attrs = Some(
         der::asn1::SetOfVec::try_from(vec![attr(
-            super::COUNTERSIGNATURE_OID,
+            COUNTERSIGNATURE_OID,
             vec![der::Any::encode_from(&counter).unwrap()],
         )])
         .unwrap(),
@@ -863,7 +841,7 @@ fn countersigned(tamper: bool) -> cms::signed_data::SignedData {
 
 fn countersignature_sources(sd: &cms::signed_data::SignedData) -> Vec<(TimeSource, bool)> {
     let bag = super::cert_bag(sd);
-    super::countersignature_times(&sd.signer_infos.0.as_slice()[0], &bag)
+    countersignature_times(&sd.signer_infos.0.as_slice()[0], &bag)
         .map(|t| (t.source, t.chain.is_empty()))
         .collect()
 }
@@ -875,6 +853,31 @@ fn countersignature_over_this_signature_is_attested() {
         countersignature_sources(&sd),
         [(TimeSource::Countersignature, false)]
     );
+}
+
+/// The signer's own `signingTime` is whatever the holder of the key wrote,
+/// so a leaked certificate can backdate itself into its validity window.
+/// A verified countersignature attests the time independently and wins.
+#[test]
+fn a_verified_countersignature_outranks_the_signers_own_signing_time() {
+    let sd = countersigned(false);
+    let signer = &sd.signer_infos.0.as_slice()[0];
+    assert!(
+        signer.signed_attrs.as_ref().is_some_and(|attrs| attrs
+            .iter()
+            .any(|a| a.oid.to_string() == "1.2.840.113549.1.9.5")),
+        "the fixture's signer carries its own signingTime"
+    );
+    let time = super::signing_time(signer, &super::cert_bag(&sd)).unwrap();
+    assert_eq!(time.source, TimeSource::Countersignature);
+    assert!(!time.chain.is_empty());
+
+    // A countersignature that does not verify attests nothing, and the
+    // signer's own word stands ahead of it.
+    let sd = countersigned(true);
+    let signer = &sd.signer_infos.0.as_slice()[0];
+    let time = super::signing_time(signer, &super::cert_bag(&sd)).unwrap();
+    assert_eq!(time.source, TimeSource::Signer);
 }
 
 #[test]
@@ -939,7 +942,7 @@ fn chain_stops_where_a_path_length_is_exceeded() {
 fn chain_anchors_at_a_pinned_root() {
     let bag = bags::Bag::load(BAG_ECDSA);
     let root = bag.cert("EC Root", "EC Root").clone();
-    let pinned = [super::PinnedRoot {
+    let pinned = [PinnedRoot {
         vendor: super::Vendor::Apple,
         thumbprint: bags::Bag::thumbprint(&root),
         cert: root,
@@ -951,13 +954,13 @@ fn chain_anchors_at_a_pinned_root() {
         .filter(|c| c.tbs_certificate.subject != c.tbs_certificate.issuer)
         .collect();
     for certs in [bag.certs(), without_root] {
-        let chain = super::walk_chain(&certs, leaf, &pinned);
+        let chain = walk_chain(&certs, leaf, &pinned);
         assert_eq!(chain.anchor, Some(super::Vendor::Apple));
         assert_eq!(chain.thumbprints.len(), 3);
         assert_eq!(chain.thumbprints[2], pinned[0].thumbprint);
     }
     // Unpinned, the same chain names no anchor.
-    assert_eq!(super::walk_chain(&bag.certs(), leaf, &[]).anchor, None);
+    assert_eq!(walk_chain(&bag.certs(), leaf, &[]).anchor, None);
 }
 
 /// A real SHA-1-era Microsoft signature (mfc100.dll 10.00.30319.01): the
@@ -994,7 +997,7 @@ fn sha1_era_microsoft_chains_anchor_at_the_1997_root() {
 #[test]
 fn an_unpinned_certificate_without_basic_constraints_cannot_issue() {
     use der::Decode;
-    let root = super::PINNED_ROOTS
+    let root = PINNED_ROOTS
         .iter()
         .find(|r| r.thumbprint == MICROSOFT_ROOT_AUTHORITY_1997)
         .map(|r| r.cert.clone())
@@ -1023,7 +1026,7 @@ fn an_unpinned_certificate_without_basic_constraints_cannot_issue() {
         .unwrap();
     certs.push(root);
     let bag: Vec<_> = certs.iter().collect();
-    let chain = super::walk_chain(&bag, &leaf, &[]);
+    let chain = walk_chain(&bag, &leaf, &[]);
     assert_eq!(chain.anchor, None);
     assert_eq!(chain.thumbprints.len(), 2, "stops at the PCA");
 }
@@ -1033,7 +1036,7 @@ fn an_unpinned_certificate_without_basic_constraints_cannot_issue() {
 #[test]
 fn pinned_roots_are_the_published_certificates() {
     use super::Vendor::{Apple, Microsoft};
-    let thumbprints: Vec<_> = super::PINNED_ROOTS
+    let thumbprints: Vec<_> = PINNED_ROOTS
         .iter()
         .map(|r| (r.vendor, r.thumbprint.as_str()))
         .collect();
@@ -1207,7 +1210,11 @@ fn win_certificate(blob: &[u8]) -> Vec<u8> {
 #[test]
 fn pe_signature_without_an_image_digest_does_not_verify() {
     let sig = super::parse_cms_blob(COUNTERSIG_OUTER).unwrap();
-    assert_eq!(sig["verified"], true, "the graft is a genuine signature");
+    assert_eq!(sig["verification_unsupported"], true, "{sig}");
+    assert!(
+        sig.get("verification_failure").is_none(),
+        "the graft is a genuine signature"
+    );
     assert!(sig.get("signature_digest").is_none());
 
     let sig = super::certificate_table(&win_certificate(COUNTERSIG_OUTER))[0].to_json();
@@ -1236,10 +1243,7 @@ fn pe_signature_without_an_image_digest_does_not_verify() {
 /// is the one the authority signed.
 #[test]
 fn rfc3161_time_comes_from_the_signed_tst_info() {
-    use super::{
-        ContentInfo, MS_TIMESTAMP_TOKEN_OID, TST_INFO_OID_DER, cert_bag,
-        decode_signed_data_lenient, gen_time_from_token, signing_time,
-    };
+    use super::{ContentInfo, cert_bag, signing_time};
     use der::{Decode, Encode};
 
     let outer = signed_data(der_element(DIGICERT_TENCENT).unwrap());
@@ -1344,13 +1348,13 @@ fn chain_walk_tries_a_bounded_number_of_issuers() {
     let walk = |decoys: usize| {
         let mut certs = vec![impostor; decoys];
         certs.extend(real);
-        super::walk_chain(&certs, leaf, &[]).thumbprints.len()
+        walk_chain(&certs, leaf, &[]).thumbprints.len()
     };
     // The budget covers the whole walk: the CA and the root take one try
     // each after the decoys.
-    assert_eq!(walk(super::MAX_LINK_ATTEMPTS - 2), 3);
-    assert_eq!(walk(super::MAX_LINK_ATTEMPTS - 1), 2);
-    assert_eq!(walk(super::MAX_LINK_ATTEMPTS), 1);
+    assert_eq!(walk(MAX_LINK_ATTEMPTS - 2), 3);
+    assert_eq!(walk(MAX_LINK_ATTEMPTS - 1), 2);
+    assert_eq!(walk(MAX_LINK_ATTEMPTS), 1);
 }
 
 // ---------------------------------------------------------------------
@@ -1442,4 +1446,31 @@ fn generalized_time_rejects_impossible_dates() {
     assert!(parse_generalized_time("20230230000000Z").is_none());
     assert!(parse_generalized_time("20230406246000Z").is_none());
     assert!(parse_generalized_time("20240229000000Z").is_some());
+}
+
+/// A signature the format carries detached (a Mach-O CodeDirectory's, an
+/// APK `.SF`'s) proves something only about the content the caller hands
+/// over. A genuine SignedData that encapsulates content of its own — any
+/// signed document by any signer — lifted into that slot must not verify
+/// against its own content and pass for a signature over the file.
+#[test]
+fn detached_signature_binds_the_callers_content_not_its_own() {
+    // The lifted blob is sound over what it encapsulates.
+    let own = super::parse_pkcs7(
+        COUNTERSIG_OUTER,
+        Signs::Detached(b"countersigned content\n"),
+    )
+    .unwrap()
+    .to_json();
+    assert_eq!(own["verified"], true, "{own}");
+
+    let sig =
+        super::parse_detached_cms_blob(COUNTERSIG_OUTER, b"attacker's code directory").unwrap();
+    assert_eq!(sig["verified"], false, "{sig}");
+    assert_eq!(sig["verification_failure"], "message_digest_mismatch");
+
+    // With no content from the caller, it binds nothing in the file.
+    let sig = super::parse_cms_blob(COUNTERSIG_OUTER).unwrap();
+    assert_eq!(sig["verified"], serde_json::Value::Null, "{sig}");
+    assert_eq!(sig["verification_unsupported"], true);
 }

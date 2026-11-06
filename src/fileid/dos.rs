@@ -1,7 +1,8 @@
 //! DOS-era x86 without a header: COM programs and FAT boot sectors. The
 //! GetPC idioms of position-independent code are in `shellcode`.
 
-use super::{heuristics::binary_not_source, text::contains_ci};
+use super::{sniff::Sniff, text::contains_ci};
+use crate::bytes;
 
 /// Largest image a DOS COM program can occupy: one 64 KiB segment less the PSP.
 pub(super) const DOS_COM_MAX_SIZE: usize = 0xFF00;
@@ -55,11 +56,24 @@ pub(super) fn looks_like_fat_boot_sector(data: &[u8]) -> bool {
 /// point -- a BIOS disk service followed by bootstrap, or one with the
 /// complete shape of a small overwriter. A bare
 /// `CD 21` is not enough: two bytes recur in arbitrary binary data.
-pub(super) fn looks_like_dos_com(data: &[u8]) -> bool {
-    let not_text = binary_not_source(data) || std::str::from_utf8(data).is_err();
-    data.len() <= DOS_COM_MAX_SIZE
-        && ((not_text && (has_dos_service_call(data) || has_entry_dos_service_call(data)))
-            || looks_like_dos_com_overwriter(data))
+///
+/// The size gate comes first: every unclaimed body of any size is asked, and
+/// only one that fits a COM image is worth reading.
+pub(super) fn looks_like_dos_com(sniff: &Sniff<'_>) -> bool {
+    let data = sniff.data;
+    if data.len() > DOS_COM_MAX_SIZE {
+        return false;
+    }
+    let not_text = || sniff.binary_not_source() || std::str::from_utf8(data).is_err();
+    // `mov ah, n` or `mov ax, n` immediately before `int 21h`.
+    let adjacent_service_call = || {
+        data.windows(4).any(|w| matches!(w, [0xB4, _, 0xCD, 0x21]))
+            || data
+                .windows(5)
+                .any(|w| matches!(w, [0xB8, _, _, 0xCD, 0x21]))
+    };
+    (not_text() && (adjacent_service_call() || has_entry_dos_service_call(data)))
+        || looks_like_dos_com_overwriter(data)
 }
 
 /// A short DOS overwriter may be mostly zero-padded, so the general binary
@@ -188,17 +202,6 @@ fn has_entry_dos_service_call(data: &[u8]) -> bool {
     false
 }
 
-/// `mov ah, n` or `mov ax, n` immediately before `int 21h`.
-fn has_dos_service_call(data: &[u8]) -> bool {
-    data.windows(4).any(|w| matches!(w, [0xB4, _, 0xCD, 0x21]))
-        || data
-            .windows(5)
-            .any(|w| matches!(w, [0xB8, _, _, 0xCD, 0x21]))
-}
-
-#[cfg(test)]
-mod tests;
-
 /// Recognize a structurally coherent MZ-format 16-bit DOS executable. MZ is
 /// not enough by itself: page geometry, relocation table and CS:IP must all
 /// fit. PE/NE and other stronger formats are classified before this fallback.
@@ -206,12 +209,7 @@ pub(super) fn looks_like_dos_mz(data: &[u8]) -> bool {
     if data.len() < 32 || !data.starts_with(b"MZ") {
         return false;
     }
-    let word = |at: usize| -> Option<usize> {
-        let &[lo, hi] = data.get(at..at.checked_add(2)?)? else {
-            return None;
-        };
-        Some(u16::from_le_bytes([lo, hi]) as usize)
-    };
+    let word = |at| bytes::u16_le(data, at).map(usize::from);
     let (
         Some(tail),
         Some(pages),
@@ -269,54 +267,4 @@ pub(super) fn looks_like_dos_mz(data: &[u8]) -> bool {
 }
 
 #[cfg(test)]
-mod mz_header_tests {
-    use super::looks_like_dos_mz;
-    fn example() -> Vec<u8> {
-        let mut b = vec![0u8; 96];
-        b[..2].copy_from_slice(b"MZ");
-        b[2..4].copy_from_slice(&96u16.to_le_bytes());
-        b[4..6].copy_from_slice(&1u16.to_le_bytes());
-        b[8..10].copy_from_slice(&2u16.to_le_bytes());
-        b[24..26].copy_from_slice(&28u16.to_le_bytes());
-        b[32..34].copy_from_slice(&[0xcd, 0x20]);
-        b
-    }
-    #[test]
-    fn valid_header_and_nonzero_entry() {
-        let mut b = example();
-        assert!(looks_like_dos_mz(&b));
-        b[20..22].copy_from_slice(&20u16.to_le_bytes());
-        assert!(looks_like_dos_mz(&b));
-    }
-    #[test]
-    fn file_identification_preserves_extended_formats() {
-        let mut b = example();
-        let path = std::path::Path::new("legacy.exe");
-        assert_eq!(
-            super::super::detect(path, &b).unwrap().file_type,
-            crate::FileType::Data
-        );
-        b[0x3c..0x40].copy_from_slice(&64u32.to_le_bytes());
-        b[64..68].copy_from_slice(b"PE\0\0");
-        assert_eq!(
-            super::super::detect(path, &b).unwrap().file_type,
-            crate::FileType::Pe
-        );
-    }
-    #[test]
-    fn rejects_incoherent_geometry() {
-        let b = example();
-        assert!(!looks_like_dos_mz(&b[..31]));
-        for (at, value) in [(0, 0), (4, 0), (8, 0), (20, 255), (22, 255)] {
-            let mut changed = b.clone();
-            changed[at] = value;
-            assert!(!looks_like_dos_mz(&changed), "offset {at}");
-        }
-        let mut changed = b.clone();
-        changed[2..4].copy_from_slice(&512u16.to_le_bytes());
-        assert!(!looks_like_dos_mz(&changed));
-        let mut changed = b;
-        changed[6..8].copy_from_slice(&2u16.to_le_bytes());
-        assert!(!looks_like_dos_mz(&changed));
-    }
-}
+mod tests;

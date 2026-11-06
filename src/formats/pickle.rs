@@ -8,7 +8,8 @@
 //!
 //! - `pickle.protocol` — PROTO byte (0..5).
 //! - `pickle.modules[]` — distinct `(module)` names from GLOBAL and
-//!   statically resolved STACK_GLOBAL operands.
+//!   statically resolved STACK_GLOBAL operands, as Python imports them
+//!   (a protocol 0–2 `__builtin__` is `builtins`).
 //! - `pickle.opcodes[]` — sorted set of opcode names seen.
 //! - `pickle.dangerous_opcodes[]` — Pike-style flag array of
 //!   the canonical-RCE opcode family (`reduce`, `build`, `inst`,
@@ -20,9 +21,13 @@ use crate::value_key;
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use crate::formats::common::bytes_at::{u32_le, u64_le};
 use crate::formats::common::{XorScan, extract_binary_strings, put_str};
 use crate::output::{Metrics, Strings, Values};
+
+mod compat;
+pub(super) mod ops;
+
+use ops::{Arg, Op};
 
 /// Cap on opcode-stream bytes scanned. Real malicious payloads are
 /// tiny; the cap guards against pathological model files
@@ -69,10 +74,6 @@ struct PickleStack<'a> {
 }
 
 impl<'a> PickleStack<'a> {
-    fn push(&mut self, value: StackValue<'a>) {
-        self.values.push(value);
-    }
-
     fn pop(&mut self) -> StackValue<'a> {
         self.values.pop().unwrap_or(StackValue::Other)
     }
@@ -95,11 +96,6 @@ impl<'a> PickleStack<'a> {
         if let Some(value) = self.values.last() {
             self.memo.insert(index, *value);
         }
-    }
-
-    fn memo_get(&mut self, index: usize) {
-        self.values
-            .push(self.memo.get(&index).copied().unwrap_or(StackValue::Other));
     }
 
     /// Whether STACK_GLOBAL operands `module` and `attr` should be recorded.
@@ -130,7 +126,7 @@ pub(super) fn extract(
     }
     let scan = bytes.get(..MAX_BYTES_SCANNED).unwrap_or(bytes);
 
-    let mut protocol: i32 = -1;
+    let mut protocol: Option<u8> = None;
     let mut modules: BTreeSet<String> = BTreeSet::new();
     // Fully-qualified `module.attr` callable references resolved from GLOBAL
     // and STACK_GLOBAL — the actual RCE targets, gated to Python-identifier
@@ -145,30 +141,24 @@ pub(super) fn extract(
     let torch_legacy = crate::fileid::torch_protocol2_legacy_header(scan);
     let mut streams_left = if torch_legacy { 5 } else { 1 };
     let mut i = 0_usize;
-    while let Some(&op) = scan.get(i) {
-        let Some(name) = opcode_name(op) else { break };
-        // Unsupported/truncated PROTO operands are not protocol declarations.
-        if op == 0x80 && scan.get(i + 1).is_none_or(|p| *p > 5) {
+    while let Ok((op, next)) = ops::decode(scan, i) {
+        // Unsupported PROTO operands are not protocol declarations.
+        if matches!(op.arg, Arg::Int(p) if op.code == 0x80 && p > 5) {
             break;
         }
-        let Some(frame) = payload_size(op, i, scan) else {
-            break;
-        };
-        if i.checked_add(frame).is_none_or(|end| end > scan.len()) {
-            break;
+        if let Some(name) = ops::name(op.code) {
+            opcodes.insert(name);
         }
-        opcodes.insert(name);
         apply_side_effects(
-            op,
+            &op,
             i,
-            scan,
             &mut protocol,
             &mut modules,
             &mut globals,
             &mut stack,
         );
-        i += frame;
-        if op == b'.' {
+        i = next;
+        if op.code == b'.' {
             streams_left -= 1;
             if streams_left == 0 {
                 break;
@@ -191,11 +181,11 @@ pub(super) fn extract(
             "opcode scan stopped at an unknown opcode or a truncated operand"
         );
     }
-    if opcodes.is_empty() && modules.is_empty() && protocol < 0 {
+    if opcodes.is_empty() && modules.is_empty() && protocol.is_none() {
         return;
     }
 
-    if protocol >= 0 {
+    if let Some(protocol) = protocol {
         metrics.insert(metric!("pickle.protocol"), f64::from(protocol));
         put_str(values, value_key!("pickle.protocol"), protocol.to_string());
     }
@@ -259,48 +249,6 @@ fn is_dangerous(name: &str) -> bool {
     )
 }
 
-/// Bytes occupied by `op` plus its payload. Returns `None` when
-/// the payload runs past `scan.len()` or the length prefix can't
-/// be read — caller treats that as end-of-stream.
-fn payload_size(op: u8, i: usize, scan: &[u8]) -> Option<usize> {
-    let read_until_newline = || -> Option<usize> {
-        let nl = scan.get(i + 1..)?.iter().position(|&b| b == b'\n')?;
-        Some(2 + nl)
-    };
-    let read_len_prefixed = |len_bytes: usize, len_value: usize| -> Option<usize> {
-        // `len_value` comes from the file; unchecked, a u64 length wraps the
-        // frame to 0 and the caller's scan never advances.
-        let frame = len_value.checked_add(1 + len_bytes)?;
-        (i.checked_add(frame)? <= scan.len()).then_some(frame)
-    };
-    match op {
-        0x80 | b'K' | 0x82 | b'h' | b'q' => Some(2),
-        0x83 | b'M' => Some(3),
-        0x84 | b'J' | b'j' | b'r' => Some(5),
-        b'G' | 0x95 => Some(9),
-        b'I' | b'L' | b'F' | b'V' | b'S' | b'g' | b'p' => read_until_newline(),
-        b'c' | b'i' => {
-            let m_nl = scan.get(i + 1..)?.iter().position(|&b| b == b'\n')?;
-            let attr_start = i + 2 + m_nl;
-            let a_nl = scan.get(attr_start..)?.iter().position(|&b| b == b'\n')?;
-            Some((attr_start + a_nl + 1) - i)
-        }
-        0x8A | 0x8C | b'U' | b'C' => {
-            let len = *scan.get(i + 1)? as usize;
-            read_len_prefixed(1, len)
-        }
-        0x8B | b'X' | b'T' | b'B' => {
-            let len = u32_le(scan, i + 1)? as usize;
-            read_len_prefixed(4, len)
-        }
-        0x8D | 0x8E | 0x96 => {
-            let len = usize::try_from(u64_le(scan, i + 1)?).ok()?;
-            read_len_prefixed(8, len)
-        }
-        _ => Some(1),
-    }
-}
-
 /// Python-identifier shape (allowing dotted submodules), matching the gate
 /// used when forming `module.attr` callable references.
 fn is_pickle_ident(s: &str) -> bool {
@@ -311,49 +259,41 @@ fn is_pickle_ident(s: &str) -> bool {
         && s.starts_with(|c: char| c.is_alphabetic() || c == '_')
 }
 
-fn line_usize(scan: &[u8], start: usize) -> Option<usize> {
-    let end = scan.get(start..)?.iter().position(|&byte| byte == b'\n')? + start;
-    std::str::from_utf8(scan.get(start..end)?)
-        .ok()?
-        .parse()
-        .ok()
+/// The text a Unicode-string opcode pushes.
+fn unicode_operand<'a>(op: &Op<'a>) -> Option<&'a str> {
+    match (op.code, op.arg) {
+        (0x8C | b'X' | 0x8D, Arg::Bytes(bytes)) | (b'V', Arg::Line(bytes)) => {
+            std::str::from_utf8(bytes).ok()
+        }
+        _ => None,
+    }
 }
 
-fn inline_global(scan: &[u8], i: usize) -> Option<(&str, &str)> {
-    let module_end = scan.get(i + 1..)?.iter().position(|&byte| byte == b'\n')? + i + 1;
-    let attr_start = module_end + 1;
-    let attr_end = scan
-        .get(attr_start..)?
-        .iter()
-        .position(|&byte| byte == b'\n')?
-        + attr_start;
+/// GLOBAL's and INST's module and attribute.
+fn inline_global<'a>(op: &Op<'a>) -> Option<(&'a str, &'a str)> {
+    let Arg::Lines(module, attr) = op.arg else {
+        return None;
+    };
     Some((
-        std::str::from_utf8(scan.get(i + 1..module_end)?).ok()?,
-        std::str::from_utf8(scan.get(attr_start..attr_end)?).ok()?,
+        std::str::from_utf8(module).ok()?,
+        std::str::from_utf8(attr).ok()?,
     ))
 }
 
-fn unicode_operand(op: u8, scan: &[u8], i: usize) -> Option<&str> {
-    let slice = match op {
-        0x8C => {
-            let len = usize::from(*scan.get(i + 1)?);
-            scan.get(i + 2..i + 2 + len)?
-        }
-        b'X' => {
-            let len = usize::try_from(u32_le(scan, i + 1)?).ok()?;
-            scan.get(i + 5..i + 5 + len)?
-        }
-        0x8D => {
-            let len = usize::try_from(u64_le(scan, i + 1)?).ok()?;
-            scan.get(i + 9..i + 9 + len)?
-        }
-        b'V' => {
-            let end = scan.get(i + 1..)?.iter().position(|&byte| byte == b'\n')? + i + 1;
-            scan.get(i + 1..end)?
-        }
-        _ => return None,
-    };
-    std::str::from_utf8(slice).ok()
+/// How far [`renpy_pycode_sources`] is into one `PyCode` construction.
+#[derive(Clone, Copy)]
+enum PyCodeWalk<'a> {
+    Idle,
+    /// GLOBAL (or a memo GET of) `renpy.ast.PyCode`.
+    Global,
+    /// NEWOBJ or NEWOBJ_EX built the object.
+    Constructed,
+    /// The state tuple's MARK.
+    StateTuple,
+    /// The state version, 1.
+    Version,
+    /// The source string, waiting for BUILD.
+    Source(&'a str),
 }
 
 /// Recover source stored by Ren'Py's `renpy.ast.PyCode.__getstate__` without
@@ -368,34 +308,23 @@ pub(crate) fn renpy_pycode_sources(bytes: &[u8]) -> Vec<String> {
     let scan = bytes.get(..MAX_BYTES_SCANNED).unwrap_or(bytes);
     let mut out = Vec::new();
     let mut pos = 0usize;
-    let mut stage = 0u8;
+    let mut walk = PyCodeWalk::Idle;
     let mut age = 0usize;
-    let mut candidate: Option<&str> = None;
     let mut stack = PickleStack::default();
-    let mut protocol = -1;
+    let mut protocol = None;
     let mut modules = BTreeSet::new();
     let mut globals = BTreeSet::new();
-    while let Some(&op) = scan.get(pos) {
-        if opcode_name(op).is_none() {
-            break;
-        }
-        let Some(width) = payload_size(op, pos, scan) else {
-            break;
-        };
-        if pos.checked_add(width).is_none_or(|end| end > scan.len()) {
-            break;
-        }
-        if stage != 0 {
+    while let Ok((decoded, next)) = ops::decode(scan, pos) {
+        let op = decoded.code;
+        if !matches!(walk, PyCodeWalk::Idle) {
             age += 1;
             if age > MAX_WALK_OPCODES {
-                stage = 0;
-                candidate = None;
+                walk = PyCodeWalk::Idle;
             }
         }
         apply_side_effects(
-            op,
+            &decoded,
             pos,
-            scan,
             &mut protocol,
             &mut modules,
             &mut globals,
@@ -411,36 +340,33 @@ pub(crate) fn renpy_pycode_sources(bytes: &[u8]) -> Vec<String> {
                     attr: "PyCode"
                 })
             );
-        match stage {
-            0 if pycode_global => {
-                stage = 1;
+        walk = match walk {
+            PyCodeWalk::Idle if pycode_global => {
                 age = 0;
+                PyCodeWalk::Global
             }
-            1 if matches!(op, 0x81 | 0x92) => stage = 2, // NEWOBJ / NEWOBJ_EX
-            1 if !matches!(op, b'q' | b'r' | 0x94 | b')') => stage = 0,
-            2 if op == b'(' => stage = 3, // state tuple MARK
-            2 if !matches!(op, b'q' | b'r' | 0x94) => stage = 0,
-            3 if op == b'K' && scan.get(pos + 1) == Some(&1) => stage = 4,
-            3 if op == b'J' && scan.get(pos + 1..pos + 5) == Some(&[1, 0, 0, 0]) => stage = 4,
-            4 => {
-                candidate = unicode_operand(op, scan, pos)
-                    .filter(|source| !source.is_empty() && source.len() <= MAX_SOURCE_BYTES);
-                stage = if candidate.is_some() { 5 } else { 0 };
+            PyCodeWalk::Global if matches!(op, 0x81 | 0x92) => PyCodeWalk::Constructed,
+            PyCodeWalk::Global if !matches!(op, b'q' | b'r' | 0x94 | b')') => PyCodeWalk::Idle,
+            PyCodeWalk::Constructed if op == b'(' => PyCodeWalk::StateTuple,
+            PyCodeWalk::Constructed if !matches!(op, b'q' | b'r' | 0x94) => PyCodeWalk::Idle,
+            PyCodeWalk::StateTuple if matches!(op, b'K' | b'J') && decoded.arg == Arg::Int(1) => {
+                PyCodeWalk::Version
             }
-            5 if op == b'b' => {
-                if let Some(source) = candidate.take()
-                    && !out.iter().any(|existing| existing == source)
-                {
+            PyCodeWalk::Version => unicode_operand(&decoded)
+                .filter(|source| !source.is_empty() && source.len() <= MAX_SOURCE_BYTES)
+                .map_or(PyCodeWalk::Idle, PyCodeWalk::Source),
+            PyCodeWalk::Source(source) if op == b'b' => {
+                if !out.iter().any(|existing| existing == source) {
                     out.push(source.to_owned());
                     if out.len() >= MAX_SOURCE_COUNT {
                         break;
                     }
                 }
-                stage = 0;
+                PyCodeWalk::Idle
             }
-            _ => {}
-        }
-        pos += width;
+            unchanged => unchanged,
+        };
+        pos = next;
         if op == b'.' {
             break;
         }
@@ -448,12 +374,16 @@ pub(crate) fn renpy_pycode_sources(bytes: &[u8]) -> Vec<String> {
     out
 }
 
+/// Record the global a pickle at `protocol` names as `module.attr`, as the
+/// name Python imports for it (see [`compat::find_class`]).
 fn record_global(
     module: &str,
     attr: &str,
+    protocol: Option<u8>,
     modules: &mut BTreeSet<String>,
     globals: &mut BTreeSet<String>,
 ) {
+    let (module, attr) = compat::find_class(protocol, module, attr);
     if !module.is_empty() {
         modules.insert(module.to_owned());
     }
@@ -462,86 +392,69 @@ fn record_global(
     }
 }
 
+/// Model one opcode's effect on the stack, recording the globals it names.
+/// `i` is the opcode's offset, which names the operands it pushes.
 fn apply_side_effects<'a>(
-    op: u8,
+    op: &Op<'a>,
     i: usize,
-    scan: &'a [u8],
-    protocol: &mut i32,
+    protocol: &mut Option<u8>,
     modules: &mut BTreeSet<String>,
     globals: &mut BTreeSet<String>,
     stack: &mut PickleStack<'a>,
 ) {
-    match op {
+    let index = match op.arg {
+        Arg::Int(n) => usize::try_from(n).ok(),
+        // A decimal memo index on a text line.
+        Arg::Line(line) => std::str::from_utf8(line).ok().and_then(|s| s.parse().ok()),
+        _ => None,
+    };
+    match op.code {
         0x80 => {
-            if let Some(&p) = scan.get(i + 1) {
-                *protocol = i32::from(p);
+            // PROTO's operand is one byte, so it always narrows.
+            if let Arg::Int(p) = op.arg {
+                *protocol = u8::try_from(p).ok();
             }
         }
         b'c' => {
-            let global = inline_global(scan, i);
+            let global = inline_global(op);
             if let Some((module, attr)) = global {
-                record_global(module, attr, modules, globals);
+                record_global(module, attr, *protocol, modules, globals);
             }
-            stack.push(
-                global.map_or(StackValue::Other, |(module, attr)| StackValue::Global {
-                    module,
-                    attr,
-                }),
-            );
+            stack
+                .values
+                .push(
+                    global.map_or(StackValue::Other, |(module, attr)| StackValue::Global {
+                        module,
+                        attr,
+                    }),
+                );
         }
         0x8C | b'X' | 0x8D | b'V' => {
-            stack.push(
-                unicode_operand(op, scan, i).map_or(StackValue::Other, |text| {
+            stack
+                .values
+                .push(unicode_operand(op).map_or(StackValue::Other, |text| {
                     StackValue::Text(Operand { at: i, text })
-                }),
-            );
+                }));
         }
-        b'(' => stack.push(StackValue::Mark),
+        b'(' => stack.values.push(StackValue::Mark),
         b'0' => {
             stack.pop();
         }
         b'1' => stack.pop_through_mark(),
         b'2' => {
             if let Some(&value) = stack.values.last() {
-                stack.push(value);
+                stack.values.push(value);
             }
         }
-        b'q' => {
-            if let Some(&index) = scan.get(i + 1) {
-                stack.memo_put(usize::from(index));
-            }
-        }
-        b'r' => {
-            if let Some(index) = u32_le(scan, i + 1).and_then(|value| usize::try_from(value).ok()) {
-                stack.memo_put(index);
-            }
-        }
-        b'p' => {
-            if let Some(index) = line_usize(scan, i + 1) {
+        b'q' | b'r' | b'p' => {
+            if let Some(index) = index {
                 stack.memo_put(index);
             }
         }
         0x94 => stack.memo_put(stack.memo.len()),
-        b'h' => {
-            if let Some(&index) = scan.get(i + 1) {
-                stack.memo_get(usize::from(index));
-            } else {
-                stack.push(StackValue::Other);
-            }
-        }
-        b'j' => {
-            if let Some(index) = u32_le(scan, i + 1).and_then(|value| usize::try_from(value).ok()) {
-                stack.memo_get(index);
-            } else {
-                stack.push(StackValue::Other);
-            }
-        }
-        b'g' => {
-            if let Some(index) = line_usize(scan, i + 1) {
-                stack.memo_get(index);
-            } else {
-                stack.push(StackValue::Other);
-            }
+        b'h' | b'j' | b'g' => {
+            let value = index.and_then(|index| stack.memo.get(&index).copied());
+            stack.values.push(value.unwrap_or(StackValue::Other));
         }
         0x93 => {
             let attr = stack.pop();
@@ -549,7 +462,7 @@ fn apply_side_effects<'a>(
             let resolved = match (module, attr) {
                 (StackValue::Text(module), StackValue::Text(attr)) => {
                     if stack.admit_global(module, attr) {
-                        record_global(module.text, attr.text, modules, globals);
+                        record_global(module.text, attr.text, *protocol, modules, globals);
                     }
                     StackValue::Global {
                         module: module.text,
@@ -558,19 +471,19 @@ fn apply_side_effects<'a>(
                 }
                 _ => StackValue::Other,
             };
-            stack.push(resolved);
+            stack.values.push(resolved);
         }
         // Scalars, bytes, extension-registry results and out-of-band buffers.
         b'F' | b'I' | b'J' | b'K' | b'L' | b'M' | b'N' | b'S' | b'T' | b'U' | b'G' | b'B'
         | b'C' | 0x82 | 0x83 | 0x84 | 0x88 | 0x89 | 0x8A | 0x8B | 0x8E | 0x96 | 0x97 | b'P' => {
-            stack.push(StackValue::Other)
+            stack.values.push(StackValue::Other)
         }
         // Empty containers.
-        b')' | b']' | b'}' | 0x8F => stack.push(StackValue::Other),
+        b')' | b']' | b'}' | 0x8F => stack.values.push(StackValue::Other),
         // MARK-delimited container constructors.
         b'd' | b'l' | b't' | 0x91 => {
             stack.pop_through_mark();
-            stack.push(StackValue::Other);
+            stack.values.push(StackValue::Other);
         }
         // Batch mutations consume through MARK but retain their container.
         b'e' | b'u' | 0x90 => stack.pop_through_mark(),
@@ -580,119 +493,44 @@ fn apply_side_effects<'a>(
         // Fixed-arity tuples.
         0x85 => {
             stack.pop_n(1);
-            stack.push(StackValue::Other);
+            stack.values.push(StackValue::Other);
         }
         0x86 => {
             stack.pop_n(2);
-            stack.push(StackValue::Other);
+            stack.values.push(StackValue::Other);
         }
         0x87 => {
             stack.pop_n(3);
-            stack.push(StackValue::Other);
+            stack.values.push(StackValue::Other);
         }
         // Construction never executes here; only stack effects are modeled.
         b'R' | 0x81 => {
             stack.pop_n(2);
-            stack.push(StackValue::Other);
+            stack.values.push(StackValue::Other);
         }
         0x92 => {
             stack.pop_n(3);
-            stack.push(StackValue::Other);
+            stack.values.push(StackValue::Other);
         }
         b'b' => stack.pop_n(1),
         b'i' => {
-            if let Some((module, attr)) = inline_global(scan, i) {
-                record_global(module, attr, modules, globals);
+            if let Some((module, attr)) = inline_global(op) {
+                record_global(module, attr, *protocol, modules, globals);
             }
             stack.pop_through_mark();
-            stack.push(StackValue::Other);
+            stack.values.push(StackValue::Other);
         }
         b'o' => {
             stack.pop_through_mark();
-            stack.push(StackValue::Other);
+            stack.values.push(StackValue::Other);
         }
         b'Q' => {
             stack.pop_n(1);
-            stack.push(StackValue::Other);
+            stack.values.push(StackValue::Other);
         }
         // PROTO, FRAME, STOP and READONLY_BUFFER have no modeled stack effect.
         _ => {}
     }
-}
-
-/// Name of a pickle opcode, or `None` for a byte no protocol assigns.
-const fn opcode_name(op: u8) -> Option<&'static str> {
-    Some(match op {
-        b'(' => "MARK",
-        b'.' => "STOP",
-        b'0' => "POP",
-        b'1' => "POP_MARK",
-        b'2' => "DUP",
-        b'F' => "FLOAT",
-        b'I' => "INT",
-        b'J' => "BININT",
-        b'K' => "BININT1",
-        b'L' => "LONG",
-        b'M' => "BININT2",
-        b'N' => "NONE",
-        b'P' => "PERSID",
-        b'Q' => "BINPERSID",
-        b'R' => "REDUCE",
-        b'S' => "STRING",
-        b'T' => "BINSTRING",
-        b'B' => "BINBYTES",
-        b'C' => "SHORT_BINBYTES",
-        b'U' => "SHORT_BINSTRING",
-        b'V' => "UNICODE",
-        b'X' => "BINUNICODE",
-        b'a' => "APPEND",
-        b'b' => "BUILD",
-        b'c' => "GLOBAL",
-        b'd' => "DICT",
-        b'}' => "EMPTY_DICT",
-        b'e' => "APPENDS",
-        b'g' => "GET",
-        b'h' => "BINGET",
-        b'i' => "INST",
-        b'j' => "LONG_BINGET",
-        b'l' => "LIST",
-        b']' => "EMPTY_LIST",
-        b'o' => "OBJ",
-        b'p' => "PUT",
-        b'q' => "BINPUT",
-        b'r' => "LONG_BINPUT",
-        b's' => "SETITEM",
-        b't' => "TUPLE",
-        b')' => "EMPTY_TUPLE",
-        b'u' => "SETITEMS",
-        b'G' => "BINFLOAT",
-        0x80 => "PROTO",
-        0x81 => "NEWOBJ",
-        0x82 => "EXT1",
-        0x83 => "EXT2",
-        0x84 => "EXT4",
-        0x85 => "TUPLE1",
-        0x86 => "TUPLE2",
-        0x87 => "TUPLE3",
-        0x88 => "NEWTRUE",
-        0x89 => "NEWFALSE",
-        0x8A => "LONG1",
-        0x8B => "LONG4",
-        0x8C => "SHORT_BINUNICODE",
-        0x8D => "BINUNICODE8",
-        0x8E => "BINBYTES8",
-        0x8F => "EMPTY_SET",
-        0x90 => "ADDITEMS",
-        0x91 => "FROZENSET",
-        0x92 => "NEWOBJ_EX",
-        0x93 => "STACK_GLOBAL",
-        0x94 => "MEMOIZE",
-        0x95 => "FRAME",
-        0x96 => "BYTEARRAY8",
-        0x97 => "NEXT_BUFFER",
-        0x98 => "READONLY_BUFFER",
-        _ => return None,
-    })
 }
 
 #[cfg(test)]

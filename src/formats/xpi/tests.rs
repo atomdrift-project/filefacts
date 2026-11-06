@@ -10,10 +10,9 @@ fn run(bytes: &[u8]) -> Values {
 
 fn run_with_errors(bytes: &[u8]) -> (Values, Errors) {
     let mut v = Values::new();
-    let mut m = Metrics::new();
     let mut e = Errors::new();
     if let Some(mut zip) = crate::formats::testutil::open_zip(bytes) {
-        extract_from_archive(&mut zip, &mut v, &mut m, &mut e);
+        extract_from_archive(&mut zip, &mut v, &mut e);
     }
     (v, e)
 }
@@ -180,4 +179,24 @@ fn empty_archive_emits_nothing() {
 fn non_zip_input_is_silent() {
     let v = run(b"not a zip");
     assert!(v.get("xpi.signing.schemes").is_none());
+}
+
+/// Signature member names are matched without regard to case, as the JAR
+/// specification reads them.
+#[test]
+fn signing_member_names_ignore_case() {
+    let xpi = stored_zip(&[
+        ("manifest.json", b"{}"),
+        ("META-INF/MOZILLA.SF", b"sf"),
+        ("meta-inf/Mozilla.RSA", b"rsa"),
+        ("META-INF/COSE.MANIFEST", b"m"),
+        ("META-INF/Cose.Sig", b"s"),
+    ]);
+    let v = run(&xpi);
+    let schemes = v
+        .get("xpi.signing.schemes")
+        .and_then(|x| x.as_array())
+        .unwrap();
+    let names: Vec<&str> = schemes.iter().filter_map(|x| x.as_str()).collect();
+    assert_eq!(names, vec!["pkcs7", "cose"]);
 }

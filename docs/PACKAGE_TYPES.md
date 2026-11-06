@@ -3,12 +3,16 @@
 filefacts gives each package ecosystem (npm, PyPI, RubyGems, Cargo, Debian,
 RPM, Alpine, Android, …) its own `FileType`, separate from the container it
 ships in (zip, tar, gzip-tar, ar, xar). A wheel is `whl`, not `zip`; an npm
-tarball is `npm`, not `tar_gz`. The fine-grained `file_type` label is what a
-consumer routes on, while the coarse `file_group` of every package type stays
-`archive`, so code that only cares about "is this a container?" is unaffected.
+tarball is `npm`, not `tar.gz`. The fine-grained `FileType` label is what a
+consumer routes on. Every package type's `FileType::group()` is
+`Group::Archives` (label `archives`), and `FileType::archive_format()` names
+the container it is read as, so code that only asks "is this a container?",
+or "which container?", is unaffected.
 
-The authoritative list is the `file_types!` table in `src/fileid/mod.rs`.
-Each package type documents its container and its discriminator there.
+The authoritative list is the `file_types!` table in
+`src/fileid/file_type.rs`. Each row gives a type's label, group and
+container (`=> Zip`, `=> Tar(Gzip)`, …), and its doc comment names the
+discriminator. `docs/file-groups.json` lists every label by group.
 
 ## Two separate jobs
 
@@ -67,8 +71,10 @@ Arch), detection reads member *names*:
 
 ## Rules for a new package type
 
-- Add a row to the `file_types!` table in the `archive` group, with its
-  container and discriminator in the doc comment.
+- Add a row to the `file_types!` table in `src/fileid/file_type.rs` with the
+  `Archives` group and its container (`=> Zip`, `=> Tar(Gzip)`, …), and name
+  its discriminator in the doc comment. Update `docs/file-groups.json`; the
+  `published_group_table_is_current` test prints its new contents.
 - Detect it with the cheapest tier that separates it, and add a negative test
   showing the generic container still wins when the marker is absent.
 - Open the container once. Detection must not parse a zip central directory

@@ -5,10 +5,6 @@ use serde_json::{Map, Value as JsonValue};
 
 use crate::error::Error;
 
-/// Nesting cap for plists; see [`plist_guard`](super::super::plist_guard).
-#[cfg(test)]
-pub(super) const PLIST_MAX_DEPTH: usize = super::super::plist_guard::MAX_DEPTH;
-
 /// Parse a plist (XML, binary or ASCII) into the JSON tree `values` holds,
 /// through [`plist_guard::parse`](super::super::plist_guard::parse), which refuses
 /// reference expansion and nesting the conversion below could not survive.

@@ -16,30 +16,36 @@ mod batch_lines;
 mod call_target_metrics;
 mod comment_metrics;
 mod escapes;
-mod go_syntax;
+mod function_metrics;
+pub(crate) mod go_syntax;
+mod identifier_metrics;
+mod import_metrics;
+mod langs;
+mod literal;
+pub(crate) mod parse;
 mod payload_flow;
 mod python_module_calls;
 mod runtime_imports;
-mod shell_fifo;
-mod value_flow;
-pub use payload_flow::go_package_payload_flow;
 mod rust_syntax;
 mod scope;
+mod shell_fifo;
+mod string_metrics;
+mod text_metrics;
+mod value_flow;
+mod visit;
 
-/// Decode the escape sequences a parsed source string literal carries, so a
-/// consumer sees the text the program will actually use rather than the way the
-/// source spelled it.
+pub use payload_flow::go_package_payload_flow;
+pub(crate) use payload_flow::{Budget, GoMember, package_flow};
+
+/// Decode the escape sequences of a parsed short-string body by the rules
+/// of `file_type`'s language, so a consumer sees the text the program will
+/// actually use rather than the way the source spelled it. Lua's decimal
+/// byte escapes differ from the C and Python forms every other language
+/// shares.
 ///
 /// Public so a consumer that builds its own literal corpus from the syntax
 /// tree lands on the same values this crate reports in the literal tier; if
 /// the two disagree, a rule written against the reported facts cannot match.
-pub fn decode_source_escapes(literal: &str) -> String {
-    escapes::decode(literal)
-}
-
-/// Decode a parsed short-string body with the source language's escape rules.
-/// Consumers rebuilding literal corpora must use the same language as the
-/// producer; notably Lua decimal byte escapes differ from C/Python forms.
 pub fn decode_source_escapes_for_type(literal: &str, file_type: crate::FileType) -> String {
     if file_type == crate::FileType::Lua {
         escapes::decode_lua(literal)
@@ -47,14 +53,6 @@ pub fn decode_source_escapes_for_type(literal: &str, file_type: crate::FileType)
         escapes::decode(literal)
     }
 }
-mod function_metrics;
-mod identifier_metrics;
-mod import_metrics;
-mod langs;
-pub(crate) mod parse;
-mod string_metrics;
-mod text_metrics;
-mod visit;
 
 use crate::metric;
 use crate::value_key;
@@ -69,6 +67,7 @@ use crate::fileid::FileType;
 use crate::output::{MetricKey, Metrics, Strings, Values};
 
 use langs::{Lang, QueryKind};
+use literal::{decode_string_literal, unquoted_literal};
 use serde_json::Value as JsonValue;
 
 pub(crate) use parse::{TreeCache, TreeParse, TreeSitterDiagnostic};
@@ -76,6 +75,23 @@ pub(crate) use parse::{TreeCache, TreeParse, TreeSitterDiagnostic};
 /// Recursion bound shared by the payload- and value-flow evaluators, which
 /// recurse once per syntax level they descend.
 const MAX_FLOW_DEPTH: usize = 96;
+
+/// Longest import path an alias expands to. The flow analyses and Rust call
+/// resolution copy the path into every name read through the alias, so one
+/// long path named by many short references would multiply; real import
+/// paths are a few dozen bytes.
+const MAX_ALIAS_BYTES: usize = 512;
+
+/// `name` with its first segment (up to `.`, `:` or `(`) replaced by the
+/// import path `alias` resolves it to; `None` when it resolves none. An empty
+/// path marks conflicting imports and resolves nothing, and one longer than
+/// [`MAX_ALIAS_BYTES`] is not expanded.
+fn expand_alias<'a>(name: &str, alias: impl FnOnce(&str) -> Option<&'a str>) -> Option<String> {
+    let end = name.find(['.', ':', '(']).unwrap_or(name.len());
+    let prefix = alias(&name[..end])
+        .filter(|prefix| !prefix.is_empty() && prefix.len() <= MAX_ALIAS_BYTES)?;
+    Some(format!("{prefix}{}", &name[end..]))
+}
 
 /// The source text `node` spans. Empty when the range does not fall on
 /// character boundaries of `source`, which a tree parsed from it never does.
@@ -185,14 +201,6 @@ thread_local! {
     static QUERY_WORK_OVERRIDE: Cell<u64> = const { Cell::new(0) };
 }
 
-fn query_work_budget() -> u64 {
-    #[cfg(test)]
-    if let polls @ 1.. = QUERY_WORK_OVERRIDE.get() {
-        return polls;
-    }
-    SOURCE_QUERY_WORK_BUDGET
-}
-
 /// Progress-callback state for one query: counts polls against the work
 /// budget, with the wall-clock backstop behind it.
 struct QueryBudget {
@@ -204,9 +212,16 @@ struct QueryBudget {
 
 impl QueryBudget {
     fn new() -> Self {
+        #[cfg(test)]
+        let budget = match QUERY_WORK_OVERRIDE.get() {
+            0 => SOURCE_QUERY_WORK_BUDGET,
+            polls => polls,
+        };
+        #[cfg(not(test))]
+        let budget = SOURCE_QUERY_WORK_BUDGET;
         Self {
             polls: Cell::new(0),
-            budget: query_work_budget(),
+            budget,
             deadline: Instant::now() + SOURCE_QUERY_WALL_BACKSTOP,
             exhausted: Cell::new(false),
         }
@@ -246,8 +261,17 @@ pub(super) fn extract(
     // Byte-level / line-level / whitespace text metrics — language-agnostic.
     text_metrics::emit(source, metrics);
     if lang == Lang::Batch {
-        batch_concat::emit(source, metrics);
-        batch_cycles::emit(source, metrics);
+        let lines = batch_lines::Lines::new(source).inspect_err(|why| {
+            tracing::debug!(
+                target: "filefacts::source",
+                format = "batch",
+                len = source.len(),
+                reason = ?why,
+                "batch: file not modelled"
+            );
+        });
+        batch_concat::emit(&lines, metrics);
+        batch_cycles::emit(&lines, metrics);
     }
 
     let mut walked = visit::Collectors {
@@ -262,8 +286,9 @@ pub(super) fn extract(
         runtime_imports: lang
             .is_ecmascript()
             .then(runtime_imports::Collector::default),
-        python: (lang == Lang::Python).then(|| python_module_calls::Collector::new(source)),
-        shell: (lang == Lang::Bash).then(shell_fifo::Collector::default),
+        python: (lang == Lang::Python)
+            .then(|| python_module_calls::Collector::new(source, cache.cancel())),
+        shell: (lang == Lang::Bash).then(|| shell_fifo::Collector::new(cache.cancel())),
     };
     visit::walk(root, source, config, &mut walked);
     // Comment metrics over the comment nodes the walk found; also fills the
@@ -381,23 +406,15 @@ pub(super) fn extract(
             functions.items.len() as f64,
         );
     }
-    for (name, offset) in &functions.items {
-        symbols_out.push(crate::Symbol::Function {
-            name: name.clone(),
-            offset: Some(*offset),
-            complexity: None,
-            callees: Vec::new(),
-        });
-    }
     if !classes.items.is_empty() {
         metrics.insert(metric!("source.class_count"), classes.items.len() as f64);
     }
     // Class declarations surface as `Symbol::Function` too — the symbol
     // axis is "things declared here", regardless of function vs class.
-    for (name, offset) in &classes.items {
+    for (name, offset) in functions.items.into_iter().chain(classes.items) {
         symbols_out.push(crate::Symbol::Function {
-            name: name.clone(),
-            offset: Some(*offset),
+            name,
+            offset: Some(offset),
             complexity: None,
             callees: Vec::new(),
         });
@@ -434,22 +451,20 @@ pub(super) fn extract(
         (_, Some(go)) => payload_flow::Imports::Go(go),
         _ => payload_flow::Imports::None,
     };
-    payload_flow::emit(
-        root,
-        source,
-        config,
-        values,
-        walked
-            .payload
-            .take()
-            .map(|payload| payload.into_collected(test_only)),
-        &payload_imports,
-    );
+    if let Some(payload) = walked.payload.take() {
+        payload_flow::emit(
+            root,
+            source,
+            config,
+            values,
+            payload.into_collected(test_only),
+            &payload_imports,
+        );
+    }
 }
 
 /// Walk the tree-sitter parse and push every `Symbol::Call`,
-/// `Symbol::Member`, and `Symbol::Bind` into `symbols_out`. Replaces
-/// the prior `build_ast` which materialised a separate `Ast` struct.
+/// `Symbol::Member`, and `Symbol::Bind` into `symbols_out`.
 pub(crate) fn build_symbols(
     cache: &TreeCache,
     symbols_out: &mut crate::Symbols,
@@ -475,17 +490,6 @@ pub(crate) fn build_value_flow(cache: &TreeCache<'_>, symbols: &crate::Symbols) 
         cache.config(),
         symbols,
     )
-}
-
-/// The package clause of Go `source`, `""` when it has none, read from the
-/// syntax tree alone; `None` when the source does not parse.
-pub(crate) fn go_package_clause(
-    source: &str,
-    cancel: Option<&std::sync::atomic::AtomicBool>,
-) -> Option<String> {
-    let parsed = TreeCache::parse(source.as_bytes(), FileType::Go, cancel);
-    let cache = parsed.cache()?;
-    Some(go_syntax::package_name(cache.tree().root_node(), cache.source()).to_string())
 }
 
 pub(super) fn looks_like_protocolless_url(value: &str) -> bool {
@@ -515,106 +519,6 @@ pub(super) fn looks_like_protocolless_url(value: &str) -> bool {
     })
 }
 
-/// The value a quoted string literal denotes: any `b`/`r`/`f`/`u` prefix and
-/// the quotes stripped, escapes decoded unless the literal is raw. Shared by
-/// the literal tier, call arguments, subscript folding and value flow so all
-/// of them agree on what `f"…"` or `b'…'` holds.
-///
-/// `None` when the node is not a complete quoted literal: an unterminated
-/// one, or an unquoted form such as a heredoc body or Perl `q{…}`,
-/// whose text callers treat as they see fit. Lua long strings are decoded.
-fn decode_string_literal(
-    node: Node<'_>,
-    source: &str,
-    config: &langs::LangConfig,
-) -> Option<String> {
-    let raw = node.utf8_text(source.as_bytes()).ok()?;
-    if config.lang == Lang::Lua && raw.starts_with('[') {
-        let after_open = raw.strip_prefix('[')?;
-        let level = after_open.bytes().take_while(|&byte| byte == b'=').count();
-        let body = after_open.get(level..)?.strip_prefix('[')?;
-        let close = format!("]{}]", "=".repeat(level));
-        let body = body.strip_suffix(&close)?;
-        // Lua long strings are raw, ignore an initial line break, and
-        // normalize every line-ending form to a single newline.
-        let body = body
-            .strip_prefix("\r\n")
-            .or_else(|| body.strip_prefix("\n\r"))
-            .or_else(|| body.strip_prefix('\n'))
-            .or_else(|| body.strip_prefix('\r'))
-            .unwrap_or(body);
-        return Some(
-            body.replace("\r\n", "\n")
-                .replace("\n\r", "\n")
-                .replace('\r', "\n"),
-        );
-    }
-    if config.lang == Lang::Kotlin && raw.starts_with("\"\"\"") {
-        return raw
-            .strip_prefix("\"\"\"")?
-            .strip_suffix("\"\"\"")
-            .map(str::to_owned);
-    }
-    if config.lang == Lang::Cpp && node.kind() == "raw_string_literal" {
-        let raw = ["u8R\"", "uR\"", "UR\"", "LR\"", "R\""]
-            .into_iter()
-            .find_map(|prefix| raw.strip_prefix(prefix))?;
-        let (delimiter, body) = raw.split_once('(')?;
-        if delimiter.len() > 16 {
-            return None;
-        }
-        return body
-            .strip_suffix(&format!("){delimiter}\""))
-            .map(str::to_owned);
-    }
-    let raw = if config.lang == Lang::Cpp {
-        ["u8", "u", "U", "L"]
-            .into_iter()
-            .find_map(|prefix| {
-                raw.strip_prefix(prefix)
-                    .filter(|body| body.starts_with('"'))
-            })
-            .unwrap_or(raw)
-    } else {
-        raw
-    };
-    if config.lang == Lang::Elixir && (raw.starts_with("\"\"\"") || raw.starts_with("'''")) {
-        return escapes::decode_elixir_heredoc(raw);
-    }
-    let quoted = raw.trim_start_matches(is_string_prefix);
-    let prefix = &raw[..raw.len() - quoted.len()];
-    let open = quoted
-        .chars()
-        .next()
-        .filter(|c| matches!(c, '"' | '\'' | '`'))?;
-    let body = quoted[1..].strip_suffix(open)?;
-    // A raw literal (Python `r"..."`, Rust `r#"..."#`, Go backticks) carries
-    // the backslash as data, so decoding it would corrupt the value.
-    let raw_literal = prefix.contains(['r', 'R'])
-        || node.kind().contains("raw")
-        || node.kind().contains("verbatim");
-    if raw_literal {
-        return Some(body.to_string());
-    }
-    Some(if config.lang == Lang::Lua {
-        escapes::decode_lua(body)
-    } else {
-        escapes::decode(body)
-    })
-}
-
-/// Source text of a string-kind node that has no opening quote at all, which
-/// [`decode_string_literal`] leaves to its caller.
-fn unquoted_literal<'s>(node: Node<'_>, source: &'s str) -> Option<&'s str> {
-    let raw = node.utf8_text(source.as_bytes()).ok()?;
-    let first = raw.trim_start_matches(is_string_prefix).chars().next()?;
-    (!matches!(first, '"' | '\'' | '`')).then_some(raw)
-}
-
-fn is_string_prefix(c: char) -> bool {
-    matches!(c, 'b' | 'B' | 'r' | 'R' | 'f' | 'F' | 'u' | 'U')
-}
-
 #[derive(Default)]
 struct QueryCollection {
     items: Vec<(String, u64)>,
@@ -638,27 +542,15 @@ fn emit_query_limit_metrics(metrics: &mut Metrics, label: &str, result: &QueryCo
         return;
     }
     metrics.insert(metric!("source.query_limited"), 1.0);
-    metrics.insert(
-        crate::source_query_limited(label, crate::QueryLimit::Any),
-        1.0,
-    );
-    if result.timed_out {
-        metrics.insert(
-            crate::source_query_limited(label, crate::QueryLimit::Timeout),
-            1.0,
-        );
-    }
-    if result.match_limited {
-        metrics.insert(
-            crate::source_query_limited(label, crate::QueryLimit::Match),
-            1.0,
-        );
-    }
-    if result.output_limited {
-        metrics.insert(
-            crate::source_query_limited(label, crate::QueryLimit::Output),
-            1.0,
-        );
+    for (limit, hit) in [
+        (crate::QueryLimit::Any, true),
+        (crate::QueryLimit::Timeout, result.timed_out),
+        (crate::QueryLimit::Match, result.match_limited),
+        (crate::QueryLimit::Output, result.output_limited),
+    ] {
+        if hit {
+            metrics.insert(crate::source_query_limited(label, limit), 1.0);
+        }
     }
 }
 
@@ -717,7 +609,7 @@ fn collect_query(query: &Query, kind: QueryKind, source: &str, root: Node<'_>) -
                     }
                     (import_name(cap.node, cleaned, source), library)
                 } else {
-                    (cleaned, None)
+                    (cleaned.to_owned(), None)
                 };
                 seen.entry(key).or_insert(offset);
                 if seen.len() >= SOURCE_QUERY_OUTPUT_LIMIT {
@@ -754,7 +646,7 @@ fn collect_query(query: &Query, kind: QueryKind, source: &str, root: Node<'_>) -
 /// read structurally since Python permits tabs, repeated spaces and line
 /// continuations around `as`, and a relative from-import member qualified
 /// with its module.
-fn import_name(node: Node<'_>, cleaned: String, source: &str) -> String {
+fn import_name(node: Node<'_>, cleaned: &str, source: &str) -> String {
     let cleaned = match (
         node.child_by_field_name("name")
             .filter(|_| node.kind() == "aliased_import"),
@@ -765,7 +657,7 @@ fn import_name(node: Node<'_>, cleaned: String, source: &str) -> String {
             text(module, source).trim(),
             text(alias, source).trim()
         ),
-        _ => cleaned,
+        _ => cleaned.to_owned(),
     };
     qualify_relative_member(node, cleaned, source)
 }
@@ -815,14 +707,15 @@ fn qualify_relative_member(node: Node<'_>, cleaned: String, source: &str) -> Str
     }
 }
 
-fn strip_quotes(s: &str) -> String {
-    if let [first, inner @ .., last] = s.as_bytes()
+fn strip_quotes(s: &str) -> &str {
+    if let [first, .., last] = s.as_bytes()
         && first == last
         && matches!(first, b'"' | b'\'' | b'`')
     {
-        return std::str::from_utf8(inner).unwrap_or(s).to_string();
+        // ASCII quotes, so both cuts fall on character boundaries.
+        return s.get(1..s.len() - 1).unwrap_or(s);
     }
-    s.to_string()
+    s
 }
 
 /// True when this file type is a source language filefacts can parse.
@@ -847,10 +740,10 @@ pub(crate) fn file_type_for_language(name: &str) -> Option<FileType> {
 
 /// Emit text-level metrics (`text.*`) without a tree-sitter parse.
 ///
-/// Called from the format dispatcher for text-like languages that
-/// don't yet have a [`LangConfig`](langs::LangConfig) entry (Vbs, Batch, …). Only emits
-/// the byte-level / line-level / whitespace metrics that don't need
-/// an AST — language-agnostic by construction.
+/// Called for text-like languages without a [`LangConfig`](langs::LangConfig)
+/// entry (VBScript, …), and for a source file whose parse is unavailable.
+/// Only emits the byte-level / line-level / whitespace metrics that don't
+/// need an AST — language-agnostic by construction.
 pub(crate) fn extract_text_only(bytes: &[u8], metrics: &mut Metrics) {
     if let Ok(content) = std::str::from_utf8(bytes) {
         text_metrics::emit(content, metrics);
@@ -866,7 +759,7 @@ fn emit_text_ratios(
     functions_total: usize,
     imports_total: usize,
 ) {
-    let get = |metrics: &Metrics, key: MetricKey| metrics.get_key(&key).unwrap_or(0.0);
+    let get = |metrics: &Metrics, key: MetricKey| metrics.lookup(&key).unwrap_or(0.0);
 
     // Counted by the caller: `functions.count` / `imports.count` are only
     // emitted later, from the unified symbols view.

@@ -6,11 +6,13 @@ use std::io::Read;
 use aho_corasick::AhoCorasick;
 use std::sync::LazyLock;
 
-use super::{FileType, Sniff, path_ends_with_ci};
+use super::{FileType, Sniff};
 use crate::bytes;
+use crate::fileid::ext::names_apk;
 use crate::fileid::{
     ArchiveFormat, Compression, container_of, go_module,
     package_layout::{self, TarProbe},
+    zip_probe,
 };
 
 /// How far detection will inflate a gzip tar while reading its member names.
@@ -56,7 +58,7 @@ pub(super) fn tar_layout(mut reader: impl Read, deep: bool) -> Inside {
     let Ok(mut entries) = archive.entries() else {
         return Inside::NotTar;
     };
-    let mut probe = TarProbe::new();
+    let mut probe = TarProbe::default();
     loop {
         let entry = match entries.next() {
             Some(Ok(entry)) => entry,
@@ -110,7 +112,7 @@ pub(super) fn classify_tar(
     compression: Compression,
     inside: Inside,
 ) -> Option<FileType> {
-    let (path, data) = (sniff.path, sniff.data);
+    let data = sniff.data;
     let layout = match inside {
         Inside::NotTar => return None,
         Inside::Unreadable => None,
@@ -124,7 +126,7 @@ pub(super) fn classify_tar(
         return Some(ft);
     }
     // `.apk` names Android's zip or Alpine's gzip tar; the container decides.
-    let claim = if path_ends_with_ci(path, b".apk") {
+    let claim = if names_apk(sniff.path) {
         Some(FileType::ApkAlpine)
     } else {
         sniff.ext_type()
@@ -137,7 +139,7 @@ pub(super) fn classify_tar(
         Compression::Bzip2 => FileType::TarBz2,
         Compression::Xz => FileType::TarXz,
         Compression::Zstd => FileType::TarZst,
-        _ => FileType::Tar,
+        Compression::None | Compression::Lzma => FileType::Tar,
     })
 }
 
@@ -192,7 +194,7 @@ impl<'a> Iterator for ZipNames<'a> {
         }
         self.left -= 1;
         let u16_at = |at| bytes::u16_le(data, at).map(usize::from);
-        let u32_at = |at| bytes::u32_le(data, at).map(|v| v as usize);
+        let u32_at = |at| bytes::u32_le(data, at).map(bytes::sat_usize);
         let sig = data.get(off..off + 4)?;
         if sig != b"PK\x03\x04" {
             // Only a real end-of-chain marker completes the walk. Anything else
@@ -258,41 +260,54 @@ struct ZipMarks {
 }
 
 impl ZipMarks {
-    fn scan(data: &[u8]) -> Self {
+    /// The marks along the local-header chain and in the central directory.
+    /// Installers and office suites read the central directory, which can
+    /// name members the chain steps over or never reaches, so a member named
+    /// in either counts.
+    fn scan(sniff: &Sniff<'_>) -> Self {
         let mut m = Self::default();
-        let mut names = ZipNames::new(data);
+        let mut names = ZipNames::new(sniff.data);
         for name in names.by_ref() {
-            let top_level = !name.contains(&b'/');
-            match name {
-                b"AndroidManifest.xml" => m.android = true,
-                b"[Content_Types].xml" => m.content_types = true,
-                b"mimetype" => m.mimetype = true,
-                b"extension.vsixmanifest" => m.vsix = true,
-                b"AppxManifest.xml" | b"AppxMetadata/AppxBundleManifest.xml" => m.appx = true,
-                b"META-INF/MANIFEST.MF" => m.jar = true,
-                b"EGG-INFO/PKG-INFO" => m.egg = true,
-                b"metadata.json" => m.conda_metadata = true,
-                b"install.rdf" | b"META-INF/mozilla.rsa" => m.xpi = true,
-                _ if top_level && name.ends_with(b".nuspec") => m.nuspec = true,
-                _ if top_level && name.starts_with(b"info-") && name.ends_with(b".tar.zst") => {
-                    m.conda_info = true;
-                }
-                _ if name
-                    .strip_suffix(b".dist-info/WHEEL")
-                    .is_some_and(|dir| !dir.is_empty() && !dir.contains(&b'/')) =>
-                {
-                    m.wheel = true;
-                }
-                _ if name.starts_with(b"Payload/")
-                    && memchr::memmem::find(name, b".app/").is_some() =>
-                {
-                    m.ipa = true;
-                }
-                _ => {}
-            }
+            m.mark(name);
         }
         m.complete = names.complete;
+        if let Some(archive) = sniff.zip() {
+            for name in zip_probe::names(&archive) {
+                m.mark(name.as_bytes());
+            }
+        }
         m
+    }
+
+    fn mark(&mut self, name: &[u8]) {
+        let top_level = !name.contains(&b'/');
+        match name {
+            b"AndroidManifest.xml" => self.android = true,
+            b"[Content_Types].xml" => self.content_types = true,
+            b"mimetype" => self.mimetype = true,
+            b"extension.vsixmanifest" => self.vsix = true,
+            b"AppxManifest.xml" | b"AppxMetadata/AppxBundleManifest.xml" => self.appx = true,
+            b"META-INF/MANIFEST.MF" => self.jar = true,
+            b"EGG-INFO/PKG-INFO" => self.egg = true,
+            b"metadata.json" => self.conda_metadata = true,
+            b"install.rdf" | b"META-INF/mozilla.rsa" => self.xpi = true,
+            _ if top_level && name.ends_with(b".nuspec") => self.nuspec = true,
+            _ if top_level && name.starts_with(b"info-") && name.ends_with(b".tar.zst") => {
+                self.conda_info = true;
+            }
+            _ if name
+                .strip_suffix(b".dist-info/WHEEL")
+                .is_some_and(|dir| !dir.is_empty() && !dir.contains(&b'/')) =>
+            {
+                self.wheel = true;
+            }
+            _ if name.starts_with(b"Payload/")
+                && memchr::memmem::find(name, b".app/").is_some() =>
+            {
+                self.ipa = true;
+            }
+            _ => {}
+        }
     }
 }
 
@@ -355,7 +370,7 @@ fn markers_in(data: &[u8]) -> u8 {
 /// shared with Alpine's gzip tar, so the name says Zip; a zip so named is an
 /// Android package.
 fn zip_name_claim(sniff: &Sniff<'_>) -> Option<FileType> {
-    if path_ends_with_ci(sniff.path, b".apk") {
+    if names_apk(sniff.path) {
         return Some(FileType::ApkAndroid);
     }
     sniff.ext_type().filter(|ft| {
@@ -374,7 +389,7 @@ fn zip_name_claim(sniff: &Sniff<'_>) -> Option<FileType> {
 /// package delivered without its extension must still reach its own.
 pub(super) fn classify_pk(sniff: &Sniff<'_>) -> FileType {
     let data = sniff.data;
-    let m = ZipMarks::scan(data);
+    let m = ZipMarks::scan(sniff);
     let found = std::cell::OnceCell::new();
     let present =
         |marker: Marker| *found.get_or_init(|| markers_in(data)) & (1 << marker as u8) != 0;

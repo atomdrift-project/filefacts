@@ -14,11 +14,11 @@
 use serde_json::Value as JsonValue;
 
 use super::archive_stats::{Agg, ArchiveStats, Reading, Scope, member_value};
-use super::bounded::{Limits, MAX_ARCHIVE_MEMBERS, inflate_capped};
+use super::bounded::{Limits, MAX_ARCHIVE_MEMBERS, OnError, inflate_capped};
+use crate::bytes::{Reader, u32_le, u64_le};
 use crate::error::Error;
-use crate::formats::common::bytes_at::{u32_le, u64_le};
 use crate::output::{ArchiveCompression, ArchiveMember, EntryType, Metrics, Values};
-use crate::value_key;
+use crate::{metric, value_key};
 
 /// The shared aggregates a 7z reports. Path traversal is counted on files
 /// only.
@@ -48,16 +48,14 @@ const SIGNATURE_HEADER_LEN: usize = 32;
 /// Largest next header, raw or decoded. Real headers run from a few hundred
 /// bytes to a few MiB for archives with very many members.
 const MAX_HEADER_BYTES: u64 = 32 << 20;
-/// Most files (and non-empty streams) a header may declare. Of those, only
-/// the first [`MAX_ARCHIVE_MEMBERS`] are listed: a few bytes of LZMA-packed
-/// header can declare a million names.
+/// Most files, non-empty streams, folders and packed streams a header may
+/// declare. Of the files, only the first [`MAX_ARCHIVE_MEMBERS`] are listed:
+/// a few bytes of LZMA-packed header can declare a million names.
 const MAX_FILES: usize = 1 << 20;
 /// Per-folder coder and coder-stream limits, the same ones 7-Zip's own reader
 /// enforces.
 const MAX_FOLDER_CODERS: u64 = 64;
 const MAX_FOLDER_STREAMS: u64 = 64;
-/// Seconds between the FILETIME epoch (1601) and the Unix epoch.
-const FILETIME_UNIX_DIFF_SECS: i64 = 11_644_473_600;
 
 // Property IDs, from 7-Zip's `7zFormat.txt`.
 const K_END: u8 = 0x00;
@@ -97,6 +95,10 @@ pub(super) fn extract(
         value_key!("archive.format.kind"),
         JsonValue::String("7z".into()),
     );
+    metrics.insert(
+        metric!("7z.header_crc_mismatch_count"),
+        header.crc_mismatches as f64,
+    );
 
     let folder_methods: Vec<String> = header
         .folders
@@ -116,20 +118,18 @@ pub(super) fn extract(
         .map(|f| f.coders.iter().any(|(id, _)| *id == ID_AES256SHA256))
         .collect();
 
-    let listed = header.files.len().min(MAX_ARCHIVE_MEMBERS);
+    let file_count = header.files.len();
+    let listed = file_count.min(MAX_ARCHIVE_MEMBERS);
     let mut members = Vec::with_capacity(listed);
     let mut stats = ArchiveStats::new(AGGS);
     let mut next_stream = 0usize;
-    for file in header.files.iter().take(listed) {
+    for file in header.files.into_iter().take(listed) {
         let mut member = if file.has_stream {
             let stream = header.streams.get(next_stream);
             next_stream += 1;
             let folder = stream.map(|s| s.folder);
-            let mut member = ArchiveMember::new(
-                file.name.clone(),
-                stream.map_or(0, |s| s.size),
-                EntryType::Regular,
-            );
+            let mut member =
+                ArchiveMember::new(file.name, stream.map_or(0, |s| s.size), EntryType::Regular);
             member.crc32 = stream.and_then(|s| s.crc);
             member.encrypted = folder
                 .and_then(|f| encrypted_folders.get(f))
@@ -151,7 +151,7 @@ pub(super) fn extract(
             } else {
                 EntryType::Directory
             };
-            ArchiveMember::new(file.name.clone(), 0, entry_type)
+            ArchiveMember::new(file.name, 0, entry_type)
         };
         member.mtime_unix = file.mtime_unix;
         stats.observe(&member, &Reading::of(&member));
@@ -159,11 +159,11 @@ pub(super) fn extract(
         archive_members.push(member);
     }
 
-    if header.files.len() > listed {
+    if file_count > listed {
         let mut limits = Limits::default();
         limits.push(
             "member-cap",
-            format!("listed {listed} of {} members", header.files.len()),
+            format!("listed {listed} of {file_count} members"),
         );
         limits.emit(values, value_key!("7z.limits"));
     }
@@ -184,6 +184,8 @@ struct Header {
     /// Every unpacked stream, in the order files with data consume them.
     streams: Vec<Stream>,
     files: Vec<File>,
+    /// Start-header and next-header CRCs that did not match their bytes.
+    crc_mismatches: u64,
 }
 
 /// One `FilesInfo` entry.
@@ -307,20 +309,34 @@ fn read_header(bytes: &[u8]) -> Result<Header, Error> {
         .checked_add(offset)
         .and_then(|from| file_range(bytes, from, size))
         .ok_or_else(|| invalid("next header overruns file"))?;
+    // 7-Zip refuses an archive whose header CRCs disagree; the listing is
+    // still read here, and each mismatch counted as the anomaly it is.
+    let crc_mismatches = [
+        (start.get(12..), u32_le(start, 8)),
+        (Some(raw), u32_le(start, 28)),
+    ]
+    .into_iter()
+    .filter(|(covered, stored)| covered.map(crc32fast::hash) != *stored)
+    .count() as u64;
+    if crc_mismatches > 0 {
+        tracing::debug!(target: "filefacts::7z", stage = "header", crc_mismatches, "header CRC mismatch");
+    }
 
-    let mut r = HeaderReader { buf: raw };
-    match r.u8()? {
+    let mut r = HeaderReader::new(raw);
+    let mut header = match r.u8()? {
         K_HEADER => plain_header(&mut r),
         K_ENCODED_HEADER => {
             let decoded = decode_header(bytes, &mut r)?;
-            let mut r = HeaderReader { buf: &decoded };
+            let mut r = HeaderReader::new(&decoded);
             if r.u8()? != K_HEADER {
                 return Err(invalid("decoded header is not a Header"));
             }
             plain_header(&mut r)
         }
         _ => Err(invalid("next header is neither Header nor EncodedHeader")),
-    }
+    }?;
+    header.crc_mismatches = crc_mismatches;
+    Ok(header)
 }
 
 /// `len` bytes at absolute offset `from`, if the file holds them.
@@ -367,7 +383,7 @@ fn decode_header(bytes: &[u8], r: &mut HeaderReader<'_>) -> Result<Vec<u8>, Erro
             let dict_size = u32::from_le_bytes([d0, d1, d2, d3])
                 .min(crate::bytes::sat_u32(crate::bytes::sat_usize(unpack_size)));
             lzma_rust2::LzmaReader::new_with_props(packed, unpack_size, lc_lp_pb, dict_size, None)
-                .and_then(|lzma| inflate_capped(lzma, unpack_size))
+                .and_then(|lzma| inflate_capped(lzma, unpack_size, OnError::Discard))
                 .map_err(|e| Error::malformed_with_source("7z", "encoded header", e))?
                 .bytes
         }
@@ -381,45 +397,40 @@ fn decode_header(bytes: &[u8], r: &mut HeaderReader<'_>) -> Result<Vec<u8>, Erro
 }
 
 /// Bounds-checked reader over a 7z header.
-struct HeaderReader<'a> {
-    buf: &'a [u8],
-}
+struct HeaderReader<'a>(Reader<'a>);
 
 impl<'a> HeaderReader<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self(Reader::new(buf))
+    }
+
     fn u8(&mut self) -> Result<u8, Error> {
-        let (&b, rest) = self
-            .buf
-            .split_first()
-            .ok_or_else(|| invalid("header truncated"))?;
-        self.buf = rest;
-        Ok(b)
+        self.0.u8().ok_or_else(|| invalid("header truncated"))
     }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
-        if n > self.buf.len() {
-            return Err(invalid("header field overruns header"));
-        }
-        let (head, rest) = self.buf.split_at(n);
-        self.buf = rest;
-        Ok(head)
+        self.0
+            .bytes(n)
+            .ok_or_else(|| invalid("header field overruns header"))
+    }
+
+    /// Everything left, consumed.
+    fn rest(&mut self) -> &'a [u8] {
+        self.0.bytes(self.0.remaining()).unwrap_or_default()
     }
 
     /// The next `n` bytes, as a reader of their own.
     fn sub(&mut self, n: u64) -> Result<HeaderReader<'a>, Error> {
         let n = usize::try_from(n).map_err(|_| invalid("header field overruns header"))?;
-        Ok(HeaderReader { buf: self.take(n)? })
-    }
-
-    fn skip(&mut self, n: u64) -> Result<(), Error> {
-        self.sub(n).map(drop)
+        Ok(HeaderReader::new(self.take(n)?))
     }
 
     fn u32_le(&mut self) -> Result<u32, Error> {
-        u32_le(self.take(4)?, 0).ok_or_else(|| invalid("header truncated"))
+        self.0.u32_le().ok_or_else(|| invalid("header truncated"))
     }
 
     fn u64_le(&mut self) -> Result<u64, Error> {
-        u64_le(self.take(8)?, 0).ok_or_else(|| invalid("header truncated"))
+        self.0.u64_le().ok_or_else(|| invalid("header truncated"))
     }
 
     /// 7z `NUMBER`: the leading one bits of the first byte count the
@@ -444,7 +455,7 @@ impl<'a> HeaderReader<'a> {
         let n = self.number()?;
         usize::try_from(n)
             .ok()
-            .filter(|&n| n <= self.buf.len())
+            .filter(|&n| n <= self.0.remaining())
             .ok_or_else(|| invalid("declared count exceeds header size"))
     }
 
@@ -478,8 +489,9 @@ fn plain_header(r: &mut HeaderReader<'_>) -> Result<Header, Error> {
     let mut nid = r.u8()?;
     if nid == K_ARCHIVE_PROPERTIES {
         while r.u8()? != K_END {
+            // Step over the property's bytes.
             let size = r.number()?;
-            r.skip(size)?;
+            r.sub(size)?;
         }
         nid = r.u8()?;
     }
@@ -514,7 +526,9 @@ fn files_info(r: &mut HeaderReader<'_>) -> Result<Vec<File>, Error> {
             ..File::default()
         })
         .collect();
-    let mut empty_stream: Vec<bool> = Vec::new();
+    // The files without a stream, in order: what `EmptyFile` and `Anti`
+    // flag, found once per `EmptyStream` rather than once per property.
+    let mut empty: Vec<usize> = Vec::new();
     loop {
         let id = r.u8()?;
         if id == K_END {
@@ -524,16 +538,19 @@ fn files_info(r: &mut HeaderReader<'_>) -> Result<Vec<File>, Error> {
         let mut p = r.sub(size)?;
         match id {
             K_EMPTY_STREAM => {
-                empty_stream = p.bits(n)?;
-                for (file, &empty) in files.iter_mut().zip(&empty_stream) {
-                    file.has_stream = !empty;
+                empty.clear();
+                for (index, (file, is_empty)) in files.iter_mut().zip(p.bits(n)?).enumerate() {
+                    file.has_stream = !is_empty;
+                    if is_empty {
+                        empty.push(index);
+                    }
                 }
             }
             K_EMPTY_FILE | K_ANTI => {
-                let empties = empty_stream.iter().filter(|&&e| e).count();
-                let flags = p.bits(empties)?;
-                let empty_files = files.iter_mut().filter(|f| !f.has_stream);
-                for (file, set) in empty_files.zip(flags) {
+                for (&index, set) in empty.iter().zip(p.bits(empty.len())?) {
+                    let Some(file) = files.get_mut(index) else {
+                        continue;
+                    };
                     if id == K_EMPTY_FILE {
                         file.empty_file = set;
                     } else {
@@ -546,7 +563,7 @@ fn files_info(r: &mut HeaderReader<'_>) -> Result<Vec<File>, Error> {
                     return Err(invalid("external file names"));
                 }
                 let units: Vec<u16> = p
-                    .buf
+                    .rest()
                     .as_chunks::<2>()
                     .0
                     .iter()
@@ -565,7 +582,7 @@ fn files_info(r: &mut HeaderReader<'_>) -> Result<Vec<File>, Error> {
                 }
                 for (file, d) in files.iter_mut().zip(defined) {
                     if d {
-                        file.mtime_unix = filetime_to_unix(p.u64_le()?);
+                        file.mtime_unix = Some(crate::time::filetime_to_unix(p.u64_le()?));
                     }
                 }
             }
@@ -577,19 +594,15 @@ fn files_info(r: &mut HeaderReader<'_>) -> Result<Vec<File>, Error> {
     Ok(files)
 }
 
-/// A Windows FILETIME (100 ns ticks since 1601) as Unix seconds.
-fn filetime_to_unix(ticks: u64) -> Option<i64> {
-    i64::try_from(ticks / 10_000_000)
-        .ok()?
-        .checked_sub(FILETIME_UNIX_DIFF_SECS)
-}
-
 fn streams_info(r: &mut HeaderReader<'_>) -> Result<StreamsInfo, Error> {
     let mut info = StreamsInfo::default();
     let mut nid = r.u8()?;
     if nid == K_PACK_INFO {
         info.pack_pos = r.number()?;
         let n = r.count()?;
+        if n > MAX_FILES {
+            return Err(invalid("pack stream count over cap"));
+        }
         nid = r.u8()?;
         if nid == K_SIZE {
             for _ in 0..n {
@@ -611,6 +624,9 @@ fn streams_info(r: &mut HeaderReader<'_>) -> Result<StreamsInfo, Error> {
             return Err(invalid("UnpackInfo without Folder"));
         }
         let n = r.count()?;
+        if n > MAX_FILES {
+            return Err(invalid("folder count over cap"));
+        }
         if r.u8()? != 0 {
             return Err(invalid("external folders"));
         }

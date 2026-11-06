@@ -4,7 +4,9 @@ use crate::output::{Metrics, Values};
 fn run(bytes: &[u8]) -> (Values, Metrics) {
     let mut v = Values::new();
     let mut m = Metrics::new();
-    let _ = extract(bytes, &mut v, &mut m, &mut Errors::new());
+    if let Ok(mut comp) = open(bytes) {
+        extract(&mut comp, &mut v, &mut m, &mut Errors::new());
+    }
     (v, m)
 }
 
@@ -14,9 +16,10 @@ fn run(bytes: &[u8]) -> (Values, Metrics) {
 fn unopenable_compound_file_is_reported() {
     let mut bytes = b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1".to_vec();
     bytes.resize(1024, 0xAB);
-    let mut errors = Errors::new();
-    let result = extract(&bytes, &mut Values::new(), &mut Metrics::new(), &mut errors);
-    assert!(result.is_err(), "malformed compound file must not pass");
+    assert!(
+        open(&bytes).is_err(),
+        "malformed compound file must not pass"
+    );
 
     let parsed = crate::OpenOptions::new()
         .path(std::path::Path::new("x.doc"))
@@ -55,7 +58,8 @@ fn unreadable_stream_is_recorded() {
     cut_stream_chain(&mut bytes);
     let mut errors = Errors::new();
     let mut v = Values::new();
-    extract(&bytes, &mut v, &mut Metrics::new(), &mut errors).unwrap();
+    let mut comp = open(&bytes).unwrap();
+    extract(&mut comp, &mut v, &mut Metrics::new(), &mut errors);
     assert_eq!(v.get("office.kind").and_then(|x| x.as_str()), Some("doc"));
     assert!(
         errors
@@ -637,14 +641,6 @@ fn compobj_parser_rejects_truncated_stream() {
 }
 
 #[test]
-fn iso8601_format_matches_known_unix_timestamp() {
-    // 2024-01-15T08:00:00Z = 1_705_305_600
-    assert_eq!(format_iso8601_utc(1_705_305_600), "2024-01-15T08:00:00Z");
-    // 1970-01-01T00:00:00Z = 0
-    assert_eq!(format_iso8601_utc(0), "1970-01-01T00:00:00Z");
-}
-
-#[test]
 fn macro_count_reflects_multiple_vba_storages() {
     // Real macro-enabled docs sometimes have nested VBA storages.
     let cfb = build_cfb(&[
@@ -993,4 +989,14 @@ fn stream_reads_stop_at_the_cap() {
     assert_eq!(data, body);
     limits.emit(&mut v, crate::value_key!("office.limits"));
     assert!(v.get("office.limits").is_none());
+}
+
+/// A property FILETIME before 1970 is still a date, not a duration.
+#[test]
+fn pre_1970_filetime_property_is_a_date() {
+    let ticks = (11_644_473_600u64 - 2_208_988_800) * 10_000_000;
+    assert_eq!(
+        read_filetime(&ticks.to_le_bytes()),
+        Some(JsonValue::String("1900-01-01T00:00:00Z".into()))
+    );
 }

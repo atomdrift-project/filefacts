@@ -135,12 +135,11 @@ pub(super) fn emit(identifiers: &[&str], metrics: &mut Metrics) {
         if KEYBOARD.is_match(s) {
             keyboard_pattern += 1;
         }
-        if len >= 3 {
-            if let Some(first_char) = s.chars().next() {
-                if s.chars().all(|c| c == first_char) {
-                    repeated_char += 1;
-                }
-            }
+        if len >= 3
+            && let Some(first_char) = s.chars().next()
+            && s.chars().all(|c| c == first_char)
+        {
+            repeated_char += 1;
         }
 
         let entropy = string_entropy(s);
@@ -240,9 +239,6 @@ pub(super) fn emit(identifiers: &[&str], metrics: &mut Metrics) {
 }
 
 /// Shannon entropy in bits over the byte distribution of `s`.
-/// Thin wrapper around [`crate::scan::entropy::shannon`] so the
-/// math stays in one place and any future tweak (e.g. lazy
-/// histogram construction) lands once.
 pub(super) fn string_entropy(s: &str) -> f64 {
     crate::scan::entropy::shannon(s.as_bytes())
 }
@@ -256,23 +252,11 @@ fn is_sequential(s: &str) -> bool {
             _ => {}
         }
     }
-    if s.len() >= 2 {
-        if let Some(last) = s.chars().last() {
-            if last.is_ascii_digit() {
-                // The final ASCII digit is one byte, so the byte before it is a
-                // char boundary — slice the prefix instead of reallocating it.
-                let prefix = &s[..s.len() - 1];
-                let common = [
-                    "var", "tmp", "temp", "arg", "param", "item", "val", "x", "y", "z", "i", "j",
-                    "k",
-                ];
-                if common.iter().any(|p| prefix.eq_ignore_ascii_case(p)) {
-                    return true;
-                }
-            }
-        }
-    }
-    false
+    let common = [
+        "var", "tmp", "temp", "arg", "param", "item", "val", "x", "y", "z", "i", "j", "k",
+    ];
+    s.strip_suffix(|c: char| c.is_ascii_digit())
+        .is_some_and(|prefix| common.iter().any(|p| prefix.eq_ignore_ascii_case(p)))
 }
 
 #[cfg(test)]

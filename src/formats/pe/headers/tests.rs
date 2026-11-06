@@ -44,3 +44,18 @@ fn dll_characteristics_picks_up_force_integrity_and_aslr() {
 fn subsystem_string_unknown_fallback() {
     assert_eq!(subsystem_string(99), "unknown");
 }
+
+/// Entropy costs a pass over each section's bytes, and nothing makes the
+/// raw extents disjoint: thousands of headers claiming the whole file would
+/// cost sections × file size. The file's length is the budget, which the
+/// disjoint sections of a real image never exceed.
+#[test]
+fn overlapping_sections_are_measured_within_the_file_length() {
+    let bytes = crate::formats::pe::tests::pe_with_overlapping_sections(1000, 64 * 1024);
+    let layout = crate::formats::common::read_layout(&bytes).expect("binform reads it");
+    let mut out = Vec::new();
+    sections(&layout, 0, &bytes, &mut out);
+    assert_eq!(out.len(), 1000, "every header is still reported");
+    let measured = out.iter().filter(|s| s.entropy.is_some()).count();
+    assert_eq!(measured, 1, "one whole-file section exhausts the budget");
+}

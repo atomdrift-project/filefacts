@@ -12,16 +12,11 @@ contains the Go runtime (BSD-3-Clause).
 
 `a_stripped_go_elf_reads_its_functions_from_the_pclntab`
 (`src/formats/go_pclntab/tests.rs`) asserts that filefacts reads all 2,078
-functions from the pclntab itself, long and generic names included, so
-rizin never starts. `go_recovery_names_pclntab_functions`
-(`src/rizin/tests.rs`, skipped without rizin) runs rizin's Go script on it
-directly, for a Go binary whose table does not validate, and asserts that
-rizin recovers more than 1,000 functions, that fewer than 10% stay unnamed
-`fcn.*`, and that `OpenSealedPayload`, `ReportLength` and `mustValue` come
-back by name. That holds only when the Go analysis script
-runs `aalg` (pclntab names) before `aa; aac`. The long and generic names
-also exercise stng's funcnametab splitter, which must keep names over 80
-bytes and names with generic shapes.
+functions from the pclntab itself, long and generic names included
+(`OpenSealedPayload`, `ReportLength`, `mustValue[...]`), so binform's
+function recovery never runs. The long and generic names also exercise
+stng's funcnametab splitter, which must keep names over 80 bytes and names
+with generic shapes.
 
 Built with Go 1.27 from:
 

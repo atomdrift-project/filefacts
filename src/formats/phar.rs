@@ -145,7 +145,7 @@ pub(super) fn extract(
     );
     values.insert_key(
         value_key!("phar.api_version"),
-        JsonValue::String(phar.api_version.clone()),
+        JsonValue::String(phar.api_version),
     );
     if !phar.alias.is_empty() {
         values.insert_key(

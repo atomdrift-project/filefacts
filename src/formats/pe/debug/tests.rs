@@ -1,5 +1,6 @@
-use super::debug_type_label;
+use super::{MAX_DEBUG_ENTRIES, debug_type_label};
 use crate::output::{Metrics, Values};
+use serde_json::Value as JsonValue;
 
 #[test]
 fn debug_type_labels_cover_known_types() {
@@ -175,4 +176,25 @@ fn ansi_code_page_pdb_path_is_kept_and_flagged() {
         v.get("pe.debug.pdb.path_hex").and_then(|x| x.as_str()),
         Some(crate::formats::common::hex_encode(&raw[..raw.len() - 1]).as_str())
     );
+}
+
+/// A forged debug directory may span the file: one entry per 28 bytes,
+/// each a JSON object ten times that. The entry list is capped.
+#[test]
+fn debug_entries_are_capped() {
+    let entries = 4 * MAX_DEBUG_ENTRIES;
+    let (mut bytes, va, _) = crate::formats::goblin_safe::tests::pe_with_last_section(28 * entries);
+    let pe_offset = u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()) as usize;
+    // PE32+: the data directories start 112 bytes into the optional header.
+    let debug_dir = pe_offset + 24 + 112 + 6 * 8;
+    bytes[debug_dir..debug_dir + 4].copy_from_slice(&va.to_le_bytes());
+    bytes[debug_dir + 4..debug_dir + 8].copy_from_slice(&((28 * entries) as u32).to_le_bytes());
+    let mut out = crate::formats::Sinks::default();
+    crate::formats::pe::extract(&bytes, out.ctx()).unwrap();
+    let listed = out
+        .values
+        .get("pe.debug.entries")
+        .and_then(JsonValue::as_array)
+        .map(Vec::len);
+    assert_eq!(listed, Some(MAX_DEBUG_ENTRIES));
 }

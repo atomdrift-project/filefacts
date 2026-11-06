@@ -1,8 +1,8 @@
 //! Hostile-input regressions.
 //!
 //! Each case builds a known-bad input in memory, opens it, and touches every
-//! view. To pass, the case must finish on a 2 MiB worker thread (the stack a
-//! rayon worker gets) within a CPU-time budget and a peak-RSS cap.
+//! view. To pass, the case must finish on a 2 MiB host worker thread within a
+//! CPU-time budget and a peak-RSS cap.
 //!
 //! A stack overflow or an allocation failure aborts the process, which no
 //! `catch_unwind` can stop. So every case runs in a child copy of this test
@@ -45,7 +45,8 @@ use filefacts::FileId;
 /// Set in the child process: run the case body instead of supervising it.
 const CHILD_ENV: &str = "FILEFACTS_HOSTILE_CHILD";
 
-/// The stack a rayon worker thread gets by default.
+/// The stack of a host worker thread: 2 MiB, the default for spawned threads
+/// in Rust and in common thread pools.
 const WORKER_STACK: usize = 2 << 20;
 
 /// Peak resident set allowed for one case, in KiB, unless the case sets its own.

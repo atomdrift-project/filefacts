@@ -20,6 +20,11 @@ use crate::metric;
 use crate::output::{Errors, Metrics, Values};
 use crate::value_key;
 
+/// Most `pe.debug.entries` reported. A forged directory may span the file,
+/// one entry per 28 bytes and each a JSON object ten times that; real
+/// images carry a handful.
+const MAX_DEBUG_ENTRIES: usize = 1024;
+
 /// Emit the PDB path and its derived basename + stem. The path itself
 /// is the forensic anchor; basename and stem are the comparison
 /// surfaces traits use to flag mismatches against the binary's own
@@ -78,8 +83,19 @@ pub(super) fn extract(
     );
     // Enumerate every directory entry so a consumer can see the full
     // set of debug-information shapes the binary carries.
+    if directory.len() > MAX_DEBUG_ENTRIES {
+        tracing::debug!(
+            target: "filefacts::pe",
+            format = "pe",
+            stage = "debug-directory",
+            entries = directory.len(),
+            reported = MAX_DEBUG_ENTRIES,
+            "debug directory past the entry cap"
+        );
+    }
     let entries: Vec<JsonValue> = directory
         .iter()
+        .take(MAX_DEBUG_ENTRIES)
         .map(|e| {
             // Emit both a stable string label (forensic consumers) and
             // the raw IMAGE_DEBUG_TYPE_* numeric id so downstream
@@ -118,10 +134,10 @@ fn codeview_pdb70(
     values: &mut Values,
     metrics: &mut Metrics,
 ) {
+    let entry = find_codeview_entry(directory);
     // RSDS header: CvSignature(4) + Signature/GUID(16) + Age(4) = 24 bytes
     // before the filename string.
-    let path_offset =
-        find_codeview_entry(directory).map(|idd| u64::from(idd.pointer_to_raw_data) + 24);
+    let path_offset = entry.map(|idd| u64::from(idd.pointer_to_raw_data) + 24);
     put_pdb_path(values, metrics, cv.filename, path_offset);
     put_str(
         values,
@@ -133,7 +149,7 @@ fn codeview_pdb70(
     // Pair the GUID with the originating debug-entry timestamp so
     // consumers can build the same `<GUID><age>` PE-debug fingerprint
     // tools like symchk/symbol-server use to look the PDB up.
-    if let Some(idd) = find_codeview_entry(directory) {
+    if let Some(idd) = entry {
         put_i64(
             values,
             value_key!("pe.debug.pdb.timestamp"),

@@ -71,7 +71,7 @@ fn oversized_metadata_is_read_up_to_the_cap() {
     // characters; one more body byte puts it inside one.
     for body_start in ["", "x"] {
         let mut meta = format!("Name: mypkg\nAuthor: Jane\n\n{body_start}").into_bytes();
-        while meta.len() <= 256 * 1024 {
+        while meta.len() as u64 <= crate::formats::bounded::MAX_MANIFEST_BYTES {
             meta.extend_from_slice("\u{e9}".as_bytes());
         }
         let whl = stored_zip(&[("mypkg-1.0.0.dist-info/METADATA", &meta)]);
@@ -79,6 +79,10 @@ fn oversized_metadata_is_read_up_to_the_cap() {
         assert_eq!(
             v.get("whl.authors[0].name").and_then(|x| x.as_str()),
             Some("Jane")
+        );
+        assert_eq!(
+            v.get("whl.limits[0].stage").and_then(|x| x.as_str()),
+            Some("metadata")
         );
     }
 }
