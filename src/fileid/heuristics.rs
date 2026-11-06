@@ -456,6 +456,19 @@ fn scan_scores(data: &[u8]) -> Scores {
         {
             continue;
         }
+        // A Kotlin `package` header opens its line. Mid-sentence prose
+        // ("installs the package inside…", "No package name") is not one,
+        // and two such sentences in a README reached the Kotlin threshold.
+        if m == b"package "
+            && !before
+                .rsplit(|&b| b == b'\n')
+                .next()
+                .unwrap_or_default()
+                .iter()
+                .all(|b| matches!(b, b' ' | b'\t'))
+        {
+            continue;
+        }
         if m == b"let " {
             const PROSE: &[&[u8]] = &[
                 b"the ", b"the\n", b"a ", b"an ", b"us ", b"me ", b"it ", b"you ", b"them ",

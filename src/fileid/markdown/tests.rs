@@ -21,6 +21,21 @@ wolfcrypt_test(&args);\n\
     assert_eq!(id.file_type(), FileType::Markdown);
 }
 
+/// Prose that says "package" twice before the first fence is not a Kotlin
+/// `package` header; the README stays Markdown.
+#[test]
+fn prose_package_mentions_do_not_score_as_kotlin() {
+    let doc = b"# config-normalizer\n\n\
+A service installs the package inside a freshly built CI image.\n\n\
+Nothing. No package name, no version, no file paths.\n\n\
+```js\n\
+const normalize = require('config-normalizer');\n\
+```\n";
+    assert!(document_structure(doc));
+    let id = FileId::from_path_and_bytes(Path::new("README.md"), doc);
+    assert_eq!(id.file_type(), FileType::Markdown);
+}
+
 #[test]
 fn readmes_with_program_examples_remain_markdown() {
     for bytes in [

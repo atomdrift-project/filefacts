@@ -739,6 +739,26 @@ fn npm_lock_aliases_resolve_to_the_real_package() {
 }
 
 #[test]
+fn yarn_lock_local_protocol_blocks_are_not_registry_packages() {
+    let lock =
+        b"\"sapling-output-plugin@file:src/plugins/sapling-output\":\n  version \"0.0.0\"\n  \
+            dependencies:\n    tmp-promise \"^3.0.3\"\n\n\
+            \"@acme/ui@link:../ui\":\n  version \"1.0.0\"\n\n\
+            \"app@workspace:packages/app\":\n  version \"0.0.0-use.local\"\n\n\
+            \"tool@portal:../tool\":\n  version \"2.0.0\"\n\n\
+            \"mixed@file:vendor/x@y\", \"mixed@^1.2.0\":\n  version \"1.2.3\"\n\n\
+            \"filey@^3.0.0\":\n  version \"3.1.0\"\n";
+    let refs = derive(FileType::YarnLock, lock, &Values::new());
+    // Only purely local blocks drop. A registry range beside a local decoy
+    // still names the registry package (by its own spec, not the decoy's
+    // path), and a name merely starting with `file` is not a protocol.
+    assert_eq!(
+        purls(&refs),
+        vec!["pkg:npm/mixed@1.2.3", "pkg:npm/filey@3.1.0"]
+    );
+}
+
+#[test]
 fn yarn_lock_alias_resolves_to_the_real_package() {
     let lock = b"\"wrap-ansi-cjs@npm:wrap-ansi@^7.0.0\":\n  version \"7.0.0\"\n\n\
             lodash@npm:^4.17.15:\n  version \"4.17.21\"\n";

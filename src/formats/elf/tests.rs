@@ -1180,6 +1180,34 @@ fn static_function_fallback_keeps_static_executable_globals() {
 }
 
 #[test]
+fn recovered_inventory_keeps_public_symtab_aliases() {
+    use crate::output::Symbol;
+    // binform names each address once; a static libc's public entry point
+    // (`syscall`, `sendto`) must survive beside the inventory, while locals
+    // and names already present are not repeated.
+    let bytes = read_fixture("elf-syscall-wrapper-static.elf");
+    let elf = Elf::parse(&bytes).unwrap();
+    let mut out = crate::Symbols::default();
+    out.push(Symbol::Function {
+        name: "main".into(),
+        offset: Some(64),
+        complexity: Some(3),
+        callees: Vec::new(),
+    });
+    static_function_fallback(&elf, bytes.len(), &mut out);
+    let names: Vec<&str> = out
+        .iter_kind(SymbolKind::Function)
+        .filter_map(Symbol::name)
+        .collect();
+    assert!(names.contains(&"syscall"), "{names:?}");
+    assert_eq!(
+        names.iter().filter(|n| **n == "main").count(),
+        1,
+        "{names:?}"
+    );
+}
+
+#[test]
 fn the_symtab_fallback_names_the_executable_section_functions() {
     // The last-resort path (binform recovered nothing, no pclntab): every
     // `.symtab` function in an executable section is named.

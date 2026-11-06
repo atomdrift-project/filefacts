@@ -303,9 +303,9 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
             native.functions.apply(symbols_out, metrics);
         }
     }
-    // Symbol-table names when nothing above produced a function inventory:
-    // binform recovered none (an instruction set it does not decode) and there
-    // was no pclntab.
+    // Symbol-table names when nothing above produced a function inventory
+    // (binform recovered none and there was no pclntab); otherwise only the
+    // public `.symtab` aliases the inventory lacks.
     symbols::static_function_fallback(&elf, bytes.len(), symbols_out);
     linker_family(&elf, values);
     comment_fingerprint(values);

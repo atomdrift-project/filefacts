@@ -23,11 +23,24 @@ use crate::value_key;
 /// `.dynsym` to export them, so a local-only walk hides exactly the calls a
 /// symbol rule looks for. Functions `.dynsym` already exports stay exports
 /// only, so a dynamic object reports each name once, in the same view it did.
+///
+/// When an inventory already exists (binform recovered it), only the public
+/// `.symtab` names it lacks are added: binform names each address once, so a
+/// static libc's weak entry point (`sendto`) disappears behind its internal
+/// alias (`__sendto`) at the same address, and with no `.dynsym` nothing else
+/// reports it.
 pub(super) fn static_function_fallback(elf: &Elf<'_>, file_len: usize, out: &mut crate::Symbols) {
-    use crate::output::Symbol;
-    if crate::formats::common::has_functions(out) {
-        return;
-    }
+    use crate::output::{Symbol, SymbolKind};
+    let have_inventory = crate::formats::common::has_functions(out);
+    let present: std::collections::HashSet<String> = if have_inventory {
+        out.iter()
+            .filter(|symbol| matches!(symbol.kind(), SymbolKind::Function | SymbolKind::Export))
+            .filter_map(Symbol::name)
+            .map(str::to_string)
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
     let exported: std::collections::HashSet<&str> = elf
         .dynsyms
         .iter()
@@ -46,7 +59,9 @@ pub(super) fn static_function_fallback(elf: &Elf<'_>, file_len: usize, out: &mut
             continue;
         }
         let Some(name) = elf.strtab.get_at(sym.st_name).filter(|name| {
-            !name.is_empty() && (sym.st_bind() == STB_LOCAL || !exported.contains(name))
+            !name.is_empty()
+                && (sym.st_bind() == STB_LOCAL || !exported.contains(name))
+                && (!have_inventory || (sym.st_bind() != STB_LOCAL && !present.contains(*name)))
         }) else {
             continue;
         };

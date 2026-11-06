@@ -297,14 +297,31 @@ fn flush_yarn(out: &mut Refs<'_>, name: Option<&str>, version: Option<&str>, int
 fn yarn_key_name(line: &str) -> Option<&str> {
     // The header ends in `:`; splitting on the first one instead would cut an
     // alias spec (`"a@npm:b@^1":`) in half.
-    let key = line
-        .trim_end()
-        .strip_suffix(':')?
+    let header = line.trim_end().strip_suffix(':')?;
+    // A block resolved solely from local sources (`file:`, `link:`, `portal:`,
+    // `workspace:`) is not a registry package: its `version` is the local
+    // manifest's, so a same-named registry record would be unrelated. Name the
+    // block from its first non-local spec, so a decoy local spec beside an
+    // ordinary range can neither hide the registry resolution nor (with an `@`
+    // in its path) distort the name.
+    let key = header
         .split(',')
-        .next()?
-        .trim()
-        .trim_matches('"');
+        .map(|spec| spec.trim().trim_matches('"'))
+        .find(|spec| !yarn_spec_is_local(spec))?;
     npm_alias_target(key).or_else(|| npm_spec(key).map(|(name, _)| name))
+}
+
+/// Whether a yarn.lock spec (`name@range`) uses a local-path protocol. The
+/// name ends at the first `@` after an optional leading scope `@`, so an `@`
+/// inside the path cannot shift the boundary.
+fn yarn_spec_is_local(spec: &str) -> bool {
+    let start = usize::from(spec.starts_with('@'));
+    let Some(at) = spec[start..].find('@').map(|i| i + start) else {
+        return false;
+    };
+    ["file:", "link:", "portal:", "workspace:"]
+        .iter()
+        .any(|proto| spec[at + 1..].starts_with(proto))
 }
 
 /// The package an npm alias points at, for a spec key spelled
