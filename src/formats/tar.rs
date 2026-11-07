@@ -5,18 +5,24 @@
 //! never decompresses entry content — it walks headers and skips over
 //! the data blocks via stream-position arithmetic.
 //!
-//! Only uncompressed tars are walked: plain `.tar` and the packages built on
-//! one (gem, OCI image, Gentoo binpkg). The gzip/bzip2/xz/zstd-wrapped
-//! variants and the packages built on them (npm, crate, sdist, Alpine apk,
-//! FreeBSD/Arch pkg, xbps) get the `archive.format.kind` label and nothing
-//! else: the caller decompresses them and submits the inner tar, which is
-//! walked then. Package identity for the gzipped ones is read by their own
-//! modules, not here.
+//! Plain `.tar` and the packages built on one (gem, OCI image, Gentoo
+//! binpkg) are walked in place. A bare `.tar.gz`/`.tar.xz`/`.tar.zst` is
+//! walked through a bounded decoder ([`MAX_TARGZ_SEARCH`] inflated bytes)
+//! so its member listing and `archive.*` aggregates exist on the archive
+//! itself: callers unpack those members without resubmitting the inner tar,
+//! which left archive-scope rules blind to them. Tar headers are read and
+//! data blocks skipped; nothing is decoded beyond the stream inflation.
+//! `.tar.bz2` (no bzip2 decoder) and the packages built on a compressed tar
+//! (npm, crate, sdist, Alpine apk, FreeBSD/Arch pkg, xbps) keep the
+//! `archive.format.kind` label only; their identity is read by their own
+//! modules.
+
+use std::io::Read;
 
 use serde_json::Value as JsonValue;
 
 use super::archive_stats::{Agg, ArchiveStats, Reading, Scope, member_value};
-use super::bounded::{Limits, MAX_ARCHIVE_MEMBERS};
+use super::bounded::{Limits, MAX_ARCHIVE_MEMBERS, MAX_TARGZ_SEARCH, xz_decoder, zstd_decoder};
 use crate::error::Error;
 use crate::fileid::FileType;
 use crate::metric;
@@ -59,16 +65,70 @@ pub(super) fn extract(
         JsonValue::String(format_label(file_type).into()),
     );
 
-    // A compressed variant is reported by label only (see the module doc).
-    // That is the designed outcome for a well-formed file, not a parse
-    // failure, so it returns Ok rather than an error the caller would record.
-    if crate::fileid::container_of(file_type, bytes)
-        .is_some_and(|c| c.compression != crate::fileid::Compression::None)
-    {
-        return Ok(());
+    use crate::fileid::Compression;
+    let compression = crate::fileid::container_of(file_type, bytes)
+        .map_or(Compression::None, |c| c.compression);
+    if compression == Compression::None {
+        let mut limits = Limits::default();
+        let result = walk_entries(
+            &mut tar::Archive::new(bytes),
+            file_type,
+            values,
+            metrics,
+            archive_members,
+            &mut limits,
+        );
+        limits.emit(values, value_key!("tar.limits"));
+        return result;
     }
+    // Only the bare compressed tars are inflated (see the module doc); every
+    // other compressed variant is reported by label. That is the designed
+    // outcome for a well-formed file, so it returns Ok, not an error.
+    let decoder: Box<dyn Read + '_> = match (file_type, compression) {
+        (FileType::TarGz, Compression::Gzip) => Box::new(flate2::read::GzDecoder::new(bytes)),
+        (FileType::TarXz, Compression::Xz) => Box::new(xz_decoder(bytes)),
+        (FileType::TarZst, Compression::Zstd) => match zstd_decoder(bytes) {
+            Ok(decoder) => Box::new(decoder),
+            Err(e) => {
+                tracing::debug!(target: "filefacts::tar", stage = "open", error = %e, "zstd decoder setup failed; label only");
+                return Ok(());
+            }
+        },
+        _ => return Ok(()),
+    };
+    let mut archive = tar::Archive::new(decoder.take(MAX_TARGZ_SEARCH));
+    let mut limits = Limits::default();
+    let result = walk_entries(
+        &mut archive,
+        file_type,
+        values,
+        metrics,
+        archive_members,
+        &mut limits,
+    );
+    // The `Take` running dry means the walk stopped at the inflate budget,
+    // not at the tar's end: the listing is a prefix.
+    if archive.into_inner().limit() == 0 {
+        limits.push(
+            "inflate-cap",
+            format!("walked the first {MAX_TARGZ_SEARCH} inflated bytes"),
+        );
+    }
+    limits.emit(values, value_key!("tar.limits"));
+    result
+}
 
-    let mut archive = tar::Archive::new(bytes);
+/// Walk `archive`'s headers into the member listing and aggregates. A
+/// damaged header ends the walk; the members before it are still reported
+/// and the error is returned after them.
+fn walk_entries<R: Read>(
+    archive: &mut tar::Archive<R>,
+    file_type: FileType,
+    values: &mut Values,
+    metrics: &mut Metrics,
+    archive_members: &mut Vec<ArchiveMember>,
+    limits: &mut Limits,
+) -> Result<(), Error> {
     let mut members: Vec<JsonValue> = Vec::new();
     let mut stats = ArchiveStats::new(AGGS);
     // Entries past the cap are counted, not listed: each listed one costs a
@@ -156,9 +216,7 @@ pub(super) fn extract(
     if unlisted > 0 {
         let total = listed as u64 + unlisted;
         metrics.insert(metric!("archive.member_count"), total as f64);
-        let mut limits = Limits::default();
         limits.push("member-cap", format!("listed {listed} of {total} members"));
-        limits.emit(values, value_key!("tar.limits"));
     }
     walk_error.map_or(Ok(()), Err)
 }

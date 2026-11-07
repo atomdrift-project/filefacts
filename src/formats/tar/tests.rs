@@ -172,29 +172,72 @@ fn format_kind_set_to_tar() {
     );
 }
 
-#[test]
-fn compressed_variants_report_format_only() {
-    // Bytes don't matter — compressed variants are never walked here.
+fn extract_as(bytes: &[u8], file_type: FileType) -> (Result<(), Error>, Values, Metrics) {
     let mut values = Values::new();
     let mut metrics = Metrics::new();
     let mut archive_members = Vec::new();
-    let result = extract(
-        b"any bytes",
-        FileType::TarGz,
-        &mut values,
-        &mut metrics,
-        &mut archive_members,
-    );
-    assert!(result.is_ok(), "label-only is not a parse failure");
+    let result = extract(bytes, file_type, &mut values, &mut metrics, &mut archive_members);
+    (result, values, metrics)
+}
+
+#[test]
+fn bzip2_and_compressed_packages_report_format_only() {
+    // No bzip2 decoder, and packages are read by their own modules: the
+    // bytes are never inflated here.
+    for (file_type, label) in [(FileType::TarBz2, "tar.bz2"), (FileType::Npm, "npm")] {
+        let (result, values, _) = extract_as(b"any bytes", file_type);
+        assert!(result.is_ok(), "label-only is not a parse failure");
+        assert_eq!(
+            values.get("archive.format.kind").and_then(|x| x.as_str()),
+            Some(label)
+        );
+        assert!(values.get("archive.members").is_none());
+    }
+}
+
+#[test]
+fn bare_compressed_tars_report_member_aggregates() {
+    use std::io::Write;
+    let tar = build_tar(&[
+        ("pkg/a.txt", 0o644, 0, 0, 1_700_000_000, b"a\n"),
+        ("pkg/b.txt", 0o644, 0, 0, 1_700_000_000, b"b\n"),
+    ]);
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gz.write_all(&tar).unwrap();
+    let gz = gz.finish().unwrap();
+    let zst = zstd::encode_all(&tar[..], 3).unwrap();
+    let mut xz = Vec::new();
+    {
+        let mut w = lzma_rust2::XzWriter::new(&mut xz, lzma_rust2::XzOptions::default()).unwrap();
+        w.write_all(&tar).unwrap();
+        w.finish().unwrap();
+    }
+    for (bytes, file_type) in [
+        (gz, FileType::TarGz),
+        (xz, FileType::TarXz),
+        (zst, FileType::TarZst),
+    ] {
+        let (result, values, metrics) = extract_as(&bytes, file_type);
+        assert!(result.is_ok(), "{file_type:?}: {result:?}");
+        assert_eq!(metrics.get("archive.file_count"), Some(2.0), "{file_type:?}");
+        let members = values.get("archive.members").and_then(|x| x.as_array()).unwrap();
+        assert_eq!(members.len(), 2, "{file_type:?}");
+        // Offsets index the bytes handed in, which a compressed stream isn't.
+        assert!(members[0].get("header_offset").is_none(), "{file_type:?}");
+    }
+}
+
+#[test]
+fn undecodable_tar_gz_is_malformed() {
+    let (result, values, _) = extract_as(b"not gzip at all", FileType::TarGz);
+    assert!(result.is_err(), "a stream that won't inflate is a parse failure");
     assert_eq!(
         values.get("archive.format.kind").and_then(|x| x.as_str()),
         Some("tar.gz")
     );
-    assert!(values.get("archive.members").is_none());
 }
 
-/// A well-formed `.tar.gz` is not malformed: declining to walk the
-/// compressed stream is the designed outcome, not a failed parse.
+/// A well-formed `.tar.gz` opens without errors.
 #[test]
 fn valid_tar_gz_opens_without_errors() {
     use std::io::Write;
