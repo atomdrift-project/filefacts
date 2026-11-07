@@ -163,6 +163,14 @@ fn recover_from_region(
             continue;
         };
         let value_off = entry + align4(key_off + key.len() - entry);
+        // An intact header that ends at the key declares an empty value
+        // (`wValueLength` 0): reading on would take the next `String`'s
+        // header and key as this one's text.
+        if let (Some(w_length), Some(0)) = (u16_le(bytes, entry), u16_le(bytes, entry + 2))
+            && entry + usize::from(w_length) <= value_off
+        {
+            continue;
+        }
         let Some(data) = bytes.get(value_off..window_end) else {
             continue;
         };

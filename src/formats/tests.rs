@@ -68,3 +68,47 @@ fn oversized_package_json_is_skipped_like_generic_json() {
     );
     assert_eq!(small.values().get("name"), Some(&serde_json::json!("ok")));
 }
+
+/// A melange recipe exposes the GitHub owners its source steps read from and
+/// the owner its update monitor tracks; a document `melange` key never
+/// stands in for them, and other YAML gets neither.
+#[test]
+fn melange_recipe_exposes_source_and_update_owners() {
+    let recipe = br"package:
+  name: beat-exporter
+  version: 0.3.0
+melange:
+  update_github_owner: forged
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/Fork-Owner/beat-exporter
+  - uses: fetch
+    with:
+      uri: https://github.com/fork-owner/x/raw/main/x.tar.gz
+  - uses: go/build
+update:
+  github:
+    identifier: Trustpilot/beat-exporter
+";
+    let opened = crate::OpenOptions::new()
+        .file_type(crate::FileType::Yaml)
+        .open(recipe);
+    let values = opened.values();
+    assert_eq!(
+        values.get("melange.source_github_owners"),
+        Some(&serde_json::json!(["fork-owner"]))
+    );
+    assert_eq!(
+        values.get("melange.update_github_owner"),
+        Some(&serde_json::json!("trustpilot"))
+    );
+
+    let other = crate::OpenOptions::new()
+        .file_type(crate::FileType::Yaml)
+        .open(b"melange:\n  update_github_owner: forged\npipeline: []\n");
+    assert_eq!(
+        other.values().get("melange.update_github_owner"),
+        Some(&serde_json::json!("forged"))
+    );
+}

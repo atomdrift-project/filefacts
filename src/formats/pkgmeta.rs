@@ -176,7 +176,7 @@ fn finalize(root: Map<String, JsonValue>, values: &mut Values) {
 /// Covers `https://github.com/OWNER/repo`, `git+https://…`, codeload, and
 /// release-download URLs. `None` for non-github URLs or an unresolved `$var`
 /// owner (which can't be compared).
-fn github_owner(s: &str) -> Option<String> {
+pub(super) fn github_owner(s: &str) -> Option<String> {
     let rest = s.split_once("github.com/")?.1;
     let owner = rest.split(['/', '#', '?']).next()?;
     if owner.is_empty() || owner.contains('$') {

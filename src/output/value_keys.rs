@@ -508,6 +508,8 @@ pub(crate) const VALUE_CATALOG: &[&str] = &[
     "media.stowaway",
     "media.trailing_content_kind",
     "media.valid",
+    "melange.source_github_owners",
+    "melange.update_github_owner",
     "msbuild.downloads",
     "nib.actions",
     "nib.archiver",

@@ -541,3 +541,25 @@ fn fixed_file_info_is_read_from_the_root() {
     root[signature] ^= 0xff;
     assert!(walked(&root).get("pe.version.os").is_none());
 }
+
+/// A `String` with an intact header and no value (`wValueLength` 0) is
+/// empty: recovery must not read the next entry's header and key as its
+/// text (EldoS RawDisk's `Comments` came out as "D\u{12}\u{1}CompanyName").
+#[test]
+fn empty_string_is_not_recovered_from_next_entry() {
+    let strings = [
+        version_block("Comments", None, &[]),
+        version_block("CompanyName", Some("EldoS Corporation"), &[]),
+    ]
+    .concat();
+    let table = version_block("040904b0", None, &strings);
+    let root = version_block(
+        "VS_VERSION_INFO",
+        None,
+        &version_block("StringFileInfo", None, &table),
+    );
+    let mut info = VersionInfo::default();
+    assert!(recover_from_region(&root, (0, root.len()), true, &mut info));
+    assert_eq!(info.string("CompanyName"), Some("EldoS Corporation"));
+    assert_eq!(info.string("Comments"), None);
+}

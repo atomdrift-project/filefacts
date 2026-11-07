@@ -165,10 +165,11 @@ fn validate_rejects_oversized_section_count() {
     );
 }
 
-/// A forged resource size is refused; an import size is not, since goblin no
-/// longer walks the import table.
+/// A forged resource size skips goblin's resource walk but keeps the rest of
+/// the parse (Enigma-protected images declare one); an import size is
+/// ignored, since goblin no longer walks the import table.
 #[test]
-fn validate_rejects_an_oversized_resource_table_only() {
+fn oversized_resource_table_skips_resources_only() {
     let header = |directory: usize| {
         let mut data = vec![0u8; 1024];
         data[0] = b'M';
@@ -184,14 +185,15 @@ fn validate_rejects_an_oversized_resource_table_only() {
         data[size_ptr + 3] = 0x01; // size = 16 MiB (>10 MiB cap)
         data
     };
+    assert_eq!(validate_pe_header(&header(RESOURCE_DIRECTORY)), Ok(()));
     assert_eq!(
-        validate_pe_header(&header(RESOURCE_DIRECTORY)),
-        Err(Rejection::OversizedDirectory {
+        oversized_resource_directory(&header(RESOURCE_DIRECTORY)),
+        Some(Rejection::OversizedDirectory {
             table: "resource",
             size: 16 << 20,
         })
     );
-    assert_eq!(validate_pe_header(&header(1)), Ok(()));
+    assert_eq!(oversized_resource_directory(&header(1)), None);
 }
 
 /// The reasons land verbatim in the structured errors view, so the typed

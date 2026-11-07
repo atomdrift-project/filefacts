@@ -248,7 +248,9 @@ pub(crate) fn prepare_pe(data: &[u8]) -> PreparedPe<'_> {
         entry.fill(0);
         prepared.exports_skipped = Some(reason);
     }
-    if let Err(reason) = resource_walk_budget(&prepared.bytes, &sections, &optional) {
+    if let Some(reason) = oversized_resource_directory(&prepared.bytes)
+        .or_else(|| resource_walk_budget(&prepared.bytes, &sections, &optional).err())
+    {
         tracing::debug!(
             target: "filefacts::goblin_safe",
             format = "pe",
@@ -541,18 +543,30 @@ fn validate_pe_header(data: &[u8]) -> Result<(), Rejection> {
         return Err(Rejection::TooManyDataDirectories(n_dirs));
     }
 
-    if sat_usize(n_dirs) > RESOURCE_DIRECTORY
-        && let Some(size) = layout::data_directory_offset(pe_offset, magic, RESOURCE_DIRECTORY)
-            .and_then(|at| u32_le(data, at.checked_add(4)?))
-        && (size > MAX_RESOURCE_DIRECTORY_SIZE || sat_usize(size) > data.len())
-    {
-        return Err(Rejection::OversizedDirectory {
+    Ok(())
+}
+
+/// The resource directory's declared size, when it is past
+/// [`MAX_RESOURCE_DIRECTORY_SIZE`] or the file. Protectors (Enigma) declare
+/// one routinely; it says nothing about the headers or sections, so only
+/// goblin's resource walk is skipped, and the image hash, sections and
+/// signature are still read.
+fn oversized_resource_directory(data: &[u8]) -> Option<Rejection> {
+    let pe_offset = u32_le(data, 0x3C).map(sat_usize)?;
+    let magic = u16_le(data, pe_offset.checked_add(24)?)?;
+    let n_dirs = layout::data_directory_offset(pe_offset, magic, 0)
+        .and_then(|at| u32_le(data, at.checked_sub(4)?))?;
+    if sat_usize(n_dirs) <= RESOURCE_DIRECTORY {
+        return None;
+    }
+    let size = layout::data_directory_offset(pe_offset, magic, RESOURCE_DIRECTORY)
+        .and_then(|at| u32_le(data, at.checked_add(4)?))?;
+    (size > MAX_RESOURCE_DIRECTORY_SIZE || sat_usize(size) > data.len()).then_some(
+        Rejection::OversizedDirectory {
             table: "resource",
             size,
-        });
-    }
-
-    Ok(())
+        },
+    )
 }
 
 /// Parse only the DOS, COFF and optional headers of a PE, panic-safe. The

@@ -240,9 +240,79 @@ pub(super) fn extract_yaml(
     values: &mut Values,
     errors: &mut Errors,
 ) -> Result<(), Error> {
-    let json = parse_yaml(bytes)?;
+    let mut json = parse_yaml(bytes)?;
+    let melange = melange_owners(&mut json);
     merge_document(json, values, errors);
+    // Derived after the merge, so a derived key always holds what was
+    // derived, never a document field of the same name.
+    if let Some(owners) = melange {
+        owners.emit(values);
+    }
     Ok(())
+}
+
+/// The GitHub owners a melange (Wolfi) build recipe names: those its source
+/// steps (`git-checkout` repository, `fetch` uri) read from, and the one its
+/// `update.github.identifier` tracks releases of. A recipe that builds from
+/// one owner's repository while tracking another's releases has had its
+/// source swapped for a fork.
+struct MelangeOwners {
+    checkout: Vec<String>,
+    update: Option<String>,
+}
+
+impl MelangeOwners {
+    fn emit(self, values: &mut Values) {
+        if !self.checkout.is_empty() {
+            values.insert_key(
+                value_key!("melange.source_github_owners"),
+                JsonValue::Array(self.checkout.into_iter().map(JsonValue::String).collect()),
+            );
+        }
+        if let Some(owner) = self.update {
+            values.insert_key(
+                value_key!("melange.update_github_owner"),
+                JsonValue::String(owner),
+            );
+        }
+    }
+}
+
+/// [`MelangeOwners`] for a document shaped like a melange recipe (a
+/// `package` mapping with a `name` and a `pipeline` sequence), with any
+/// document-supplied root `melange` key removed so it cannot stand in for
+/// the derived one. `None` for any other document.
+fn melange_owners(json: &mut JsonValue) -> Option<MelangeOwners> {
+    let root = json.as_object_mut()?;
+    root.get("package")?.get("name")?.as_str()?;
+    let pipeline = root.get("pipeline")?.as_array()?;
+    let mut checkout = Vec::new();
+    for step in pipeline {
+        let source = match step.get("uses").and_then(JsonValue::as_str) {
+            Some("git-checkout") => "repository",
+            Some("fetch") => "uri",
+            _ => continue,
+        };
+        if let Some(owner) = step
+            .get("with")
+            .and_then(|with| with.get(source))
+            .and_then(JsonValue::as_str)
+            .and_then(super::pkgmeta::github_owner)
+            && !checkout.contains(&owner)
+        {
+            checkout.push(owner);
+        }
+    }
+    let update = root
+        .get("update")
+        .and_then(|update| update.get("github"))
+        .and_then(|github| github.get("identifier"))
+        .and_then(JsonValue::as_str)
+        .and_then(|identifier| identifier.split_once('/'))
+        .map(|(owner, _)| owner.trim().to_ascii_lowercase())
+        .filter(|owner| !owner.is_empty() && !owner.contains('$'));
+    root.remove("melange");
+    Some(MelangeOwners { checkout, update })
 }
 
 /// Parse the bytes as one TOML document.
