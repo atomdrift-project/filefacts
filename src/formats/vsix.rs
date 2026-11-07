@@ -52,10 +52,59 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         "manifest",
         errors,
     );
+    let package = super::zip::read_manifest_member(
+        zip,
+        "extension/package.json",
+        MAX_MANIFEST,
+        &mut limits,
+        "package",
+        errors,
+    );
     limits.emit(values, value_key!("vsix.limits"));
     if let Some(buf) = manifest {
         extract(&buf, values, strings, metrics, errors);
     }
+    if let Some((size, own)) = package
+        .and_then(|buf| serde_json::from_slice::<JsonValue>(&buf).ok())
+        .as_ref()
+        .and_then(extension_pack_counts)
+    {
+        metrics.insert(metric!("vsix.extension_pack_size"), f64::from(size));
+        metrics.insert(metric!("vsix.extension_pack_self_entries"), f64::from(own));
+    }
+}
+
+/// How an extension pack is composed: `(entries, entries the publisher
+/// owns)`, from the package's `extensionPack` and `publisher`; `None` without
+/// a pack or a publisher to compare its entries against.
+///
+/// A pack contributes no code: `extensionPack` lists marketplace ids
+/// (`publisher.name`) the editor installs with it. A vendor's pack is mostly
+/// its own extensions and a community pack entirely others'; the laundering
+/// shape sits between, popular third-party entries as ballast around one or
+/// two of the publisher's. Two neutral counts, since where curation ends is
+/// a rule's policy.
+fn extension_pack_counts(package: &JsonValue) -> Option<(u32, u32)> {
+    let entries: Vec<&str> = package
+        .get("extensionPack")?
+        .as_array()?
+        .iter()
+        .filter_map(JsonValue::as_str)
+        .collect();
+    let publisher = package.get("publisher")?.as_str()?;
+    if entries.is_empty() || publisher.is_empty() {
+        return None;
+    }
+    // Neither half of a marketplace id may contain a dot.
+    let own = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .split_once('.')
+                .is_some_and(|(owner, _)| owner.eq_ignore_ascii_case(publisher))
+        })
+        .count();
+    Some((u32::try_from(entries.len()).ok()?, u32::try_from(own).ok()?))
 }
 
 pub(super) fn extract(

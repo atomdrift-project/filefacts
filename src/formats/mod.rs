@@ -72,6 +72,7 @@ mod nupkg;
 mod oci;
 mod ole2;
 mod ooxml;
+mod package_consistency;
 mod pbxproj;
 mod pdf;
 mod pe;
@@ -506,7 +507,9 @@ pub(crate) fn extract(
         }
         FileType::Nib => nib::extract(bytes, ctx.values, ctx.strings, ctx.metrics),
         FileType::Pbxproj => pbxproj::extract(bytes, ctx.reborrow()),
-        FileType::PkgInfo => structured::extract_pkginfo(bytes, ctx.values, ctx.errors),
+        FileType::PkgInfo => {
+            structured::extract_pkginfo(bytes, ctx.values, ctx.metrics, ctx.errors)
+        }
         FileType::SrcInfo => pkgmeta::extract_srcinfo(bytes, ctx.values),
         FileType::Registry => registry::extract(bytes, ctx.values, ctx.metrics),
         FileType::Chm => {

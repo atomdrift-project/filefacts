@@ -103,7 +103,7 @@ fn emits_name_version_and_author_email() {
                     \n\
                     long description body: Name: not-a-header\n";
     let mut values = Values::new();
-    emit(text, &mut values);
+    emit(text, None, &mut values, &mut Metrics::new());
     assert_eq!(
         values.get("python.name").and_then(JsonValue::as_str),
         Some("requests")
@@ -135,7 +135,7 @@ fn emits_name_version_and_author_email() {
 fn author_email_in_name_angle_form() {
     let text = "Name: x\nAuthor-email: Jane Doe <jane@example.com>\n";
     let mut values = Values::new();
-    emit(text, &mut values);
+    emit(text, None, &mut values, &mut Metrics::new());
     assert_eq!(
         values
             .get("python.authors[0].name")
@@ -157,7 +157,9 @@ fn comma_separated_authors_are_separate_people() {
     let mut values = Values::new();
     emit(
         "Name: x\nAuthor: Ada, Grace\nAuthor-email: ada@example.org, grace@example.org\nMaintainer: UNKNOWN\n",
+        None,
         &mut values,
+        &mut Metrics::new(),
     );
     assert_eq!(
         values.get("python.authors"),
@@ -171,7 +173,9 @@ fn comma_separated_authors_are_separate_people() {
     let mut values = Values::new();
     emit(
         "Name: x\nAuthor-email: Ada <ada@example.org>, Grace <grace@example.org>\n",
+        None,
         &mut values,
+        &mut Metrics::new(),
     );
     assert_eq!(
         values.get("python.authors"),
@@ -180,4 +184,24 @@ fn comma_separated_authors_are_separate_people() {
             {"name": "Grace", "email": "grace@example.org"},
         ]))
     );
+}
+
+/// The `requires.txt` setuptools writes counts toward the self-dependency
+/// judgement, read in the same walk as `PKG-INFO`.
+#[test]
+fn requires_txt_counts_toward_the_self_dependency() {
+    let bytes = tgz(&[
+        (
+            "my-pkg-1.0/PKG-INFO",
+            b"Metadata-Version: 1.1\nName: my-pkg\nVersion: 1.0\n",
+        ),
+        (
+            "my-pkg-1.0/my_pkg.egg-info/requires.txt",
+            b"requests\nmy_pkg>=1.0\n",
+        ),
+    ]);
+    let mut out = crate::formats::Sinks::default();
+    extract(&bytes, out.ctx()).unwrap();
+    assert_eq!(out.metrics.get("consistency.self_dependency"), Some(1.0));
+    assert_eq!(out.metrics.get("consistency.name_typosquat"), Some(0.0));
 }

@@ -336,3 +336,32 @@ fn target_discovery_is_linear_in_members() {
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
     assert_eq!(context.targets.len(), 30_000);
 }
+
+#[test]
+fn unused_runtime_dependencies_counts_phantoms() {
+    // An injected dependency the code never references.
+    assert_eq!(
+        unused_runtime_dependencies(["dayjs", "easy-day-js"], ["dayjs/plugin/utc", "./util"]),
+        Some(1)
+    );
+    // Scoped and dotted names are whole names; a subpath counts as a use.
+    assert_eq!(
+        unused_runtime_dependencies(
+            ["@scope/pkg", "lodash.merge"],
+            ["@scope/pkg/sub", "lodash.merge"]
+        ),
+        Some(0)
+    );
+    // A prefix is not a use: `react-dom` does not use `react`.
+    assert_eq!(
+        unused_runtime_dependencies(["react"], ["react-dom"]),
+        Some(1)
+    );
+}
+
+#[test]
+fn unused_runtime_dependencies_abstains_without_both_sides() {
+    assert_eq!(unused_runtime_dependencies([], ["x"]), None);
+    // No imports observed: unused cannot be told from unparsed.
+    assert_eq!(unused_runtime_dependencies(["x"], []), None);
+}

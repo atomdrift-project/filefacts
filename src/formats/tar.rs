@@ -66,8 +66,8 @@ pub(super) fn extract(
     );
 
     use crate::fileid::Compression;
-    let compression = crate::fileid::container_of(file_type, bytes)
-        .map_or(Compression::None, |c| c.compression);
+    let compression =
+        crate::fileid::container_of(file_type, bytes).map_or(Compression::None, |c| c.compression);
     if compression == Compression::None {
         let mut limits = Limits::default();
         let result = walk_entries(

@@ -454,7 +454,7 @@ fn binary_plist_truncated_is_an_error() {
 fn pkginfo_simple() {
     let mut v = Values::new();
     let input = b"Metadata-Version: 2.1\nName: foo\nVersion: 1.2.3\n";
-    extract_pkginfo(input, &mut v, &mut Errors::new()).unwrap();
+    extract_pkginfo(input, &mut v, &mut Metrics::new(), &mut Errors::new()).unwrap();
     assert_eq!(
         v.get("metadata-version").and_then(|x| x.as_str()),
         Some("2.1")
@@ -466,7 +466,7 @@ fn pkginfo_simple() {
 fn pkginfo_keys_are_lowercase() {
     let mut v = Values::new();
     let input = b"Summary: Dependency confusion PoC\nAuthor-email: a@example.com\n";
-    extract_pkginfo(input, &mut v, &mut Errors::new()).unwrap();
+    extract_pkginfo(input, &mut v, &mut Metrics::new(), &mut Errors::new()).unwrap();
     assert_eq!(
         v.get("summary").and_then(|x| x.as_str()),
         Some("Dependency confusion PoC")
@@ -481,7 +481,7 @@ fn pkginfo_keys_are_lowercase() {
 fn pkginfo_multi_value_becomes_array() {
     let mut v = Values::new();
     let input = b"Classifier: A\nClassifier: B\nClassifier: C\n";
-    extract_pkginfo(input, &mut v, &mut Errors::new()).unwrap();
+    extract_pkginfo(input, &mut v, &mut Metrics::new(), &mut Errors::new()).unwrap();
     let arr = v.get("classifier").and_then(|x| x.as_array()).unwrap();
     assert_eq!(arr.len(), 3);
 }

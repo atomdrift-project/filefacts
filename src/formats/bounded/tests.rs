@@ -220,3 +220,23 @@ fn member_failures_keep_their_source_and_record_one_line() {
         recorded.message
     );
 }
+
+/// Several members come from one walk, each its matcher's last occurrence;
+/// an absent one is `None` beside the found ones.
+#[test]
+fn finds_several_members_in_one_walk() {
+    let bytes = targz(&[
+        ("pkg/a", b"first a"),
+        ("pkg/b", b"b"),
+        ("pkg/a", b"later a"),
+    ]);
+    let is = |name: &'static str| move |path: &str| path == name;
+    let (a, b, c) = (is("pkg/a"), is("pkg/b"), is("pkg/c"));
+    let TarGzMembers::Read([a, b, c]) = find_targz_members(&bytes, [&a, &b, &c], 64).unwrap()
+    else {
+        panic!("inflate capped");
+    };
+    assert_eq!(a.unwrap().1.bytes, b"later a");
+    assert_eq!(b.unwrap().1.bytes, b"b");
+    assert!(c.is_none());
+}

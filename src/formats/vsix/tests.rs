@@ -245,3 +245,44 @@ fn malformed_xml_records_one_error() {
         (Stage::FormatExtract, crate::DiagnosticKind::Malformed)
     );
 }
+
+fn pack(publisher: &str, entries: &[&str]) -> serde_json::Value {
+    serde_json::json!({ "publisher": publisher, "extensionPack": entries })
+}
+
+#[test]
+fn extension_pack_counts_separates_borrowed_from_own() {
+    // The laundering shape: one of the publisher's own extensions carried in
+    // by three well-known third-party ones.
+    assert_eq!(
+        extension_pack_counts(&pack(
+            "krabt",
+            &[
+                "krabt.krabt-proto",
+                "eamodio.gitlens",
+                "golang.go",
+                "ms-python.python"
+            ],
+        )),
+        Some((4, 1)),
+    );
+    // A vendor pack of its own extensions.
+    assert_eq!(
+        extension_pack_counts(&pack(
+            "ms-python",
+            &["ms-python.python", "ms-python.debugpy"]
+        )),
+        Some((2, 2)),
+    );
+}
+
+#[test]
+fn extension_pack_counts_abstain_without_a_pack_or_publisher() {
+    assert_eq!(extension_pack_counts(&pack("krabt", &[])), None);
+    // Entries but no publisher: nothing to compare ownership against.
+    assert_eq!(extension_pack_counts(&pack("", &["eamodio.gitlens"])), None);
+    assert_eq!(
+        extension_pack_counts(&serde_json::json!({ "extensionPack": ["a.b"] })),
+        None
+    );
+}

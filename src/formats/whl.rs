@@ -146,7 +146,7 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         // carries that the filename and dir name don't.
         let name = format!("{dist_info}/METADATA");
         match read_text_member(zip, &name, values) {
-            Ok(Some(meta)) => emit_metadata_identity(&meta, values),
+            Ok(Some(meta)) => emit_metadata_identity(&meta, values, metrics),
             // `has_metadata` can come from a second dist-info directory;
             // the chosen one having none is an absence, not a failure.
             Ok(None) => {}
@@ -277,8 +277,9 @@ fn read_text_member<R: Read + Seek>(
 /// `whl.description` from a Core Metadata `METADATA` header block. Only the
 /// first occurrence of each field is taken, and `UNKNOWN` placeholders are
 /// skipped.
-fn emit_metadata_identity(meta: &str, values: &mut Values) {
+fn emit_metadata_identity(meta: &str, values: &mut Values, metrics: &mut Metrics) {
     let headers = super::core_metadata::CoreMetadata::parse(meta);
+    super::package_consistency::core_metadata(&headers, None, metrics);
     super::core_metadata::emit_people(
         &headers,
         values,

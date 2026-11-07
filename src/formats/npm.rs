@@ -161,6 +161,9 @@ pub(super) fn emit(manifest: &JsonValue, values: &mut Values, metrics: &mut Metr
             f64::from(u8::from(self_ref)),
         );
     }
+    if let Some(count) = super::package_consistency::npm_self_dependencies(obj) {
+        metrics.insert(metric!("consistency.self_dependency"), f64::from(count));
+    }
 }
 
 /// Fold a string to its comparable core: no separators, no case.

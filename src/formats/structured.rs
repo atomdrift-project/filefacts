@@ -312,12 +312,15 @@ pub(super) fn plist_entitlement_metrics(values: &Values, metrics: &mut Metrics) 
 pub(super) fn extract_pkginfo(
     bytes: &[u8],
     values: &mut Values,
+    metrics: &mut Metrics,
     errors: &mut Errors,
 ) -> Result<(), Error> {
     let text = std::str::from_utf8(bytes)
         .map_err(|e| Error::malformed_with_source("pkginfo", "input is not utf-8", e))?;
+    let headers = super::core_metadata::CoreMetadata::parse(text);
+    super::package_consistency::core_metadata(&headers, None, metrics);
     let mut root: Map<String, JsonValue> = Map::new();
-    for (key, value) in super::core_metadata::CoreMetadata::parse(text).fields {
+    for (key, value) in headers.fields {
         let value = JsonValue::String(value);
         match root.get_mut(&key) {
             None => {

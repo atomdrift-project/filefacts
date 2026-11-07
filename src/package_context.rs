@@ -309,6 +309,43 @@ fn discovered_targets<'f>(
         })
 }
 
+/// How many runtime `dependencies` of an npm package no code member imports.
+///
+/// A phantom runtime dependency -- declared, never `import`ed or `require`d
+/// by the package's own code -- is the fingerprint of an install-time payload:
+/// a hijacked publisher appends a malicious package to `dependencies` (its
+/// `postinstall` does the work) without touching the code that would
+/// reference it.
+///
+/// `declared` are the names under the manifest's `dependencies` (never dev,
+/// peer or optional ones, which shipped code is not expected to import), and
+/// `imported` the module specifiers the package's code members import; the
+/// caller excludes manifests and lockfiles, whose declared names would make
+/// every dependency look used. A specifier uses a dependency when it is the
+/// name or a subpath of it (`dayjs/plugin/utc`). `None` without declared
+/// dependencies, or without a single observed import: without imports,
+/// "unused" cannot be told from "never parsed", and a types-only or asset
+/// package would look all phantom.
+#[must_use]
+pub fn unused_runtime_dependencies<'a>(
+    declared: impl IntoIterator<Item = &'a str>,
+    imported: impl IntoIterator<Item = &'a str>,
+) -> Option<u64> {
+    let declared: Vec<&str> = declared.into_iter().collect();
+    let imported: Vec<&str> = imported.into_iter().collect();
+    if declared.is_empty() || imported.is_empty() {
+        return None;
+    }
+    let used = |dependency: &str| {
+        imported.iter().any(|specifier| {
+            specifier
+                .strip_prefix(dependency)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+        })
+    };
+    u64::try_from(declared.iter().filter(|d| !used(d)).count()).ok()
+}
+
 /// Resolve Cargo entry points and declared modules inside the supplied members.
 /// Entry points are the build script, the library, `src/main.rs`, and every
 /// binary, example, test and bench target, declared or discovered as Cargo

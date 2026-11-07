@@ -176,7 +176,13 @@ fn extract_as(bytes: &[u8], file_type: FileType) -> (Result<(), Error>, Values, 
     let mut values = Values::new();
     let mut metrics = Metrics::new();
     let mut archive_members = Vec::new();
-    let result = extract(bytes, file_type, &mut values, &mut metrics, &mut archive_members);
+    let result = extract(
+        bytes,
+        file_type,
+        &mut values,
+        &mut metrics,
+        &mut archive_members,
+    );
     (result, values, metrics)
 }
 
@@ -219,8 +225,15 @@ fn bare_compressed_tars_report_member_aggregates() {
     ] {
         let (result, values, metrics) = extract_as(&bytes, file_type);
         assert!(result.is_ok(), "{file_type:?}: {result:?}");
-        assert_eq!(metrics.get("archive.file_count"), Some(2.0), "{file_type:?}");
-        let members = values.get("archive.members").and_then(|x| x.as_array()).unwrap();
+        assert_eq!(
+            metrics.get("archive.file_count"),
+            Some(2.0),
+            "{file_type:?}"
+        );
+        let members = values
+            .get("archive.members")
+            .and_then(|x| x.as_array())
+            .unwrap();
         assert_eq!(members.len(), 2, "{file_type:?}");
         // Offsets index the bytes handed in, which a compressed stream isn't.
         assert!(members[0].get("header_offset").is_none(), "{file_type:?}");
@@ -230,7 +243,10 @@ fn bare_compressed_tars_report_member_aggregates() {
 #[test]
 fn undecodable_tar_gz_is_malformed() {
     let (result, values, _) = extract_as(b"not gzip at all", FileType::TarGz);
-    assert!(result.is_err(), "a stream that won't inflate is a parse failure");
+    assert!(
+        result.is_err(),
+        "a stream that won't inflate is a parse failure"
+    );
     assert_eq!(
         values.get("archive.format.kind").and_then(|x| x.as_str()),
         Some("tar.gz")

@@ -119,6 +119,7 @@ impl Limits {
 }
 
 /// The first bytes of a member, read through a cap.
+#[derive(Clone)]
 pub(crate) struct MemberPrefix {
     /// At most the cap's worth of the member.
     pub(crate) bytes: Vec<u8>,
@@ -274,9 +275,44 @@ fn find_targz_member_within(
     max_member: u64,
     max_inflate: u64,
 ) -> Result<TarGzSearch, TarGzError> {
+    Ok(
+        match find_targz_members_within(bytes, [&matches], max_member, max_inflate)? {
+            TarGzMembers::InflateCapped => TarGzSearch::InflateCapped,
+            TarGzMembers::Read([found]) => found.map_or(TarGzSearch::Absent, |(path, prefix)| {
+                TarGzSearch::Found { path, prefix }
+            }),
+        },
+    )
+}
+
+/// What a search for several gzipped-tar members found.
+pub(super) enum TarGzMembers<const N: usize> {
+    /// Per matcher, the last member it accepted, and its capped bytes.
+    Read([Option<(String, MemberPrefix)>; N]),
+    /// The inflate budget ran out before the tarball's end.
+    InflateCapped,
+}
+
+/// [`find_targz_member`] for several members in one walk: for each of
+/// `matchers`, the last member it accepts. One inflate serves them all, where
+/// a search per member would inflate the tarball once each.
+pub(super) fn find_targz_members<const N: usize>(
+    bytes: &[u8],
+    matchers: [&dyn Fn(&str) -> bool; N],
+    max_member: u64,
+) -> Result<TarGzMembers<N>, TarGzError> {
+    find_targz_members_within(bytes, matchers, max_member, MAX_TARGZ_SEARCH)
+}
+
+fn find_targz_members_within<const N: usize>(
+    bytes: &[u8],
+    matchers: [&dyn Fn(&str) -> bool; N],
+    max_member: u64,
+    max_inflate: u64,
+) -> Result<TarGzMembers<N>, TarGzError> {
     let mut archive = tar::Archive::new(GzDecoder::new(bytes).take(max_inflate));
     let entries = archive.entries().map_err(TarGzError::Walk)?;
-    let mut found = None;
+    let mut found: [Option<(String, MemberPrefix)>; N] = std::array::from_fn(|_| None);
     let mut failure = None;
     for entry in entries {
         let entry = match entry {
@@ -289,14 +325,33 @@ fn find_targz_member_within(
         let Ok(path) = entry.path().map(|p| p.to_string_lossy().into_owned()) else {
             continue;
         };
-        if !matches(&path) {
+        let wanted = matchers.map(|matches| matches(&path));
+        if !wanted.contains(&true) {
             continue;
         }
-        if found.is_some() {
+        if found
+            .iter()
+            .zip(&wanted)
+            .any(|(slot, &w)| w && slot.is_some())
+        {
             tracing::debug!(target: "filefacts::bounded", stage = "targz-search", path = %path, "member repeated; the later one replaces the earlier");
         }
         match inflate_capped(entry, max_member, OnError::Discard) {
-            Ok(prefix) => found = Some(TarGzSearch::Found { path, prefix }),
+            Ok(prefix) => {
+                // Matchers rarely overlap: the last one takes the bytes, any
+                // other a copy.
+                let last = wanted.iter().rposition(|&w| w);
+                let mut member = Some((path, prefix));
+                for (i, (slot, &w)) in found.iter_mut().zip(&wanted).enumerate() {
+                    if w {
+                        *slot = if Some(i) == last {
+                            member.take()
+                        } else {
+                            member.clone()
+                        };
+                    }
+                }
+            }
             Err(source) => {
                 failure = Some(TarGzError::Member { path, source });
                 break;
@@ -307,11 +362,11 @@ fn find_targz_member_within(
     // tar reader made of the cut-off stream, the search ran out, not the
     // tarball.
     if archive.into_inner().limit() == 0 {
-        return Ok(TarGzSearch::InflateCapped);
+        return Ok(TarGzMembers::InflateCapped);
     }
     match failure {
         Some(failure) => Err(failure),
-        None => Ok(found.unwrap_or(TarGzSearch::Absent)),
+        None => Ok(TarGzMembers::Read(found)),
     }
 }
 
