@@ -28,6 +28,7 @@ mod axml;
 mod binary_attribution;
 pub(crate) mod bounded;
 mod build_toolchain;
+mod builder_paths;
 mod cab;
 mod carrier;
 pub(crate) mod cfml;
@@ -798,6 +799,16 @@ pub(crate) fn extract(
         if let Some(movie) = cws::movie(bytes) {
             common::extract_text_strings(&movie, ctx.strings, common::XorScan::No);
         }
+    }
+
+    // Builder home directories and usernames leaked into a native binary.
+    if matches!(file_type, FileType::Pe | FileType::Elf | FileType::MachO) {
+        let pdb_path = ctx
+            .values
+            .lookup(value_key!("pe.debug.pdb.path"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        builder_paths::emit(bytes, pdb_path.as_deref(), ctx.values);
     }
 
     // Cross-format binary attribution derived from the merged symbol

@@ -1,6 +1,8 @@
 //! Header arithmetic that does not add up: section extents past the file,
 //! misalignment and overlap, an entry point outside the code, overlays, a
-//! rewritten DOS stub, a stale checksum, and malformed data directories.
+//! rewritten DOS stub, a stale checksum, malformed data directories, and a
+//! container reshaped around an unchanged program (inflated headers, data
+//! directories in sections named for others, sections stuffed with prose).
 
 use goblin::pe::PE;
 use goblin::pe::section_table::{IMAGE_SCN_MEM_WRITE, SectionTable};
@@ -10,8 +12,109 @@ use super::layout::{self, CERTIFICATE_DIRECTORY, DIRECTORY_NAMES};
 use crate::bytes::{sat_usize, u16_le, u32_le};
 use crate::formats::common::put_str;
 use crate::metric;
-use crate::output::{Metrics, Values};
+use crate::output::{Metrics, Section, Values};
 use crate::value_key;
+
+/// Container geometry: the shape of the file around the program.
+///
+/// A PE can be restructured — padded, renamed, stuffed — without one
+/// instruction changing, and every behavioural signal keeps describing the
+/// original program. A genuine signed utility can be given a 10 MB
+/// `SizeOfHeaders` (a zero hole the loader maps) and sections stuffed with
+/// licence prose; only the container's shape gives it away.
+///
+/// - `pe.headers_size` / `pe.headers_size_ratio` — `SizeOfHeaders`, and its
+///   share of the file. Nothing bounds it above, and even a 96-section image
+///   needs under 8 KB, so a large value is a deliberate choice.
+/// - `pe.prose_section_count` / `pe.executable_prose_section_count` —
+///   sections whose bytes are natural-language text, overall and among those
+///   mapped executable: text in a CODE|EXECUTE page is not a misfiled
+///   resource, it is a section whose declared purpose its contents cannot
+///   serve.
+pub(super) fn container_geometry(
+    size_of_headers: Option<u32>,
+    bytes: &[u8],
+    sections: &[Section],
+    metrics: &mut Metrics,
+) {
+    if let Some(headers) = size_of_headers.map(f64::from) {
+        metrics.insert(metric!("pe.headers_size"), headers);
+        if !bytes.is_empty() {
+            metrics.insert(
+                metric!("pe.headers_size_ratio"),
+                headers / bytes.len() as f64,
+            );
+        }
+    }
+    let (mut prose, mut prose_executable) = (0_u32, 0_u32);
+    for section in sections {
+        let Some(data) = bytes
+            .get(sat_usize(section.file_offset)..)
+            .and_then(|rest| rest.get(..sat_usize(section.file_size)))
+        else {
+            continue;
+        };
+        if section_is_prose(data) {
+            prose = prose.saturating_add(1);
+            if section.is_executable() {
+                prose_executable = prose_executable.saturating_add(1);
+            }
+        }
+    }
+    metrics.insert(metric!("pe.prose_section_count"), f64::from(prose));
+    metrics.insert(
+        metric!("pe.executable_prose_section_count"),
+        f64::from(prose_executable),
+    );
+}
+
+/// Whether a section's bytes are natural-language prose rather than code or
+/// structured data.
+///
+/// Trailing zero padding to `FileAlignment` is trimmed first — it is layout,
+/// not content — and a section too short to judge is not prose. Prose runs
+/// ~0.99 printable, ~0.15 spaces and ~0.80 letters, while compiled code and
+/// structured tables sit below 0.67, 0.02 and 0.46; the thresholds are set in
+/// the empty middle.
+fn section_is_prose(bytes: &[u8]) -> bool {
+    let trimmed = bytes
+        .iter()
+        .rposition(|&b| b != 0)
+        .and_then(|last| bytes.get(..=last))
+        .unwrap_or_default();
+    // Below this a run of ASCII is as likely to be a string-table fragment as
+    // a document, and the ratios get noisy.
+    if trimmed.len() < 256 {
+        return false;
+    }
+    let (mut printable, mut spaces, mut letters) = (0_usize, 0_usize, 0_usize);
+    for &b in trimmed {
+        printable += usize::from((0x20..0x7f).contains(&b) || matches!(b, b'\t' | b'\n' | b'\r'));
+        spaces += usize::from(b == b' ');
+        letters += usize::from(b.is_ascii_alphabetic());
+    }
+    let len = trimmed.len() as f64;
+    printable as f64 / len >= 0.95 && spaces as f64 / len >= 0.08 && letters as f64 / len >= 0.60
+}
+
+/// The data directory a standard section name is *reserved for*. Only names
+/// with a rigid, single-purpose convention are listed: `.text`, `.rdata` and
+/// `.data` are absent because real toolchains park imports, TLS, debug and
+/// load-config data in all three, and a packer's invented name (`UPX1`,
+/// `.vmp0`) claims nothing. That keeps `pe.directory_section_mismatch_count`
+/// a lie detector rather than a novelty detector.
+fn section_name_reserved_for(name: &str) -> Option<&'static str> {
+    match name {
+        ".rsrc" => Some("resource"),
+        ".reloc" => Some("base_relocation"),
+        ".edata" => Some("export"),
+        ".idata" => Some("import"),
+        ".pdata" => Some("exception"),
+        ".tls" => Some("tls"),
+        ".didat" => Some("delay_import"),
+        _ => None,
+    }
+}
 
 /// Section extents past the end of the file, from binform's reading of the
 /// section table when goblin could not parse the image. Only a complete,
@@ -409,6 +512,7 @@ pub(super) fn data_directory_anomalies(
 
     let mut declared = Vec::new();
     let mut anomalies = Vec::new();
+    let mut misplaced = 0_u32;
     let mut zero_rva_nonzero_size = 0_u64;
     let mut nonzero_rva_zero_size = 0_u64;
     for (index, name) in DIRECTORY_NAMES.iter().enumerate().take(directory_count) {
@@ -434,6 +538,12 @@ pub(super) fn data_directory_anomalies(
             .then(|| layout::section_containing(&pe.sections, u64::from(rva)))
             .flatten()
             .and_then(|s| s.name().ok());
+        if section
+            .and_then(section_name_reserved_for)
+            .is_some_and(|owner| owner != *name)
+        {
+            misplaced = misplaced.saturating_add(1);
+        }
         declared.push(serde_json::json!({
             "index": index,
             "name": name,
@@ -466,6 +576,11 @@ pub(super) fn data_directory_anomalies(
     metrics.insert(
         metric!("pe.declared_data_directory_count"),
         declared.len() as f64,
+    );
+    // A directory parked in a section whose name is reserved for another.
+    metrics.insert(
+        metric!("pe.directory_section_mismatch_count"),
+        f64::from(misplaced),
     );
     if !declared.is_empty() {
         values.insert_key(

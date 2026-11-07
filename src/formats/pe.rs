@@ -271,6 +271,15 @@ fn parsed(
             ctx,
         );
     }
+    anomalies::container_geometry(
+        pe.header
+            .optional_header
+            .as_ref()
+            .map(|opt| opt.windows_fields.size_of_headers),
+        bytes,
+        ctx.sections,
+        ctx.metrics,
+    );
     let super::ExtractCtx {
         values,
         metrics,
@@ -391,10 +400,10 @@ fn version_resources(
     values: &mut crate::output::Values,
     metrics: &mut Metrics,
 ) {
-    let Some(resources) = optional.and_then(|opt| opt.data_directories.get_resource_table()) else {
-        return;
-    };
-    if version_info::extract(sections, file_alignment, *resources, bytes, values, metrics) {
+    let resources = optional
+        .and_then(|opt| opt.data_directories.get_resource_table())
+        .copied();
+    if version_info::extract(sections, file_alignment, resources, bytes, values, metrics) {
         metrics.insert(metric!("pe.has_version_info"), 1.0);
     }
 }
@@ -521,6 +530,12 @@ fn header_only(
             ctx,
         );
     }
+    anomalies::container_geometry(
+        opt.map(|opt| opt.windows_fields.size_of_headers),
+        bytes,
+        ctx.sections,
+        ctx.metrics,
+    );
     recover_functions(layout, ctx);
     Ok(())
 }

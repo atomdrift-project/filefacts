@@ -68,28 +68,39 @@ fn partial_version_pe() -> Vec<u8> {
     pe[0x500..0x500 + root.len()].copy_from_slice(&root);
     pe
 }
-/// Run [`extract`] over `pe` as [`partial_version_pe`] lays it out: one
-/// section at RVA 0x1000, file offset 0x400, and the resource directory the
-/// header's slot declares.
-fn read(pe: &[u8]) -> Values {
-    let section = SectionTable {
+/// The one section [`partial_version_pe`] lays out: RVA 0x1000, file offset
+/// 0x400. Unnamed, so recovery can only reach it through the directory.
+fn partial_section() -> SectionTable {
+    SectionTable {
         virtual_address: 0x1000,
         virtual_size: 0xc00,
         size_of_raw_data: 0xc00,
         pointer_to_raw_data: 0x400,
         ..SectionTable::default()
-    };
+    }
+}
+
+/// The resource directory `pe`'s header slot declares.
+fn declared_resources(pe: &[u8]) -> DataDirectory {
     let word = |at: usize| {
         pe.get(at..at + 4)
             .map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()))
     };
-    let resources = DataDirectory {
+    DataDirectory {
         virtual_address: word(0x98 + 112),
         size: word(0x98 + 116),
-    };
+    }
+}
+
+/// Run [`extract`] over `pe` as [`partial_version_pe`] lays it out.
+fn read(pe: &[u8]) -> Values {
+    read_with(pe, &[partial_section()], Some(declared_resources(pe)))
+}
+
+fn read_with(pe: &[u8], sections: &[SectionTable], resources: Option<DataDirectory>) -> Values {
     let mut values = Values::new();
     extract(
-        &[section],
+        sections,
         Some(0x200),
         resources,
         pe,
@@ -99,23 +110,33 @@ fn read(pe: &[u8]) -> Values {
     values
 }
 
+fn product_name(values: &Values) -> Option<&str> {
+    values
+        .get("pe.version.product_name")
+        .and_then(JsonValue::as_str)
+}
+
 #[test]
 fn resource_recovery_is_bounded_and_structural() {
     let pe = partial_version_pe();
-    let values = read(&pe);
-    assert_eq!(
-        values
-            .get("pe.version.product_name")
-            .and_then(JsonValue::as_str),
-        Some("Disk Manager Tool")
-    );
+    assert_eq!(product_name(&read(&pe)), Some("Disk Manager Tool"));
     assert!(
-        values
+        read(&pe)
             .get("pe.version.product_name_offset")
             .and_then(JsonValue::as_u64)
             .unwrap()
             >= 0x500
     );
+    // A forged directory never leads the walk anywhere: no leaves.
+    let leaves = |pe: &[u8]| {
+        version_leaves(
+            &[partial_section()],
+            Some(0x200),
+            declared_resources(pe),
+            pe,
+        )
+    };
+    assert_eq!(leaves(&pe).len(), 1);
     for (off, data) in [
         (0x410, 10u32),
         (0x414, 0x80000000),
@@ -124,22 +145,92 @@ fn resource_recovery_is_bounded_and_structural() {
     ] {
         let mut invalid = pe.clone();
         invalid[off..off + 4].copy_from_slice(&data.to_le_bytes());
-        assert!(
-            read(&invalid).get("pe.version.product_name").is_none(),
-            "offset {off:x}"
-        );
+        assert!(leaves(&invalid).is_empty(), "offset {off:x}");
     }
     for length in [0, 64, 256, 1024, 1280] {
-        assert!(read(&pe[..length]).get("pe.version.product_name").is_none());
+        assert!(product_name(&read(&pe[..length])).is_none());
     }
-    let mut invalid = pe.clone();
+}
+
+/// Hand-crafted resources: the directory entry, the directory itself, or a
+/// `String` header is damaged while the strings stay readable. The value is
+/// recovered from the resource region, at the offset of its text.
+#[test]
+fn version_strings_recovered_past_damaged_structure() {
+    let pe = partial_version_pe();
+    let expected = read(&pe)
+        .get("pe.version.product_name_offset")
+        .and_then(JsonValue::as_u64);
+
+    // Directory leaf points nowhere; the directory range still maps.
+    let mut broken_directory = pe.clone();
+    broken_directory[0x460..0x464].copy_from_slice(&0xfffffff0u32.to_le_bytes());
+    let values = read(&broken_directory);
+    assert_eq!(product_name(&values), Some("Disk Manager Tool"));
+    assert_eq!(
+        values
+            .get("pe.version.product_name_offset")
+            .and_then(JsonValue::as_u64),
+        expected
+    );
+
+    // No resource directory at all: the `.rsrc` section is searched.
+    let mut rsrc = partial_section();
+    rsrc.name = *b".rsrc\0\0\0";
+    assert_eq!(
+        product_name(&read_with(&pe, &[rsrc], None)),
+        Some("Disk Manager Tool")
+    );
+    // Nothing names the resources: nothing to search.
+    assert!(product_name(&read_with(&pe, &[partial_section()], None)).is_none());
+
+    // `wValueLength` overruns the block, so the walker skips the string.
+    let mut damaged = pe.clone();
     let key: Vec<u8> = "ProductName"
         .encode_utf16()
         .flat_map(u16::to_le_bytes)
         .collect();
-    let at = memchr::memmem::find(&invalid, &key).unwrap();
-    invalid[at - 4..at - 2].copy_from_slice(&65535u16.to_le_bytes());
-    assert!(read(&invalid).get("pe.version.product_name").is_none());
+    let at = memchr::memmem::find(&damaged, &key).unwrap();
+    damaged[at - 4..at - 2].copy_from_slice(&65535u16.to_le_bytes());
+    assert_eq!(product_name(&read(&damaged)), Some("Disk Manager Tool"));
+}
+
+/// The value is aligned from the start of its `String` entry: an entry that
+/// starts two bytes past a DWORD boundary must not lose its first character.
+#[test]
+fn recovered_value_alignment_is_entry_relative() {
+    let mut info = VersionInfo::default();
+    // Key + NUL is 24 bytes, so the value sits at entry + 6 + 24 = entry + 30,
+    // aligned up to entry + 32 regardless of where the entry starts.
+    let mut blob = vec![0u8; 2];
+    blob.extend(
+        "VS_VERSION_INFO\0"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes),
+    );
+    let entry = blob.len();
+    blob.extend_from_slice(&[0xff; 6]); // damaged wLength/wValueLength/wType
+    blob.extend(
+        "OriginalFilename\0"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes),
+    );
+    while !(blob.len() - entry).is_multiple_of(4) {
+        blob.push(0);
+    }
+    blob.extend(
+        "WinRT.Runtime.dll\0"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes),
+    );
+    assert_eq!(entry % 4, 2);
+    assert!(recover_from_region(
+        &blob,
+        (0, blob.len()),
+        false,
+        &mut info
+    ));
+    assert_eq!(info.string("OriginalFilename"), Some("WinRT.Runtime.dll"));
 }
 
 /// Every `StringFileInfo` key reaches `pe.version.*` with its offset, the

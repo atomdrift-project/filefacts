@@ -20,6 +20,13 @@
 //! with format-conventional names — flag bits as a sorted string array, OS
 //! class as a stable label. The same walk serves an image goblin parsed and
 //! one it could not, given a section table.
+//!
+//! Hand-crafted resources break the directory walk or individual `String`
+//! headers while the strings themselves stay readable. When the walk leaves
+//! a known string unread, [`recover_from_region`] finds the UTF-16
+//! `VS_VERSION_INFO` key in the resource region directly, walks the block
+//! from there, and reads each still-missing key's value straight after the
+//! key.
 
 use crate::metric;
 use goblin::pe::data_directories::DataDirectory;
@@ -35,19 +42,23 @@ use crate::scan::entropy;
 use crate::value_key;
 
 /// Read the `RT_VERSION` resources under the resource directory `resources`
-/// into `pe.version.*`, resolving RVAs through `sections`. Returns whether
-/// there was a `VS_VERSIONINFO` resource.
+/// into `pe.version.*`, resolving RVAs through `sections`, then recover what
+/// the walk left unread from the resource region (see the module docs).
+/// Returns whether there was a `VS_VERSIONINFO` resource.
 pub(super) fn extract(
     sections: &[SectionTable],
     file_alignment: Option<u32>,
-    resources: DataDirectory,
+    resources: Option<DataDirectory>,
     bytes: &[u8],
     values: &mut Values,
     metrics: &mut Metrics,
 ) -> bool {
     let mut info = VersionInfo::default();
     let mut found = false;
-    for (off, len) in version_leaves(sections, file_alignment, resources, bytes) {
+    for (off, len) in resources
+        .map(|dir| version_leaves(sections, file_alignment, dir, bytes))
+        .unwrap_or_default()
+    {
         let end = off.saturating_add(len);
         let (key, _) = read_utf16_key(bytes, off.saturating_add(6), end);
         if key != "VS_VERSION_INFO" {
@@ -57,8 +68,113 @@ pub(super) fn extract(
         let mut budget = MAX_VERSION_NODES;
         walk_version_block(bytes, off, end, 0, &mut budget, &mut info);
     }
+    if (!found || info.strings.iter().any(Option::is_none))
+        && let Some(region) = resource_region(sections, file_alignment, resources, bytes)
+        && recover_from_region(bytes, region, !found, &mut info)
+    {
+        if !found {
+            tracing::debug!(
+                target: "filefacts::pe",
+                format = "pe",
+                stage = "version-info",
+                "VS_VERSION_INFO recovered from the resource region, not the directory"
+            );
+        }
+        found = true;
+    }
     info.emit(values, metrics);
     found
+}
+
+/// How far past the `VS_VERSION_INFO` key recovery looks: a `wLength` caps a
+/// version block at 64 KiB.
+const RECOVERY_WINDOW: usize = 64 * 1024;
+
+/// The file range holding the resources: what the resource directory maps
+/// to, else the `.rsrc` section's raw data.
+fn resource_region(
+    sections: &[SectionTable],
+    file_alignment: Option<u32>,
+    resources: Option<DataDirectory>,
+    bytes: &[u8],
+) -> Option<(usize, usize)> {
+    let clamp = |off: usize, len: usize| -> Option<(usize, usize)> {
+        let end = off.saturating_add(len).min(bytes.len());
+        (off < end).then_some((off, end))
+    };
+    resources
+        .filter(|dir| dir.size > 0)
+        .and_then(|dir| {
+            let off = section_rva_to_file_offset(sections, file_alignment, dir.virtual_address)?;
+            clamp(off, crate::bytes::sat_usize(dir.size))
+        })
+        .or_else(|| {
+            let rsrc = sections.iter().find(|s| s.name().ok() == Some(".rsrc"))?;
+            clamp(
+                crate::bytes::sat_usize(rsrc.pointer_to_raw_data),
+                crate::bytes::sat_usize(rsrc.size_of_raw_data),
+            )
+        })
+}
+
+/// Find the UTF-16LE `VS_VERSION_INFO` key in `region`. When `walk` is set
+/// (the directory never led to the block), walk the block it heads. Then read
+/// every known string still missing straight after its key: the `String`
+/// header before a key may be damaged while the key and value are intact.
+/// The value is DWORD-aligned from the start of its `String` entry (six bytes
+/// before the key), not from the file. Returns whether the key was found.
+fn recover_from_region(
+    bytes: &[u8],
+    (start, end): (usize, usize),
+    walk: bool,
+    info: &mut VersionInfo,
+) -> bool {
+    let utf16z = |s: &str| -> Vec<u8> {
+        s.encode_utf16()
+            .chain(std::iter::once(0))
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    };
+    let Some(region) = bytes.get(start..end) else {
+        return false;
+    };
+    let Some(anchor) = memchr::memmem::find(region, &utf16z("VS_VERSION_INFO")) else {
+        return false;
+    };
+    let anchor = start + anchor;
+    let window_end = anchor.saturating_add(RECOVERY_WINDOW).min(end);
+    if walk && let Some(block) = anchor.checked_sub(6).filter(|&b| b >= start) {
+        let mut budget = MAX_VERSION_NODES;
+        walk_version_block(bytes, block, window_end, 0, &mut budget, info);
+    }
+    let Some(window) = bytes.get(anchor..window_end) else {
+        return true;
+    };
+    for ((name, ..), slot) in STRING_FIELDS.iter().zip(info.strings.iter_mut()) {
+        if slot.is_some() {
+            continue;
+        }
+        let key = utf16z(name);
+        let Some(pos) = memchr::memmem::find(window, &key) else {
+            continue;
+        };
+        let key_off = anchor + pos;
+        let Some(entry) = key_off.checked_sub(6) else {
+            continue;
+        };
+        let value_off = entry + align4(key_off + key.len() - entry);
+        let Some(data) = bytes.get(value_off..window_end) else {
+            continue;
+        };
+        let text = crate::bytes::utf16_lossy(
+            crate::bytes::utf16_until_nul(data),
+            crate::bytes::Endian::Little,
+        );
+        if !text.is_empty() {
+            *slot = Some((text, value_off));
+        }
+    }
+    true
 }
 
 /// `StringFileInfo` keys and the `pe.version.*` leaves their value and its

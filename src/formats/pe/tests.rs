@@ -111,6 +111,26 @@ fn end_to_end_parses_real_pe_fixture() {
     assert!(m.get("binary.is_pie").is_some());
 }
 
+/// A well-formed image carries the container-geometry metrics, unconditionally:
+/// header size and share, no misplaced directories, no prose sections.
+#[test]
+fn real_pe_fixture_reports_container_geometry() {
+    let bytes = read_fixture("test.exe");
+    let (v, _, m) = run(&bytes);
+    let headers = v
+        .get("pe.headers_size")
+        .and_then(JsonValue::as_u64)
+        .unwrap();
+    assert_eq!(m.get("pe.headers_size"), Some(headers as f64));
+    assert_eq!(
+        m.get("pe.headers_size_ratio"),
+        Some(headers as f64 / bytes.len() as f64)
+    );
+    assert_eq!(m.get("pe.directory_section_mismatch_count"), Some(0.0));
+    assert_eq!(m.get("pe.prose_section_count"), Some(0.0));
+    assert_eq!(m.get("pe.executable_prose_section_count"), Some(0.0));
+}
+
 // Managed CLR extraction, end to end, against tiny C# libraries built from
 // the same source with and without `csc /keyfile` (see tests/fixtures).
 #[test]
