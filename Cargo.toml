@@ -115,7 +115,7 @@ cab = "0.6"
 tar = "0.4"
 # XML parser for VSIX / WiX-style manifests. Pure Rust, no external
 # binary calls.
-roxmltree = "0.21"
+roxmltree = "0.21.2"  # 0.21.2 parses nested elements iteratively (deep-XML stack overflow fix)
 # Deflate decompressor for PDF FlateDecode streams. Already in the
 # transitive tree via `zip`; surfacing it as a direct dep avoids
 # reaching through `zip`'s public re-exports.

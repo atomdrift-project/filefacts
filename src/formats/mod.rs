@@ -702,7 +702,7 @@ pub(crate) fn extract(
         }
         // An MSBuild project, or Android binary XML.
         FileType::Xml => {
-            msbuild::extract(bytes, ctx.values);
+            msbuild::extract(bytes, ctx.values, ctx.errors);
             if axml::looks_like_axml(bytes) {
                 axml::extract_values(bytes, ctx.values);
             }
