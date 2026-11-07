@@ -1113,3 +1113,30 @@ fn jar_signing_files_are_classified_without_regard_to_case() {
     assert_eq!(jar_signing("META-INF/cose.sig"), None);
     assert_eq!(jar_signing("lib/CERT.SF"), None);
 }
+
+#[test]
+fn signature_counts_cover_ordinary_archive() {
+    let z = build_zip(&[
+        ("a.txt", b"one", CompressionMethod::Stored),
+        ("b.txt", b"two", CompressionMethod::Stored),
+    ]);
+    let (_, m) = run(&z);
+    assert_eq!(m.get("archive.local_header_signature_count"), Some(2.0));
+    assert_eq!(m.get("archive.eocd_signature_count"), Some(1.0));
+}
+
+#[test]
+fn signature_counts_survive_unreadable_archive_chain() {
+    // Thirty single-member archives back to back, the last EOCD cut short
+    // of its comment-length field: no reader opens it, yet the chain is
+    // still measured.
+    let one = build_zip(&[("doc.js", b"WScript.Echo(1)", CompressionMethod::Stored)]);
+    let mut chain = Vec::new();
+    for _ in 0..30 {
+        chain.extend_from_slice(&one);
+    }
+    chain.truncate(chain.len() - 2);
+    let (_, m) = run(&chain);
+    assert_eq!(m.get("archive.local_header_signature_count"), Some(30.0));
+    assert_eq!(m.get("archive.eocd_signature_count"), Some(30.0));
+}

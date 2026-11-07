@@ -32,6 +32,10 @@ const DATA_SHAPES: &[(&str, Shape)] = &[
     // A 16-bit impure Unix a.out image. Its 0407 magic does not name a CPU,
     // so it is generic data. Without this, it is Unknown.
     ("unix_aout16_image", looks_like_aout16_image),
+    // A uFile download descriptor: a MessagePack header string and map that
+    // name a file for the uFiler client to fetch. Without this, a .ufile
+    // stub is Unknown and its download URL is never read.
+    ("ufile_descriptor", looks_like_ufile_descriptor),
 ];
 
 /// The name of the first shape `data` has.
@@ -188,6 +192,26 @@ fn looks_like_aout16_image(data: &[u8]) -> bool {
     }
     let image_size = text + initialized;
     image_size <= 65_536 && 16 + image_size + symbols <= data.len()
+}
+
+/// A uFile download descriptor: the MessagePack fixstr `uFile/<d>.<d>`, then
+/// a non-empty map whose first key is a short string, and the descriptor's
+/// own `uFileId` key in the bounded prefix.
+fn looks_like_ufile_descriptor(data: &[u8]) -> bool {
+    const KEY: &[u8] = b"\xa7uFileId";
+    let Some(&[0xa9, b'u', b'F', b'i', b'l', b'e', b'/', major, b'.', minor, map, key]) =
+        data.get(..12)
+    else {
+        return false;
+    };
+    let map_follows = matches!(map, 0x81..=0x8f | 0xde);
+    let fixstr_key = matches!(key, 0xa1..=0xbf);
+    if !(major.is_ascii_digit() && minor.is_ascii_digit() && map_follows && fixstr_key) {
+        return false;
+    }
+    data[..data.len().min(4096)]
+        .windows(KEY.len())
+        .any(|window| window == KEY)
 }
 
 #[cfg(test)]

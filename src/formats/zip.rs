@@ -213,6 +213,7 @@ pub(super) fn open_and_walk<'a>(
     archive_members: &mut Vec<ArchiveMember>,
     errors: &mut Errors,
 ) -> Result<Option<Archive<'a>>, Error> {
+    record_signature_counts(bytes, metrics);
     match open(bytes)? {
         Opened::Archive {
             mut archive,
@@ -311,6 +312,23 @@ pub(super) fn open_and_walk<'a>(
             Ok(None)
         }
     }
+}
+
+/// Raw counts of local-header and end-of-central-directory signatures,
+/// taken before parsing so they survive an archive no reader will open.
+///
+/// One EOCD is normal. Archives that store nested ZIPs uncompressed carry
+/// one per nested archive, each with many local headers behind it. Hundreds
+/// of EOCDs alongside about as many local headers means the file is a chain
+/// of single-member archives, a layout built to defeat archive parsers.
+fn record_signature_counts(bytes: &[u8], metrics: &mut Metrics) {
+    let local_headers = memchr::memmem::find_iter(bytes, b"PK\x03\x04").count();
+    let eocds = memchr::memmem::find_iter(bytes, b"PK\x05\x06").count();
+    metrics.insert(
+        metric!("archive.local_header_signature_count"),
+        local_headers as f64,
+    );
+    metrics.insert(metric!("archive.eocd_signature_count"), eocds as f64);
 }
 
 /// One walked member, with the per-entry facts the walk aggregates.

@@ -51,6 +51,12 @@ fn aout16() -> Vec<u8> {
     b
 }
 
+fn ufile() -> Vec<u8> {
+    let mut b = b"\xa9uFile/1.0\x86\xa4data\x88\xa4type\x03".to_vec();
+    b.extend_from_slice(b"\xa9publisher\xa6uCloud\xa7uFileId\xa4fMc4");
+    b
+}
+
 /// What every shape prevents: an unnamed copy is Data, which generic binary
 /// analysis reads, rather than Unknown, which nothing reads. Each shape is
 /// the only thing that recognises its sample.
@@ -62,6 +68,7 @@ fn each_shape_routes_an_unnamed_copy_to_data_rather_than_unknown() {
         ("prodos_boot_code", prodos_boot()),
         ("sign_of_misery_script", sign_of_misery()),
         ("unix_aout16_image", aout16()),
+        ("ufile_descriptor", ufile()),
     ] {
         assert_eq!(shape_of(&sample), Some(name));
         for path in ["unnamed", "renamed.bin"] {
@@ -138,4 +145,18 @@ fn aout16_rejects_truncation_and_inconsistent_geometry() {
         changed[at] = value;
         assert!(!looks_like_aout16_image(&changed), "offset {at}");
     }
+}
+
+#[test]
+fn ufile_descriptor_needs_header_map_and_id_key() {
+    let bytes = ufile();
+    assert!(looks_like_ufile_descriptor(&bytes));
+    assert!(!looks_like_ufile_descriptor(&bytes[..11]));
+    for (at, value) in [(0, 0xa8), (8, b'x'), (10, 0x80), (11, 0x00)] {
+        let mut altered = bytes.clone();
+        altered[at] = value;
+        assert!(!looks_like_ufile_descriptor(&altered), "offset {at}");
+    }
+    let without_id: Vec<u8> = bytes[..bytes.len() - 13].to_vec();
+    assert!(!looks_like_ufile_descriptor(&without_id));
 }
