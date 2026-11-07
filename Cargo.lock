@@ -878,9 +878,9 @@ dependencies = [
 
 [[package]]
 name = "inout"
-version = "0.2.5"
+version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b5cf4372d022092674a83b8febf5865f7a573cc0c5baec5e49c879b6a20978f"
+checksum = "3a580c13f0ffc335ef42dd3f6b1a41b726051c5e1656d9a3aa6fddb3c5dfbbf9"
 dependencies = [
  "hybrid-array",
 ]
@@ -1630,7 +1630,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stng"
 version = "3.0.0-beta.1"
-source = "git+https://github.com/atomdrift-project/stng.git#eed8096ecb2daec9c7cb281e841e5248d205c698"
+source = "git+https://github.com/atomdrift-project/stng.git#24dc3ff34099e72dfc1067a32f0f9bc222e730c9"
 dependencies = [
  "aho-corasick",
  "base64 0.22.1",
@@ -1917,7 +1917,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter"
 version = "0.28.0"
-source = "git+https://github.com/tstromberg/tree-sitter#10d5d1372be200e04480a6b1d6780229c5b1ee79"
+source = "git+https://github.com/tstromberg/tree-sitter#1eccaf16a89d6d5d9b82bc4bb09813aac3db2632"
 dependencies = [
  "cc",
  "regex",
@@ -2046,7 +2046,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-language"
 version = "0.1.8"
-source = "git+https://github.com/tstromberg/tree-sitter#10d5d1372be200e04480a6b1d6780229c5b1ee79"
+source = "git+https://github.com/tstromberg/tree-sitter#1eccaf16a89d6d5d9b82bc4bb09813aac3db2632"
 
 [[package]]
 name = "tree-sitter-lua"
