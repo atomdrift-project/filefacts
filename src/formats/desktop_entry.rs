@@ -146,3 +146,6 @@ fn split_desktop_list(input: &str) -> Vec<String> {
 
     items
 }
+
+#[cfg(test)]
+mod tests;

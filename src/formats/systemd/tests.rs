@@ -129,3 +129,77 @@ fn sections_commands_resets_lists_and_continuations() {
         extract(&bytes[..end], &mut Values::default(), &mut Errors::new());
     }
 }
+
+#[test]
+fn environment_reset_and_raw_tracking() {
+    let bytes = br#"
+[Service]
+Environment="LD_PRELOAD=/tmp/old.so" "URL=https://old.example/payload.sh"
+Environment=
+Environment="LD_PRELOAD=/tmp/new.so" PATH=/tmp/bin
+ExecStart=/bin/old
+ExecStart=
+ExecStart=/bin/new
+"#;
+    let mut values = Values::default();
+    extract(bytes, &mut values, &mut Errors::new());
+    assert_eq!(
+        values.get("service.environment.LD_PRELOAD"),
+        Some(&json!("/tmp/new.so"))
+    );
+    // `Environment=` clears what came before it.
+    assert_eq!(values.get("service.environment.URL"), None);
+    assert_eq!(
+        values.get("service.environment_list"),
+        Some(&json!(["LD_PRELOAD=/tmp/new.so", "PATH=/tmp/bin"]))
+    );
+    assert_eq!(
+        values.get("service._raw.environment"),
+        Some(&json!("\"LD_PRELOAD=/tmp/new.so\" PATH=/tmp/bin"))
+    );
+    assert_eq!(values.get("service.exec_start"), Some(&json!("/bin/new")));
+    assert_eq!(
+        values.get("service._raw.exec_start"),
+        Some(&json!("/bin/new"))
+    );
+}
+
+#[test]
+fn escaped_items_quoted_paths_and_semicolon_comments() {
+    let bytes = br#"
+; leading comment
+[Service]
+ReadOnlyPaths=/opt/my\sdir "/srv/quoted path"
+Environment='GREETING=hello world' PATH=/tmp/my\sbin
+ExecStartPre=/bin/echo start \
+; comment inside continued block
+  done
+ReadWritePaths=/etc/systemd/system /tmp
+"#;
+    let mut values = Values::default();
+    extract(bytes, &mut values, &mut Errors::new());
+    assert_eq!(
+        values.get("service.read_only_paths"),
+        Some(&json!(["/opt/my dir", "/srv/quoted path"]))
+    );
+    assert_eq!(
+        values.get("service.environment.GREETING"),
+        Some(&json!("hello world"))
+    );
+    assert_eq!(
+        values.get("service.environment.PATH"),
+        Some(&json!("/tmp/my bin"))
+    );
+    assert_eq!(
+        values.get("service.environment_list"),
+        Some(&json!(["GREETING=hello world", "PATH=/tmp/my bin"]))
+    );
+    assert_eq!(
+        values.get("service.exec_start_pre"),
+        Some(&json!("/bin/echo start done"))
+    );
+    assert_eq!(
+        values.get("service.read_write_paths"),
+        Some(&json!(["/etc/systemd/system", "/tmp"]))
+    );
+}

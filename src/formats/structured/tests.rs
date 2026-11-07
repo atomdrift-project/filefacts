@@ -487,6 +487,72 @@ fn pkginfo_multi_value_becomes_array() {
 }
 
 #[test]
+fn pkginfo_body_cannot_supply_or_override_headers() {
+    for newline in ["\n", "\r\n"] {
+        let input = [
+            "Metadata-Version: 2.4",
+            "Name: declared-package",
+            "Version: 1.0",
+            "",
+            "Name: description-example",
+            "Requires-Dist: example-dependency",
+            "License-Expression: MIT",
+        ]
+        .join(newline);
+        let mut v = Values::new();
+        extract_pkginfo(
+            input.as_bytes(),
+            &mut v,
+            &mut Metrics::new(),
+            &mut Errors::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            v.into_json(),
+            serde_json::json!({
+                "metadata-version": "2.4",
+                "name": "declared-package",
+                "version": "1.0"
+            }),
+            "{newline:?}"
+        );
+    }
+}
+
+#[test]
+fn pkginfo_folded_and_repeated_headers() {
+    let input = concat!(
+        "Metadata-Version: 2.4\n",
+        "Name: declared-package\n",
+        "Summary: Short\n",
+        " continuation\n",
+        "Requires-Dist: first-dependency\n",
+        "Requires-Dist: second-dependency\n",
+        "\n",
+        "Requires-Dist: description-example\n"
+    );
+    let mut v = Values::new();
+    extract_pkginfo(
+        input.as_bytes(),
+        &mut v,
+        &mut Metrics::new(),
+        &mut Errors::new(),
+    )
+    .unwrap();
+    assert_eq!(
+        v.get("summary"),
+        Some(&serde_json::json!("Short\ncontinuation"))
+    );
+    assert_eq!(
+        v.get("requires-dist"),
+        Some(&serde_json::json!([
+            "first-dependency",
+            "second-dependency"
+        ]))
+    );
+}
+
+#[test]
 fn base64_encodes_known_vectors() {
     assert_eq!(base64_encode(b""), "");
     assert_eq!(base64_encode(b"f"), "Zg==");
