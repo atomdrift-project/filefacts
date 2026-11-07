@@ -396,7 +396,7 @@ fn surfaces_office_properties_from_summary_information() {
 /// Build a property-set stream containing a mix of VT_LPSTR and
 /// VT_I4 properties. Mirror of `build_summary_info` but supports
 /// both types so we can exercise DocumentSummaryInformation
-/// counts (slide_count, security_flag).
+/// counts (slide_count).
 enum PropValue {
     Lpstr(&'static str),
     I4(i32),
@@ -451,11 +451,15 @@ fn build_property_set(props: &[(u32, PropValue)]) -> Vec<u8> {
 #[test]
 fn merges_document_summary_information_into_office_properties() {
     let summary = build_summary_info(&[(0x02, "Quarterly Report"), (0x04, "Alice")]);
+    // The PIDs Office writes (PIDDSI_*), beside neighbours that must not
+    // be mistaken for them: LINKSDIRTY, CCHWITHSPACES, HIDDENCOUNT.
     let dsi = build_property_set(&[
-        (0x10, PropValue::Lpstr("Eve")),      // manager
-        (0x11, PropValue::Lpstr("Acme Inc")), // company
-        (0x09, PropValue::I4(42)),            // slide_count
-        (0x13, PropValue::I4(1)),             // security_flag
+        (0x0E, PropValue::Lpstr("Eve")),      // PIDDSI_MANAGER
+        (0x0F, PropValue::Lpstr("Acme Inc")), // PIDDSI_COMPANY
+        (0x07, PropValue::I4(42)),            // PIDDSI_SLIDECOUNT
+        (0x09, PropValue::I4(3)),             // PIDDSI_HIDDENCOUNT
+        (0x10, PropValue::I4(0)),             // PIDDSI_LINKSDIRTY
+        (0x11, PropValue::I4(1234)),          // PIDDSI_CCHWITHSPACES
     ]);
     let cfb = build_cfb(&[
         ("/WordDocument", b"x"),
@@ -485,19 +489,12 @@ fn merges_document_summary_information_into_office_properties() {
         v.get("office.slide_count").and_then(|x| x.as_i64()),
         Some(42)
     );
-    assert_eq!(
-        v.get("office.security_flag").and_then(|x| x.as_i64()),
-        Some(1)
-    );
 }
 
 #[test]
 fn document_summary_alone_still_populates_office_properties() {
     // No SummaryInformation present — DSI fields should still land in office.*.
-    let dsi = build_property_set(&[
-        (0x11, PropValue::Lpstr("Acme Inc")),
-        (0x1A, PropValue::Lpstr("https://intranet.acme/docs")),
-    ]);
+    let dsi = build_property_set(&[(0x0F, PropValue::Lpstr("Acme Inc"))]);
     let cfb = build_cfb(&[
         ("/WordDocument", b"x"),
         ("/\x05DocumentSummaryInformation", &dsi),
@@ -506,10 +503,6 @@ fn document_summary_alone_still_populates_office_properties() {
     assert_eq!(
         v.get("office.company").and_then(|x| x.as_str()),
         Some("Acme Inc")
-    );
-    assert_eq!(
-        v.get("office.hyperlink_base").and_then(|x| x.as_str()),
-        Some("https://intranet.acme/docs")
     );
 }
 
@@ -999,4 +992,83 @@ fn pre_1970_filetime_property_is_a_date() {
         read_filetime(&ticks.to_le_bytes()),
         Some(JsonValue::String("1900-01-01T00:00:00Z".into()))
     );
+}
+
+/// An OLE1 Packager stream wrapping `payload` under `label`.
+fn ole10_native(label: &str, payload: &[u8]) -> Vec<u8> {
+    let mut body = 2_u16.to_le_bytes().to_vec();
+    for s in [label, "C:\\Users\\Public\\payload.exe"] {
+        body.extend_from_slice(s.as_bytes());
+        body.push(0);
+    }
+    body.extend_from_slice(&[0, 0, 3, 0]);
+    let temp = b"C:\\Temp\\payload.exe\0";
+    body.extend_from_slice(&(temp.len() as u32).to_le_bytes());
+    body.extend_from_slice(temp);
+    body.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    body.extend_from_slice(payload);
+    let mut stream = (body.len() as u32).to_le_bytes().to_vec();
+    stream.extend_from_slice(&body);
+    stream
+}
+
+#[test]
+fn packager_payload_is_an_embedded_object_with_its_offset() {
+    let mut pe = b"MZ".to_vec();
+    pe.resize(256, 0);
+    let native = ole10_native("payload.exe", &pe);
+    let cfb = build_cfb(&[
+        ("/WordDocument", b"x"),
+        ("/ObjectPool/_1/\u{1}Ole10Native", &native),
+    ]);
+    let (v, m) = run(&cfb);
+    let embedded = v.get("office.embedded").and_then(|x| x.as_array()).unwrap();
+    assert_eq!(embedded.len(), 1, "{embedded:?}");
+    let obj = &embedded[0];
+    assert_eq!(obj["filename"], "payload.exe");
+    assert_eq!(obj["kind"], "pe");
+    assert_eq!(obj["size_bytes"], 256);
+    assert_eq!(obj["stream"], "/ObjectPool/_1/\u{1}Ole10Native");
+    // The offset lands on the payload's first byte.
+    let offset = usize::try_from(obj["data_offset"].as_u64().unwrap()).unwrap();
+    assert_eq!(native.get(offset..offset + 2), Some(&b"MZ"[..]));
+    assert_eq!(m.get("office.embedded_count"), Some(1.0));
+    assert_eq!(m.get("office.embedded_executable_count"), Some(1.0));
+}
+
+#[test]
+fn a_package_whose_payload_overruns_its_stream_is_not_trusted() {
+    let mut native = ole10_native("payload.exe", b"MZ");
+    let len = native.len();
+    // Claim a payload far larger than the stream holds.
+    native[len - 6..len - 2].copy_from_slice(&u32::MAX.to_le_bytes());
+    let cfb = build_cfb(&[
+        ("/WordDocument", b"x"),
+        ("/ObjectPool/_1/\u{1}Ole10Native", &native),
+    ]);
+    let (v, _) = run(&cfb);
+    assert!(v.get("office.embedded").is_none());
+}
+
+#[test]
+fn executable_streams_are_embedded_objects() {
+    let mut pe = b"MZ".to_vec();
+    pe.resize(64, 0);
+    let cfb = build_cfb(&[("/WordDocument", b"x"), ("/Data", &pe), ("/Text", b"plain")]);
+    let (v, m) = run(&cfb);
+    let embedded = v.get("office.embedded").and_then(|x| x.as_array()).unwrap();
+    assert_eq!(embedded.len(), 1);
+    assert_eq!(embedded[0]["filename"], "/Data");
+    assert_eq!(embedded[0]["kind"], "pe");
+    assert_eq!(m.get("office.embedded_executable_count"), Some(1.0));
+}
+
+#[test]
+fn an_encrypted_package_sets_is_encrypted() {
+    let cfb = build_cfb(&[
+        ("/EncryptionInfo", b"\x04\x00\x04\x00"),
+        ("/EncryptedPackage", b"x"),
+    ]);
+    let (_, m) = run(&cfb);
+    assert_eq!(m.get("office.is_encrypted"), Some(1.0));
 }

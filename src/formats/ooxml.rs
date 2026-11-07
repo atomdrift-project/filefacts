@@ -32,7 +32,7 @@ use serde_json::Value as JsonValue;
 
 use crate::bytes::ends_with_ci;
 use crate::formats::bounded::Limits;
-use crate::formats::common::put_str;
+use crate::formats::common::{embedded_kind, put_str};
 use crate::output::{DiagnosticKind, Errors, Metrics, Stage, ValueKey, Values};
 use crate::value_key;
 
@@ -160,6 +160,8 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         }
     }
 
+    package_stats(zip, &names, metrics);
+
     for rel in &index.relationships {
         match rel.short_type.as_str() {
             short_type @ ("oleObject" | "package") => {
@@ -228,6 +230,30 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         .filter(|rel| rel.mode.as_deref() == Some("External") || is_external_target(&rel.target))
         .map(external_relationship_value)
         .collect();
+    // The injection vectors (CVE-2017-0199 and kin) load a remote object,
+    // frame or sub-document; a local target or a hyperlink is no vector.
+    let remote = |types: &[&str]| {
+        index
+            .relationships
+            .iter()
+            .filter(|rel| types.contains(&rel.short_type.as_str()))
+            .filter(|rel| workbook::is_remote_target(&rel.target))
+            .count()
+    };
+    for (key, count) in [
+        (
+            metric!("office.external_oleobject_count"),
+            remote(&["oleObject"]),
+        ),
+        (
+            metric!("office.external_frame_count"),
+            remote(&["frame", "subDocument"]),
+        ),
+    ] {
+        if count > 0 {
+            metrics.insert(key, count as f64);
+        }
+    }
     if !external_relationships.is_empty() {
         let count = external_relationships.len() as f64;
         values.insert_key(
@@ -259,6 +285,8 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
 
     let mut dde_links: Vec<JsonValue> = Vec::new();
     let mut custom_ui_onload: Vec<JsonValue> = Vec::new();
+    let mut xlm_calls = workbook::XlmCalls::default();
+    let mut book: Option<workbook::Workbook> = None;
     // Oversized parts are routine (a long document, a big sheet). They are a
     // coverage limit, not a parse failure, so they land in `office.limits`
     // like the other archive walkers' limits and stay out of `errors` (which
@@ -294,6 +322,18 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
             }
         };
         scan_budget = scan_budget.saturating_sub(text.len() as u64);
+        if workbook::is_macrosheet(name) {
+            xlm_calls.add(&text);
+        }
+        if index
+            .content_type_for(name)
+            .is_some_and(is_workbook_content_type)
+        {
+            match roxmltree::Document::parse(&text) {
+                Ok(doc) => book = Some(workbook::parse(&doc)),
+                Err(e) => errors.record_malformed(Stage::OoxmlParse, format!("{name}: {e}")),
+            }
+        }
         // Most parts carry neither: skip the parse unless an element either
         // scan looks for is named. Element names cannot be written as
         // character references, so a plain search finds every candidate.
@@ -346,6 +386,10 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         );
     }
     limits.emit(values, value_key!("office.limits"));
+    xlm_calls.emit(metrics);
+    if let Some(book) = book {
+        workbook::emit(book, values, metrics, &mut features);
+    }
     if !dde_links.is_empty() {
         let count = dde_links.len() as f64;
         values.insert_key(value_key!("office.dde_links"), JsonValue::Array(dde_links));
@@ -661,6 +705,59 @@ fn push_embedded<R: Read + std::io::Seek>(
     }
 }
 
+/// Whether `content_type` is a SpreadsheetML workbook's main part (`.xlsx`,
+/// `.xlsm`, templates and add-ins).
+fn is_workbook_content_type(content_type: &str) -> bool {
+    content_type.ends_with(".main+xml")
+        && (content_type.contains("spreadsheetml") || content_type.contains("ms-excel"))
+}
+
+/// Package-level part statistics: the largest part (the padding that
+/// inflates a payload past a scanner's size limit compresses away, so it
+/// shows only uncompressed), the image parts a lure is built from, and the
+/// parts named like something to run.
+fn package_stats<R: Read + std::io::Seek>(
+    zip: &mut ::zip::ZipArchive<R>,
+    names: &[String],
+    metrics: &mut Metrics,
+) {
+    const RUNNABLE: [&str; 8] = ["exe", "dll", "hta", "lnk", "bat", "js", "scr", "vbs"];
+    let max_entry_size = (0..zip.len().min(names.len()))
+        .filter_map(|i| zip.by_index_raw(i).ok().map(|entry| entry.size()))
+        .max()
+        .unwrap_or(0);
+    let image_parts = names
+        .iter()
+        .filter(|n| {
+            ["word/media/", "xl/media/", "ppt/media/"]
+                .iter()
+                .any(|p| n.starts_with(p))
+        })
+        .count();
+    let runnable_parts = names
+        .iter()
+        .filter(|n| {
+            n.rsplit_once('.')
+                .is_some_and(|(_, ext)| RUNNABLE.iter().any(|r| ext.eq_ignore_ascii_case(r)))
+        })
+        .count();
+    metrics.insert(
+        metric!("office.ooxml.max_entry_size"),
+        max_entry_size as f64,
+    );
+    for (key, count) in [
+        (metric!("office.ooxml.image_part_count"), image_parts),
+        (
+            metric!("office.ooxml.suspicious_extension_count"),
+            runnable_parts,
+        ),
+    ] {
+        if count > 0 {
+            metrics.insert(key, count as f64);
+        }
+    }
+}
+
 fn is_macro_relationship(short_type: &str) -> bool {
     matches!(short_type, "vbaProject" | "xlIntlMacrosheet")
 }
@@ -687,40 +784,6 @@ fn external_relationship_value(rel: &RelationshipInfo) -> JsonValue {
         obj.insert("mode".into(), JsonValue::String(mode.clone()));
     }
     JsonValue::Object(obj)
-}
-
-/// Classify the first few bytes of an embedded payload by magic.
-/// Returns a short kind label suitable for traits to match against
-/// (`"pe"`, `"elf"`, `"macho"`, `"ole2"`, `"zip"`) or `None` when the
-/// bytes don't match any known executable / container shape.
-fn embedded_kind(bytes: &[u8]) -> Option<&'static str> {
-    if bytes.starts_with(b"MZ") {
-        return Some("pe");
-    }
-    if bytes.starts_with(b"\x7fELF") {
-        return Some("elf");
-    }
-    if let Some(m) = crate::bytes::u32_le(bytes, 0) {
-        // MH_MAGIC / MH_CIGAM / MH_MAGIC_64 / MH_CIGAM_64
-        if matches!(m, 0xFEED_FACE | 0xCEFA_EDFE | 0xFEED_FACF | 0xCFFA_EDFE) {
-            return Some("macho");
-        }
-        // Universal binary (fat) — sometimes ships as a single embedded
-        // mach-o multi-arch payload.
-        if matches!(m, 0xCAFE_BABE | 0xBEBA_FECA) {
-            // 0xCAFEBABE clashes with Java .class; in embedded-doc
-            // context Java class files are extremely uncommon while
-            // fat Mach-O bundles are the documented attack surface.
-            return Some("macho");
-        }
-    }
-    if bytes.starts_with(b"PK\x03\x04") {
-        return Some("zip");
-    }
-    if bytes.starts_with(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1") {
-        return Some("ole2");
-    }
-    None
 }
 
 /// Read `[Content_Types].xml` and map its primary content type onto a
@@ -1005,6 +1068,8 @@ fn decode_xml_bytes(buf: Vec<u8>) -> Option<String> {
     }
     String::from_utf8(buf).ok()
 }
+
+mod workbook;
 
 #[cfg(test)]
 mod tests;

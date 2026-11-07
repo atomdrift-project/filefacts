@@ -787,3 +787,19 @@ fn refused_modules_spend_the_decompression_budget() {
         MAX_PROJECT_SOURCE.div_ceil(MAX_DECOMPRESSED_SIZE)
     );
 }
+
+#[test]
+fn logical_lines_skip_blanks() {
+    let source = "Sub Main()\r\n  ' a comment\r\n\r\n   \r\n  x = 1\r\nEnd Sub\r\n";
+    assert_eq!(logical_line_count(source), 4);
+}
+
+#[test]
+fn generated_module_names() {
+    for chosen in ["Module1", "ThisDocument", "clsLogger", "Sheet1", "Short"] {
+        assert!(!looks_generated_name(chosen), "{chosen}");
+    }
+    for generated in ["qWeRty12Ab", "xKpL7m8sWq"] {
+        assert!(looks_generated_name(generated), "{generated}");
+    }
+}

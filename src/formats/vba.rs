@@ -219,6 +219,8 @@ fn extract_project<R: Read + Seek>(
     // `vba_symbols::extract` so a doc with three modules and one Declare
     // each surfaces a single `office.vba.declare_count = 3`.
     let mut agg = super::vba_symbols::VbaSymbolStats::default();
+    let mut logical_lines = 0_usize;
+    let mut generated_names = 0_usize;
     // Mark where this document's VBA symbols start so the identifier-shape
     // metrics below are computed over exactly the symbols emitted here.
     let sym_start = symbols_out.len();
@@ -320,6 +322,10 @@ fn extract_project<R: Read + Seek>(
         // Run the symbol extractor before moving `source` into the
         // module record.
         super::vba_symbols::extract(&source, symbols_out, &mut agg);
+        logical_lines += logical_line_count(&source);
+        if looks_generated_name(&info.name) {
+            generated_names += 1;
+        }
 
         let mut obj = serde_json::Map::new();
         obj.insert("name".into(), JsonValue::String(info.name.clone()));
@@ -376,6 +382,16 @@ fn extract_project<R: Read + Seek>(
             metric!("office.vba.trigger_handler_count"),
             f64::from(agg.trigger_handler_count),
         );
+        metrics.insert(
+            metric!("office.vba.total_logical_lines"),
+            logical_lines as f64,
+        );
+        if generated_names > 0 {
+            metrics.insert(
+                metric!("office.vba.random_named_module_count"),
+                generated_names as f64,
+            );
+        }
 
         // Identifier-shape signals over this document's VBA symbol names
         // (imports + functions): mean length, Shannon entropy of the
@@ -421,6 +437,26 @@ fn extract_project<R: Read + Seek>(
             distinct_triggers.len() as f64,
         );
     }
+}
+
+/// Non-blank lines of VBA source: the size of the code a person (or a
+/// generator) wrote, independent of padding blank lines.
+fn logical_line_count(source: &str) -> usize {
+    source
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count()
+}
+
+/// Whether a module name looks generated rather than chosen: eight or more
+/// characters mixing upper case, lower case and digits (`xKpL7m8sWq`).
+/// Office's own names (`Module1`, `ThisDocument`, `Sheet1`) and a person's
+/// (`clsLogger`) do not.
+fn looks_generated_name(name: &str) -> bool {
+    name.len() >= 8
+        && name.bytes().any(|b| b.is_ascii_uppercase())
+        && name.bytes().any(|b| b.is_ascii_lowercase())
+        && name.bytes().any(|b| b.is_ascii_digit())
 }
 
 /// Decompress VBA macros carried in an OOXML `vbaProject.bin` member.

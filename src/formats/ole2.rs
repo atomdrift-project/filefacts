@@ -93,6 +93,7 @@ pub(super) fn extract<R: Read + Seek>(
     let mut had_encrypted_summary = false;
     let mut had_object_pool = false;
     let mut dangerous_clsids: Vec<JsonValue> = Vec::new();
+    let mut stream_entries: Vec<embedded::StreamEntry> = Vec::new();
     let mut limits = Limits::default();
 
     for entry in comp.walk() {
@@ -157,6 +158,12 @@ pub(super) fn extract<R: Read + Seek>(
             had_encrypted_summary = true;
         }
 
+        if entry.is_stream() {
+            stream_entries.push(embedded::StreamEntry {
+                path: path.clone(),
+                len: entry.len(),
+            });
+        }
         streams.push(path);
     }
 
@@ -249,7 +256,10 @@ pub(super) fn extract<R: Read + Seek>(
         // Visibility 2 is "very hidden": the sheet cannot be unhidden from
         // Excel's own UI, only from VBA. Nothing a person maintaining a
         // workbook has a reason to set.
-        let very_hidden = sheets.iter().any(|s| s.visibility == SHEET_VERY_HIDDEN);
+        let very_hidden = sheets
+            .iter()
+            .filter(|s| s.visibility == SHEET_VERY_HIDDEN)
+            .count();
         metrics.insert(metric!("office.sheet_count"), sheets.len() as f64);
         values.insert_key(
             value_key!("office.sheet_names"),
@@ -268,8 +278,12 @@ pub(super) fn extract<R: Read + Seek>(
         if hidden > 0 {
             metrics.insert(metric!("office.hidden_sheet_count"), hidden as f64);
         }
-        if very_hidden {
+        if very_hidden > 0 {
             features.push("veryhidden_sheets");
+            metrics.insert(
+                metric!("office.xlm.very_hidden_sheet_count"),
+                very_hidden as f64,
+            );
         }
     }
     if had_ole10native || had_object_pool {
@@ -285,6 +299,32 @@ pub(super) fn extract<R: Read + Seek>(
         || word_document_encrypted
     {
         features.push("encryption");
+        metrics.insert(metric!("office.is_encrypted"), 1.0);
+    }
+    let embedded = embedded::scan(comp, &stream_entries);
+    if embedded.len() >= embedded::MAX_EMBEDDED {
+        limits.push(
+            "embedded-cap",
+            format!(
+                "embedded objects past the first {} not listed",
+                embedded::MAX_EMBEDDED
+            ),
+        );
+    }
+    if !embedded.is_empty() {
+        let executables = embedded
+            .iter()
+            .filter(|e| matches!(e["kind"].as_str(), Some("pe" | "elf" | "macho")))
+            .count();
+        metrics.insert(metric!("office.embedded_count"), embedded.len() as f64);
+        if executables > 0 {
+            features.push("embedded_executable");
+            metrics.insert(
+                metric!("office.embedded_executable_count"),
+                executables as f64,
+            );
+        }
+        values.insert_key(value_key!("office.embedded"), JsonValue::Array(embedded));
     }
     if !dangerous_clsids.is_empty() {
         features.push("dangerous_clsid");
@@ -317,8 +357,8 @@ pub(super) fn extract<R: Read + Seek>(
         .map(|data| property_set(data, summary_key))
         .unwrap_or_default();
     // DocumentSummaryInformation extends the summary set with
-    // manager / company / security_flag / hyperlink_base — fields
-    // OOXML carries in `docProps/app.xml`.
+    // category / presentation format / slide count / manager / company —
+    // fields OOXML carries in `docProps/core.xml` and `docProps/app.xml`.
     if let Some(data) = read_stream_data(
         comp,
         "\x05DocumentSummaryInformation",
@@ -419,18 +459,16 @@ fn summary_key(pid: u32) -> Option<ValueKey> {
 }
 
 /// The `\x05DocumentSummaryInformation` PIDs read (PIDDSI_*, MS-OLEPS
-/// §2.4.2): only the fields that have a matching OOXML core /
-/// app-properties slot. Its second section, the user-defined custom
-/// properties, is not read.
+/// §2.18.2; the Windows SDK's `PIDDSI_*` constants): only the fields that
+/// have a matching OOXML core / app-properties slot. Its second section, the
+/// user-defined custom properties, is not read.
 fn document_summary_key(pid: u32) -> Option<ValueKey> {
     Some(match pid {
-        0x02 => value_key!("office.category"),
-        0x05 => value_key!("office.presentation_format"),
-        0x09 => value_key!("office.slide_count"),   // VT_I4
-        0x10 => value_key!("office.manager"),       // VT_LPSTR
-        0x11 => value_key!("office.company"),       // VT_LPSTR
-        0x13 => value_key!("office.security_flag"), // VT_I4 — bitfield
-        0x1A => value_key!("office.hyperlink_base"), // VT_LPSTR
+        0x02 => value_key!("office.category"), // PIDDSI_CATEGORY
+        0x03 => value_key!("office.presentation_format"), // PIDDSI_PRESFORMAT
+        0x07 => value_key!("office.slide_count"), // PIDDSI_SLIDECOUNT, VT_I4
+        0x0E => value_key!("office.manager"),  // PIDDSI_MANAGER
+        0x0F => value_key!("office.company"),  // PIDDSI_COMPANY
         _ => return None,
     })
 }
@@ -1128,6 +1166,8 @@ fn detect_kind(streams: &[String]) -> &'static str {
     }
     "ole2"
 }
+
+mod embedded;
 
 #[cfg(test)]
 mod tests;

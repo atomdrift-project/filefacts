@@ -403,5 +403,43 @@ pub(super) fn plist_to_json(value: plist::Value, depth: u8) -> JsonValue {
     }
 }
 
+/// Classify the first few bytes of an embedded payload by magic.
+/// Returns a short kind label suitable for traits to match against
+/// (`"pe"`, `"elf"`, `"macho"`, `"ole2"`, `"zip"`, `"cab"`) or `None` when
+/// the bytes don't match any known executable / container shape. Shared by
+/// the OOXML and OLE2 embedded-object views.
+pub(super) fn embedded_kind(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"MZ") {
+        return Some("pe");
+    }
+    if bytes.starts_with(b"\x7fELF") {
+        return Some("elf");
+    }
+    if let Some(m) = crate::bytes::u32_le(bytes, 0) {
+        // MH_MAGIC / MH_CIGAM / MH_MAGIC_64 / MH_CIGAM_64
+        if matches!(m, 0xFEED_FACE | 0xCEFA_EDFE | 0xFEED_FACF | 0xCFFA_EDFE) {
+            return Some("macho");
+        }
+        // Universal binary (fat) — sometimes ships as a single embedded
+        // mach-o multi-arch payload.
+        if matches!(m, 0xCAFE_BABE | 0xBEBA_FECA) {
+            // 0xCAFEBABE clashes with Java .class; in embedded-doc
+            // context Java class files are extremely uncommon while
+            // fat Mach-O bundles are the documented attack surface.
+            return Some("macho");
+        }
+    }
+    if bytes.starts_with(b"PK\x03\x04") {
+        return Some("zip");
+    }
+    if bytes.starts_with(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1") {
+        return Some("ole2");
+    }
+    if bytes.starts_with(b"MSCF") {
+        return Some("cab");
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests;
