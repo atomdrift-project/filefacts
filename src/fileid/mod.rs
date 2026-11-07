@@ -1121,6 +1121,16 @@ fn extension(sniff: &Sniff<'_>) -> Option<Detection> {
     if file_type == FileType::Bmp && !data.is_empty() && !magic::looks_like_dib_header(data) {
         return misnamed();
     }
+    // Readers look for the `%PDF` header within a prefix of the body and
+    // tolerate junk before it, which is why the name is otherwise trusted.
+    // A body with no header anywhere opens in no reader; under a `.pdf` name
+    // it is a lure (a base64 shortcut, a script) and is typed by its bytes.
+    if file_type == FileType::Pdf
+        && !data.is_empty()
+        && memchr::memmem::find(data, b"%PDF").is_none()
+    {
+        return misnamed();
+    }
     // Reaching this fallback means the body has no `<svg>` root, so the name
     // is not a reason to call it an image: `logo.svg` holding a script is the
     // script.

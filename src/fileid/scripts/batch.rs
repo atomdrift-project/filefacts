@@ -502,6 +502,17 @@ fn batch_verb(verb: &[u8], rest: &[u8]) -> Grade {
         };
     }
     if let Some(cmd) = BATCH_COMMANDS.iter().find(|c| is(c)) {
+        // `powershell.exe -w hidden "..."`, `certutil.exe -urlcache ...`: the
+        // program by its Windows file name, then an option, is a command line
+        // for cmd.exe whichever option syntax the program itself takes.
+        if (starts_ci(rest, b".exe") || starts_ci(rest, b".com"))
+            && let Some(after) = rest.get(4..)
+            && after.first().is_some_and(u8::is_ascii_whitespace)
+        {
+            let arg = after.trim_ascii_start();
+            let option = matches!(arg, [b'-' | b'/', c, ..] if c.is_ascii_alphabetic());
+            return if option { Grade::Strong } else { Grade::Weak };
+        }
         // Something has to follow the verb the way it follows a command: an
         // argument, a redirect, a separator. `Type:` and `Label,` are prose.
         if !rest

@@ -55,6 +55,17 @@ fn caret_obfuscation_is_batch() {
     assert_eq!(verdict(data), Some(FileType::Batch));
 }
 
+/// A dropped one-line command names its program by file name and passes
+/// options in the program's own syntax; cmd.exe runs it all the same.
+#[test]
+fn program_file_name_command_line_is_batch() {
+    let guloader = b"powershell.exe -windowstyle hidden \"Get-DiskSNV;function Sladreha ($l){ $c=3;do {$y+=$l[$c];$c+=4}until (!$l[$c])$y}\"";
+    assert_eq!(verdict(guloader), Some(FileType::Batch));
+    // Prose naming the program is not a command line.
+    let prose = b"powershell.exe is the shell that ships with Windows.\n";
+    assert_eq!(verdict(prose), None);
+}
+
 /// Polyglots put the batch half first; the rest is data to cmd.exe.
 #[test]
 fn batch_hybrid_headers() {

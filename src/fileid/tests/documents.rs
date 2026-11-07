@@ -11,7 +11,22 @@ fn pdf_magic() {
 
 #[test]
 fn pdf_by_ext() {
-    assert_ext("doc.pdf", FileType::Pdf);
+    // The name maps to PDF; whether the body is one is the header's call
+    // (see `pdf_name_without_header_is_typed_by_content`).
+    let det = detect(Path::new("doc.pdf"), b"x = 1\n").expect("detected");
+    assert_eq!(det.extension_type(), Some(FileType::Pdf));
+}
+
+/// No reader opens a body with no `%PDF` header anywhere, so the name alone
+/// does not make one: a base64-encoded shortcut mailed as `.pdf` is text.
+#[test]
+fn pdf_name_without_header_is_typed_by_content() {
+    let body = b"TAAAAAEUAgAAAAAAwAAAAAAAAEYhAQAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n";
+    let det = detect(Path::new("invoice.pdf"), body).expect("detected");
+    assert_ne!(det.file_type, FileType::Pdf);
+    assert!(det.extension_mismatch());
+    // Readers skip junk before the header; the name still stands then.
+    assert_detect("doc.pdf", b"\r\njunk%PDF-1.7\n1 0 obj", FileType::Pdf);
 }
 
 #[test]
