@@ -249,7 +249,7 @@ fn parsed(
     // version-info runs, at absolute file offsets. It takes the parse as an
     // Object, moved in and back out, so the binary is not parsed twice.
     let object = goblin::Object::PE(pe);
-    let shared: Vec<stng::Layout<'_, '_>> = layout.iter().map(|layout| (0, *layout)).collect();
+    let shared = Vec::from_iter(layout.map(|binary| stng::Layout::new(0, binary)));
     extract_binary_strings_from_object(&object, &shared, bytes, ctx.strings, XorScan::Yes);
     // Constructed as `Object::PE` above.
     let goblin::Object::PE(pe) = object else {

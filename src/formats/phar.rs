@@ -70,10 +70,10 @@ fn signature(data: &[u8], trailer: &Trailer) -> JsonValue {
     let digest = data.get(trailer.start..trailer.end).unwrap_or_default();
     let signed = data.get(..trailer.start).unwrap_or_default();
     let valid = match trailer.algorithm {
-        Algorithm::Md5 => Some(Md5::digest(signed).as_slice() == digest),
-        Algorithm::Sha1 => Some(Sha1::digest(signed).as_slice() == digest),
-        Algorithm::Sha256 => Some(Sha256::digest(signed).as_slice() == digest),
-        Algorithm::Sha512 => Some(Sha512::digest(signed).as_slice() == digest),
+        Algorithm::Md5 => Some(Md5::digest(signed)[..] == *digest),
+        Algorithm::Sha1 => Some(Sha1::digest(signed)[..] == *digest),
+        Algorithm::Sha256 => Some(Sha256::digest(signed)[..] == *digest),
+        Algorithm::Sha512 => Some(Sha512::digest(signed)[..] == *digest),
         Algorithm::OpenSsl | Algorithm::OpenSslSha256 | Algorithm::OpenSslSha512 => None,
     };
     let mut value = serde_json::Map::new();

@@ -120,7 +120,7 @@ fn valid_dex(data: &[u8], cancelled: &impl Fn() -> bool) -> bool {
         }
         hash.update(chunk);
     }
-    if hash.finalize().as_slice() != digest {
+    if hash.finalize()[..] != *digest {
         return false;
     }
     let (mut a, mut b) = (1u32, 0u32);

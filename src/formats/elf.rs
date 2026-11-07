@@ -211,7 +211,7 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
     // Reuse this parse for string extraction (move into an Object for stng,
     // then move back out) so the binary isn't parsed a second time.
     let object = goblin::Object::Elf(elf);
-    let shared: Vec<stng::Layout<'_, '_>> = layout.iter().map(|layout| (0, *layout)).collect();
+    let shared = Vec::from_iter(layout.map(|binary| stng::Layout::new(0, binary)));
     extract_binary_strings_from_object(&object, &shared, bytes, strings, XorScan::Yes);
     // Constructed as `Object::Elf` above.
     let goblin::Object::Elf(elf) = object else {

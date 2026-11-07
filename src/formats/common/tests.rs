@@ -199,7 +199,7 @@ fn malformed_utf16_bom_utf8_payload_preserves_string_offsets() {
     let command = strings
         .text
         .ascii()
-        .find(|s| s.value.contains("Invoke-WebRequest"))
+        .find(|s| s.value == "powershell -command Invoke-WebRequest")
         .expect("malformed BOM wrapper must expose its text");
     assert_eq!(command.data_offset, 13);
 }

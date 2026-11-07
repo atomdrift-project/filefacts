@@ -7,14 +7,8 @@ fn text_spans_locate_each_string_kind_correctly() {
         // anchors at the first fragment — NOT the (non-contiguous) data_offset.
         stng::ExtractedString::new("STACKSTR", 9999, stng::StringMethod::StackString)
             .with_fragments(vec![
-                stng::StringFragment {
-                    offset: 0x100,
-                    length: 4,
-                },
-                stng::StringFragment {
-                    offset: 0x200,
-                    length: 4,
-                },
+                stng::StringFragment::new(0x100, 4),
+                stng::StringFragment::new(0x200, 4),
             ]),
         // Plain byte-scan literal: span at its file offset.
         stng::ExtractedString::new("plain", 0x10, stng::StringMethod::RawScan),

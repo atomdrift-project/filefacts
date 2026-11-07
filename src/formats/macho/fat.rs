@@ -253,10 +253,10 @@ pub(super) type Layout<'a> = (u64, Result<binform::Binary<'a>, String>);
 /// The layouts read, each with its image's file offset.
 pub(super) fn read<'l, 'a>(
     layouts: &'l [Layout<'a>],
-) -> impl Iterator<Item = (u64, &'l binform::Binary<'a>)> {
+) -> impl Iterator<Item = stng::Layout<'l, 'a>> {
     layouts
         .iter()
-        .filter_map(|(at, read)| Some((*at, read.as_ref().ok()?)))
+        .filter_map(|(at, read)| Some(stng::Layout::new(*at, read.as_ref().ok()?)))
 }
 
 /// The layout read from the image at file offset `offset`.
@@ -265,8 +265,8 @@ pub(super) fn layout_at<'l, 'a>(
     offset: u64,
 ) -> Option<&'l binform::Binary<'a>> {
     read(layouts)
-        .find(|(at, _)| *at == offset)
-        .map(|(_, layout)| layout)
+        .find(|layout| layout.offset == offset)
+        .map(|layout| layout.binary)
 }
 
 /// A slice's `macho.*` subtree with its unified-view counts added, mirroring
