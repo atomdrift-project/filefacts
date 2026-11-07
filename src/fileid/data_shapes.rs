@@ -199,8 +199,9 @@ fn looks_like_aout16_image(data: &[u8]) -> bool {
 /// own `uFileId` key in the bounded prefix.
 fn looks_like_ufile_descriptor(data: &[u8]) -> bool {
     const KEY: &[u8] = b"\xa7uFileId";
-    let Some(&[0xa9, b'u', b'F', b'i', b'l', b'e', b'/', major, b'.', minor, map, key]) =
-        data.get(..12)
+    let Some(&[major, b'.', minor, map, key]) = data
+        .strip_prefix(b"\xa9uFile/")
+        .and_then(|rest| rest.get(..5))
     else {
         return false;
     };
@@ -209,7 +210,8 @@ fn looks_like_ufile_descriptor(data: &[u8]) -> bool {
     if !(major.is_ascii_digit() && minor.is_ascii_digit() && map_follows && fixstr_key) {
         return false;
     }
-    data[..data.len().min(4096)]
+    data.get(..4096)
+        .unwrap_or(data)
         .windows(KEY.len())
         .any(|window| window == KEY)
 }
