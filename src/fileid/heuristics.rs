@@ -617,6 +617,12 @@ pub(super) fn scored_type(sniff: &Sniff<'_>) -> Option<FileType> {
     {
         return Some(FileType::Text);
     }
+    // Pagefind static-site search indexes store each page as `pagefind_dcd`
+    // followed by a JSON record of its text. The page prose quotes code often
+    // enough to score as a language; the record is data either way.
+    if body.starts_with(b"pagefind_dcd{") {
+        return Some(FileType::Text);
+    }
     // Batch, VBScript, mIRC and ircII are read line by line, verb first. That
     // runs ahead of the binary and prose guards on purpose: batch files carry
     // ANSI escapes and `echo` whole paragraphs, and the line grammar is what

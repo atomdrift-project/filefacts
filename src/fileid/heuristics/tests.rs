@@ -103,6 +103,12 @@ fn ring_gui_sql_exec_is_not_python() {
 }
 
 #[test]
+fn pagefind_fragment_is_text() {
+    let data = br#"pagefind_dcd{"url":"/post/x/","content":"How to use const x = new Function(); var y = eval(z); function f() { return document.cookie; }","word_count":12}"#;
+    assert_eq!(detect_from_content(data), Some(FileType::Text));
+}
+
+#[test]
 fn python_name_main() {
     let data = b"if __name__ == '__main__':\n    main()\n";
     assert_eq!(detect_from_content(data), Some(FileType::Python));
