@@ -76,10 +76,19 @@ fn sap_abap_report(sniff: &Sniff<'_>) -> bool {
 /// sectioned `.rst` document with directives or literal blocks is a document
 /// by its content, even when those examples score as a language or carry
 /// another format's mark.
+///
+/// A Python `.doctest` file is the same kind of document: sectioned
+/// reStructuredText whose examples are `>>>` interpreter sessions rather than
+/// `::` literal blocks (NLTK's `semantics.doctest`). Its prompts are the
+/// examples; the headings are what make it a document.
 fn restructuredtext_document(sniff: &Sniff<'_>) -> bool {
-    sniff.ext_type() == Some(FileType::Text)
-        && super::ext::lowercase_ext(sniff.path).as_deref() == Some("rst")
-        && rst_document_structure(sniff.data)
+    match super::ext::lowercase_ext(sniff.path).as_deref() {
+        Some("rst") => {
+            sniff.ext_type() == Some(FileType::Text) && rst_document_structure(sniff.data, false)
+        }
+        Some("doctest") => rst_document_structure(sniff.data, true),
+        _ => false,
+    }
 }
 
 /// How much of a REXX or ABAP source is read.
@@ -235,7 +244,9 @@ fn ftp_commands(data: &[u8]) -> Option<()> {
 const RST_WINDOW: usize = 16 * 1024;
 
 /// Two or more underlined headings, and a directive or a literal block.
-fn rst_document_structure(data: &[u8]) -> bool {
+/// `doctest_prompts` lets a `>>> ` interpreter prompt stand for the literal
+/// block, as it does in a doctest file.
+fn rst_document_structure(data: &[u8], doctest_prompts: bool) -> bool {
     let data = strip_utf8_bom(data);
     let head = data.get(..RST_WINDOW).unwrap_or(data);
     let lines: Vec<&[u8]> = head.split(|b| *b == b'\n').collect();
@@ -250,6 +261,9 @@ fn rst_document_structure(data: &[u8]) -> bool {
             .trim_ascii();
         if line.starts_with(b".. ") && line.windows(2).any(|w| w == b"::") {
             directive = true;
+        }
+        if doctest_prompts && line.starts_with(b">>> ") {
+            literal_block = true;
         }
         if line.ends_with(b"::") {
             literal_block |= lines

@@ -217,3 +217,22 @@ fn mz_rejects_incoherent_geometry() {
     changed[6..8].copy_from_slice(&2u16.to_le_bytes());
     assert!(!looks_like_dos_mz(&changed));
 }
+
+#[test]
+fn entry_jump_into_the_tail_of_a_large_host_is_followed() {
+    // An appended program: the entry jumps over a 2000-byte host to code at
+    // the end, where the selector and the service call are not adjacent.
+    let mut image = vec![0xFF; 2000];
+    let tail = [0xB4, 0x4C, 0xB0, 0x00, 0xCD, 0x21];
+    let rel = u16::try_from(image.len() - 3).unwrap().to_le_bytes();
+    image[..3].copy_from_slice(&[0xE9, rel[0], rel[1]]);
+    image.extend_from_slice(&tail);
+    assert!(is_com(&image));
+
+    // The same jump into a tail that never selects a DOS service stays
+    // unrecognized: reaching the end of the file proves nothing by itself.
+    let mut inert = image.clone();
+    let at = inert.len() - tail.len();
+    inert[at..].copy_from_slice(&[0xB0, 0x4C, 0x90, 0x90, 0xCD, 0x21]);
+    assert!(!is_com(&inert));
+}

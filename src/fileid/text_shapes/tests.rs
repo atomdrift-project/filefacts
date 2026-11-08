@@ -22,7 +22,7 @@ Type::
 >>> import kotlin.io.println
 >>> println("interface")
 "#;
-    assert!(rst_document_structure(doc));
+    assert!(rst_document_structure(doc, false));
     let id = FileId::from_path_and_bytes(Path::new("README.rst"), doc);
     assert_eq!(id.file_type(), FileType::Text);
     assert!(!id.extension_mismatch());
@@ -34,7 +34,7 @@ fn source_named_rst_without_document_structure_stays_source() {
 import kotlin.io.println
 fun main() { println("ok") }
 "#;
-    assert!(!rst_document_structure(source));
+    assert!(!rst_document_structure(source, false));
     let id = FileId::from_path_and_bytes(Path::new("source.rst"), source);
     assert_eq!(id.file_type(), FileType::Kotlin);
     assert!(id.extension_mismatch());
@@ -43,7 +43,7 @@ fun main() { println("ok") }
 #[test]
 fn ordinary_text_with_one_underlined_heading_is_not_enough() {
     let text = b"Title\n=====\n\nSome prose with a Python-like phrase: return value\n";
-    assert!(!rst_document_structure(text));
+    assert!(!rst_document_structure(text, false));
 }
 
 /// The bitmask is exactly [`CODE_PUNCT`], over every byte value.
@@ -86,4 +86,36 @@ fn recognizes_report_but_not_comment_only_or_binary() {
     let mut binary = source.to_vec();
     binary.extend_from_slice(&[0; 32]);
     assert!(!looks_like_abap_report(&binary));
+}
+
+#[test]
+fn sectioned_doctest_file_is_text_not_a_language() {
+    let doc = br#".. Copyright (C) 2001-2022 NLTK Project
+.. For license information, see LICENSE.TXT
+
+=========
+Semantics
+=========
+
+    >>> from nltk.sem import Valuation, Model
+    >>> v = [('adam', 'b1'), ('betty', 'g1'), ('fido', 'd1'),
+    ... ('girl', set(['g1', 'g2'])), ('boy', set(['b1', 'b2']))]
+    >>> val = Valuation(v)
+
+Evaluation
+----------
+
+    >>> print(val['adam'])
+    b1
+"#;
+    let id = FileId::from_path_and_bytes(Path::new("semantics.doctest"), doc);
+    assert_eq!(id.file_type(), FileType::Text);
+}
+
+#[test]
+fn doctest_named_source_without_headings_is_not_text() {
+    let source = br#"function main() { const v = [('a', 'b'), ('c', 'd')]; return v; }
+>>> main()
+"#;
+    assert!(!rst_document_structure(source, true));
 }

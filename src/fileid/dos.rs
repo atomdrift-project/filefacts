@@ -94,6 +94,11 @@ fn looks_like_dos_com_overwriter(data: &[u8]) -> bool {
 /// Follow a bounded 16-bit entry path rather than searching for unrelated
 /// selector/interrupt bytes. Track AH across argument setup and segment prefixes;
 /// invalidate it on writes, other interrupts and the continuation of a call.
+///
+/// The path may lead anywhere in the image: an appending virus or a packed
+/// stub opens with a near jump to code at the end of a host of any size. The
+/// caller has already bounded the body to one COM segment, and the step budget
+/// bounds the work, so a branch target is followed wherever it lands.
 fn has_entry_dos_service_call(data: &[u8]) -> bool {
     use iced_x86::{
         Decoder, DecoderOptions, FlowControl, InstructionInfoFactory, Mnemonic, OpAccess, OpKind,
@@ -101,7 +106,7 @@ fn has_entry_dos_service_call(data: &[u8]) -> bool {
     };
     use std::collections::{HashSet, VecDeque};
 
-    let prefix = data.get(..512).unwrap_or(data);
+    let prefix = data.get(..DOS_COM_MAX_SIZE).unwrap_or(data);
     let mut pending = VecDeque::from([(0usize, None::<u8>, 0u8)]);
     let mut seen = HashSet::new();
     let mut info = InstructionInfoFactory::new();
