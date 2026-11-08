@@ -1,7 +1,8 @@
-//! Package-consistency judgements over a package's own manifest: a name one
-//! edit from a popular package, identity fields that agree on another
-//! package's name, a summary copied from one, and a manifest that depends on
-//! itself.
+//! Package-consistency judgements over a package's own manifest: identity
+//! fields that agree on another package's name, and a manifest that depends
+//! on itself. Comparisons against named popular packages -- a name one edit
+//! away, a summary copied verbatim -- are traits, so no package names live
+//! here.
 //!
 //! Each compares claims one manifest makes (plus, for an sdist, the
 //! `requires.txt` setuptools writes beside its `PKG-INFO`), so each is a
@@ -14,122 +15,12 @@ use super::core_metadata::CoreMetadata;
 use crate::metric;
 use crate::output::Metrics;
 
-/// Popular and high-value PyPI distribution names, one edit away from which
-/// a distribution name is almost certainly a typosquat.
-///
-/// Public knowledge -- top-download and documented impersonation targets --
-/// not derived from any sample set. `boto` is absent although real: it is one
-/// edit from `boto3`, and the legitimate legacy package would flag itself.
-const POPULAR_PACKAGES: &[&str] = &[
-    "requests",
-    "urllib3",
-    "boto3",
-    "botocore",
-    "setuptools",
-    "numpy",
-    "pandas",
-    "python-dateutil",
-    "six",
-    "certifi",
-    "idna",
-    "charset-normalizer",
-    "wheel",
-    "pip",
-    "typing-extensions",
-    "packaging",
-    "pyyaml",
-    "cryptography",
-    "click",
-    "jinja2",
-    "flask",
-    "django",
-    "fastapi",
-    "aiohttp",
-    "httpx",
-    "starlette",
-    "pydantic",
-    "sqlalchemy",
-    "scipy",
-    "scikit-learn",
-    "matplotlib",
-    "pillow",
-    "torch",
-    "tensorflow",
-    "keras",
-    "transformers",
-    "openai",
-    "langchain",
-    "langchain-openai",
-    "discord",
-    "discord-py",
-    "colorama",
-    "rich",
-    "tqdm",
-    "beautifulsoup4",
-    "lxml",
-    "selenium",
-    "pytest",
-    "attrs",
-    "markupsafe",
-    "werkzeug",
-    "itsdangerous",
-    "redis",
-    "pymongo",
-    "psycopg2",
-    "protobuf",
-    "grpcio",
-    "pycryptodome",
-    "paramiko",
-    "web3",
-    "eth-account",
-    "eth-utils",
-    "eth-abi",
-    "solana",
-    "pyfiglet",
-    "s3transfer",
-    "crytic-compile",
-    "psutil",
-    "pyjwt",
-    "oauthlib",
-    "pytz",
-    "babel",
-    "sphinx",
-    "tornado",
-    "gunicorn",
-    "uvicorn",
-    "celery",
-    "dnspython",
-    "figlet",
-];
-
-/// Popular packages' own distinctive one-line summaries, with the
-/// distribution that owns each. A rename-clone copies its target's metadata
-/// verbatim, so one of these under another `Name` is copied identity with the
-/// label swapped (`fluxhttp` shipping aiohttp's tagline). Exact normalised
-/// match only, so a generic tagline never earns a place here, and the owner
-/// itself is exempt by construction. Public knowledge, not sample-derived.
-const POPULAR_SUMMARIES: &[(&str, &str)] = &[
-    ("async http client/server framework (asyncio)", "aiohttp"),
-    ("python http for humans.", "requests"),
-    ("cross-platform colored terminal text.", "colorama"),
-    ("composable command line interface toolkit", "click"),
-    ("the uncompromising code formatter.", "black"),
-    ("fast, extensible progress meter", "tqdm"),
-    ("screen-scraping library", "beautifulsoup4"),
-    ("data validation using python type hints", "pydantic"),
-    ("the little asgi library that shines.", "starlette"),
-];
-
 /// Emit the `consistency.*` judgements over a Python Core Metadata block,
 /// counting an sdist's `requires.txt` toward the self-dependency.
 ///
-/// - `consistency.name_typosquat` — 1 when `Name` is one edit from a popular
-///   package without being it.
 /// - `consistency.metadata_identity_mismatch` — how many advertised identity
 ///   fields (a `name:`-prefixed summary, a GitHub homepage's repository)
 ///   agree on one name other than `Name`, when at least two do; else 0.
-/// - `consistency.cloned_summary` — 1 when the summary is a popular package's
-///   own tagline and `Name` is not that package.
 /// - `consistency.self_dependency` — unconditional requirements naming the
 ///   package itself, when it declares any requirements.
 pub(super) fn core_metadata(
@@ -144,24 +35,10 @@ pub(super) fn core_metadata(
     else {
         return;
     };
-    let squat = !POPULAR_PACKAGES.contains(&name.as_str())
-        && POPULAR_PACKAGES
-            .iter()
-            .any(|popular| within_one_edit(&name, popular));
-    metrics.insert(
-        metric!("consistency.name_typosquat"),
-        f64::from(u8::from(squat)),
-    );
     metrics.insert(
         metric!("consistency.metadata_identity_mismatch"),
         f64::from(advertised_identity_mismatch(headers, &name)),
     );
-    if let Some(summary) = headers.first("summary") {
-        metrics.insert(
-            metric!("consistency.cloned_summary"),
-            f64::from(u8::from(cloned_summary(&name, summary))),
-        );
-    }
     if let Some(count) = python_self_dependencies(headers, requires_txt, &name) {
         metrics.insert(metric!("consistency.self_dependency"), f64::from(count));
     }
@@ -185,22 +62,6 @@ pub(super) fn npm_self_dependencies(manifest: &serde_json::Map<String, JsonValue
 /// PEP 503 normalisation: case folded, runs of `-`, `_` and `.` the same.
 fn normalize_name(name: &str) -> String {
     name.trim().to_ascii_lowercase().replace(['_', '.'], "-")
-}
-
-/// Whether `a` and `b` differ by at most one character edit (substitution,
-/// insertion, or deletion): Levenshtein distance at most 1.
-fn within_one_edit(a: &str, b: &str) -> bool {
-    let (a, b) = (a.as_bytes(), b.as_bytes());
-    if a.len().abs_diff(b.len()) > 1 {
-        return false;
-    }
-    if a.len() == b.len() {
-        return a.iter().zip(b).filter(|(x, y)| x != y).count() <= 1;
-    }
-    // The shorter must be the longer with one character removed.
-    let (short, long) = if a.len() < b.len() { (a, b) } else { (b, a) };
-    let split = short.iter().zip(long).take_while(|(x, y)| x == y).count();
-    short.get(split..) == long.get(split + 1..)
 }
 
 /// How many advertised identity fields agree on one name that is not the
@@ -240,18 +101,6 @@ fn advertised_identity_mismatch(headers: &CoreMetadata, name: &str) -> u32 {
         *counts.entry(other).or_default() += 1;
     }
     counts.into_values().max().filter(|&n| n >= 2).unwrap_or(0)
-}
-
-/// Whether `summary` is a popular package's own tagline under another name.
-fn cloned_summary(name: &str, summary: &str) -> bool {
-    let summary = summary
-        .to_ascii_lowercase()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    POPULAR_SUMMARIES
-        .iter()
-        .any(|(tagline, owner)| summary == *tagline && name != normalize_name(owner))
 }
 
 /// Unconditional requirements naming the package itself, from its

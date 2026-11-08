@@ -533,12 +533,18 @@ fn first_byte_signature(p: &Probe<'_, '_>) -> Option<Found> {
             if second == b'Z' {
                 let file_type = if looks_like_ne_executable(data) {
                     FileType::Ne
+                } else if new_header(data).is_some_and(|h| h.starts_with(b"PE\0\0"))
+                    || coherent_pe_with_damaged_signature(data)
+                {
+                    FileType::Pe
                 } else if super::dos::looks_like_dos_mz(data) && !has_extended_mz_header(data) {
                     // Preserve a validated 16-bit DOS image for generic byte
                     // analysis rather than routing it to the PE parser.
                     FileType::Data
                 } else {
-                    FileType::Pe
+                    // `MZ` and nothing behind it -- text that happens to start
+                    // so, a truncated header: let the other rules type it.
+                    return None;
                 };
                 Some((file_type, DetectionSource::Magic))
             } else if data.starts_with(b"MSCF") {
@@ -1063,6 +1069,72 @@ fn has_extended_mz_header(data: &[u8]) -> bool {
 /// NE is a 16-bit executable format; it must not be routed to the PE parser.
 fn looks_like_ne_executable(data: &[u8]) -> bool {
     data.starts_with(b"MZ") && new_header(data).is_some_and(|header| header.starts_with(b"NE"))
+}
+
+/// A PE image whose `PE\0\0` signature was overwritten -- a reflective
+/// loader's trick -- but whose headers still describe a loadable program:
+/// a known machine and optional-header magic, a sane section count, the
+/// executable bit, every section inside the image and the file, and an entry
+/// point in stored executable bytes. MZ-prefixed text and truncated headers
+/// fail it.
+fn coherent_pe_with_damaged_signature(data: &[u8]) -> bool {
+    let u16_at = |at: usize| bytes::u16_le(data, at);
+    let u32_at = |at: usize| bytes::u32_le(data, at);
+    let check = || -> Option<bool> {
+        let nt = usize::try_from(u32_at(0x3c)?).ok()?;
+        if nt < 0x40 {
+            return Some(false);
+        }
+        let coff = nt.checked_add(4)?;
+        let machine = u16_at(coff)?;
+        let count = usize::from(u16_at(coff.checked_add(2)?)?);
+        let opt_size = usize::from(u16_at(coff.checked_add(16)?)?);
+        let characteristics = u16_at(coff.checked_add(18)?)?;
+        let opt = coff.checked_add(20)?;
+        let min_opt = match (machine, u16_at(opt)?) {
+            (0x014c, 0x010b) => 0xe0,
+            (0x8664 | 0xaa64, 0x020b) => 0xf0,
+            _ => return Some(false),
+        };
+        if !(1..=96).contains(&count) || opt_size < min_opt || characteristics & 2 == 0 {
+            return Some(false);
+        }
+        let entry = u32_at(opt.checked_add(16)?)?;
+        let image_size = u32_at(opt.checked_add(56)?)?;
+        let headers_size = usize::try_from(u32_at(opt.checked_add(60)?)?).ok()?;
+        let table = opt.checked_add(opt_size)?;
+        let table_end = table.checked_add(count.checked_mul(40)?)?;
+        if entry == 0
+            || entry >= image_size
+            || table_end > headers_size
+            || headers_size > data.len()
+        {
+            return Some(false);
+        }
+        let mut executable_entry = false;
+        for section in data.get(table..table_end)?.as_chunks::<40>().0 {
+            let field = |at: usize| bytes::u32_le(section, at);
+            let (virtual_size, virtual_start) = (field(8)?, field(12)?);
+            let (raw_size, raw_start, flags) = (field(16)?, field(20)?, field(36)?);
+            if virtual_start.checked_add(virtual_size.max(raw_size))? > image_size {
+                return Some(false);
+            }
+            if raw_size != 0 {
+                let start = usize::try_from(raw_start).ok()?;
+                let end = start.checked_add(usize::try_from(raw_size).ok()?)?;
+                if start < headers_size || end > data.len() {
+                    return Some(false);
+                }
+                // Stored executable bytes at the entry point, not a
+                // virtual-only zero-fill section with fabricated flags.
+                executable_entry |= flags & 0x2000_0000 != 0
+                    && entry >= virtual_start
+                    && entry < virtual_start.checked_add(raw_size)?;
+            }
+        }
+        Some(executable_entry)
+    };
+    check().unwrap_or(false)
 }
 
 /// The bytes from the header an MZ image's `e_lfanew` points at. `e_lfanew`

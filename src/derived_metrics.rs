@@ -378,12 +378,13 @@ pub(crate) fn emit_binary_aggregates(
 /// info, code signature) and the ELF section-header table would otherwise
 /// read as an overlay on every binary. PE passes `None`: its overlay stays
 /// "past the last section's raw data", Authenticode table included.
+/// Returns where the overlay starts.
 pub(crate) fn emit_binary_overlay(
     sections: &Sections,
     bytes: &[u8],
     image_end: Option<u64>,
     metrics: &mut Metrics,
-) {
+) -> Option<u64> {
     // Last on-disk extent across sections and the format's own image end.
     let file_size = bytes.len() as u64;
     let last_extent = sections
@@ -412,7 +413,9 @@ pub(crate) fn emit_binary_overlay(
                 [Span::new(last_extent, overlay_size)],
             );
         }
+        return Some(last_extent);
     }
+    None
 }
 
 #[cfg(test)]

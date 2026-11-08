@@ -37,6 +37,16 @@ fn renamed_pep621_document_requires_structured_project_fields() {
     );
 }
 
+/// The smallest MZ image the PE gate accepts: `e_lfanew` (0x3c) pointing
+/// just past the DOS header at a `PE\0\0` signature.
+fn pe_stub() -> Vec<u8> {
+    let mut pe = vec![0u8; 0x44];
+    pe[..2].copy_from_slice(b"MZ");
+    pe[0x3c] = 0x40;
+    pe[0x40..].copy_from_slice(b"PE\0\0");
+    pe
+}
+
 /// Assert `data` named `path` is identified as `expected`.
 fn assert_detect(path: &str, data: &[u8], expected: FileType) {
     let Some(det) = detect(Path::new(path), data) else {

@@ -65,9 +65,22 @@ fn elf_magic() {
 
 #[test]
 fn pe_magic() {
-    let data = b"MZ\x90\x00\x03\x00\x00\x00";
-    let (ft, _) = detect_from_content(Path::new("app.exe"), data).unwrap();
+    let mut data = vec![0u8; 0x44];
+    data[..2].copy_from_slice(b"MZ");
+    data[0x3c] = 0x40;
+    data[0x40..].copy_from_slice(b"PE\0\0");
+    let (ft, _) = detect_from_content(Path::new("app.exe"), &data).unwrap();
     assert_eq!(ft, FileType::Pe);
+    // A truncated header and MZ-prefixed text are not PE.
+    for data in [
+        &b"MZ\x90\x00\x03\x00\x00\x00"[..],
+        b"MZ is a nice prefix for prose\n",
+    ] {
+        assert_ne!(
+            detect_from_content(Path::new("app.exe"), data).map(|(ft, _)| ft),
+            Some(FileType::Pe)
+        );
+    }
 }
 
 #[test]
@@ -1740,4 +1753,66 @@ fn char_refs_without_digits_are_skipped_in_one_pass() {
     );
     assert_eq!(decode_char_refs(b"&#86;B&#x53;"), "VBS");
     assert_eq!(decode_char_refs(b"&#0000086;&#8 6;"), "V&#8 6;");
+}
+
+/// A one-section i386 image whose `PE\0\0` was overwritten (`TL\0\0`).
+fn damaged_signature_fixture() -> Vec<u8> {
+    let mut data = vec![0u8; 0x400];
+    data[..2].copy_from_slice(b"MZ");
+    data[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+    data[0x80..0x84].copy_from_slice(b"TL\0\0");
+    data[0x84..0x86].copy_from_slice(&0x14cu16.to_le_bytes());
+    data[0x86..0x88].copy_from_slice(&1u16.to_le_bytes());
+    data[0x94..0x96].copy_from_slice(&0xe0u16.to_le_bytes());
+    data[0x96..0x98].copy_from_slice(&0x102u16.to_le_bytes());
+    data[0x98..0x9a].copy_from_slice(&0x10bu16.to_le_bytes());
+    data[0xa8..0xac].copy_from_slice(&0x1000u32.to_le_bytes());
+    data[0xd0..0xd4].copy_from_slice(&0x2000u32.to_le_bytes());
+    data[0xd4..0xd8].copy_from_slice(&0x200u32.to_le_bytes());
+    let sec = &mut data[0x178..0x1a0];
+    sec[..5].copy_from_slice(b".text");
+    sec[8..12].copy_from_slice(&0x200u32.to_le_bytes());
+    sec[12..16].copy_from_slice(&0x1000u32.to_le_bytes());
+    sec[16..20].copy_from_slice(&0x200u32.to_le_bytes());
+    sec[20..24].copy_from_slice(&0x200u32.to_le_bytes());
+    sec[36..40].copy_from_slice(&0x60000020u32.to_le_bytes());
+    data[0x200] = 0xc3;
+    data
+}
+
+#[test]
+fn damaged_pe_signature_is_still_pe() {
+    let mut data = damaged_signature_fixture();
+    for signature in [*b"TL\0\0", *b"ABCD", [0; 4]] {
+        data[0x80..0x84].copy_from_slice(&signature);
+        for name in ["sample", "sample.exe", "notes.txt"] {
+            let (ft, _) = detect_from_content(Path::new(name), &data).unwrap();
+            assert_eq!(ft, FileType::Pe, "{name}");
+        }
+    }
+}
+
+#[test]
+fn damaged_pe_requires_stored_executable_entry() {
+    let data = damaged_signature_fixture();
+    for (offset, replacement) in [
+        (0x3c, u32::MAX),    // out-of-bounds NT header
+        (0x94, 0),           // missing optional header
+        (0xa8, 0x1800),      // entry outside stored section bytes
+        (0xd0, 0x1000),      // section outside declared image
+        (0x188, 0),          // no stored code
+        (0x18c, 0x300),      // raw section exceeds file
+        (0x19c, 0x40000040), // non-executable section
+    ] {
+        let mut invalid = data.clone();
+        invalid[offset..offset + 4].copy_from_slice(&replacement.to_le_bytes());
+        assert!(
+            !coherent_pe_with_damaged_signature(&invalid),
+            "offset {offset:x}"
+        );
+    }
+    assert!(!coherent_pe_with_damaged_signature(&data[..0x3ff]));
+    assert!(!coherent_pe_with_damaged_signature(
+        b"MZ = 8    # ordinary text\n"
+    ));
 }

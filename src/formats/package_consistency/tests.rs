@@ -7,31 +7,6 @@ fn metrics_of(pkg_info: &str, requires_txt: Option<&str>) -> Metrics {
 }
 
 #[test]
-fn edit_distance_is_at_most_one() {
-    assert!(within_one_edit("requests", "requests"));
-    assert!(within_one_edit("rsquests", "requests")); // substitution
-    assert!(within_one_edit("requets", "requests")); // deletion
-    assert!(within_one_edit("requestss", "requests")); // insertion
-    assert!(within_one_edit("colotama", "colorama"));
-    assert!(!within_one_edit("reqeusts", "requests")); // transposition is two
-    assert!(!within_one_edit("req", "requests"));
-}
-
-#[test]
-fn typosquat_flags_a_near_miss_but_not_the_real_package() {
-    let squat = metrics_of("Metadata-Version: 2.1\nName: colotama\n", None);
-    assert_eq!(squat.get("consistency.name_typosquat"), Some(1.0));
-    let real = metrics_of("Metadata-Version: 2.1\nName: colorama\n", None);
-    assert_eq!(real.get("consistency.name_typosquat"), Some(0.0));
-    // PEP 503: case and separators do not make a different name.
-    let spelled = metrics_of("Metadata-Version: 2.1\nName: Python_DateUtil\n", None);
-    assert_eq!(spelled.get("consistency.name_typosquat"), Some(0.0));
-    // No name, nothing judged.
-    let nameless = metrics_of("Metadata-Version: 2.1\nSummary: x\n", None);
-    assert_eq!(nameless.get("consistency.name_typosquat"), None);
-}
-
-#[test]
 fn identity_mismatch_needs_two_fields_agreeing_on_another_name() {
     let copied = metrics_of(
         "Name: ether-account\nSummary: eth-account: Sign Ethereum transactions\n\
@@ -54,22 +29,6 @@ fn identity_mismatch_needs_two_fields_agreeing_on_another_name() {
         None,
     );
     assert_eq!(own.get("consistency.metadata_identity_mismatch"), Some(0.0));
-}
-
-#[test]
-fn cloned_summary_is_a_popular_tagline_under_another_name() {
-    let clone = metrics_of(
-        "Name: fluxhttp\nSummary: Async  HTTP client/server framework (asyncio)\n",
-        None,
-    );
-    assert_eq!(clone.get("consistency.cloned_summary"), Some(1.0));
-    let owner = metrics_of(
-        "Name: aiohttp\nSummary: Async http client/server framework (asyncio)\n",
-        None,
-    );
-    assert_eq!(owner.get("consistency.cloned_summary"), Some(0.0));
-    let no_summary = metrics_of("Name: fluxhttp\n", None);
-    assert_eq!(no_summary.get("consistency.cloned_summary"), None);
 }
 
 #[test]

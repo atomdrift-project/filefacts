@@ -187,10 +187,10 @@ fn extract_as(bytes: &[u8], file_type: FileType) -> (Result<(), Error>, Values, 
 }
 
 #[test]
-fn bzip2_and_compressed_packages_report_format_only() {
-    // No bzip2 decoder, and packages are read by their own modules: the
-    // bytes are never inflated here.
-    for (file_type, label) in [(FileType::TarBz2, "tar.bz2"), (FileType::Npm, "npm")] {
+fn bzip2_and_alpine_packages_report_format_only() {
+    // No bzip2 decoder, and an Alpine apk's concatenated streams are its own
+    // module's: the bytes are never inflated here.
+    for (file_type, label) in [(FileType::TarBz2, "tar.bz2"), (FileType::ApkAlpine, "apk")] {
         let (result, values, _) = extract_as(b"any bytes", file_type);
         assert!(result.is_ok(), "label-only is not a parse failure");
         assert_eq!(
@@ -450,4 +450,30 @@ fn damaged_header_keeps_the_members_walked_before_it() {
     let listed = values.get("archive.members").and_then(|x| x.as_array());
     assert_eq!(listed.map(Vec::len), Some(1));
     assert_eq!(metrics.get("archive.member_count"), Some(1.0));
+}
+
+#[test]
+fn compressed_packages_list_their_members() {
+    use std::io::Write;
+    let tar = build_tar(&[
+        ("package/package.json", 0o644, 0, 0, 1_700_000_000, b"{}"),
+        ("package/index.js", 0o644, 0, 0, 1_700_000_000, b"//"),
+    ]);
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gz.write_all(&tar).unwrap();
+    let gz = gz.finish().unwrap();
+    for file_type in [FileType::Npm, FileType::PythonSdist, FileType::Crate] {
+        let (result, values, _) = extract_as(&gz, file_type);
+        assert!(result.is_ok(), "{file_type:?}");
+        let members = values
+            .get("archive.members")
+            .and_then(|m| m.as_array())
+            .unwrap();
+        let paths: Vec<_> = members.iter().filter_map(|m| m["path"].as_str()).collect();
+        assert_eq!(
+            paths,
+            ["package/package.json", "package/index.js"],
+            "{file_type:?}"
+        );
+    }
 }

@@ -112,3 +112,39 @@ update:
         Some(&serde_json::json!("forged"))
     );
 }
+
+#[test]
+fn pe_certificate_range_reads_security_directory() {
+    let mut pe_data = vec![0u8; 0x420];
+    pe_data[0..2].copy_from_slice(b"MZ");
+    pe_data[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+    pe_data[0x80..0x84].copy_from_slice(b"PE\0\0");
+    pe_data[0x84..0x86].copy_from_slice(&0x014cu16.to_le_bytes());
+    pe_data[0x86..0x88].copy_from_slice(&1u16.to_le_bytes());
+    pe_data[0x94..0x96].copy_from_slice(&0xE0u16.to_le_bytes());
+    pe_data[0x98..0x9a].copy_from_slice(&0x010bu16.to_le_bytes());
+    pe_data[0x80 + 24 + 92..0x80 + 24 + 96].copy_from_slice(&16u32.to_le_bytes());
+
+    let data_directories = 0x80 + 24 + 96;
+    let security_dir = data_directories + (4 * 8);
+    pe_data[security_dir..security_dir + 4].copy_from_slice(&0x300u32.to_le_bytes());
+    pe_data[security_dir + 4..security_dir + 8].copy_from_slice(&0x120u32.to_le_bytes());
+
+    let section_table = 0x80 + 24 + 0xE0;
+    pe_data[section_table..section_table + 5].copy_from_slice(b".text");
+    pe_data[section_table + 16..section_table + 20].copy_from_slice(&0x200u32.to_le_bytes());
+    pe_data[section_table + 20..section_table + 24].copy_from_slice(&0x100u32.to_le_bytes());
+
+    // WIN_CERTIFICATE header at the certificate table offset (0x300)
+    pe_data[0x300..0x304].copy_from_slice(&0x120u32.to_le_bytes());
+    pe_data[0x304..0x306].copy_from_slice(&0x0200u16.to_le_bytes());
+    pe_data[0x306..0x308].copy_from_slice(&0x0002u16.to_le_bytes());
+
+    let parsed = crate::OpenOptions::new()
+        .path(std::path::Path::new("synthetic.exe"))
+        .open(&pe_data);
+    assert_eq!(
+        super::pe_certificate_range(parsed.values(), pe_data.len()),
+        Some(0x300..0x420),
+    );
+}

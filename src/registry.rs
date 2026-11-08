@@ -14,8 +14,6 @@
 //! signals (downloads, rating, age) land in [`Metrics`], where trait authors can
 //! threshold them with `min`/`max`.
 
-mod lookalike;
-
 use crate::metric;
 use crate::value_key;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -566,12 +564,6 @@ impl Registry {
         num(
             metric!("registry.version_removed"),
             self.version_removed.map(|b| f64::from(u8::from(b))),
-        );
-        // A name one keystroke from a popular package's, 0/1, and absent for an
-        // ecosystem with no popularity list; see lookalike.
-        num(
-            metric!("registry.name_lookalike"),
-            lookalike::name_lookalike(&self.ecosystem, &self.name),
         );
     }
 }

@@ -16,6 +16,7 @@ mod api_hash;
 mod clr;
 mod debug;
 mod exports;
+mod header_integrity;
 mod headers;
 mod imports;
 pub(super) mod layout;
@@ -44,6 +45,7 @@ use crate::output::Metrics;
 use crate::value_key;
 
 pub(super) fn extract(bytes: &[u8], mut ctx: super::ExtractCtx<'_>) -> Result<(), Error> {
+    header_integrity::emit(bytes, ctx.values, ctx.metrics);
     // goblin is handed the bytes with the structures it cannot survive
     // cleared (see `goblin_safe::prepare_pe`); every raw reader — section
     // data, overlay, Authenticode, the Rich header — keeps reading the

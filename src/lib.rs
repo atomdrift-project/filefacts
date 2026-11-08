@@ -197,6 +197,22 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 
 pub use embedded_sources::{EmbeddedSource, Origin, ScriptScope};
+pub use formats::archive_magic::archive_magic;
+/// The directory of a Compiled HTML Help (`.chm`) file: every internal
+/// file, its content section and extent. Consumers that decompress the
+/// LZX section read entries from here rather than re-walking the directory.
+pub mod chm {
+    pub use crate::formats::chm::{DirEntry, Directory, directory};
+}
+
+/// Whether `bytes` carries a whole PE or ELF executable inside it (raw or
+/// base64-encoded), by the header validation behind `binary.embedded[]`.
+/// For callers deciding whether an otherwise unidentified blob is worth
+/// analyzing as a wrapper.
+#[must_use]
+pub fn has_embedded_executable(bytes: &[u8]) -> bool {
+    !formats::embedded::scan(bytes).is_empty()
+}
 pub use error::Error;
 pub use fileid::{ArchiveFormat, Compression, Container, FileId, FileType, Group, container_of};
 pub use output::EntryType;
@@ -893,7 +909,22 @@ fn run_extraction(
             derived_metrics::emit_binary_aggregates(&sections, &strings, bytes, &mut metrics);
         }
         if image_end.is_some() || !sections.is_empty() {
-            derived_metrics::emit_binary_overlay(&sections, bytes, image_end, &mut metrics);
+            let overlay =
+                derived_metrics::emit_binary_overlay(&sections, bytes, image_end, &mut metrics);
+            // The archive an ELF or Mach-O overlay starts with (a PE's comes
+            // from its own extent, which leaves out the Authenticode table).
+            if values
+                .lookup(value_key!("binary.overlay_archive"))
+                .is_none()
+                && let Some(kind) = overlay
+                    .and_then(|start| bytes.get(crate::bytes::sat_usize(start)..))
+                    .and_then(formats::archive_magic::archive_magic)
+            {
+                values.insert_key(
+                    value_key!("binary.overlay_archive"),
+                    serde_json::Value::String(kind.into()),
+                );
+            }
         }
 
         // Per-kind counts for ergonomic rule filtering. Derived from the

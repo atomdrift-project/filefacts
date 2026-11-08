@@ -44,19 +44,24 @@ fn elf_mismatch() {
 
 #[test]
 fn pe_magic() {
-    assert_detect("app.exe", b"MZ\x90\x00\x03\x00\x00\x00", FileType::Pe);
+    assert_detect("app.exe", &pe_stub(), FileType::Pe);
+    // `MZ` with no image behind it is not a PE, whatever the name says.
+    assert_ne!(
+        detect(Path::new("app.exe"), b"MZ\x90\x00\x03\x00\x00\x00").map(|d| d.file_type),
+        Some(FileType::Pe)
+    );
 }
 
 #[test]
 fn pe_extension_is_consistent() {
-    let det = detect(Path::new("app.exe"), b"MZ\x90\x00\x03\x00\x00\x00").unwrap();
+    let det = detect(Path::new("app.exe"), &pe_stub()).unwrap();
     assert_eq!(det.file_type, FileType::Pe);
     assert!(!det.extension_mismatch());
 }
 
 #[test]
 fn pe_mismatch() {
-    let det = detect(Path::new("font.woff2"), b"MZ\x90\x00\x03\x00\x00\x00").unwrap();
+    let det = detect(Path::new("font.woff2"), &pe_stub()).unwrap();
     assert_eq!(det.file_type, FileType::Pe);
     assert!(det.extension_mismatch());
 }

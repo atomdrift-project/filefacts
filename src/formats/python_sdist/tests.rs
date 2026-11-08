@@ -203,5 +203,4 @@ fn requires_txt_counts_toward_the_self_dependency() {
     let mut out = crate::formats::Sinks::default();
     extract(&bytes, out.ctx()).unwrap();
     assert_eq!(out.metrics.get("consistency.self_dependency"), Some(1.0));
-    assert_eq!(out.metrics.get("consistency.name_typosquat"), Some(0.0));
 }

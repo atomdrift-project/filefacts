@@ -22,6 +22,7 @@ use crate::value_key;
 mod ani;
 mod apk_alpine;
 mod apk_android;
+pub(crate) mod archive_magic;
 mod archive_stats;
 mod asar;
 mod axml;
@@ -32,7 +33,7 @@ mod builder_paths;
 mod cab;
 mod carrier;
 pub(crate) mod cfml;
-mod chm;
+pub(crate) mod chm;
 mod class;
 pub(crate) mod cms;
 pub(crate) mod common;
@@ -45,7 +46,9 @@ mod deb;
 mod desktop_entry;
 mod dex;
 mod dmg;
+mod dotnet_bundle;
 mod elf;
+pub(crate) mod embedded;
 mod embedded_php;
 mod font;
 mod gem;
@@ -55,6 +58,7 @@ mod go_pclntab;
 pub(crate) mod goblin_safe;
 mod image4;
 mod image_stats;
+mod installer;
 pub(crate) mod iso;
 mod jar;
 mod jpeg;
@@ -68,6 +72,8 @@ mod msbuild;
 mod ne;
 mod nib;
 mod npm;
+mod npm_facts;
+mod npm_manifest;
 mod nupkg;
 mod oci;
 mod ole2;
@@ -463,9 +469,13 @@ pub(crate) fn extract(
         // A bare package.json: the same npm.* identity layer the tarball path
         // emits, then the verbatim JSON tree, from one parse.
         FileType::PackageJson => {
-            if let Some(manifest) = structured::parse_manifest_json(bytes, ctx.values)? {
-                npm::emit(&manifest, ctx.values, ctx.metrics);
-                structured::merge_document(manifest, ctx.values, ctx.errors);
+            if structured::manifest_fits(bytes, ctx.values)
+                && let Some(manifest) = npm_manifest::parse(bytes)
+            {
+                npm_manifest::emit(&manifest, bytes, ctx.values, ctx.metrics);
+                npm::dependency_imports(&manifest.doc, bytes, ctx.symbols);
+                npm::emit(&manifest.doc, ctx.values, ctx.metrics);
+                structured::merge_document(manifest.doc, ctx.values, ctx.errors);
             }
             Ok(())
         }
@@ -814,6 +824,38 @@ pub(crate) fn extract(
         builder_paths::emit(bytes, pdb_path.as_deref(), ctx.values);
     }
 
+    // Whole executables carried inside a PE, an ELF (not a core dump, whose
+    // memory naturally holds the images it ran) or an unidentified blob.
+    let scans_embedded = match file_type {
+        FileType::Pe => true,
+        FileType::Elf => {
+            ctx.values
+                .lookup(value_key!("elf.type"))
+                .and_then(serde_json::Value::as_str)
+                != Some("core")
+        }
+        FileType::Data | FileType::Unknown => bytes.len() <= 32 << 20,
+        _ => false,
+    };
+    if scans_embedded {
+        let signature = (file_type == FileType::Pe)
+            .then(|| pe_certificate_range(ctx.values, bytes.len()))
+            .flatten();
+        let embedded = embedded::emit(bytes, signature, ctx.values, ctx.metrics);
+        if file_type == FileType::Pe {
+            installer::emit(bytes, &embedded, ctx.values);
+        }
+    }
+    // A macOS program built by PyInstaller or Nuitka carries the same
+    // payload markers; Mach-O hosts are not scanned for embedded images.
+    if file_type == FileType::MachO {
+        installer::emit(bytes, &[], ctx.values);
+    }
+    // A .NET single-file bundle rides on its apphost: a PE, ELF or Mach-O.
+    if matches!(file_type, FileType::Pe | FileType::Elf | FileType::MachO) {
+        dotnet_bundle::emit(bytes, ctx.values);
+    }
+
     // Cross-format binary attribution derived from the merged symbol
     // view (sanitizer instrumentation, FORTIFY_SOURCE wrappers).
     // Skipped silently when no symbols were collected.
@@ -829,6 +871,21 @@ pub(crate) fn extract(
     source_meta::extract(bytes, file_type, ctx.values);
 
     result
+}
+
+/// The file range of a PE's certificate table (its data directory entry
+/// holds a file offset, not an RVA), from `pe.data_directories[]`.
+fn pe_certificate_range(values: &Values, len: usize) -> Option<std::ops::Range<usize>> {
+    let directories = values
+        .lookup(value_key!("pe.data_directories"))?
+        .as_array()?;
+    let certificate = directories
+        .iter()
+        .find(|d| d.get("name").and_then(serde_json::Value::as_str) == Some("certificate"))?;
+    let start = usize::try_from(certificate.get("rva")?.as_u64()?).ok()?;
+    let size = usize::try_from(certificate.get("size")?.as_u64()?).ok()?;
+    let end = start.checked_add(size)?;
+    (start > 0 && size > 0 && end <= len).then_some(start..end)
 }
 
 #[cfg(test)]

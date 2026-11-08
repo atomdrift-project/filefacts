@@ -180,3 +180,13 @@ fn a_huge_entry_name_length_does_not_panic() {
     assert_eq!(v.get("chm.entries"), Some(&serde_json::json!(["/a.html"])));
     assert_eq!(m.get("chm.user_entry_count"), Some(1.0));
 }
+
+#[test]
+fn directory_needs_a_version_3_itsf_header() {
+    assert!(directory(b"not a CHM file at all not even close").is_none());
+    assert!(directory(b"ITSF").is_none());
+    let mut v2 = vec![0u8; 0x60];
+    v2[..4].copy_from_slice(b"ITSF");
+    v2[4..8].copy_from_slice(&2u32.to_le_bytes());
+    assert!(directory(&v2).is_none());
+}

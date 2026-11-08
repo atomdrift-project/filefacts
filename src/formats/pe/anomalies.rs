@@ -189,10 +189,12 @@ pub(super) fn inflated_sections(pe: &PE<'_>, values: &mut Values) {
 /// - `pe.entry_outside_sections`    — EP non-zero, not in any section,
 ///   and the file is an EXE (not a DLL/driver where EP=0 is normal).
 /// - `pe.has_overlay`, `pe.overlay_offset`, `pe.overlay_size`,
-///   `pe.overlay_end` — overlay extent in file-offset space.
+///   `pe.overlay_end` — overlay extent in file-offset space (the
+///   Authenticode table at the end of the file is not overlay).
 ///
 /// Emits to values:
 /// - `pe.entry_section` — name of the section containing the EP RVA.
+/// - `binary.overlay_archive` — the archive the overlay starts with.
 pub(super) fn entry_and_overlay(
     pe: &PE<'_>,
     bytes: &[u8],
@@ -270,6 +272,15 @@ pub(super) fn entry_and_overlay(
         metric!("pe.overlay_size"),
         (overlay_end - sections_end) as f64,
     );
+    if let Some(kind) = bytes
+        .get(crate::bytes::sat_usize(sections_end)..crate::bytes::sat_usize(overlay_end))
+        .and_then(crate::formats::archive_magic::archive_magic)
+    {
+        values.insert_key(
+            value_key!("binary.overlay_archive"),
+            serde_json::Value::String(kind.into()),
+        );
+    }
 }
 
 /// Header-arithmetic anomalies pefile flags as tampering signals.

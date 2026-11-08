@@ -56,15 +56,30 @@ pub(super) fn parse_manifest_json(
     bytes: &[u8],
     values: &mut Values,
 ) -> Result<Option<JsonValue>, Error> {
-    let limit = usize::try_from(super::bounded::MAX_MANIFEST_BYTES).unwrap_or(usize::MAX);
-    if bytes.len() > limit {
-        tracing::debug!(target: "filefacts::structured", len = bytes.len(), limit, "manifest over the parse cap; not parsed");
-        record_parse_skipped(bytes.len(), limit, values);
+    if !manifest_fits(bytes, values) {
         return Ok(None);
     }
     serde_json::from_slice(bytes)
         .map(Some)
         .map_err(|e| Error::malformed_caused_by("json", e))
+}
+
+/// Whether a named manifest is within
+/// [`MAX_MANIFEST_BYTES`](super::bounded::MAX_MANIFEST_BYTES); one over it
+/// gets the `json.parse.*` skip record instead of a parse.
+pub(super) fn manifest_fits(bytes: &[u8], values: &mut Values) -> bool {
+    let limit = usize::try_from(super::bounded::MAX_MANIFEST_BYTES).unwrap_or(usize::MAX);
+    if bytes.len() > limit {
+        tracing::debug!(target: "filefacts::structured", len = bytes.len(), limit, "manifest over the parse cap; not parsed");
+        record_parse_skipped(bytes.len(), limit, values);
+        return false;
+    }
+    true
+}
+
+/// JSON with `//` and `/* */` comments and trailing commas, or `None`.
+pub(super) fn parse_jsonc(bytes: &[u8]) -> Option<JsonValue> {
+    json::parse_lenient(bytes, json::CommentStyle::Jsonc)
 }
 
 /// [`parse_manifest_json`], then merge the document into `values`.

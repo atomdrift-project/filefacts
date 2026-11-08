@@ -6,16 +6,16 @@
 //! the data blocks via stream-position arithmetic.
 //!
 //! Plain `.tar` and the packages built on one (gem, OCI image, Gentoo
-//! binpkg) are walked in place. A bare `.tar.gz`/`.tar.xz`/`.tar.zst` is
-//! walked through a bounded decoder ([`MAX_TARGZ_SEARCH`] inflated bytes)
-//! so its member listing and `archive.*` aggregates exist on the archive
-//! itself: callers unpack those members without resubmitting the inner tar,
-//! which left archive-scope rules blind to them. Tar headers are read and
-//! data blocks skipped; nothing is decoded beyond the stream inflation.
-//! `.tar.bz2` (no bzip2 decoder) and the packages built on a compressed tar
-//! (npm, crate, sdist, Alpine apk, FreeBSD/Arch pkg, xbps) keep the
-//! `archive.format.kind` label only; their identity is read by their own
-//! modules.
+//! binpkg) are walked in place. A tar inside a gzip, xz or zstd stream --
+//! a bare `.tar.gz`/`.tar.xz`/`.tar.zst` and the packages built on one (npm,
+//! crate, sdist, FreeBSD/Arch pkg, xbps) -- is walked through a bounded
+//! decoder ([`MAX_TARGZ_SEARCH`] inflated bytes) so its member listing and
+//! `archive.*` aggregates exist on the archive itself: callers unpack those
+//! members without resubmitting the inner tar, which left archive-scope
+//! rules blind to them. Tar headers are read and data blocks skipped;
+//! nothing is decoded beyond the stream inflation. `.tar.bz2` (no bzip2
+//! decoder) and the Alpine apk (concatenated streams, its own module) keep
+//! the `archive.format.kind` label only.
 
 use std::io::Read;
 
@@ -81,13 +81,16 @@ pub(super) fn extract(
         limits.emit(values, value_key!("tar.limits"));
         return result;
     }
-    // Only the bare compressed tars are inflated (see the module doc); every
-    // other compressed variant is reported by label. That is the designed
-    // outcome for a well-formed file, so it returns Ok, not an error.
+    // Every tar inside a gzip, xz or zstd stream is inflated within the
+    // budget (see the module doc); an Alpine apk's concatenated streams are
+    // its own module's, and bzip2 has no decoder here, so those are reported
+    // by label. That is the designed outcome for a well-formed file, so it
+    // returns Ok, not an error.
     let decoder: Box<dyn Read + '_> = match (file_type, compression) {
-        (FileType::TarGz, Compression::Gzip) => Box::new(flate2::read::GzDecoder::new(bytes)),
-        (FileType::TarXz, Compression::Xz) => Box::new(xz_decoder(bytes)),
-        (FileType::TarZst, Compression::Zstd) => match zstd_decoder(bytes) {
+        (FileType::ApkAlpine, _) => return Ok(()),
+        (_, Compression::Gzip) => Box::new(flate2::read::GzDecoder::new(bytes)),
+        (_, Compression::Xz) => Box::new(xz_decoder(bytes)),
+        (_, Compression::Zstd) => match zstd_decoder(bytes) {
             Ok(decoder) => Box::new(decoder),
             Err(e) => {
                 tracing::debug!(target: "filefacts::tar", stage = "open", error = %e, "zstd decoder setup failed; label only");
@@ -114,6 +117,20 @@ pub(super) fn extract(
             format!("walked the first {MAX_TARGZ_SEARCH} inflated bytes"),
         );
     }
+    // A package's own module reads its manifest from the same stream and
+    // reports a corrupt one as the parse error; the walk's failure there is
+    // a listing cut short, not a second error.
+    let package = !matches!(
+        file_type,
+        FileType::TarGz | FileType::TarXz | FileType::TarZst
+    );
+    let result = match result {
+        Err(e) if package => {
+            limits.push("walk-error", format!("member listing ended early: {e}"));
+            Ok(())
+        }
+        other => other,
+    };
     limits.emit(values, value_key!("tar.limits"));
     result
 }

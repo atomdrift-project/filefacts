@@ -609,7 +609,7 @@ fn dos_com_with_source_extension_is_data() {
     assert_detect("Burger.m", &com, FileType::DosCom);
     assert_detect("Trivial.45.t", &com, FileType::DosCom);
     assert_detect("prog.com", &com, FileType::DosCom);
-    assert_detect("prog.com", b"MZ\x90\x00", FileType::Pe);
+    assert_detect("prog.com", &pe_stub(), FileType::Pe);
 }
 
 /// Content-addressed stores name files by hash or give them a generic data

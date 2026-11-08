@@ -100,6 +100,7 @@ pub(super) fn emit(manifest: &JsonValue, values: &mut Values, metrics: &mut Metr
     let Some(obj) = manifest.as_object() else {
         return;
     };
+    super::npm_facts::emit(obj, values, metrics);
     for (field, key) in [
         ("name", value_key!("npm.name")),
         ("version", value_key!("npm.version")),
@@ -142,6 +143,21 @@ pub(super) fn emit(manifest: &JsonValue, values: &mut Values, metrics: &mut Metr
                 values.insert_key(key, JsonValue::String(cmd.to_string()));
             }
         }
+        // Every script npm runs on its own during install or publish -- the
+        // ones a package author does not have to be asked to run.
+        let lifecycle: Vec<JsonValue> = LIFECYCLE_HOOKS
+            .iter()
+            .filter_map(|hook| {
+                let command = scripts.get(*hook)?.as_str()?;
+                Some(serde_json::json!({"hook": hook, "command": command}))
+            })
+            .collect();
+        if !lifecycle.is_empty() {
+            values.insert_key(
+                value_key!("npm.lifecycle_scripts"),
+                JsonValue::Array(lifecycle),
+            );
+        }
     }
     if let Some(mismatch) = name_repo_mismatch(obj) {
         metrics.insert(
@@ -164,6 +180,75 @@ pub(super) fn emit(manifest: &JsonValue, values: &mut Values, metrics: &mut Metr
     if let Some(count) = super::package_consistency::npm_self_dependencies(obj) {
         metrics.insert(metric!("consistency.self_dependency"), f64::from(count));
     }
+}
+
+/// The scripts npm runs by itself around install and publish.
+pub(super) const LIFECYCLE_HOOKS: [&str; 9] = [
+    "preinstall",
+    "install",
+    "postinstall",
+    "prepublish",
+    "prepare",
+    "prepack",
+    "postpack",
+    "publish",
+    "postpublish",
+];
+
+/// The dependency sections whose entries a package resolves at install time.
+pub(super) const DEPENDENCY_SECTIONS: [&str; 4] = [
+    "dependencies",
+    "devDependencies",
+    "peerDependencies",
+    "optionalDependencies",
+];
+
+/// Each declared dependency as an import symbol: the package name, its
+/// version spec in `library`, anchored at the entry's key in `bytes`.
+pub(super) fn dependency_imports(manifest: &JsonValue, bytes: &[u8], symbols: &mut crate::Symbols) {
+    let text = String::from_utf8_lossy(bytes);
+    for section in DEPENDENCY_SECTIONS {
+        let Some(entries) = manifest.get(section).and_then(JsonValue::as_object) else {
+            continue;
+        };
+        let section_start = text.find(&format!("\"{section}\"")).unwrap_or(0);
+        for (name, spec) in entries {
+            let offset = text
+                .get(section_start..)
+                .and_then(|rest| rest.find(&format!("\"{name}\"")))
+                .map(|rel| (section_start + rel) as u64);
+            let spec = spec.as_str();
+            // `"axois": "npm:axios@1"` installs axios under another name:
+            // the package is axios, and `axois` is only what it is called.
+            let (name, alias) = match spec.and_then(alias_target) {
+                Some(target) => (target.to_string(), Some(name.clone())),
+                None => (name.clone(), None),
+            };
+            symbols.push(crate::Symbol::Import {
+                name,
+                alias,
+                library: spec.map(str::to_string),
+                offset,
+                ordinal: None,
+            });
+        }
+    }
+}
+
+/// The package an `npm:` alias spec installs (`npm:@scope/pkg@1` →
+/// `@scope/pkg`).
+fn alias_target(spec: &str) -> Option<&str> {
+    let alias = spec.strip_prefix("npm:")?;
+    let name_end = if alias.starts_with('@') {
+        let package_start = alias.find('/')? + 1;
+        alias
+            .get(package_start..)?
+            .find('@')
+            .map_or(alias.len(), |at| package_start + at)
+    } else {
+        alias.find('@').unwrap_or(alias.len())
+    };
+    alias.get(..name_end).filter(|name| !name.is_empty())
 }
 
 /// Fold a string to its comparable core: no separators, no case.

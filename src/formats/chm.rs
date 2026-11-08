@@ -378,11 +378,53 @@ fn parse_reset_table(data: &[u8]) -> Option<ResetTable> {
     })
 }
 
-struct DirEntry {
-    name: String,
-    section: u64,
-    offset: u64,
-    length: u64,
+/// One PMGL directory entry: an internal file, its content section (0 is
+/// Uncompressed, 1 usually `MSCompressed`), and where it lies within that
+/// section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirEntry {
+    /// Internal path, e.g. `/index.html` or `::DataSpace/NameList`.
+    pub name: String,
+    /// Content section index.
+    pub section: u64,
+    /// Offset within the content section.
+    pub offset: u64,
+    /// Length in bytes.
+    pub length: u64,
+}
+
+/// A version-3 CHM's directory: every PMGL entry, and the file offset at
+/// which section-0 (Uncompressed) data begins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Directory {
+    /// File offset where section-0 data begins (ITSF `data_offset`).
+    pub data_offset: u64,
+    /// Every directory entry, in directory order.
+    pub entries: Vec<DirEntry>,
+    /// The walk stopped at its entry cap with more to read.
+    pub truncated: bool,
+}
+
+/// Read the ITSF header and ITSP/PMGL directory of a version-3 CHM.
+/// `None` when `bytes` is not one, or its directory lies outside the file.
+#[must_use]
+pub fn directory(bytes: &[u8]) -> Option<Directory> {
+    let header = bytes
+        .first_chunk::<0x60>()
+        .filter(|h| h.starts_with(b"ITSF"))?;
+    if bytes::u32_le(header, 0x04)? != 3 {
+        return None;
+    }
+    let section1_offset = bytes::sat_usize(bytes::u64_le(header, 0x48)?);
+    let section1_length = bytes::sat_usize(bytes::u64_le(header, 0x50)?);
+    let data_offset = bytes::u64_le(header, 0x58)?;
+    let dir = bytes.get(section1_offset..section1_offset.checked_add(section1_length)?)?;
+    let (entries, truncated) = parse_directory(dir);
+    Some(Directory {
+        data_offset,
+        entries,
+        truncated,
+    })
 }
 
 fn read_uncompressed<'a>(bytes: &'a [u8], data_offset: usize, e: &DirEntry) -> Option<&'a [u8]> {

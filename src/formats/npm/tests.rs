@@ -329,3 +329,23 @@ fn the_last_manifest_in_the_tarball_is_the_packages() {
     assert!(e.is_empty(), "{e:?}");
     assert_eq!(v.get("npm.name").and_then(JsonValue::as_str), Some("real"));
 }
+
+#[test]
+fn npm_aliases_import_the_installed_package() {
+    assert_eq!(alias_target("npm:axios@1"), Some("axios"));
+    assert_eq!(alias_target("npm:@scope/pkg@1.0"), Some("@scope/pkg"));
+    assert_eq!(alias_target("npm:@scope/pkg"), Some("@scope/pkg"));
+    assert_eq!(alias_target("^1.0.0"), None);
+    let manifest = serde_json::json!({"dependencies": {"axois": "npm:axios@1", "react": "18"}});
+    let mut symbols = crate::Symbols::default();
+    dependency_imports(&manifest, manifest.to_string().as_bytes(), &mut symbols);
+    let imports: Vec<_> = symbols
+        .iter()
+        .filter_map(|s| match s {
+            crate::Symbol::Import { name, alias, .. } => Some((name.as_str(), alias.as_deref())),
+            _ => None,
+        })
+        .collect();
+    assert!(imports.contains(&("axios", Some("axois"))));
+    assert!(imports.contains(&("react", None)));
+}

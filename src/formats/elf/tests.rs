@@ -1516,3 +1516,45 @@ fn sonames_reduce_to_the_library_stem() {
     assert_eq!(soname_stem("libsoap.so.1"), "libsoap");
     assert_eq!(soname_stem("libfoo"), "libfoo");
 }
+
+#[test]
+fn debuglink_and_parse_error_facts() {
+    let linked = elf_with_section(".gnu_debuglink", b"app.debug\0\0\0\x12\x34\x56\x78");
+    let (values, _, _) = run(&linked);
+    assert_eq!(
+        values.get("elf.debuglink").and_then(|v| v.as_str()),
+        Some("app.debug")
+    );
+    assert!(values.get("elf.parse_error").is_none());
+
+    let mut truncated = linked;
+    truncated.truncate(truncated.len() - 1);
+    let (values, _, _) = run(&truncated);
+    assert!(values.get("elf.parse_error").is_some());
+}
+
+#[test]
+fn raw_header_salvages_machine_class_and_order() {
+    let mut header = vec![0u8; 64];
+    header[..4].copy_from_slice(b"\x7fELF");
+    header[4] = 2; // ELFCLASS64
+    header[5] = 2; // big-endian
+    header[18..20].copy_from_slice(&22u16.to_be_bytes()); // EM_S390
+    let mut values = Values::new();
+    raw_header(&header, &mut values);
+    assert_eq!(
+        values.get("elf.class").and_then(|v| v.as_str()),
+        Some("elf64")
+    );
+    assert_eq!(
+        values.get("elf.endian").and_then(|v| v.as_str()),
+        Some("big")
+    );
+    assert_eq!(
+        values.get("elf.machine").and_then(|v| v.as_str()),
+        Some(machine_string(22))
+    );
+    let mut none = Values::new();
+    raw_header(b"MZ", &mut none);
+    assert!(none.get("elf.machine").is_none());
+}

@@ -219,6 +219,9 @@ fn header(bytes: &[u8], values: &mut Values) {
         return;
     };
     values.insert_key(value_key!("crx.format_version"), JsonValue::from(version));
+    if let Some(offset) = archive_offset(bytes, version) {
+        values.insert_key(value_key!("crx.archive_offset"), JsonValue::from(offset));
+    }
 
     let verified = match version {
         2 => {
@@ -277,6 +280,20 @@ fn header(bytes: &[u8], values: &mut Values) {
         value_key!("crx.signature_verified"),
         JsonValue::Bool(verified),
     );
+}
+
+/// Where the ZIP archive begins: after CRX2's 16-byte header, key and
+/// signature, or CRX3's 12-byte header and protobuf header. `None` when the
+/// declared lengths run past the file.
+fn archive_offset(bytes: &[u8], version: u32) -> Option<usize> {
+    let offset = match version {
+        2 => 16usize
+            .checked_add(sat_usize(u32_le(bytes, 8)?))?
+            .checked_add(sat_usize(u32_le(bytes, 12)?))?,
+        3 => 12usize.checked_add(sat_usize(u32_le(bytes, 8)?))?,
+        _ => return None,
+    };
+    (offset <= bytes.len()).then_some(offset)
 }
 
 /// Whether the CRX2 signature, which follows the key, is the key's RSA

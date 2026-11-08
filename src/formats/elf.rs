@@ -175,6 +175,10 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
             // offsets are unchanged, so `bytes` stays authoritative below.
             detached = goblin_safe::elf_without_truncated_section_headers(bytes);
             errors_out.record_malformed(crate::Stage::ElfParse, e.to_string());
+            if bytes.starts_with(b"\x7fELF") {
+                let message: String = e.to_string().chars().take(200).collect();
+                put_str(values, value_key!("elf.parse_error"), &message);
+            }
             if let Some(patched) = detached.as_ref()
                 && let goblin_safe::GoblinOutcome::Ok(elf) = goblin_safe::parse_elf(&patched.bytes)
             {
@@ -191,6 +195,7 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
             } else {
                 extract_binary_strings(bytes, strings, XorScan::Yes);
                 metrics.insert(metric!("elf.parse_failed"), 1.0);
+                raw_header(bytes, values);
                 layout_only(layout, bytes, sections_out, symbols_out);
                 return;
             }
@@ -199,6 +204,7 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
             extract_binary_strings(bytes, strings, XorScan::Yes);
             errors_out.record_panic(crate::Stage::ElfParse, msg);
             metrics.insert(metric!("elf.parse_panicked"), 1.0);
+            raw_header(bytes, values);
             layout_only(layout, bytes, sections_out, symbols_out);
             return;
         }
@@ -256,6 +262,8 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
     metrics::table_counts(&elf, metrics);
     dynamic::relocation_kinds(&elf, values);
     segments(&elf, values);
+    unbacked_load_segments(&elf, bytes.len(), metrics);
+    debuglink(&elf, bytes, values);
     section_headers(&elf, values);
     notes::segment_coverage(&elf, bytes, metrics, errors_out);
     metrics::section_file_anomalies(&elf, bytes, metrics);
@@ -747,6 +755,74 @@ fn has_present_load_or_code_bytes(elf: &Elf<'_>, file_len: usize) -> bool {
             && s.sh_type != goblin::elf::section_header::SHT_NOBITS
             && present(s.sh_offset, s.sh_size)
     })
+}
+
+/// The header fields goblin would have reported, read straight from the
+/// identification bytes when the parse failed: `elf.machine` (`e_machine` at
+/// 18, in the byte order `EI_DATA` names), `elf.class` and `elf.endian`.
+fn raw_header(bytes: &[u8], values: &mut Values) {
+    if !bytes.starts_with(b"\x7fELF") {
+        return;
+    }
+    let big_endian = bytes.get(5) == Some(&2);
+    if let Some(machine) = bytes.get(18..20).and_then(|b| <[u8; 2]>::try_from(b).ok()) {
+        let machine = if big_endian {
+            u16::from_be_bytes(machine)
+        } else {
+            u16::from_le_bytes(machine)
+        };
+        put_str(values, value_key!("elf.machine"), machine_string(machine));
+    }
+    match bytes.get(4) {
+        Some(1) => put_str(values, value_key!("elf.class"), "elf32"),
+        Some(2) => put_str(values, value_key!("elf.class"), "elf64"),
+        _ => {}
+    }
+    match bytes.get(5) {
+        Some(1) => put_str(values, value_key!("elf.endian"), "little"),
+        Some(2) => put_str(values, value_key!("elf.endian"), "big"),
+        _ => {}
+    }
+}
+
+/// `elf.unbacked_load_segments`: `PT_LOAD` segments whose file extent runs
+/// past the end of the file, as a truncated transfer or carve leaves them.
+fn unbacked_load_segments(elf: &Elf<'_>, file_len: usize, metrics: &mut Metrics) {
+    let file_len = file_len as u64;
+    let count = elf
+        .program_headers
+        .iter()
+        .filter(|p| {
+            p.p_type == goblin::elf::program_header::PT_LOAD
+                && p.p_filesz > 0
+                && p.p_offset.saturating_add(p.p_filesz) > file_len
+        })
+        .count();
+    if count > 0 {
+        metrics.insert(metric!("elf.unbacked_load_segments"), count as f64);
+    }
+}
+
+/// `elf.debuglink`: the split-debug file a `.gnu_debuglink` section names
+/// (its NUL-terminated leading string).
+fn debuglink(elf: &Elf<'_>, bytes: &[u8], values: &mut Values) {
+    let Some(section) = elf
+        .section_headers
+        .iter()
+        .find(|sh| elf.shdr_strtab.get_at(sh.sh_name) == Some(".gnu_debuglink"))
+    else {
+        return;
+    };
+    let name = usize::try_from(section.sh_offset)
+        .ok()
+        .zip(usize::try_from(section.sh_size).ok())
+        .and_then(|(offset, size)| bytes.get(offset..offset.checked_add(size)?))
+        .and_then(|data| data.get(..data.iter().position(|&b| b == 0)?))
+        .filter(|name| !name.is_empty())
+        .and_then(|name| std::str::from_utf8(name).ok());
+    if let Some(name) = name {
+        put_str(values, value_key!("elf.debuglink"), name);
+    }
 }
 
 fn elf_header(elf: &Elf<'_>, values: &mut Values) {

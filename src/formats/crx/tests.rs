@@ -438,3 +438,24 @@ fn crx3_malformed_header_does_not_verify() {
         assert_eq!(verified(&file(&header)), Some(false), "{header_tail:02x?}");
     }
 }
+
+#[test]
+fn archive_offset_follows_each_header_layout() {
+    // CRX2: magic, version, key length, signature length, key, signature.
+    let mut crx2 = b"Cr24".to_vec();
+    crx2.extend_from_slice(&2u32.to_le_bytes());
+    crx2.extend_from_slice(&3u32.to_le_bytes());
+    crx2.extend_from_slice(&2u32.to_le_bytes());
+    crx2.extend_from_slice(b"KEYSGPK");
+    assert_eq!(archive_offset(&crx2, 2), Some(21));
+    // CRX3: magic, version, header length, header.
+    let mut crx3 = b"Cr24".to_vec();
+    crx3.extend_from_slice(&3u32.to_le_bytes());
+    crx3.extend_from_slice(&4u32.to_le_bytes());
+    crx3.extend_from_slice(b"HDR!PK");
+    assert_eq!(archive_offset(&crx3, 3), Some(16));
+    // Declared lengths past the end of the file.
+    crx3[8..12].copy_from_slice(&100u32.to_le_bytes());
+    assert_eq!(archive_offset(&crx3, 3), None);
+    assert_eq!(archive_offset(&crx3, 4), None);
+}
