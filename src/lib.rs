@@ -132,6 +132,7 @@ mod go_dependency_context;
 mod go_package_context;
 mod identity;
 pub mod package_context;
+pub mod size_probe;
 pub use output::{Replaced, Resolution, UnresolvedReason};
 mod output;
 mod panic_guard;
