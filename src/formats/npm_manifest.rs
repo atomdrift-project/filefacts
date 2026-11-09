@@ -143,6 +143,14 @@ pub(super) fn emit(manifest: &Manifest, bytes: &[u8], values: &mut Values, metri
         "module.exports",
     ];
     let code = CODE.iter().any(|token| trailing.contains(token));
+    if code {
+        // Code appended past the manifest object is a JavaScript source of
+        // the file's own bytes.
+        super::source::embedded_sources::record(
+            values,
+            vec![("javascript", manifest.end, bytes.len() - manifest.end)],
+        );
+    }
     for (key, present) in [
         (
             metric!("npm.manifest.trailing_variation_selectors"),

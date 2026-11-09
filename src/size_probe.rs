@@ -6,6 +6,7 @@
 //! - gzip: the trailer's `ISIZE` (modulo 2^32).
 //! - zip: the uncompressed sizes in the central directory.
 //! - cab: the sizes in the CFFILE table.
+//! - dmg: the sector count in the UDIF `koly` trailer ([`udif_volume_size`]).
 
 use std::io::{Read, Seek, SeekFrom};
 
@@ -35,6 +36,20 @@ pub fn inflated_size<R: Read + Seek>(reader: &mut R, len: u64) -> Option<u64> {
     }
 }
 
+/// The mounted volume size an Apple disk image (UDIF `.dmg`) declares in its
+/// 512-byte `koly` trailer: `sector_count` (big-endian `u64` at trailer
+/// offset 492) times 512. `None` when the trailer is absent or truncated.
+/// A DMG has no magic at its start, so this reads only the tail of `data`.
+#[must_use]
+pub fn udif_volume_size(data: &[u8]) -> Option<u64> {
+    let trailer = data.get(data.len().checked_sub(512)?..)?;
+    if !trailer.starts_with(b"koly") {
+        return None;
+    }
+    let sectors = u64::from_be_bytes(trailer.get(492..500)?.try_into().ok()?);
+    sectors.checked_mul(512)
+}
+
 /// Whether `magic` (a file's first bytes) opens an executable (PE, ELF,
 /// Mach-O, fat Mach-O) or an OLE compound file: an image whose footprint
 /// follows its own size rather than an unknown container expansion.
@@ -52,18 +67,24 @@ pub fn is_flat_image(magic: &[u8]) -> bool {
 }
 
 fn u16_at(buf: &[u8], at: usize) -> Option<u16> {
-    Some(u16::from_le_bytes(buf.get(at..at.checked_add(2)?)?.try_into().ok()?))
+    Some(u16::from_le_bytes(
+        buf.get(at..at.checked_add(2)?)?.try_into().ok()?,
+    ))
 }
 
 fn u32_at(buf: &[u8], at: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(buf.get(at..at.checked_add(4)?)?.try_into().ok()?))
+    Some(u32::from_le_bytes(
+        buf.get(at..at.checked_add(4)?)?.try_into().ok()?,
+    ))
 }
 
 /// The sum of a zip central directory's uncompressed sizes.
 fn zip_inflated_size<R: Read + Seek>(reader: &mut R, len: u64) -> Option<u64> {
     const EOCD_MIN: u64 = 22;
     let tail_len = len.min(EOCD_MIN + 0xFFFF);
-    reader.seek(SeekFrom::End(-i64::try_from(tail_len).ok()?)).ok()?;
+    reader
+        .seek(SeekFrom::End(-i64::try_from(tail_len).ok()?))
+        .ok()?;
     let mut tail = vec![0u8; usize::try_from(tail_len).ok()?];
     reader.read_exact(&mut tail).ok()?;
     let eocd = tail
@@ -189,10 +210,28 @@ mod tests {
     }
 
     #[test]
+    fn udif_trailer_declares_the_volume_size() {
+        let mut dmg = vec![0u8; 1024];
+        let at = dmg.len() - 512;
+        dmg[at..at + 4].copy_from_slice(b"koly");
+        dmg[at + 492..at + 500].copy_from_slice(&2048u64.to_be_bytes());
+        assert_eq!(udif_volume_size(&dmg), Some(2048 * 512));
+        assert_eq!(
+            udif_volume_size(&dmg[..600]),
+            None,
+            "trailer not at the end"
+        );
+        assert_eq!(udif_volume_size(b"koly"), None, "too short for a trailer");
+        assert_eq!(udif_volume_size(&[0u8; 1024]), None, "no koly magic");
+    }
+
+    #[test]
     fn flat_images() {
         assert!(is_flat_image(b"MZ\x90\0\x03\0\0\0"));
         assert!(is_flat_image(b"\x7fELF\x02\x01\x01\0"));
-        assert!(is_flat_image(&[0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]));
+        assert!(is_flat_image(&[
+            0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1
+        ]));
         assert!(!is_flat_image(b"PK\x03\x04\0\0\0\0"));
     }
 }

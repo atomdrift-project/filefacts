@@ -198,7 +198,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 
 pub use embedded_sources::{EmbeddedSource, Origin, ScriptScope};
-pub use formats::archive_magic::archive_magic;
+pub use formats::archive_magic::{archive_magic, payload_magic};
 /// The directory of a Compiled HTML Help (`.chm`) file: every internal
 /// file, its content section and extent. Consumers that decompress the
 /// LZX section read entries from here rather than re-walking the directory.

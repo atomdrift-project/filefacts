@@ -138,3 +138,130 @@ fn elf_overlay_starts_after_section_header_table() {
     bytes.extend(pseudo_random(2048));
     assert_eq!(overlay_of(&bytes), Some((22928, 220 + 2048)));
 }
+
+const LNK_FIXTURE: &[u8] = include_bytes!("fixtures/lnk/powershell_hidden.lnk");
+
+/// Every executable type surfaces the unified `sections.*`, `imports.*`,
+/// `exports.*` and `dependencies.*` counts, the names that replaced the
+/// format-scoped `pe.import_count` / `elf.import_count` aliases.
+const CANONICAL_COUNTS: [&str; 7] = [
+    "sections.count",
+    "sections.executable_count",
+    "sections.writable_count",
+    "sections.executable_writable_count",
+    "sections.code_size",
+    "sections.name_entropy",
+    "sections.nonstandard_count",
+];
+
+/// Metrics the retired aliases once carried; none may come back.
+const RETIRED_ALIASES: [&str; 29] = [
+    "binary.section_count",
+    "binary.import_count",
+    "binary.export_count",
+    "binary.dependency_count",
+    "binary.wx_section_count",
+    "binary.has_signature",
+    "binary.signed",
+    "binary.has_executable_stack",
+    "binary.has_malformed_structure",
+    "binary.aliased_exports",
+    "binary.function_count",
+    "binary.rizin_function_count",
+    "binary.signed_with_individual_cert",
+    "pe.import_count",
+    "pe.export_count",
+    "pe.imported_library_count",
+    "elf.import_count",
+    "elf.export_count",
+    "elf.section_count",
+    "elf.needed_count",
+    "macho.import_count",
+    "macho.export_count",
+    "macho.library_count",
+    "imports.total",
+    "functions.total",
+    "archive.compression_ratio",
+    "archive.symlink_count",
+    "archive.encrypted_count",
+    "chm.itsf_lcid",
+];
+
+fn assert_metrics(parsed: &filefacts::ParsedFile<'_>, keys: &[&str]) {
+    let metrics = parsed.metrics();
+    let missing: Vec<_> = keys.iter().filter(|k| metrics.get(k).is_none()).collect();
+    assert!(missing.is_empty(), "missing metrics: {missing:?}");
+}
+
+#[test]
+fn executables_emit_canonical_section_metrics() {
+    for (name, bytes, file_type) in [
+        ("pe", PE_FIXTURE, FileType::Pe),
+        ("elf", ELF_FIXTURE, FileType::Elf),
+        ("macho", MACHO_FIXTURE, FileType::MachO),
+    ] {
+        let parsed = open(bytes);
+        assert_eq!(parsed.fileid().file_type(), file_type, "{name}");
+        assert_metrics(&parsed, &CANONICAL_COUNTS);
+        assert_metrics(&parsed, &["imports.count", "dependencies.count"]);
+        if file_type != FileType::Pe {
+            assert_metrics(&parsed, &["exports.count"]);
+        }
+        assert!(parsed.metrics().get("sections.count") > Some(0.0), "{name}");
+        assert!(!parsed.sections().is_empty(), "{name}");
+        assert!(!import_names(&parsed).is_empty(), "{name} imports");
+    }
+}
+
+#[test]
+fn retired_aliases_are_not_emitted() {
+    for (name, bytes) in [
+        ("pe", PE_FIXTURE),
+        ("elf", ELF_FIXTURE),
+        ("macho", MACHO_FIXTURE),
+    ] {
+        let parsed = open(bytes);
+        for retired in RETIRED_ALIASES {
+            assert!(
+                parsed.metrics().get(retired).is_none(),
+                "retired alias {retired} re-emitted for {name}"
+            );
+        }
+    }
+}
+
+#[test]
+fn format_specific_metrics_are_emitted() {
+    assert_metrics(
+        &open(ELF_FIXTURE),
+        &["elf.bits", "elf.little_endian", "elf.program_header_count"],
+    );
+    assert_metrics(&open(MACHO_FIXTURE), &["macho.load_command_count"]);
+}
+
+/// A healthy executable records no parse errors; the metric is absent.
+#[test]
+fn healthy_pe_has_no_parse_errors() {
+    let parsed = open(PE_FIXTURE);
+    assert_eq!(
+        parsed.metrics().get("parse.error_count").unwrap_or(0.0),
+        0.0
+    );
+}
+
+/// The LNK extractor surfaces the argument-whitespace metrics (the
+/// CVE-2025-9491 signal) whenever the shortcut has an arguments field.
+#[test]
+fn lnk_emits_argument_whitespace_metrics() {
+    let parsed = open(LNK_FIXTURE);
+    assert_eq!(parsed.fileid().file_type(), FileType::Lnk);
+    assert_metrics(
+        &parsed,
+        &[
+            "lnk.arguments_leading_spaces",
+            "lnk.arguments_leading_tabs",
+            "lnk.arguments_whitespace_count",
+            "lnk.arguments_max_whitespace_run",
+        ],
+    );
+}

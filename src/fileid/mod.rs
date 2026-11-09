@@ -57,6 +57,7 @@ mod package_layout;
 mod perl_shell_shim;
 pub(crate) mod phar;
 mod php_tag;
+mod resolve;
 mod scripts;
 mod shebang;
 pub(crate) mod shellcode;
@@ -69,6 +70,7 @@ mod zip_probe;
 pub use container::{ArchiveFormat, Compression, Container, container_of};
 pub use file_type::{FileType, Group};
 pub(crate) use magic::looks_like_obfuscated_rtf;
+pub use resolve::{declared_file_type, file_type, file_type_with};
 pub(crate) use torch::legacy_header as torch_protocol2_legacy_header;
 
 use std::path::Path;

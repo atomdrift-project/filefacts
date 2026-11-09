@@ -805,6 +805,87 @@ impl FileType {
         self.flags().contains(Flags::BINARY)
     }
 
+    /// Whether a file of this type is its own text: source, markup,
+    /// manifests and other text formats, searched as the bytes they are
+    /// rather than as strings extracted from them. A file whose parser read
+    /// a binary encoding of a text type (a compiled AppleScript) says so with
+    /// the `file.binary` metric.
+    #[must_use]
+    pub const fn is_text_content(self) -> bool {
+        matches!(
+            self,
+            Self::Shell
+                | Self::Batch
+                | Self::Jcl
+                | Self::Vbs
+                | Self::Python
+                | Self::JavaScript
+                | Self::TypeScript
+                | Self::Go
+                | Self::Rust
+                | Self::Java
+                | Self::Ruby
+                | Self::Php
+                | Self::Perl
+                | Self::Lua
+                | Self::CSharp
+                | Self::PowerShell
+                | Self::Swift
+                | Self::ObjectiveC
+                | Self::Groovy
+                | Self::Scala
+                | Self::Kotlin
+                | Self::Zig
+                | Self::Elixir
+                | Self::Clojure
+                | Self::C
+                | Self::PackageJson
+                | Self::PackageLockJson
+                | Self::VsixManifest
+                | Self::ChromeManifest
+                | Self::CargoToml
+                | Self::CargoLock
+                | Self::RequirementsTxt
+                | Self::PoetryLock
+                | Self::PipfileLock
+                | Self::GemfileLock
+                | Self::ComposerLock
+                | Self::YarnLock
+                | Self::PnpmLock
+                | Self::PyProjectToml
+                | Self::ComposerJson
+                | Self::Json
+                | Self::GithubActions
+                | Self::SystemdService
+                | Self::DesktopEntry
+                | Self::Xml
+                | Self::Yaml
+                | Self::PkgInfo
+                | Self::SrcInfo
+                | Self::Registry
+                | Self::Reg
+                | Self::GoMod
+                | Self::GoSum
+                | Self::AppleScript
+                | Self::Plist
+                | Self::Nib
+                | Self::Svg
+                | Self::Html
+                | Self::Jsp
+                | Self::Asp
+                | Self::Cfml
+                | Self::Tex
+                | Self::Yara
+                | Self::PostScript
+                | Self::Mirc
+                | Self::IrcII
+                | Self::Markdown
+                | Self::Makefile
+                | Self::Dockerfile
+                | Self::Text
+        )
+    }
+
     /// Returns true if this file type represents source code with AST support.
     #[must_use]
     pub fn is_source_code(&self) -> bool {

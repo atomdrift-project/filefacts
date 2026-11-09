@@ -9,13 +9,15 @@
 //! child, not to the host, so it is not counted here.
 //!
 //! `binary.installer = {kind, marker_offset}` names the installer and where
-//! its data starts; a consumer that unpacks installers reads it.
+//! its data starts; a consumer that unpacks installers reads it. A
+//! PyInstaller bundle adds `python_version` (`"3.11"`), the interpreter its
+//! cookie names.
 
 use memchr::memmem;
 use serde_json::{Map, Value as JsonValue};
 
 use super::embedded::EmbeddedBinary;
-use crate::bytes::{u16_le, u32_le};
+use crate::bytes::{u16_le, u32_be, u32_le};
 use crate::output::Values;
 use crate::value_key;
 
@@ -41,8 +43,26 @@ pub(crate) fn emit(data: &[u8], embedded: &[EmbeddedBinary], values: &mut Values
     obj.insert("kind".into(), kind.into());
     if let Some(offset) = marker_offset {
         obj.insert("marker_offset".into(), offset.into());
+        if kind == "pyinstaller"
+            && let Some(version) = pyinstaller_python_version(data, offset)
+        {
+            obj.insert("python_version".into(), version.into());
+        }
     }
     values.insert_key(value_key!("binary.installer"), JsonValue::Object(obj));
+}
+
+/// The Python version a PyInstaller cookie at `cookie` names: a big-endian
+/// `u32` 20 bytes in, `major * 100 + minor` (`311`), or `major * 10 + minor`
+/// before Python 3.10 (`27`, `39`).
+fn pyinstaller_python_version(data: &[u8], cookie: usize) -> Option<String> {
+    let encoded = u32_be(data, cookie.checked_add(20)?)?;
+    let (major, minor) = if encoded >= 100 {
+        (encoded / 100, encoded % 100)
+    } else {
+        (encoded / 10, encoded % 10)
+    };
+    (2..=3).contains(&major).then(|| format!("{major}.{minor}"))
 }
 
 /// The installer kind and the offset of the marker its data starts at.

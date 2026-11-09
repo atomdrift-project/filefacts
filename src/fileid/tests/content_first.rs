@@ -511,3 +511,27 @@ fn labels_are_snake_case_or_a_file_name() {
         assert!(snake || label.contains('.'), "{label}");
     }
 }
+
+/// Text formats are their own text; binaries, archives and images are not.
+#[test]
+fn text_content_types() {
+    for text in [
+        FileType::Python,
+        FileType::Text,
+        FileType::Json,
+        FileType::Svg,
+        FileType::AppleScript,
+        FileType::GoMod,
+    ] {
+        assert!(text.is_text_content(), "{text:?}");
+    }
+    for binary in [
+        FileType::Pe,
+        FileType::Elf,
+        FileType::Png,
+        FileType::Zip,
+        FileType::Unknown,
+    ] {
+        assert!(!binary.is_text_content(), "{binary:?}");
+    }
+}

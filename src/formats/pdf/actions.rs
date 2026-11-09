@@ -221,7 +221,7 @@ struct JsPayload {
 /// at-a-glance triage; here the *whole* payload is kept so a consumer can
 /// analyse each one as JavaScript in its own right.
 ///
-/// Returns one entry per site with `{source, target_object_id?,
+/// Returns one entry per site with `{source, offset, target_object_id?,
 /// filters?, content, content_bytes}`. `target_object_id` is set when
 /// the site referenced another object (so consumers can map the JS
 /// payload back to a specific object id); `filters` records the
@@ -261,6 +261,8 @@ pub(super) fn scan_javascript_payloads(
             }
             sites += 1;
             let source = object_source(region.obj_id);
+            // File offset of the `/JS` key, for naming the payload.
+            let site = region.start + next - 3;
             let cursor = skip_while(dict, next, u8::is_ascii_whitespace);
             let target = js_reference(dict, cursor);
             if let Some(&known) = target.and_then(|id| seen.get(&id)) {
@@ -270,6 +272,7 @@ pub(super) fn scan_javascript_payloads(
                 if let (Some(id), Some(len)) = (target, known) {
                     out.push(json!({
                         "source": source,
+                        "offset": site,
                         "target_object_id": id,
                         "content_bytes": len,
                     }));
@@ -297,6 +300,7 @@ pub(super) fn scan_javascript_payloads(
             budget = budget.saturating_sub(payload.content.len());
             let mut entry = serde_json::Map::new();
             entry.insert("source".into(), JsonValue::String(source));
+            entry.insert("offset".into(), json!(site));
             if let Some(target) = payload.target_object_id {
                 entry.insert("target_object_id".into(), json!(target));
             }

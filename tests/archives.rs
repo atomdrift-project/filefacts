@@ -494,3 +494,39 @@ fn iso_without_hidden_space_reports_no_slack() {
     );
     assert_eq!(parsed.parse_count(), 1);
 }
+
+/// ZIP aggregates sit under the canonical `archive.*` namespace, with
+/// `archive.security.*` for hostile permission flags. The flat aliases
+/// (`archive.symlink_count`, `archive.encrypted_count`,
+/// `archive.compression_ratio`) are retired.
+#[test]
+fn zip_emits_canonical_archive_keys() {
+    let bytes = build_minimal_zip();
+    let parsed = open(&bytes);
+    assert_eq!(parsed.fileid().file_type(), FileType::Zip);
+    let metrics = parsed.metrics();
+    for key in [
+        "archive.file_count",
+        "archive.directory_count",
+        "archive.member_count",
+        "archive.uncompressed_size",
+        "archive.compressed_size",
+        "archive.security.symlink_count",
+        "archive.security.encrypted_count",
+        "archive.security.setuid_count",
+        "archive.security.setgid_count",
+        "archive.security.world_writable_count",
+    ] {
+        assert!(
+            metrics.get(key).is_some(),
+            "missing ZIP archive metric {key}"
+        );
+    }
+    for retired in [
+        "archive.symlink_count",
+        "archive.encrypted_count",
+        "archive.compression_ratio",
+    ] {
+        assert!(metrics.get(retired).is_none(), "retired alias {retired}");
+    }
+}

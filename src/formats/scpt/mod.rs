@@ -62,6 +62,19 @@ impl TextReader {
     }
 }
 
+/// Whether `bytes` is a compiled AppleScript (`.scpt`, a `Fasd` stream)
+/// rather than source. A compiled script may carry a `#!/usr/bin/osascript`
+/// line ahead of its magic.
+fn is_compiled(bytes: &[u8]) -> bool {
+    let body = match bytes.strip_prefix(b"#!") {
+        Some(rest) => memchr::memchr(b'\n', rest)
+            .and_then(|nl| rest.get(nl + 1..))
+            .unwrap_or_default(),
+        None => bytes,
+    };
+    body.starts_with(b"Fasd")
+}
+
 pub(super) fn extract(bytes: &[u8], ctx: ExtractCtx<'_>) -> Result<(), Error> {
     let ExtractCtx {
         values,
@@ -73,16 +86,13 @@ pub(super) fn extract(bytes: &[u8], ctx: ExtractCtx<'_>) -> Result<(), Error> {
     // Plaintext AppleScript retains the generic extraction path. A compiled
     // script may carry a `#!/usr/bin/osascript` line ahead of its magic; the
     // parser skips it, so only the gate needs to look past it.
-    let body = match bytes.strip_prefix(b"#!") {
-        Some(rest) => memchr::memchr(b'\n', rest)
-            .and_then(|nl| rest.get(nl + 1..))
-            .unwrap_or_default(),
-        None => bytes,
-    };
-    if !body.starts_with(b"Fasd") {
+    if !is_compiled(bytes) {
         return Ok(());
     }
     let parsed = parser::parse(bytes).map_err(|e| Error::malformed_caused_by("scpt", e))?;
+    // A compiled script shares its type with AppleScript source; only a
+    // successful parse, never the magic alone, says its bytes are not text.
+    metrics.insert(metric!("file.binary"), 1.0);
     values.insert_key(value_key!("scpt.version"), json!(parsed.version));
     let mut seen_literals = BTreeSet::new();
     let mut text_reader = TextReader::new(MAX_LITERAL_BYTES);

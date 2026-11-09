@@ -329,6 +329,7 @@ pub(crate) const VALUE_CATALOG: &[&str] = &[
     "elf.verdef",
     "elf.version",
     "elf.x86_isa_level",
+    "embedded.sources",
     "file.basename",
     "file.stem",
     "font.content_kind",

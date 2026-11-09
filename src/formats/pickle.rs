@@ -119,6 +119,7 @@ pub(super) fn extract(
     values: &mut Values,
     strings: &mut Strings,
     metrics: &mut Metrics,
+    symbols: &mut crate::Symbols,
 ) {
     extract_binary_strings(bytes, strings, XorScan::No);
     if bytes.is_empty() {
@@ -194,6 +195,18 @@ pub(super) fn extract(
             value_key!("pickle.modules"),
             JsonValue::Array(modules.into_iter().map(JsonValue::String).collect()),
         );
+    }
+    // Each resolved callable is what unpickling imports: `os.system` from `os`.
+    for global in &globals {
+        symbols.push(crate::Symbol::Import {
+            name: global.clone(),
+            library: global
+                .rsplit_once('.')
+                .map(|(module, _)| module.to_string()),
+            offset: None,
+            ordinal: None,
+            alias: None,
+        });
     }
     if !globals.is_empty() {
         values.insert_key(

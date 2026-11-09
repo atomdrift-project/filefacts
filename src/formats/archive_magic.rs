@@ -33,6 +33,22 @@ pub fn archive_magic(bytes: &[u8]) -> Option<&'static str> {
     (bytes.get(0x8001..0x8006) == Some(b"CD001")).then_some("iso")
 }
 
+/// The format a decoded payload `bytes` begins with: an [`archive_magic`]
+/// format, or `pe` (`MZ`) or `elf`. For a caller deciding whether a decoded
+/// blob is a file worth analyzing.
+#[must_use]
+pub fn payload_magic(bytes: &[u8]) -> Option<&'static str> {
+    archive_magic(bytes).or_else(|| {
+        if bytes.starts_with(b"MZ") {
+            Some("pe")
+        } else if bytes.starts_with(b"\x7fELF") {
+            Some("elf")
+        } else {
+            None
+        }
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::indexing_slicing)]
 mod tests {
@@ -57,6 +73,15 @@ mod tests {
         ] {
             assert_eq!(archive_magic(bytes), Some(kind), "{kind}");
         }
+    }
+
+    #[test]
+    fn payload_magics_add_executables() {
+        assert_eq!(payload_magic(b"MZ"), Some("pe"));
+        assert_eq!(payload_magic(b"\x7fELF\x02"), Some("elf"));
+        assert_eq!(payload_magic(b"PK\x03\x04"), Some("zip"));
+        assert_eq!(payload_magic(b"\x7fEL"), None);
+        assert_eq!(payload_magic(b"plain text"), None);
     }
 
     #[test]

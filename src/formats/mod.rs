@@ -101,7 +101,7 @@ mod rpm;
 mod rpyc;
 mod rtf;
 mod rust_crate;
-mod scpt;
+pub(crate) mod scpt;
 mod sevenz;
 mod shellcode;
 pub(crate) mod source;
@@ -547,7 +547,7 @@ pub(crate) fn extract(
             Ok(())
         }
         FileType::Pickle => {
-            pickle::extract(bytes, ctx.values, ctx.strings, ctx.metrics);
+            pickle::extract(bytes, ctx.values, ctx.strings, ctx.metrics, ctx.symbols);
             Ok(())
         }
         FileType::Font => {
@@ -661,6 +661,9 @@ pub(crate) fn extract(
                 ctx.metrics,
                 ctx.symbols,
             );
+            if matches!(file_type, FileType::JavaScript | FileType::TypeScript) {
+                source::embedded_sources::emit(bytes, tree_cache, ctx.values);
+            }
             // A PKGBUILD additionally gets its package-metadata fields lifted
             // into a pkg.* value tree so it can be compared field-for-field
             // against a sibling .SRCINFO.

@@ -175,3 +175,22 @@ fn obfuscated_stealer_exposes_commands_and_stored_targets() {
             Some(Arg::String { value }) if value == "security find-generic-password -w -s 'Chrome Safe Storage' 2>/dev/null"))));
     assert!(parsed.errors().is_empty());
 }
+
+/// `file.binary` follows a successful parse, never the magic alone: source
+/// that merely starts with `Fasd` stays text, or prepending four bytes would
+/// switch a consumer's text rules off.
+#[test]
+fn only_a_parsed_compiled_script_is_binary() {
+    let binary = |bytes: &[u8]| {
+        crate::OpenOptions::new()
+            .file_type(crate::FileType::AppleScript)
+            .open(bytes)
+            .metrics()
+            .get("file.binary")
+            == Some(1.0)
+    };
+    assert!(binary(&fixture::compiled()));
+    assert!(!binary(b"set x to \"Fasd\"\ndisplay dialog x\n"));
+    assert!(!binary(b"Fasd is not compiled\n"));
+    assert!(!binary(b"FasdUAS"));
+}

@@ -15,6 +15,8 @@ mod batch_cycles;
 mod batch_lines;
 mod call_target_metrics;
 mod comment_metrics;
+mod data_only;
+pub(crate) mod embedded_sources;
 mod escapes;
 mod function_metrics;
 pub(crate) mod go_syntax;
@@ -424,6 +426,9 @@ pub(super) fn extract(
         value_key!("source.language"),
         JsonValue::String(config.name().to_string()),
     );
+    if data_only::is_data_only(root, source, lang) {
+        metrics.insert(metric!("source.data_only"), 1.0);
+    }
     if let Some(imports) = walked.runtime_imports.take() {
         imports.emit(values);
     }

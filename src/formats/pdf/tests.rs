@@ -60,6 +60,9 @@ fn javascript_payload_inline_literal() {
     assert_eq!(js[0]["source"].as_str(), Some("object:5"));
     assert_eq!(js[0]["content"].as_str(), Some("app.alert('hi')"));
     assert_eq!(js[0]["content_bytes"].as_u64(), Some(15));
+    // The offset is where the `/JS` key sits in the file.
+    let at = pdf.windows(3).position(|w| w == b"/JS").unwrap() as u64;
+    assert_eq!(js[0]["offset"].as_u64(), Some(at));
     assert!(js[0].get("target_object_id").is_none());
     assert_eq!(m.get("pdf.javascript_count"), Some(1.0));
     assert_eq!(m.get("pdf.javascript_total_bytes"), Some(15.0));

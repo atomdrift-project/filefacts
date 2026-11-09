@@ -167,3 +167,25 @@ fn emits_the_kind_and_marker() {
         Some(&JsonValue::from(256))
     );
 }
+
+#[test]
+fn pyinstaller_reports_the_cookie_python_version() {
+    for (encoded, version) in [(311u32, "3.11"), (27, "2.7"), (39, "3.9")] {
+        let mut data = pe_stub();
+        data.extend_from_slice(PYINSTALLER_COOKIE);
+        data.extend_from_slice(&[0; 12]);
+        data.extend_from_slice(&encoded.to_be_bytes());
+        let mut values = Values::new();
+        emit(&data, &[], &mut values);
+        assert_eq!(
+            values.get("binary.installer.python_version"),
+            Some(&JsonValue::from(version))
+        );
+    }
+    let mut data = pe_stub();
+    data.extend_from_slice(PYINSTALLER_COOKIE);
+    data.extend_from_slice(&[0xff; 16]);
+    let mut values = Values::new();
+    emit(&data, &[], &mut values);
+    assert_eq!(values.get("binary.installer.python_version"), None);
+}

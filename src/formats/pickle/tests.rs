@@ -1,11 +1,55 @@
 use super::*;
 
 fn run(bytes: &[u8]) -> (Values, Metrics) {
+    let (values, metrics, _) = run_with_symbols(bytes);
+    (values, metrics)
+}
+
+fn run_with_symbols(bytes: &[u8]) -> (Values, Metrics, crate::Symbols) {
     let mut v = Values::new();
     let mut s = Strings::default();
     let mut m = Metrics::new();
-    extract(bytes, &mut v, &mut s, &mut m);
-    (v, m)
+    let mut symbols = crate::Symbols::default();
+    extract(bytes, &mut v, &mut s, &mut m, &mut symbols);
+    (v, m, symbols)
+}
+
+/// The `(name, library)` of each import symbol `bytes` yields.
+fn imports(bytes: &[u8]) -> Vec<(String, Option<String>)> {
+    run_with_symbols(bytes)
+        .2
+        .iter_kind(crate::SymbolKind::Import)
+        .filter_map(|symbol| match symbol {
+            crate::Symbol::Import { name, library, .. } => Some((name.clone(), library.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn resolved_globals_are_imports_from_their_module() {
+    // PROTO 2, GLOBAL os.system, … REDUCE, STOP.
+    let global = b"\x80\x02cos\nsystem\nq\x00X\x02\x00\x00\x00ls\x85R.";
+    assert_eq!(
+        imports(global),
+        [("os.system".to_string(), Some("os".to_string()))]
+    );
+    // PROTO 4, SHORT_BINUNICODE builtins, SHORT_BINUNICODE exec,
+    // STACK_GLOBAL, argument, TUPLE1, REDUCE, STOP.
+    let mut stack_global = vec![0x80, 0x04, 0x8c, 0x08];
+    stack_global.extend_from_slice(b"builtins");
+    stack_global.extend_from_slice(&[0x8c, 0x04]);
+    stack_global.extend_from_slice(b"exec");
+    stack_global.push(0x93);
+    stack_global.extend_from_slice(&[0x8c, 0x02]);
+    stack_global.extend_from_slice(b"ok");
+    stack_global.extend_from_slice(&[0x85, 0x52, 0x2e]);
+    assert_eq!(
+        imports(&stack_global),
+        [("builtins.exec".to_string(), Some("builtins".to_string()))]
+    );
+    // PROTO 4, EMPTY_DICT, STOP: no callable, no import.
+    assert!(imports(&[0x80, 0x04, 0x7d, 0x2e]).is_empty());
 }
 
 #[test]
