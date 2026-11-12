@@ -487,21 +487,12 @@ fn bitstream(view: PixelView<'_>, packing: Packing<'_>, probe: &mut Probe) -> Ve
     } = packing;
     let total = width.saturating_mul(height);
     let mut out = Vec::with_capacity(cap);
-    let (mut byte, mut used) = (0u8, 0u8);
-    // The mask's bit positions, high to low, resolved once instead of
-    // re-filtering `0..8` on every sample: this walk runs for every
-    // (layout x mask x order) probe over up to `MAX_STEPS` samples per image,
-    // and the per-sample bookkeeping dominated PNG extraction on image-heavy
-    // archives.
-    let mut bits = [0u8; 8];
-    let mut bit_count = 0usize;
-    for (slot, bit) in bits
-        .iter_mut()
-        .zip((0..8).rev().filter(|bit| mask & (1 << bit) != 0))
-    {
-        *slot = bit;
-        bit_count += 1;
-    }
+    let (mut byte, mut used) = (0u16, 0u32);
+    // Every supported mask is a contiguous run (including a single bit).
+    // Append its packed sample in one operation instead of visiting each bit.
+    // At most seven pending bits plus eight new bits fit in the accumulator.
+    let bit_count = mask.count_ones();
+    let shift = mask.trailing_zeros();
     // A full mask in stream order copies the sample byte as-is.
     let whole_bytes = mask == 0xff && !reverse;
     let ordinary = 0..if prime.is_none() {
@@ -556,22 +547,15 @@ fn bitstream(view: PixelView<'_>, packing: Packing<'_>, probe: &mut Probe) -> Ve
                 }
                 continue;
             }
-            for &bit in bits.iter().take(bit_count) {
-                let value = (value >> bit) & 1;
-                if reverse {
-                    byte |= value << used;
-                } else {
-                    byte = (byte << 1) | value;
-                }
-                used += 1;
-                if used == 8 {
-                    out.push(byte);
-                    byte = 0;
-                    used = 0;
-                    if out.len() == cap {
-                        probe.limited |= index + 1 < total;
-                        return out;
-                    }
+            byte = (byte << bit_count) | u16::from((value & mask) >> shift);
+            used += bit_count;
+            if used >= 8 {
+                used -= 8;
+                let [value, _] = (byte >> used).to_le_bytes();
+                out.push(if reverse { value.reverse_bits() } else { value });
+                if out.len() == cap {
+                    probe.limited |= index + 1 < total;
+                    return out;
                 }
             }
         }

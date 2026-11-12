@@ -5,6 +5,142 @@ const SCRIPT: &[u8] = b"#!/bin/sh\nprintf '%s\\n' 'pixel payload regression'\nid
 const WIDTH: usize = 128;
 const HEIGHT: usize = 128;
 
+#[test]
+#[ignore = "manual release-mode PNG probe benchmark"]
+fn benchmark_pixel_payload_probes() {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    for (name, size, channels, pattern) in [
+        ("small-rgb-gradient", 128, 3, 0),
+        ("large-rgb-gradient", 1024, 3, 0),
+        ("large-rgb-noise", 1024, 3, 1),
+        ("large-rgb-flat", 1024, 3, 2),
+        ("large-rgba-gradient", 1024, 4, 0),
+        ("large-gray-gradient", 1024, 1, 0),
+    ] {
+        let mut state = 0x12345678u32;
+        let pixels: Vec<u8> = (0..size * size * channels)
+            .map(|i| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                match pattern {
+                    1 => state as u8,
+                    2 => 0,
+                    _ => {
+                        ((i / channels % size + i / channels / size + i % channels * 37) % 256)
+                            as u8
+                    }
+                }
+            })
+            .collect();
+        let start = Instant::now();
+        let (mut values, mut metrics) = (Values::new(), Metrics::new());
+        for _ in 0..5 {
+            values = Values::new();
+            metrics = Metrics::new();
+            extract(
+                black_box(&pixels),
+                size,
+                size,
+                channels,
+                "u8",
+                &mut values,
+                &mut metrics,
+            );
+            black_box((&values, &metrics));
+        }
+        eprintln!(
+            "{name}: {:.3} ms/image, probes={:?}, steps={:?}",
+            start.elapsed().as_secs_f64() * 200.0,
+            metrics.get("png.pixel_payload_probe_count"),
+            metrics.get("png.pixel_payload_probe_steps")
+        );
+        if let Ok(directory) = std::env::var("PNG_PROBE_SNAPSHOTS") {
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(
+                std::path::Path::new(&directory).join(format!("{name}.json")),
+                serde_json::to_vec(&(&values, &metrics)).unwrap(),
+            )
+            .unwrap();
+        }
+    }
+}
+
+#[test]
+fn packed_samples_preserve_bitstreams_and_work_bounds() {
+    for (width, height) in [(5, 7), (7, 5), (1, 33), (33, 1)] {
+        let primes: Vec<_> = prime_sieve(width * height)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, yes)| yes.then_some(i))
+            .collect();
+        for channels in 1..=4 {
+            let pixels: Vec<u8> = (0..width * height * channels)
+                .map(|i| (i * 73 + i / 3 * 11) as u8)
+                .collect();
+            let view = PixelView {
+                pixels: &pixels,
+                width,
+                height,
+                channels,
+            };
+            for offsets in [
+                vec![0],
+                (0..channels).collect(),
+                (0..channels).rev().collect(),
+            ] {
+                for mask in MASKS {
+                    let normalized = u16::from(mask >> mask.trailing_zeros());
+                    assert_eq!(normalized, (1 << mask.count_ones()) - 1);
+                    for column in [false, true] {
+                        for (flip_x, flip_y) in
+                            [(false, false), (true, false), (false, true), (true, true)]
+                        {
+                            for prime in [None, Some(primes.as_slice())] {
+                                for reverse in [false, true] {
+                                    for cap in [1, 2, 7, 512] {
+                                        for steps in [0, MAX_STEPS - 1, MAX_STEPS] {
+                                            let packing = Packing {
+                                                offsets: &offsets,
+                                                column,
+                                                prime,
+                                                flip_x,
+                                                flip_y,
+                                                cap,
+                                                mask,
+                                                reverse,
+                                            };
+                                            let mut actual = Probe {
+                                                steps,
+                                                ..Probe::default()
+                                            };
+                                            let mut expected = Probe {
+                                                steps,
+                                                ..Probe::default()
+                                            };
+                                            assert_eq!(
+                                                bitstream(view, packing, &mut actual),
+                                                reference_bitstream(view, packing, &mut expected),
+                                                "{width}x{height} channels={channels} mask={mask} cap={cap}"
+                                            );
+                                            assert_eq!(
+                                                (actual.steps, actual.limited),
+                                                (expected.steps, expected.limited)
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn cover(channels: usize) -> Vec<u8> {
     let mut pixels = Vec::new();
     for y in 0..HEIGHT {
@@ -358,4 +494,59 @@ fn reverse_pixel_directions_recover_simple_scripts() {
         let (values, _) = probe(&pixels, 3);
         assert!(kinds(&values).contains(&"shell"));
     }
+}
+
+// Deliberately simple bit-at-a-time oracle, independent of packed samples.
+fn reference_bitstream(view: PixelView<'_>, packing: Packing<'_>, probe: &mut Probe) -> Vec<u8> {
+    let total = view.width * view.height;
+    let indices: Vec<_> = packing
+        .prime
+        .map_or_else(|| (0..total.min(MAX_PIXELS)).collect(), <[usize]>::to_vec);
+    let mut out = Vec::new();
+    let (mut byte, mut used) = (0u8, 0u8);
+    for index in indices {
+        probe.steps += 1;
+        if probe.steps > MAX_STEPS {
+            probe.limited = true;
+            break;
+        }
+        let (x, y) = if packing.column {
+            (index / view.height, index % view.height)
+        } else {
+            (index % view.width, index / view.width)
+        };
+        let x = if packing.flip_x {
+            view.width - 1 - x
+        } else {
+            x
+        };
+        let y = if packing.flip_y {
+            view.height - 1 - y
+        } else {
+            y
+        };
+        for &offset in packing.offsets {
+            let value = view.pixels[(y * view.width + x) * view.channels + offset];
+            for bit in (0..8).rev().filter(|bit| packing.mask & (1 << bit) != 0) {
+                let bit = (value >> bit) & 1;
+                if packing.reverse {
+                    byte |= bit << used;
+                } else {
+                    byte = (byte << 1) | bit;
+                }
+                used += 1;
+                if used == 8 {
+                    out.push(byte);
+                    byte = 0;
+                    used = 0;
+                    if out.len() == packing.cap {
+                        probe.limited |= index + 1 < total;
+                        return out;
+                    }
+                }
+            }
+        }
+    }
+    probe.limited |= total > MAX_PIXELS;
+    out
 }
