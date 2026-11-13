@@ -653,6 +653,7 @@ pub(crate) const VALUE_CATALOG: &[&str] = &[
     "pe.header.dominant_byte",
     "pe.header.mz_offset",
     "pe.header.nt_signature",
+    "pe.header.repaired",
     "pe.headers_size",
     "pe.image_base",
     "pe.image_hash",

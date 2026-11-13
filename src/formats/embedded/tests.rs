@@ -176,6 +176,55 @@ fn test_scan_finds_base64_encoded_embedded_elf() {
 }
 
 #[test]
+fn base64_extent_is_the_decoded_size_for_every_padding_case() {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
+    // Lengths 0..=6 cover every final-group shape; 0x3000.. the real sizes.
+    for len in (0..=6).chain(0x3000..0x3003) {
+        let payload: Vec<u8> = (0..len).map(|i| (i * 7 % 251) as u8).collect();
+        for (engine, padded) in [(&STANDARD, true), (&STANDARD_NO_PAD, false)] {
+            let encoded = engine.encode(&payload);
+            let mut run = encoded.clone().into_bytes();
+            // What follows the run is not part of it: `=` past the padding
+            // a final group needs, or anything after a non-alphabet byte.
+            run.extend_from_slice(if padded { b"==\xff" } else { b"\xff==" });
+            let (encoded_len, size) = base64_extent(&run);
+            assert_eq!(size, len, "len {len} padded={padded}");
+            assert_eq!(encoded_len, encoded.len(), "len {len} padded={padded}");
+        }
+    }
+    // A lone trailing symbol carries no whole byte.
+    assert_eq!(base64_extent(b"QUJDR"), (5, 3));
+}
+
+#[test]
+fn base64_embedded_elf_reports_its_decoded_size() {
+    // One, two and zero `=`: the Kong dropper's 8,424,664-byte ELF is the
+    // two-`=` case, once reported as 8,424,666.
+    for extra in [0usize, 1, 2] {
+        let mut payload = Vec::new();
+        make_synthetic_elf(&mut payload, 0);
+        payload.resize(payload.len() + extra, 0x90);
+        for engine in [
+            &base64::engine::general_purpose::STANDARD,
+            &base64::engine::general_purpose::STANDARD_NO_PAD,
+        ] {
+            let encoded = base64::Engine::encode(engine, &payload);
+            let mut host = vec![0u8; 1024];
+            host[..4].copy_from_slice(b"\x7fELF");
+            host.extend_from_slice(encoded.as_bytes());
+            host.extend_from_slice(&[0xFF; 64]);
+            let found = scan(&host);
+            let hit = found
+                .iter()
+                .find(|f| f.offset == 1024)
+                .expect("base64 ELF found");
+            assert_eq!(hit.size, payload.len(), "{} padding", encoded.len() % 4);
+        }
+    }
+}
+
+#[test]
 fn test_scan_rejects_random_base64_run() {
     // 16 KB of base64-shaped bytes that don't decode to ELF/PE.
     let mut host = vec![0u8; 4096];

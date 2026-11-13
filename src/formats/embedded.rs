@@ -295,10 +295,7 @@ fn scan_base64(data: &[u8], results: &mut Vec<EmbeddedBinary>) {
                 continue;
             };
             let run = data.get(start..).unwrap_or_default();
-            let run_len = run
-                .iter()
-                .take_while(|&&b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
-                .count();
+            let (run_len, size) = base64_extent(run);
             if run_len < MIN_BASE64_RUN {
                 continue;
             }
@@ -315,7 +312,6 @@ fn scan_base64(data: &[u8], results: &mut Vec<EmbeddedBinary>) {
             else {
                 continue;
             };
-            let size = (run_len / 4) * 3;
             if size < MIN_EMBEDDED_ELF_SIZE {
                 continue;
             }
@@ -329,6 +325,34 @@ fn scan_base64(data: &[u8], results: &mut Vec<EmbeddedBinary>) {
             quotas.retain(bucket);
         }
     }
+}
+
+/// The standard-alphabet base64 run at the start of `run`: its encoded
+/// length, `=` padding included, and the size it decodes to.
+///
+/// Every four symbols carry three bytes, and a final group of two or three
+/// symbols carries one or two, whether or not `=` padding completes it, so
+/// the decoded size follows from the symbols alone. The run ends at the
+/// first non-alphabet byte, plus the `=` that complete its final group. A
+/// lone trailing symbol carries no whole byte.
+fn base64_extent(run: &[u8]) -> (usize, usize) {
+    let symbols = run
+        .iter()
+        .take_while(|&&b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/'))
+        .count();
+    let (tail, pad) = match symbols % 4 {
+        2 => (1, 2),
+        3 => (2, 1),
+        _ => (0, 0),
+    };
+    let padding = run
+        .get(symbols..)
+        .unwrap_or_default()
+        .iter()
+        .take(pad)
+        .take_while(|&&b| b == b'=')
+        .count();
+    (symbols + padding, symbols / 4 * 3 + tail)
 }
 
 fn classify_decoded_head(head: &[u8]) -> Option<EmbeddedKind> {

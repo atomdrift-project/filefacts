@@ -48,6 +48,7 @@ mod dos;
 mod ext;
 mod file_type;
 mod go_module;
+pub(crate) mod headerless_pe;
 mod heuristics;
 pub(crate) mod image4_trustcache;
 mod magic;
@@ -658,7 +659,28 @@ pub fn detect(path: &Path, data: &[u8]) -> Option<Detection> {
 /// expose the independently validated key.
 pub(crate) fn identify(path: &Path, data: &[u8]) -> (Option<Detection>, Option<RepeatingXorKey>) {
     let sniff = Sniff::new(path, data);
-    let (detection, key) = match detect_known(&sniff) {
+    let known = detect_known(&sniff);
+    // A PE whose loader-ignored magics were wiped reads as opaque data; its
+    // surviving headers are what identify it.
+    if known
+        .as_ref()
+        .is_none_or(|d| matches!(d.file_type, FileType::Data | FileType::Unknown))
+        && let Some(header) = headerless_pe::locate(data)
+    {
+        tracing::debug!(
+            target: "filefacts::fileid",
+            path = %path.display(),
+            len = data.len(),
+            nt_offset = header.nt_offset(),
+            wiped = ?header.fields().iter().map(|f| f.name()).collect::<Vec<_>>(),
+            "PE with wiped header magics"
+        );
+        return (
+            Some(Detection::heuristic(&sniff, FileType::Pe).excuse_convention(&sniff)),
+            None,
+        );
+    }
+    let (detection, key) = match known {
         Some(d) if matches!(d.file_type, FileType::Data | FileType::Gif) => {
             (Some(d), recover_repeating_xor_pe(data))
         }

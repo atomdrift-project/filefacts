@@ -777,6 +777,13 @@ fn run_extraction(
     tree_diagnostic: Option<&formats::source::TreeSitterDiagnostic>,
 ) -> Extracted {
     let file_type = fileid.file_type();
+    // A PE whose header magics were wiped is extracted from a copy with them
+    // restored, so every view describes the program the loader maps. The
+    // copy keeps the input's length: offsets still name the input's bytes.
+    let repaired = (file_type == FileType::Pe)
+        .then(|| fileid::headerless_pe::repair(bytes))
+        .flatten();
+    let bytes = repaired.as_ref().map_or(bytes, |r| r.image.as_slice());
     let extension_mismatch = fileid.extension_mismatch();
     let mismatch_transition = fileid.extension_mismatch_transition();
     let xor_pe_key = fileid.xor_pe_key();
@@ -790,6 +797,16 @@ fn run_extraction(
     let mut errors = Errors::new();
     if fileid.source() == fileid::DetectionSource::Failed {
         errors.record_panic(Stage::Identify, "file identification panicked");
+    }
+    if let Some(repaired) = &repaired {
+        let fields: Vec<&str> = repaired.header.fields().iter().map(|f| f.name()).collect();
+        tracing::debug!(
+            stage = Stage::PeParse.as_str(),
+            nt_offset = repaired.header.nt_offset(),
+            ?fields,
+            "restored wiped PE header fields before extraction"
+        );
+        values.insert_key(value_key!("pe.header.repaired"), serde_json::json!(fields));
     }
     if let Some(name) = basename {
         values.insert_key(
