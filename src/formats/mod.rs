@@ -58,7 +58,7 @@ mod go_pclntab;
 pub(crate) mod goblin_safe;
 mod image4;
 mod image_stats;
-mod installer;
+pub(crate) mod installer;
 pub(crate) mod iso;
 mod jar;
 mod jpeg;

@@ -1,5 +1,6 @@
 //! Self-extracting installers a PE carries in its own body: NSIS, Inno
-//! Setup, PyInstaller, Nuitka one-file and IExpress cabinets.
+//! Setup, PyInstaller, Nuitka one-file, IExpress cabinets and InstallShield
+//! `ISSetupStream` launchers.
 //!
 //! Each format writes a marker its runtime looks for -- the NSIS
 //! `0xDEADBEEF` first header beside its strings, Inno's setup-data banner,
@@ -11,7 +12,14 @@
 //! `binary.installer = {kind, marker_offset}` names the installer and where
 //! its data starts; a consumer that unpacks installers reads it. A
 //! PyInstaller bundle adds `python_version` (`"3.11"`), the interpreter its
-//! cookie names.
+//! cookie names. An InstallShield launcher adds `entry_count` and `entries`
+//! (`name`, absolute `offset`, `stored_size`) from its stream table, which
+//! [`installshield`] decodes. An NSIS installer whose header decodes adds
+//! `script`: its install commands, rendered and by kind (see
+//! [`nsis::script`]).
+
+pub(crate) mod installshield;
+pub(crate) mod nsis;
 
 use memchr::memmem;
 use serde_json::{Map, Value as JsonValue};
@@ -48,8 +56,49 @@ pub(crate) fn emit(data: &[u8], embedded: &[EmbeddedBinary], values: &mut Values
         {
             obj.insert("python_version".into(), version.into());
         }
+        if kind == "installshield" {
+            installshield_values(data, offset, &mut obj);
+        }
+    }
+    if kind == "nsis" {
+        match nsis::script(data) {
+            Ok(script) => {
+                obj.insert("script".into(), nsis::values(&script));
+            }
+            Err(error) => {
+                tracing::debug!(target: "filefacts::nsis", %error, "NSIS install script not decoded");
+            }
+        }
     }
     values.insert_key(value_key!("binary.installer"), JsonValue::Object(obj));
+}
+
+/// Most `ISSetupStream` entries listed in the values.
+const MAX_LISTED_ENTRIES: usize = 512;
+
+/// The `ISSetupStream` table at `offset`: its entry count and entries.
+fn installshield_values(data: &[u8], offset: usize, obj: &mut Map<String, JsonValue>) {
+    let Some(listing) = data
+        .get(offset..)
+        .and_then(|stream| installshield::entries(stream).ok())
+    else {
+        return;
+    };
+    obj.insert("entry_count".into(), listing.declared.into());
+    obj.insert("complete".into(), listing.complete.into());
+    let entries = listing
+        .entries
+        .iter()
+        .take(MAX_LISTED_ENTRIES)
+        .map(|entry| {
+            let mut item = Map::new();
+            item.insert("name".into(), entry.name.clone().into());
+            item.insert("offset".into(), offset.saturating_add(entry.offset).into());
+            item.insert("stored_size".into(), entry.stored_size.into());
+            JsonValue::Object(item)
+        })
+        .collect();
+    obj.insert("entries".into(), JsonValue::Array(entries));
 }
 
 /// The Python version a PyInstaller cookie at `cookie` names: a big-endian
@@ -71,6 +120,9 @@ pub(crate) fn detect(
     embedded: &[EmbeddedBinary],
 ) -> Option<(&'static str, Option<usize>)> {
     let outside = |marker: &[u8]| marker_outside(data, marker, embedded);
+    if let Some(at) = installshield::find(data).filter(|&at| !inside_image(at, embedded)) {
+        return Some(("installshield", Some(at)));
+    }
     if let Some(at) = outside(INNO_MARKER) {
         return Some(("inno", Some(at)));
     }

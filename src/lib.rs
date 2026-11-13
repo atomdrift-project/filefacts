@@ -174,6 +174,21 @@ pub mod recover {
         pub use crate::formats::rpa::{Chunk, Member, members};
     }
 
+    /// InstallShield `ISSetupStream` entries, for hosts that extract them:
+    /// list the table, then decode each entry's file under a size limit.
+    pub mod installshield {
+        pub use crate::formats::installer::installshield::{
+            Entry, Listing, MAGIC, MAX_ENTRIES, decode_entry, entries, is_stream,
+        };
+    }
+
+    /// The install script decoded from an NSIS installer's header.
+    pub mod nsis {
+        pub use crate::formats::installer::nsis::{
+            Command, MAX_COMMANDS, MAX_HEADER_LEN, Script, script,
+        };
+    }
+
     /// Structurally framed JVM classes embedded in a JPHP compiled module.
     pub use crate::formats::jphp::class_frames as jphp_class_frames;
 }
