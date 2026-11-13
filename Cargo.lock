@@ -122,9 +122,9 @@ dependencies = [
 
 [[package]]
 name = "bumpalo"
-version = "3.20.3"
+version = "3.20.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
+checksum = "87a0cf66fd1eb2fb7b822cb78370d82303750809bc6ba855f3f58e517d3238db"
 
 [[package]]
 name = "byteorder"
@@ -1639,7 +1639,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stng"
 version = "3.0.0-beta.2"
-source = "git+https://github.com/atomdrift-project/stng.git#441cc228572e823c0cfa3cb00692b8f5da9537e2"
+source = "git+https://github.com/atomdrift-project/stng.git#387fd4aa438b3e4bcf8b5a64c6c55a8c4070f28f"
 dependencies = [
  "aho-corasick",
  "base64 0.22.1",
