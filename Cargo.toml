@@ -212,7 +212,7 @@ tracing-subscriber = { version = "0.3", optional = true, default-features = fals
 # Disk cache — zstd-compressed JSON blobs keyed by sha256. JSON (not a
 # positional format) round-trips the `skip_serializing_if` fields the
 # cached payload carries; zstd keeps the on-disk size competitive.
-zstd = "0.14.3"
+zstd = "0.14.4"
 
 # Temp file handling for atomic disk-cache writes. `tempfile` cleans up properly on Drop and avoids races.
 tempfile = "3"
