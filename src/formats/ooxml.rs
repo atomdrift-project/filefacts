@@ -271,13 +271,29 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         // tens of kilobytes; the padding that hides a payload, or defeats a
         // scanner's size limit, shows up here and nowhere else -- the
         // document itself stays small because the padding compresses away.
-        let vba_bytes: u64 = macros
+        // Excel 4.0 macro sheets are listed as macros too, but they are
+        // formula parts, not the VBA project: count and size them apart,
+        // like the BIFF reader's `office.xlm_sheet_count`.
+        let (sheets, projects): (Vec<&str>, Vec<&str>) = macros
             .iter()
             .filter_map(|m| m.as_str())
-            .filter_map(|name| zip.by_name(name).ok().map(|e| e.size()))
-            .sum();
+            .partition(|name| workbook::is_macrosheet(name));
+        let mut part_bytes = |names: &[&str]| -> u64 {
+            names
+                .iter()
+                .filter_map(|name| zip.by_name(name).ok().map(|e| e.size()))
+                .sum()
+        };
+        let vba_bytes = part_bytes(&projects);
+        let sheet_bytes = part_bytes(&sheets);
         if vba_bytes > 0 {
             metrics.insert(metric!("office.vba.project_size"), vba_bytes as f64);
+        }
+        if !sheets.is_empty() {
+            metrics.insert(metric!("office.xlm_sheet_count"), sheets.len() as f64);
+        }
+        if sheet_bytes > 0 {
+            metrics.insert(metric!("office.xlm.macrosheet_size"), sheet_bytes as f64);
         }
         values.insert_key(value_key!("office.macros"), JsonValue::Array(macros));
         metrics.insert(metric!("office.macro_count"), count);

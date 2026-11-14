@@ -730,6 +730,16 @@ pub(super) fn scored_type(sniff: &Sniff<'_>) -> Option<FileType> {
         }
     }
 
+    // PHP only runs between tags (see the tag gate below), so untagged bytes
+    // cannot be PHP -- and must not make a real language look ambiguous
+    // either: jQuery's `$this` / `$select` score as PHP variables and pushed
+    // a plain plugin under the ambiguity margin.
+    if !(has_php_tag(body) || (padded_head && has_php_tag(tail)))
+        && let Some(score) = scores.0.get_mut(Lang::Php.idx())
+    {
+        *score = 0;
+    }
+
     // Find the best and second-best scoring languages
     let mut best_lang: Option<Lang> = None;
     let mut best_score: u16 = 0;

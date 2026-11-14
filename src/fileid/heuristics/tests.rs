@@ -946,3 +946,22 @@ fn language_gates_read_the_scored_window_past_leading_padding() {
     }
     assert_eq!(detect_from_content(&php), Some(FileType::Php));
 }
+
+#[test]
+fn untagged_dollar_variables_do_not_make_jquery_ambiguous() {
+    // A jQuery plugin: `$this` / `$select` are PHP-shaped variables, but with
+    // no `<?` tag the bytes cannot be PHP and must not crowd out JavaScript.
+    let mut src = String::from(
+        "/**\n * jQuery Demo Sortable\n * License: GPL\n */\n\n(function ($) {\n    var $this = this.filter('[multiple]');\n    $this.each(function () {\n        var $select = $(this);\n        if (typeof ($select.data('demo')) !== 'object') { return false; }\n        var sorted = JSON.stringify($select.val());\n        if (sorted === '') { window.location.hash = 'x'; }\n        document.getElementById('d').addEventListener('click', function () {});\n    });\n",
+    );
+    for i in 0..8 {
+        src.push_str(&format!(
+            "    var $opt{i} = $select.find('option');\n    $this.data('k{i}', $opt{i});\n"
+        ));
+    }
+    src.push_str("})(jQuery);\n");
+    assert_eq!(
+        detect_from_content(src.as_bytes()),
+        Some(FileType::JavaScript)
+    );
+}

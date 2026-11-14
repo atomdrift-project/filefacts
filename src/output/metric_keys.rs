@@ -651,6 +651,7 @@ pub(crate) const CATALOG: &[&str] = &[
     "office.xlm.day_now_count",
     "office.xlm.formula_fill_count",
     "office.xlm.get_cell_count",
+    "office.xlm.macrosheet_size",
     "office.xlm.run_count",
     "office.xlm.very_hidden_sheet_count",
     "office.xlm_sheet_count",

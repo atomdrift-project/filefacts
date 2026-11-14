@@ -190,6 +190,27 @@ fn reports_the_uncompressed_size_of_the_vba_project() {
 }
 
 #[test]
+fn an_xlsb_macro_sheet_is_counted_apart_from_the_vba_project() {
+    // An .xlsb's Excel 4.0 macro sheet is a BIFF12 formula part declared
+    // by its own content type; it is a macro, but not the VBA project.
+    let types = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Override PartName="/xl/macrosheets/intlsheet1.bin" ContentType="application/vnd.ms-excel.intlmacrosheet"/>
+</Types>"#;
+    let blob = vec![b'A'; 50_000];
+    let z = build_ooxml(&[
+        ("[Content_Types].xml", types.as_bytes()),
+        ("xl/macrosheets/intlsheet1.bin", &blob),
+    ]);
+    let (v, m) = run(&z);
+    let macros = v.get("office.macros").and_then(|x| x.as_array()).unwrap();
+    assert_eq!(macros.len(), 1);
+    assert_eq!(m.get("office.vba.project_size"), None);
+    assert_eq!(m.get("office.xlm_sheet_count"), Some(1.0));
+    assert_eq!(m.get("office.xlm.macrosheet_size"), Some(50_000.0));
+}
+
+#[test]
 fn no_vba_project_size_without_macros() {
     let z = build_ooxml(&[("[Content_Types].xml", CONTENT_TYPES_DOCX.as_bytes())]);
     let (_, m) = run(&z);

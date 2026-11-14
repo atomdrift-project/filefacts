@@ -491,12 +491,17 @@ pub(super) fn extract_from_zip<R: Read + Seek>(
     // OPC part names compare without regard to ASCII case (ECMA-376 Part 2
     // §9.1.1.1), so a declared name that matches no part exactly still
     // finds its part whatever the case of either.
+    //
+    // `office.macros` also lists Excel 4.0 macro sheets
+    // (`xl/macrosheets/*`): those are formula parts (XML or BIFF12), never
+    // a VBA compound file, so they are not candidates for the project.
     let declared: Vec<&str> = values
         .lookup(value_key!("office.macros"))
         .and_then(JsonValue::as_array)
         .into_iter()
         .flatten()
         .filter_map(JsonValue::as_str)
+        .filter(|n| !is_macrosheet_part(n))
         .collect();
     let exact = declared
         .iter()
@@ -533,6 +538,11 @@ pub(super) fn extract_from_zip<R: Read + Seek>(
         }
     }
     report.finish(values);
+}
+
+/// Whether `name` is an Excel 4.0 macro sheet part (`xl/macrosheets/...`).
+fn is_macrosheet_part(name: &str) -> bool {
+    crate::formats::common::starts_with_ci(name, "xl/macrosheets/")
 }
 
 /// The bytes of the `vbaProject.bin` part, or `None` once the failure or

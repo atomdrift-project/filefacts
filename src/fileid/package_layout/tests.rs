@@ -139,3 +139,33 @@ fn oversized_manifests_remain_generic() {
         FileType::Zip
     );
 }
+
+#[test]
+fn go_containerregistry_tarball_image_is_an_oci_image() {
+    let hex = "5a99c1aa63bbf4de393361eb196b89853c13bb61dc276cc103587107f338b8a0";
+    let config = format!("sha256:{hex}");
+    let layer = format!("{hex}.tar.gz");
+    let manifest =
+        format!(r#"[{{"Config":"{config}","RepoTags":["demo:latest"],"Layers":["{layer}"]}}]"#);
+    let bytes = tar(
+        &[
+            (config.as_str(), b"{}"),
+            (layer.as_str(), b"\x1f\x8b\x08\0"),
+            ("manifest.json", manifest.as_bytes()),
+        ],
+        false,
+    );
+    let id = FileId::from_path_and_bytes(Path::new("image.tar"), &bytes);
+    assert_eq!(id.file_type(), FileType::OciImage);
+
+    // A manifest.json next to an ordinary tarball member is not an image.
+    let plain = tar(
+        &[
+            ("manifest.json", b"{}"),
+            ("notes.tar.gz", b"\x1f\x8b\x08\0"),
+        ],
+        false,
+    );
+    let id = FileId::from_path_and_bytes(Path::new("bundle.tar"), &plain);
+    assert_ne!(id.file_type(), FileType::OciImage);
+}

@@ -632,6 +632,38 @@ fn an_ooxml_project_that_does_not_open_is_recorded() {
     assert!(values.get("office.vba").is_none());
 }
 
+/// An Excel 4.0 macro sheet listed in `office.macros` (a BIFF12
+/// `intlsheet1.bin` in an `.xlsb`) is a formula part, not a VBA project:
+/// it is not opened as a compound file and records no failure.
+#[test]
+fn a_listed_xlm_macro_sheet_is_not_read_as_a_vba_project() {
+    use std::io::Write;
+    let mut zw = zip::ZipWriter::new(Cursor::new(Vec::<u8>::new()));
+    zw.start_file(
+        "xl/macrosheets/intlsheet1.bin",
+        zip::write::SimpleFileOptions::default(),
+    )
+    .unwrap();
+    zw.write_all(b"BIFF12 formula records").unwrap();
+    let zip_bytes = zw.finish().unwrap().into_inner();
+    let mut zip = zip::ZipArchive::new(Cursor::new(zip_bytes)).unwrap();
+    let mut values = Values::new();
+    values.insert(
+        "office.macros",
+        serde_json::json!(["xl/macrosheets/intlsheet1.bin"]),
+    );
+    let mut errors = Errors::new();
+    extract_from_zip(
+        &mut zip,
+        &mut values,
+        &mut Metrics::new(),
+        &mut crate::output::Symbols::new(),
+        &mut errors,
+    );
+    assert!(errors.is_empty(), "{errors:?}");
+    assert!(values.get("office.vba").is_none());
+}
+
 /// Every module may name the same small stream of copy tokens, each
 /// decompressing it to just under the per-module cap: 256 of them made
 /// 2.5 GiB of source. The modules share one project budget, and those past

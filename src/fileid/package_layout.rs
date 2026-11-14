@@ -265,7 +265,10 @@ impl TarProbe {
             "index.json" => self.oci_index = true,
             "manifest.json" => self.docker_manifest = true,
             "repositories" => self.docker_layers = true,
-            _ if path.ends_with("/layer.tar") || path.starts_with("blobs/") => {
+            _ if path.ends_with("/layer.tar")
+                || path.starts_with("blobs/")
+                || is_tarball_image_blob(path) =>
+            {
                 self.docker_layers = true;
             }
             _ => {}
@@ -418,6 +421,16 @@ pub(super) fn composer_zip(sniff: &Sniff<'_>) -> bool {
         .is_ok()
         && body.len() as u64 <= MANIFEST_LIMIT
         && manifest(&name, &body) == Some(FileType::Composer)
+}
+
+/// A root-level blob of go-containerregistry's `tarball` image format (written
+/// by kaniko and crane): the config as `sha256:<hex>` and each layer as
+/// `<hex>.tar.gz`, next to a docker-style `manifest.json`.
+fn is_tarball_image_blob(path: &str) -> bool {
+    let digest = path
+        .strip_prefix("sha256:")
+        .or_else(|| path.strip_suffix(".tar.gz"));
+    digest.is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 #[cfg(test)]
