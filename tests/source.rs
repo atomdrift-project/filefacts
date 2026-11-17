@@ -854,6 +854,53 @@ fn infinite_loop_js_while_true() {
     assert_eq!(p.metrics().get("ast.infinite_loop_count"), Some(1.0));
 }
 
+#[test]
+fn this_subscript_count_metric() {
+    // Computed and optional-chained access on `this` count. A dotted access,
+    // a subscript on another object, and the same text quoted in a string or
+    // a comment do not: a regex over the source cannot tell those apart.
+    let js = br#"
+this[name](1);
+var v = this?.[key];
+this.plain = 1;
+obj[key] = 2;
+var quoted = "{\n  this[propertyName] = properties[propertyName]\n}";
+// this[commented]
+"#;
+    let p = options().path(std::path::Path::new("t.js")).open(js);
+    assert_eq!(p.metrics().get("ast.this_subscript_count"), Some(2.0));
+    let ts = b"class A { m(k: string) { return this[k]; } }\n";
+    let p = options().path(std::path::Path::new("t.ts")).open(ts);
+    assert_eq!(p.metrics().get("ast.this_subscript_count"), Some(1.0));
+}
+
+#[test]
+fn delete_subscript_count_metric() {
+    // A comment between `delete` and its operand still counts; deleting a
+    // dotted property, and the text inside a string, do not.
+    let js = br#"
+delete cache[key];
+delete /* operator */ this[key];
+delete table[row][column];
+delete obj.plain;
+var quoted = "delete other[1]";
+"#;
+    let p = options().path(std::path::Path::new("d.js")).open(js);
+    assert_eq!(p.metrics().get("ast.delete_subscript_count"), Some(3.0));
+}
+
+#[test]
+fn subscript_shape_metrics_absent_without_the_shape() {
+    let js = b"var a = obj[key]; delete obj.plain; this.x = 1;\n";
+    let p = options().path(std::path::Path::new("n.js")).open(js);
+    assert_eq!(p.metrics().get("ast.this_subscript_count"), None);
+    assert_eq!(p.metrics().get("ast.delete_subscript_count"), None);
+    // Python's `del self[k]` is not the JavaScript shape.
+    let py = b"class A:\n    def f(self, k):\n        del self[k]\n";
+    let p = options().path(std::path::Path::new("n.py")).open(py);
+    assert_eq!(p.metrics().get("ast.delete_subscript_count"), None);
+}
+
 /// A parse cut short by the caller is not a fact about the bytes, and says so
 /// for callers that cache by content; an ordinary parse does not.
 #[test]

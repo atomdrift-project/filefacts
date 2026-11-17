@@ -228,6 +228,14 @@ pub(super) fn finish(
             metric!("ast.infinite_loop_count"),
             state.infinite_loop_count,
         ),
+        (
+            metric!("ast.this_subscript_count"),
+            state.this_subscript_count,
+        ),
+        (
+            metric!("ast.delete_subscript_count"),
+            state.delete_subscript_count,
+        ),
     ] {
         if value > 0 {
             metrics.insert(key, f64::from(value));
@@ -631,6 +639,14 @@ pub(super) struct State {
     /// `while (1)`, `for (;;)`) — infinite-loop obfuscation/rotators, matched
     /// on the loop node so it never fires on prose (`ast.infinite_loop_count`).
     infinite_loop_count: u32,
+    /// Count of JavaScript/TypeScript computed accesses on `this`
+    /// (`this[k]`, `this?.[k]`) -- read from the tree, so code quoted in a
+    /// string or comment never counts (`ast.this_subscript_count`).
+    this_subscript_count: u32,
+    /// Count of JavaScript/TypeScript `delete` of a computed property
+    /// (`delete o[k]`), comments between the tokens included
+    /// (`ast.delete_subscript_count`).
+    delete_subscript_count: u32,
 }
 
 impl State {
@@ -675,8 +691,18 @@ impl State {
         // same path, so a JS sandbox-escape pattern like
         // `obj["constructor"]["constructor"]("...")` lands as a member chain
         // instead of dropping out as a dynamic access.
-        if ids.member_or_subscript.contains(kind) && !self.resolved_links.remove(&node.id()) {
-            self.record_member_chain(node, source, config, depth);
+        if ids.member_or_subscript.contains(kind) {
+            if !self.resolved_links.remove(&node.id()) {
+                self.record_member_chain(node, source, config, depth);
+            }
+            if config.lang.is_ecmascript()
+                && node.kind() == "subscript_expression"
+                && node
+                    .child_by_field_name("object")
+                    .is_some_and(|object| object.kind() == "this")
+            {
+                self.this_subscript_count += 1;
+            }
         }
 
         if ids.call.contains(kind) {
@@ -719,6 +745,14 @@ impl State {
         if let Some(op_node) = op_node
             && let Ok(op) = op_node.utf8_text(source.as_bytes())
         {
+            if op == "delete"
+                && config.lang.is_ecmascript()
+                && node
+                    .child_by_field_name("argument")
+                    .is_some_and(|argument| argument.kind() == "subscript_expression")
+            {
+                self.delete_subscript_count += 1;
+            }
             if let Some(name) = canonical_op(op) {
                 *self.op_counts.entry(name).or_insert(0) += 1;
                 // Rolling-XOR decode shape: an `^` whose operand subtree
