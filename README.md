@@ -40,16 +40,6 @@ Views include `fileid`, `identity`, `values`, `text`, `literals`, `metrics`,
 | Option | Effect |
 |---|---|
 | `-f`, `--format <terminal\|json>` | Output format (default `terminal`) |
-| `--no-cache` | Neither read nor write the disk cache |
-
-| Environment | Effect |
-|---|---|
-| `FILEFACTS_CACHE=0` | Disable the disk cache (`~/.cache/atomdrift/filefacts` or the platform equivalent) |
-| `FILEFACTS_DEBUG=1` | Print extractor diagnostics to stderr |
-
-For PE, ELF, and Mach-O, filefacts reads the sections, imports and exports,
-and recovers the functions of a binary with no symbol table, in-process with
-[binform](https://github.com/atomdrift-project/binform). It starts no subprocess.
 
 ## Library
 
@@ -58,13 +48,6 @@ let parsed = filefacts::open(&bytes);
 println!("{:?}", parsed.fileid().file_type());
 let metrics = parsed.metrics(); // views are computed lazily and cached
 ```
-
-`OpenOptions` sets the path, a known type, cancellation, and caching per
-file; the library reads no environment variables. filefacts is not
-on crates.io yet, so depend on it via git with `default-features = false` (the
-default features build the CLI) and copy the `[patch.crates-io]` block from
-`Cargo.toml`: `[patch]` applies only in the root of a build, and without it
-you get the unpatched tree-sitter releases.
 
 ## Project
 
