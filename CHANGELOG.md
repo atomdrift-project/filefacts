@@ -3,6 +3,26 @@
 All notable changes to filefacts. Versions follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
 The output schema is versioned separately by `filefacts::SCHEMA_VERSION`; a bump is noted with its new value.
 
+## 3.0.0 (2026-11-17)
+
+### Features
+
+- Restore wiped PE header magics before analysis, so mangled samples stop hiding; `pe.header.repaired` records what changed.
+- Decode NSIS installer scripts, so the commands they run and the registry keys they write are no longer hidden.
+- Read InstallShield setup streams, so the files packed inside are no longer opaque.
+- Recognize container image tarballs written by kaniko and crane, not just docker's layout.
+- Count computed accesses on `this` and deletes of computed properties in JavaScript, both read from the parse tree.
+
+### Fixes
+
+- Stop untagged text scoring as PHP, so jQuery plugins are no longer called ambiguous.
+- Stop treating Excel 4.0 macro sheets as VBA projects; their size lands in `office.xlm.macrosheet_size`.
+- Size unpadded base64 runs from their symbols alone, so embedded ELF files missing trailing `=` are no longer skipped.
+
+### Optimizations
+
+- Speed up PNG bit-plane probing by appending each mask's samples in one step, not bit by bit.
+
 ## 3.0.0-beta.1 (2026-11-09)
 
 ### Security
