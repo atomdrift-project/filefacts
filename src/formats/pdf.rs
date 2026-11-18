@@ -50,7 +50,7 @@ mod streams;
 mod tokens;
 
 use actions::{Action, ActionKind, JsScan};
-use lex::value_after_key;
+use lex::{has_name, key_ends, value_after_key};
 use objects::{DictRegion, MAX_DICT_REGIONS, ObjectIndex, ObjectStreams, TypeCounts};
 use tokens::{INFO_KEYS, Tok, TokenScan};
 
@@ -90,11 +90,6 @@ pub(super) fn extract(
         );
         return;
     };
-    let features = catalog_features(&scan);
-    if !features.is_empty() {
-        values.insert_key(value_key!("pdf.catalog"), json!({ "features": features }));
-    }
-
     let walk = objects::collect_dict_regions(bytes);
     let regions = walk.regions.as_slice();
     tracing::debug!(
@@ -126,11 +121,22 @@ pub(super) fn extract(
     let object_streams = objects::decode_object_streams(bytes, regions, MAX_OBJSTM_TOTAL);
     object_stream_limits(&object_streams, &mut limits);
     let mut types = TypeCounts::default();
-    for region in regions {
-        types.add(region.dict(bytes));
+    let mut has_openaction = scan.has(Tok::OpenAction);
+    let dictionaries = regions.iter().map(|region| region.dict(bytes)).chain(
+        object_streams
+            .decoded
+            .iter()
+            .map(|(_, text)| text.as_slice()),
+    );
+    for dict in dictionaries {
+        types.add(dict);
+        has_openaction = has_openaction
+            || (has_name(dict, b"Type", b"Catalog")
+                && key_ends(dict, b"OpenAction").next().is_some());
     }
-    for (_, text) in &object_streams.decoded {
-        types.add(text);
+    let features = catalog_features(&scan, has_openaction);
+    if !features.is_empty() {
+        values.insert_key(value_key!("pdf.catalog"), json!({ "features": features }));
     }
 
     shape(bytes, &scan, &types, values, metrics);
@@ -234,12 +240,12 @@ fn header_version(bytes: &[u8], header_at: usize) -> Option<String> {
 /// booleans. Names use the PDF-spec keys analysts already know (AcroForm,
 /// XFA, OpenAction) lowercased; `additional_actions` expands the
 /// abbreviated `/AA`; `3d` matches the spec name.
-fn catalog_features(scan: &TokenScan) -> Vec<&'static str> {
+fn catalog_features(scan: &TokenScan, has_openaction: bool) -> Vec<&'static str> {
     let three_d = scan.get(Tok::Subtype3dSpaced).all + scan.get(Tok::Subtype3dJoined).all;
     [
         (scan.has(Tok::AcroForm), "acroform"),
         (scan.has(Tok::Xfa), "xfa"),
-        (scan.has(Tok::OpenAction), "openaction"),
+        (has_openaction, "openaction"),
         (scan.has(Tok::AdditionalActions), "additional_actions"),
         (scan.has(Tok::JavaScript), "names_javascript"),
         (scan.has(Tok::RichMedia), "richmedia"),

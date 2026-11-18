@@ -212,6 +212,12 @@ pub(super) fn mirc_line(line: &[u8]) -> Grade {
     if is(b"sockopen") || is(b"sockwrite") || is(b"socklisten") || is(b"sockread") {
         return Grade::Strong;
     }
+    if is(b"dcc") && identifiers {
+        let (command, args) = split_verb(arg);
+        if command.eq_ignore_ascii_case(b"send") && !args.trim_ascii().is_empty() {
+            return Grade::Strong;
+        }
+    }
     if identifiers {
         return Grade::Weak;
     }

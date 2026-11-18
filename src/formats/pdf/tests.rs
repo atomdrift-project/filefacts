@@ -82,6 +82,25 @@ fn javascript_payload_hex_string() {
     assert_eq!(js[0]["content"].as_str(), Some("app=1"));
 }
 
+#[test]
+fn escaped_catalog_action_and_javascript_keys() {
+    let pdf = b"%PDF-1.5\n1 0 obj<</Type/Catalog/Ope#6eAction 2 0 R>>endobj\n\
+        2 0 obj<</S/Java#53cript/#4aS (app=1)>>endobj\n%%EOF";
+    let (values, _) = extract_pdf(pdf);
+    assert_eq!(
+        values.get("pdf.catalog").unwrap()["features"][0].as_str(),
+        Some("openaction")
+    );
+    assert_eq!(
+        values.get("pdf.actions").unwrap()[0]["kind"].as_str(),
+        Some("javascript")
+    );
+    assert_eq!(
+        values.get("pdf.javascript").unwrap()[0]["content"].as_str(),
+        Some("app=1")
+    );
+}
+
 /// `/JS N N R` follows the indirect reference into a string-
 /// object body and surfaces its content — the target object id
 /// is recorded so analysts can map JS back to a specific obj.

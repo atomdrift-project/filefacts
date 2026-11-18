@@ -421,6 +421,15 @@ fn mirc_event_headers_and_saved_script() {
     );
 }
 
+#[test]
+fn mirc_scripts_allow_irc_formatting_bytes() {
+    let message = b"\x0305Hi \x02friend\x02 \x1fWelcome\x1f \x0f";
+    let mut src = b"[script]\r\nn0=on 1:JOIN:#:{ /msg $nick ".to_vec();
+    src.extend_from_slice(&message.repeat(8));
+    src.extend_from_slice(b" }\r\nn1=on 1:PART:#:{ .msg $nick Goodbye }\r\n");
+    assert_detect("remote.ini", &src, FileType::Mirc);
+}
+
 /// An alias file written with mIRC identifiers is mIRC even when it
 /// writes batch lines into the file it drops.
 #[test]

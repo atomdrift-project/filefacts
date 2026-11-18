@@ -8,8 +8,8 @@ use serde_json::{Value as JsonValue, json};
 use super::MAX_INFLATED;
 use super::filters::{StageBudget, decode_stream, find_filters};
 use super::lex::{
-    find_info_value, has_name, parse_indirect_ref_value, read_hex_string, read_literal_string,
-    skip_while, truncate,
+    dict_name_spans, find_info_value, has_name, key_ends, parse_indirect_ref_value,
+    read_hex_string, read_literal_string, skip_while, truncate,
 };
 use super::objects::{DictRegion, ObjectIndex};
 
@@ -77,17 +77,6 @@ pub(super) struct Action {
 ///
 /// At most `cap` sites are recorded.
 pub(super) fn scan_actions(bytes: &[u8], dict_regions: &[DictRegion], cap: usize) -> Vec<Action> {
-    const KINDS: &[(&[u8], ActionKind)] = &[
-        (b"/JS", ActionKind::JavaScript),
-        (b"/Launch", ActionKind::Launch),
-        (b"/URI", ActionKind::Uri),
-        (b"/SubmitForm", ActionKind::SubmitForm),
-        (b"/GoToR", ActionKind::GoToR),
-        (b"/GoToE", ActionKind::GoToE),
-        (b"/Movie", ActionKind::Movie),
-        (b"/Sound", ActionKind::Sound),
-        (b"/ImportData", ActionKind::ImportData),
-    ];
     let mut out = Vec::new();
     for region_info in dict_regions {
         if out.len() >= cap {
@@ -97,36 +86,36 @@ pub(super) fn scan_actions(bytes: &[u8], dict_regions: &[DictRegion], cap: usize
         if region.is_empty() {
             continue;
         }
-        let source = if has_name(region, b"Type", b"Catalog") {
+        let source = if has_name(region, b"Type", b"Catalog")
+            && key_ends(region, b"OpenAction").next().is_some()
+        {
             "openaction".to_string()
         } else {
             object_source(region_info.obj_id)
         };
-        for &(needle, kind) in KINDS {
-            let mut pos = 0;
-            while let Some(rel) = region
-                .get(pos..)
-                .and_then(|rest| memchr::memmem::find(rest, needle))
-            {
-                let next = pos + rel + needle.len();
-                pos = next;
-                // Reject `/JS` matching `/JSON` or `/JavaScript`.
-                if region.get(next).is_some_and(u8::is_ascii_alphabetic) {
-                    continue;
+        for (name, _, next) in dict_name_spans(region) {
+            let kind = match name.as_ref() {
+                b"JS" => ActionKind::JavaScript,
+                b"Launch" => ActionKind::Launch,
+                b"URI" => ActionKind::Uri,
+                b"SubmitForm" => ActionKind::SubmitForm,
+                b"GoToR" => ActionKind::GoToR,
+                b"GoToE" => ActionKind::GoToE,
+                b"Movie" => ActionKind::Movie,
+                b"Sound" => ActionKind::Sound,
+                b"ImportData" => ActionKind::ImportData,
+                _ => continue,
+            };
+            // Action-type declarations without a payload do not make sites.
+            if let Some(snippet) = action_snippet(region, next) {
+                if out.len() >= cap {
+                    return out;
                 }
-                // Only emit when the key has a value-bearing payload
-                // — filters out `/S /URI` action-type declarations
-                // (where `/URI` is a *name value*, not a key).
-                if let Some(snippet) = action_snippet(region, next) {
-                    if out.len() >= cap {
-                        return out;
-                    }
-                    out.push(Action {
-                        kind,
-                        source: source.clone(),
-                        snippet,
-                    });
-                }
+                out.push(Action {
+                    kind,
+                    source: source.clone(),
+                    snippet,
+                });
             }
         }
     }
@@ -244,15 +233,8 @@ pub(super) fn scan_javascript_payloads(
     let mut stages = StageBudget::default();
     'regions: for region in dict_regions {
         let dict = region.dict(bytes);
-        let mut pos = 0;
-        while let Some(rel) = dict
-            .get(pos..)
-            .and_then(|rest| memchr::memmem::find(rest, b"/JS"))
-        {
-            let next = pos + rel + 3;
-            pos = next;
-            // Reject /JSON, /JavaScript (the *name*, not the key form).
-            if dict.get(next).is_some_and(u8::is_ascii_alphabetic) {
+        for (name, start, next) in dict_name_spans(dict) {
+            if name.as_ref() != b"JS" {
                 continue;
             }
             if sites >= MAX_JS_SITES {
@@ -262,7 +244,7 @@ pub(super) fn scan_javascript_payloads(
             sites += 1;
             let source = object_source(region.obj_id);
             // File offset of the `/JS` key, for naming the payload.
-            let site = region.start + next - 3;
+            let site = region.start + start;
             let cursor = skip_while(dict, next, u8::is_ascii_whitespace);
             let target = js_reference(dict, cursor);
             if let Some(&known) = target.and_then(|id| seen.get(&id)) {

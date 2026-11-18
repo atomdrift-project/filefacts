@@ -968,9 +968,11 @@ fn pod_document(sniff: &Sniff<'_>) -> Option<Detection> {
 /// so its name stays what it says.
 fn unmistakable_mark(sniff: &Sniff<'_>) -> Option<Detection> {
     let marked = sniff.unmistakable()?;
+    let irc_script = matches!(marked, FileType::Mirc | FileType::IrcII);
     // Marks are text syntax; object code can hold their bytes by chance (a
     // column-zero `x:` and a tab-led line read as a make target and recipe).
-    if sniff.binary_not_source() {
+    // IRC marks already check the script control-byte set through the parser.
+    if !irc_script && sniff.binary_not_source() {
         return None;
     }
     sniff
@@ -978,6 +980,8 @@ fn unmistakable_mark(sniff: &Sniff<'_>) -> Option<Detection> {
         .is_none_or(|c| {
             c.file_type == marked
                 || c.yields_to_mark()
+                // Saved mIRC scripts use INI extensions.
+                || (irc_script && c.file_type == FileType::Text)
                 || (c.claims_language() && heuristics::lacks_language_evidence(c.file_type, sniff))
         })
         .then(|| Detection::heuristic(sniff, marked))

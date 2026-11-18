@@ -276,6 +276,9 @@ fn mirc_scripts() {
     assert_eq!(verdict(remote), Some(FileType::Mirc));
     let saved = b"[script]\r\nn0=on 1:JOIN:#:{ /dcc send $nick c:\\x.com }\r\nn1=on 1:PART:#:{ .msg $nick bye }\r\n";
     assert_eq!(verdict(saved), Some(FileType::Mirc));
+    let single_handler =
+        b"[script]\r\nn0=on 1:JOIN:#:{\r\nn1=/msg $nick Welcome\r\nn2=/dcc send $nick guide.txt\r\nn3=}\r\n";
+    assert_eq!(verdict(single_handler), Some(FileType::Mirc));
     let aliases =
         b"alias xspread {\r\n  .write x-.bat net view > x-.txt\r\n  .timersx 1 20 xcopy1\r\n}\r\n\
 alias xcopy1 {\r\n  if ($lines(x-.txt) < 6) { halt }\r\n}\r\n";

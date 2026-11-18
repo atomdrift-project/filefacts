@@ -84,21 +84,25 @@ fn name_at(bytes: &[u8], slash: usize) -> Option<(Cow<'_, [u8]>, usize)> {
     Some((decode_name(bytes.get(start..end)?), end))
 }
 
+pub(super) fn dict_name_spans(dict: &[u8]) -> impl Iterator<Item = (Cow<'_, [u8]>, usize, usize)> {
+    let mut pos = 0;
+    std::iter::from_fn(move || {
+        let slash = pos + memchr::memchr(b'/', dict.get(pos..)?)?;
+        let (name, end) = name_at(dict, slash)?;
+        pos = end;
+        Some((name, slash, end))
+    })
+}
+
 /// The position just past each `key` entry's key in `dict`, wherever the
 /// name appears (nested dictionaries included).
 ///
 /// Every name is compared decoded: writers that obfuscate spell keys and
 /// values with escapes (`/Ty#70e` is `/Type`) to slip past byte searches.
 pub(super) fn key_ends<'a>(dict: &'a [u8], key: &'a [u8]) -> impl Iterator<Item = usize> + 'a {
-    let mut pos = 0;
-    std::iter::from_fn(move || {
-        let slash = pos + memchr::memchr(b'/', dict.get(pos..)?)?;
-        let (name, end) = name_at(dict, slash)?;
-        pos = end;
-        Some((name, end))
-    })
-    .filter(move |(name, _)| **name == *key)
-    .map(|(_, end)| end)
+    dict_name_spans(dict)
+        .filter(move |(name, _, _)| **name == *key)
+        .map(|(_, _, end)| end)
 }
 
 /// The name values of every `key` entry in `dict`, decoded. Key and value
