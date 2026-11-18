@@ -18,6 +18,7 @@ use serde_json::Value as JsonValue;
 use crate::fileid::FileType;
 use crate::output::{HashAlgo, PinnedHash, RefKind, RefLocator, Reference, Values};
 use crate::value_key;
+pub(crate) mod browser;
 pub(crate) mod go;
 mod manifests;
 

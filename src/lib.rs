@@ -985,7 +985,13 @@ fn run_extraction(
     // hooks, staged URLs), normalized to PURL/URL. Reads the same `values`
     // the format extractors wrote; never fetches.
     let references = guarded(Stage::FormatExtract.as_str(), || {
-        formats::references::derive(file_type, bytes, &values)
+        let mut references = formats::references::derive(file_type, bytes, &values);
+        if matches!(file_type, FileType::JavaScript | FileType::TypeScript)
+            && let Some(cache) = tree_cache
+        {
+            formats::references::browser::extend(cache, &mut references);
+        }
+        references
     })
     .unwrap_or_else(|panic| {
         errors.record_panic(Stage::FormatExtract, panic.0);
