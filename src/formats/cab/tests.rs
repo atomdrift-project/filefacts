@@ -51,6 +51,25 @@ fn header_walk_emits_members_and_counts_executables() {
 }
 
 #[test]
+fn png_preamble_preserves_cabinet_members() {
+    let body = cabinet_with("readme.txt", b"example");
+    let mut wrapped = b"PNG".to_vec();
+    wrapped.extend_from_slice(&body);
+    let id = crate::FileId::from_path_and_bytes(std::path::Path::new("sample.gz"), &wrapped);
+    assert_eq!(id.file_type(), crate::FileType::Cab);
+
+    let (values, metrics, members) = run(&wrapped);
+    assert_eq!(
+        values.get("cab.png_prefix").and_then(JsonValue::as_bool),
+        Some(true)
+    );
+    assert_eq!(metrics.get("archive.trailing_bytes"), Some(0.0));
+    assert_eq!(members.len(), 1);
+    assert!(png_prefixed_cabinet(b"PNGMSCF\0\0\0\0").is_none());
+    assert!(png_prefixed_cabinet(&body).is_none());
+}
+
+#[test]
 fn appended_bytes_are_reported_as_trailing() {
     let mut bytes = cabinet_with("a.txt", b"hi");
     let clean = run(&bytes).1.get("archive.trailing_bytes");

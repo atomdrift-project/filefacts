@@ -559,6 +559,8 @@ fn first_byte_signature(p: &Probe<'_, '_>) -> Option<Found> {
                 })
             {
                 Some((classify_pk(p.sniff), DetectionSource::Magic))
+            } else if second == b'N' && crate::formats::cab::png_prefixed_cabinet(data).is_some() {
+                Some((FileType::Cab, DetectionSource::Magic))
             } else {
                 None
             }

@@ -66,6 +66,30 @@ const FLAG_RESERVE_PRESENT: u16 = 0x4;
 /// Fixed part of the CFHEADER, before any reserve or cabinet-name fields.
 const CFHEADER_FIXED_LEN: usize = 36;
 
+/// Return the CAB body when a three-byte PNG lookalike precedes a bounded
+/// cabinet header. A genuine PNG starts with its eight-byte binary signature.
+#[must_use]
+pub(crate) fn png_prefixed_cabinet(bytes: &[u8]) -> Option<&[u8]> {
+    let body = bytes.strip_prefix(b"PNG")?;
+    let header = body.first_chunk::<CFHEADER_FIXED_LEN>()?;
+    if !header.starts_with(b"MSCF\0\0\0\0")
+        || header[12..16] != [0; 4]
+        || header[20..26] != [0, 0, 0, 0, 3, 1]
+    {
+        return None;
+    }
+    let size = bytes::sat_usize(bytes::u32_le(header, 8)?);
+    let first_file = bytes::sat_usize(bytes::u32_le(header, 16)?);
+    let folders = usize::from(bytes::u16_le(header, 26)?);
+    let files = usize::from(bytes::u16_le(header, 28)?);
+    (folders > 0
+        && files > 0
+        && first_file >= CFHEADER_FIXED_LEN + 8 * folders
+        && first_file < size
+        && first_file < body.len())
+    .then_some(body)
+}
+
 struct Header {
     declared_total_size: u32,
     first_file_offset: u32,
@@ -207,6 +231,12 @@ pub(super) fn extract(
     metrics: &mut Metrics,
     archive_members: &mut Vec<ArchiveMember>,
 ) -> Result<(), Error> {
+    let bytes = if let Some(body) = png_prefixed_cabinet(bytes) {
+        values.insert_key(value_key!("cab.png_prefix"), JsonValue::Bool(true));
+        body
+    } else {
+        bytes
+    };
     let header = parse_header(bytes)?;
     let mut limits = Limits::default();
 

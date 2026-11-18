@@ -190,6 +190,7 @@ pub(crate) const VALUE_CATALOG: &[&str] = &[
     "cab.limits",
     "cab.next_cabinet",
     "cab.next_disk",
+    "cab.png_prefix",
     "cab.prev_cabinet",
     "cab.prev_disk",
     "cab.set_id",

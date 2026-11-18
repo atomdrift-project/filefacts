@@ -30,7 +30,7 @@ mod binary_attribution;
 pub(crate) mod bounded;
 mod build_toolchain;
 mod builder_paths;
-mod cab;
+pub(crate) mod cab;
 mod carrier;
 pub(crate) mod cfml;
 pub(crate) mod chm;

@@ -574,6 +574,37 @@ pub(super) fn head_scores(body: &[u8]) -> Scores {
     scan_scores(body.get(..SCAN_LIMIT).unwrap_or(body))
 }
 
+/// Shell scripts can store nearly all syntax inside quoted assignments.
+/// An eval whose operand is a long concatenation of simple shell variable
+/// expansions supplies the executable-language evidence that the fragments lack.
+fn looks_like_shell_fragment_eval(head: &[u8]) -> bool {
+    if !contains(head, b"eval ") || memchr::memmem::find_iter(head, b"='").take(8).count() < 8 {
+        return false;
+    }
+    head.split(|&b| b == b'\n').any(|line| {
+        let Some(operand) = line
+            .trim_ascii()
+            .strip_prefix(b"eval ")
+            .and_then(|rest| rest.trim_ascii_start().strip_prefix(b"\"$"))
+            .and_then(|rest| rest.strip_suffix(b"\""))
+        else {
+            return false;
+        };
+        let mut count = 0;
+        for name in operand.split(|&b| b == b'$') {
+            if !name
+                .first()
+                .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
+                || !name.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+            {
+                return false;
+            }
+            count += 1;
+        }
+        count >= 8
+    })
+}
+
 /// The language the content scorer finds in [`Sniff::text`]: the bytes, or
 /// their UTF-16 decode, since Windows scripts are routinely saved as UTF-16
 /// and every scorer here reads bytes.
@@ -647,6 +678,9 @@ pub(super) fn scored_type(sniff: &Sniff<'_>) -> Option<FileType> {
 
     if leading_powershell_here_string(body) {
         return Some(FileType::PowerShell);
+    }
+    if looks_like_shell_fragment_eval(head) {
+        return Some(FileType::Shell);
     }
 
     // Natural-language prose is never one of the scored languages either, but
