@@ -508,7 +508,13 @@ pub(super) fn build(root: Node<'_>, source: &str, config: &LangConfig, symbols: 
         .limitations
         .insert(Limitation::SourceLocalMayFlowNotReachability);
     for symbol in symbols {
-        if let Symbol::Import { name, alias, .. } = symbol {
+        if let Symbol::Import {
+            name,
+            alias,
+            library,
+            ..
+        } = symbol
+        {
             // A path's last segment is its default local name.
             let alias = alias.clone().or_else(|| match config.lang {
                 Lang::Rust => name.rsplit("::").next().map(str::to_string),
@@ -516,7 +522,20 @@ pub(super) fn build(root: Node<'_>, source: &str, config: &LangConfig, symbols: 
                 _ => None,
             });
             if let Some(alias) = alias.filter(|alias| !matches!(alias.as_str(), "*" | "_" | ".")) {
-                builder.aliases.insert(alias, name.clone());
+                let target = match (config.lang, library.as_deref()) {
+                    (Lang::Python, Some(owner)) if !name.starts_with('.') => {
+                        format!("{owner}.{name}")
+                    }
+                    _ => name.clone(),
+                };
+                let binding = builder
+                    .aliases
+                    .entry(alias)
+                    .or_insert_with(|| target.clone());
+                if *binding != target {
+                    // The imported target is ambiguous across the file.
+                    binding.clear();
+                }
             }
         }
     }

@@ -67,6 +67,29 @@ pub(super) struct Script {
     pub(super) body: Range<usize>,
     /// How a browser runs it, or `None` when it is a data block.
     pub(super) scope: Option<ScriptScope>,
+    external_source: Option<Range<usize>>,
+}
+
+pub(crate) fn external_scripts(page: &[u8]) -> impl Iterator<Item = (&str, usize)> {
+    let has_base = page
+        .windows(b"<base".len())
+        .any(|bytes| bytes.eq_ignore_ascii_case(b"<base"));
+    script_bodies(page, false)
+        .into_iter()
+        .filter_map(move |script| {
+            script.scope?;
+            let range = script.external_source?;
+            let raw = std::str::from_utf8(span(page, range.clone())).ok()?;
+            let value = raw.trim_ascii();
+            // Entity references and a document base require additional resolution.
+            if value.contains('&') || has_base && !value.starts_with("http") {
+                return None;
+            }
+            Some((
+                value,
+                range.start + raw.len() - raw.trim_ascii_start().len(),
+            ))
+        })
 }
 
 /// The executable inline scripts of an HTML or SVG page, in page order. The
@@ -130,6 +153,7 @@ fn past(page: &[u8], from: usize, needle: &[u8]) -> usize {
 pub(super) fn script_bodies(page: &[u8], xml: bool) -> Vec<Script> {
     let mut scripts = Vec::new();
     let mut at = 0;
+    let mut template_depth = 0usize;
     while let Some(found) = memchr::memchr(b'<', tail(page, at)) {
         let start = at + found;
         let rest = tail(page, start);
@@ -155,6 +179,17 @@ pub(super) fn script_bodies(page: &[u8], xml: bool) -> Vec<Script> {
             );
             continue;
         }
+        if !xml
+            && rest.starts_with(b"</")
+            && rest
+                .get(2..10)
+                .is_some_and(|name| name.eq_ignore_ascii_case(b"template"))
+            && rest
+                .get(10)
+                .is_some_and(|b| b.is_ascii_whitespace() || *b == b'>')
+        {
+            template_depth = template_depth.saturating_sub(1);
+        }
         let Some(tag) = start_tag(page, start) else {
             at = start + 1;
             continue;
@@ -163,6 +198,9 @@ pub(super) fn script_bodies(page: &[u8], xml: bool) -> Vec<Script> {
             // A tag the page never closes swallows the rest of it.
             break;
         };
+        if !xml && tag.name.eq_ignore_ascii_case(b"template") {
+            template_depth += 1;
+        }
         if tag.name.eq_ignore_ascii_case(b"script") {
             let close = if xml && tag.self_closing {
                 // An empty element: no body, but still a script element.
@@ -176,6 +214,7 @@ pub(super) fn script_bodies(page: &[u8], xml: bool) -> Vec<Script> {
             scripts.push(Script {
                 body: end..close,
                 scope: script_scope(tag.kind.as_deref(), tag.language.as_deref()),
+                external_source: if template_depth == 0 { tag.src } else { None },
             });
             at = close;
         } else if !xml && tag.name.eq_ignore_ascii_case(b"plaintext") {
@@ -219,6 +258,7 @@ struct StartTag<'a> {
     kind: Option<String>,
     /// The legacy `language` attribute, if present.
     language: Option<String>,
+    src: Option<Range<usize>>,
     /// The tag ends `/>`. HTML ignores it; XML does not.
     self_closing: bool,
     /// Just past the closing `>`, or `None` when the page ends first.
@@ -239,6 +279,7 @@ fn start_tag(page: &[u8], start: usize) -> Option<StartTag<'_>> {
         name: span(page, name_start..name_end),
         kind: None,
         language: None,
+        src: None,
         self_closing: false,
         end: None,
     };
@@ -277,14 +318,14 @@ fn start_tag(page: &[u8], start: usize) -> Option<StartTag<'_>> {
             continue;
         }
         i = skip_space(i + 1);
-        let value = match page.get(i) {
+        let range = match page.get(i) {
             Some(&quote @ (b'"' | b'\'')) => {
                 let value_start = i + 1;
                 let Some(len) = memchr::memchr(quote, tail(page, value_start)) else {
                     return Some(tag);
                 };
                 i = value_start + len + 1;
-                span(page, value_start..value_start + len)
+                value_start..value_start + len
             }
             _ => {
                 let value_start = i;
@@ -294,14 +335,20 @@ fn start_tag(page: &[u8], start: usize) -> Option<StartTag<'_>> {
                 {
                     i += 1;
                 }
-                span(page, value_start..i)
+                value_start..i
             }
         };
-        let value = || Some(String::from_utf8_lossy(value).to_ascii_lowercase());
+        let value =
+            || Some(String::from_utf8_lossy(span(page, range.clone())).to_ascii_lowercase());
         if attr.eq_ignore_ascii_case(b"type") {
             tag.kind = value();
         } else if attr.eq_ignore_ascii_case(b"language") {
             tag.language = value();
+        } else if tag.name.eq_ignore_ascii_case(b"script")
+            && attr.eq_ignore_ascii_case(b"src")
+            && tag.src.is_none()
+        {
+            tag.src = Some(range);
         }
     }
 }

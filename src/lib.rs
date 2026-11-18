@@ -991,6 +991,16 @@ fn run_extraction(
         {
             formats::references::browser::extend(cache, &mut references);
         }
+        if file_type == FileType::Html {
+            for (value, offset) in embedded_sources::html::external_scripts(bytes).take(128) {
+                formats::references::browser::push_reference(
+                    &mut references,
+                    value.into(),
+                    "browser.html-script",
+                    offset,
+                );
+            }
+        }
         references
     })
     .unwrap_or_else(|panic| {
