@@ -126,7 +126,10 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
             push_unique_string(&mut macros_seen, &mut macros, target);
         }
     }
-    let has_macro_relationship = !macros.is_empty();
+    let has_vba_relationship = index
+        .relationships
+        .iter()
+        .any(|rel| rel.short_type == "vbaProject");
     let other_targets: HashSet<&str> = index
         .relationships
         .iter()
@@ -140,7 +143,7 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
             // Only by `Default`: trust it when nothing names the project
             // and nothing says this part is something else.
             None => {
-                !has_macro_relationship
+                !has_vba_relationship
                     && !other_targets.contains(name.as_str())
                     && is_macro_content_type(content_type)
             }
@@ -775,11 +778,19 @@ fn package_stats<R: Read + std::io::Seek>(
 }
 
 fn is_macro_relationship(short_type: &str) -> bool {
-    matches!(short_type, "vbaProject" | "xlIntlMacrosheet")
+    matches!(
+        short_type,
+        "vbaProject" | "xlMacrosheet" | "xlIntlMacrosheet"
+    )
 }
 
 fn is_macro_content_type(content_type: &str) -> bool {
-    content_type.contains("vbaProject") || content_type.contains("intlmacrosheet")
+    content_type.contains("vbaProject")
+        || content_type.contains("intlmacrosheet")
+        || matches!(
+            content_type,
+            "application/vnd.ms-excel.macrosheet" | "application/vnd.ms-excel.macrosheet+xml"
+        )
 }
 
 fn external_relationship_value(rel: &RelationshipInfo) -> JsonValue {

@@ -211,6 +211,35 @@ fn an_xlsb_macro_sheet_is_counted_apart_from_the_vba_project() {
 }
 
 #[test]
+fn a_regular_macro_sheet_can_be_declared_by_type_or_relationship() {
+    let types = br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Override PartName="/xl/macrosheets/sheet1.bin" ContentType="application/vnd.ms-excel.macrosheet"/>
+</Types>"#;
+    let rels = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.microsoft.com/office/2006/relationships/xlMacrosheet" Target="macrosheets/sheet1.bin"/>
+</Relationships>"#;
+    let declared_by_type = build_ooxml(&[
+        ("[Content_Types].xml", types),
+        ("xl/macrosheets/sheet1.bin", b"data"),
+    ]);
+    let declared_by_relationship = build_ooxml(&[
+        ("[Content_Types].xml", CONTENT_TYPES_XLSX.as_bytes()),
+        ("xl/_rels/workbook.bin.rels", rels),
+        ("xl/macrosheets/sheet1.bin", b"data"),
+    ]);
+    for z in [declared_by_type, declared_by_relationship] {
+        let (v, m) = run(&z);
+        assert_eq!(
+            v.get("office.macros"),
+            Some(&serde_json::json!(["xl/macrosheets/sheet1.bin"]))
+        );
+        assert_eq!(m.get("office.xlm_sheet_count"), Some(1.0));
+        assert_eq!(m.get("office.xlm.macrosheet_size"), Some(4.0));
+        assert_eq!(m.get("office.vba.project_size"), None);
+    }
+}
+
+#[test]
 fn no_vba_project_size_without_macros() {
     let z = build_ooxml(&[("[Content_Types].xml", CONTENT_TYPES_DOCX.as_bytes())]);
     let (_, m) = run(&z);
