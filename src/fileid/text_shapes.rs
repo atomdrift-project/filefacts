@@ -28,6 +28,7 @@ type Holds = fn(&Sniff<'_>) -> bool;
 pub(super) const TEXT_SHAPES: &[(&str, Holds)] = &[
     ("gcc_specs", gcc_specs),
     ("git_config", |sniff| sniff.looks_like_git_config()),
+    ("mime_message", mime_message),
     ("ftp_command_script", ftp_command_script),
     ("rexx_cms_exec", rexx_cms_exec),
     ("sap_abap_report", sap_abap_report),
@@ -40,6 +41,49 @@ pub(super) fn shape_of(sniff: &Sniff<'_>) -> Option<&'static str> {
         .iter()
         .find(|(_, holds)| holds(sniff))
         .map(|&(name, _)| name)
+}
+
+/// Identify a serialized MIME message even when an archive member has no
+/// filename. Inspect only its header so a body containing source or markup
+/// does not determine the type of the message itself.
+fn mime_message(sniff: &Sniff<'_>) -> bool {
+    const HEADER_LIMIT: usize = 64 * 1024;
+    const REQUIRED_FIELDS: &[&[u8]] = &[
+        b"From:",
+        b"Date:",
+        b"Message-ID:",
+        b"MIME-Version:",
+        b"Content-Type:",
+    ];
+    if sniff.ext_type().is_some_and(|ft| ft != FileType::Text) {
+        return false;
+    }
+    let mut seen = [false; REQUIRED_FIELDS.len()];
+    let mut has_field = false;
+    let prefix = sniff.data.get(..HEADER_LIMIT).unwrap_or(sniff.data);
+    for line in prefix.split_inclusive(|&byte| byte == b'\n') {
+        let Some(line) = line.strip_suffix(b"\n") else {
+            break;
+        };
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            return seen.into_iter().all(|field| field);
+        }
+        if has_field && matches!(line.first(), Some(b' ' | b'\t')) {
+            continue;
+        }
+        if !is_rfc822_field_line(line) {
+            return false;
+        }
+        has_field = true;
+        for (seen, field) in seen.iter_mut().zip(REQUIRED_FIELDS) {
+            *seen |= starts_ci(line, field)
+                && line
+                    .get(field.len()..)
+                    .is_some_and(|value| !value.trim_ascii().is_empty());
+        }
+    }
+    false
 }
 
 /// GCC's extensionless specs files contain named `*spec:` sections. A name

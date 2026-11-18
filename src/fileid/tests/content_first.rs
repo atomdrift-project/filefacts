@@ -196,6 +196,27 @@ fn unnamed_bom_marked_utf16_falls_back_to_text() {
 }
 
 #[test]
+fn unnamed_mime_message_identifies_the_message_over_its_body() {
+    let header = b"Received: from relay.example\r\n\tby inbox.example\r\n\
+        From: sender@example.test\r\nDate: Tue, 17 Nov 2026 10:00:00 +0000\r\n\
+        Message-ID: <123@example.test>\r\nMIME-Version: 1.0\r\n\
+        Content-Type: text/html\r\n";
+    let body = b"<html><body><p>Hello</p></body></html>\r\n";
+    let mut message = header.to_vec();
+    message.extend(b"\r\n");
+    message.extend(body);
+    let path = Path::new("decoded-member");
+    let detection = detect(path, &message).unwrap();
+    assert_eq!(detection.file_type, FileType::Text);
+    assert_eq!(detection.source, DetectionSource::Heuristic);
+    assert_eq!(
+        super::super::text_shapes::shape_of(&super::super::sniff::Sniff::new(path, header)),
+        None,
+        "unterminated headers do not identify a message"
+    );
+}
+
+#[test]
 fn binary_unknown_extension_is_not_called_text_from_filename() {
     for name in ["override.local", "override.conf"] {
         let det = detect(Path::new(name), b"\x00\x01\x02\x03binary");
