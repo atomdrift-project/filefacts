@@ -2,6 +2,8 @@
 //! distribution ZIP without inflating member contents.
 
 use super::{Sniff, zip_probe};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 
 /// Recognize the distribution convention, not whether Go would accept every
 /// byte of this package. Older modules need not have a go.mod or a .go file.
@@ -47,15 +49,22 @@ pub(super) fn recognized(sniff: &Sniff<'_>) -> bool {
 fn module_prefix(name: &str) -> Option<&str> {
     let (module, after) = name.split_once('@')?;
     let (version, _) = after.split_once('/')?;
-    let host = module.split('/').next()?;
+    if !downloadable_module_path(module) || !canonical_version(version) {
+        return None;
+    }
+    name.get(..module.len() + version.len() + 2)
+}
+
+fn downloadable_module_path(module: &str) -> bool {
+    let host = module.split('/').next().unwrap_or_default();
     // Downloadable module paths have a DNS-shaped first element; Go's !x
     // URL escaping is not used in archive member names (uppercase is literal).
-    if !host.contains('.')
-        || host.starts_with(['.', '-'])
-        || !host
+    host.contains('.')
+        && !host.starts_with(['.', '-'])
+        && host
             .bytes()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || b".-".contains(&c))
-        || !module.split('/').all(|part| {
+        && module.split('/').all(|part| {
             !part.is_empty()
                 && part != "."
                 && part != ".."
@@ -63,11 +72,36 @@ fn module_prefix(name: &str) -> Option<&str> {
                     .bytes()
                     .all(|c| c.is_ascii_alphanumeric() || b"-._~".contains(&c))
         })
-        || !canonical_version(version)
-    {
-        return None;
+}
+
+/// A renamed checksum file still consists entirely of Go module sum records.
+pub(super) fn looks_like_go_sum(data: &[u8]) -> bool {
+    if data.len() > 16 * 1024 * 1024 {
+        return false;
     }
-    name.get(..module.len() + version.len() + 2)
+    let Ok(text) = std::str::from_utf8(data) else {
+        return false;
+    };
+    let mut has_record = false;
+    for line in text.lines().filter(|line| !line.trim_ascii().is_empty()) {
+        let mut fields = line.split_ascii_whitespace();
+        let (Some(path), Some(version), Some(hash), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return false;
+        };
+        let Some(hash) = hash.strip_prefix("h1:").filter(|hash| hash.len() == 44) else {
+            return false;
+        };
+        if !downloadable_module_path(path)
+            || !canonical_version(version.strip_suffix("/go.mod").unwrap_or(version))
+            || STANDARD.decode_slice(hash, &mut [0; 33]) != Ok(32)
+        {
+            return false;
+        }
+        has_record = true;
+    }
+    has_record
 }
 
 fn canonical_version(version: &str) -> bool {

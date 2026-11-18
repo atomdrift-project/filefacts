@@ -60,3 +60,35 @@ pub(super) fn npm_json_lockfile(data: &[u8]) -> Option<FileType> {
     }
     Some(FileType::PackageLockJson)
 }
+
+/// Composer versions use either `hash` or `content-hash` and two package
+/// lists. Match the lockfile's shape without treating its source URLs as trusted.
+pub(super) fn composer_json_lockfile(data: &[u8]) -> Option<FileType> {
+    if data.len() > 16 * 1024 * 1024 {
+        return None;
+    }
+    let data = strip_utf8_bom(data).trim_ascii();
+    if !data.starts_with(b"{") || memchr::memmem::find(data, b"\"packages-dev\"").is_none() {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(data).ok()?;
+    let root = value.as_object()?;
+    let hash = root
+        .get("content-hash")
+        .or_else(|| root.get("hash"))?
+        .as_str()?;
+    if hash.len() != 32 || !hash.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    for key in ["packages", "packages-dev"] {
+        if !root.get(key)?.as_array()?.iter().all(|pkg| {
+            pkg.get("name")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|name| name.contains('/'))
+                && pkg.get("version").is_some_and(serde_json::Value::is_string)
+        }) {
+            return None;
+        }
+    }
+    Some(FileType::ComposerLock)
+}

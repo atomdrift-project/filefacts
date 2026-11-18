@@ -1076,14 +1076,24 @@ fn filename(sniff: &Sniff<'_>) -> Option<Detection> {
     Some(Detection::named(claim.file_type, DetectionSource::Filename))
 }
 
-/// Text under a named suffix fileid does not know (`.conf.local`). An
-/// extensionless file is left unclassified unless a stronger rule
-/// recognized it: plenty of opaque files are named without one.
+/// Text under an unknown suffix, or with a matching UTF-16 byte-order mark.
+/// A marked UTF-16 text stream can have no source-language tokens in the
+/// sampled head and tail, including after single-file decompression.
 fn named_text(sniff: &Sniff<'_>) -> Option<Detection> {
+    let marked_utf16 = match sniff.data {
+        [0xff, 0xfe, body @ ..] => {
+            text::utf16_lanes(body.get(..heuristics::SCAN_LIMIT).unwrap_or(body))
+                == Some(crate::bytes::Endian::Little)
+        }
+        [0xfe, 0xff, body @ ..] => {
+            text::utf16_lanes(body.get(..heuristics::SCAN_LIMIT).unwrap_or(body))
+                == Some(crate::bytes::Endian::Big)
+        }
+        _ => false,
+    };
     (sniff.claim().is_none()
-        && has_named_extension(sniff.path)
         && !sniff.data.is_empty()
-        && text::head_is_text(sniff.data))
+        && (marked_utf16 || (has_named_extension(sniff.path) && text::head_is_text(sniff.data))))
     .then_some(Detection {
         file_type: FileType::Text,
         source: DetectionSource::Heuristic,

@@ -338,14 +338,17 @@ fn script_encoder(p: &Probe<'_, '_>) -> Option<Found> {
     encoded_script(p.path, p.head).map(|ft| (ft, DetectionSource::Magic))
 }
 
-/// Lockfiles announce themselves in their opening lines, so a lockfile
-/// renamed for storage (`yarn.<sha>.lock`) is still one. A header is a line
-/// of comments a script under a language's name may open with as well; npm's
-/// JSON is parsed whole, so nothing else can follow it.
+/// Recognize lockfiles by a generator header or complete record framing,
+/// including lockfiles renamed for storage.
 fn lockfile(p: &Probe<'_, '_>) -> Option<Found> {
     lockfile::lockfile_header(p.data)
         .filter(|_| !p.named_language())
         .or_else(|| lockfile::npm_json_lockfile(p.data))
+        .or_else(|| lockfile::composer_json_lockfile(p.data))
+        .or_else(|| {
+            (p.text && !p.named_language() && go_module::looks_like_go_sum(p.data))
+                .then_some(FileType::GoSum)
+        })
         .map(|ft| (ft, DetectionSource::Magic))
 }
 
@@ -484,13 +487,7 @@ fn first_byte_signature(p: &Probe<'_, '_>) -> Option<Found> {
             // consumer that skips what `is_analyzed` rejects skips it.
             if data.starts_with(&[0x00, 0x05, 0x16, 0x07]) {
                 Some((FileType::Unknown, DetectionSource::Magic))
-            } else if let &[_, 0x00, 0x01 | 0x02, 0x00, lo, hi, ..] = data
-                && (1..=512).contains(&u16::from_le_bytes([lo, hi]))
-            {
-                // Windows icon/cursor: reserved=0, type=1|2, then a plausible
-                // image count. Checked before the sfnt arm because sfnt 1.0 is
-                // `00 01 00 00`, which an icon header can never be (its type
-                // field would have to be 0x0100).
+            } else if has_icon_directory(data) {
                 Some((FileType::Ico, DetectionSource::Magic))
             } else if let &[_, a, b, c, d, _, _, _, _, 1, 0, 0, 0, 0, 0, 0, 0, ..] = data
                 && [a, b, c, d] != [0; 4]
@@ -1269,6 +1266,27 @@ pub(crate) fn looks_like_dib_header(dib: &[u8]) -> bool {
         _ => return false,
     };
     planes == Some(1) && matches!(bits, Some(0 | 1 | 2 | 4 | 8 | 16 | 24 | 32 | 48 | 64))
+}
+
+/// Windows icon and cursor headers share their first four bytes with a classic
+/// Mac resource fork whose data starts at offset 256. Require the first entry
+/// whose nonempty image lies after the directory. A named .ico or .cur still
+/// reaches the format parser by extension when its directory is damaged.
+fn has_icon_directory(data: &[u8]) -> bool {
+    let &[0, 0, 1 | 2, 0, low, high, ..] = data else {
+        return false;
+    };
+    let count = usize::from(u16::from_le_bytes([low, high]));
+    if !(1..=512).contains(&count) {
+        return false;
+    }
+    let directory_end = 6 + count * 16;
+    let Some(entry) = data.get(6..22).filter(|entry| entry.get(3) == Some(&0)) else {
+        return false;
+    };
+    let size = u64::from(bytes::u32_le(entry, 8).unwrap_or(0));
+    let offset = u64::from(bytes::u32_le(entry, 12).unwrap_or(0));
+    size != 0 && offset >= directory_end as u64 && offset + size <= data.len() as u64
 }
 
 #[cfg(test)]

@@ -176,6 +176,26 @@ fn readable_unknown_extension_is_detected_as_text_from_content() {
 }
 
 #[test]
+fn unnamed_bom_marked_utf16_falls_back_to_text() {
+    let phrase = "This stream contains plain text.\r\n".repeat(4);
+    let mut le = vec![0xff, 0xfe];
+    le.extend(phrase.encode_utf16().flat_map(u16::to_le_bytes));
+    let mut be = vec![0xfe, 0xff];
+    be.extend(phrase.encode_utf16().flat_map(u16::to_be_bytes));
+    for content in [le, be] {
+        let detection = detect(Path::new("decoded-member"), &content).unwrap();
+        assert_eq!(detection.file_type, FileType::Text);
+        assert_eq!(detection.source, DetectionSource::Heuristic);
+    }
+    let mut opaque = vec![0xff, 0xfe];
+    opaque.extend([0; 128]);
+    assert!(
+        detect(Path::new("decoded-member"), &opaque)
+            .is_none_or(|detection| detection.file_type != FileType::Text)
+    );
+}
+
+#[test]
 fn binary_unknown_extension_is_not_called_text_from_filename() {
     for name in ["override.local", "override.conf"] {
         let det = detect(Path::new(name), b"\x00\x01\x02\x03binary");
