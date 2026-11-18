@@ -82,9 +82,14 @@ fn shell_heuristic() {
 #[test]
 fn shell_eval_concatenates_quoted_fragments() {
     let prefix = b"a='prin';b='tf';c=' ';d='t';e='e';f='s';g='t';h='\\n'\n";
-    let mut script = prefix.to_vec();
-    script.extend(b"eval \"$a$b$c$d$e$f$g$h\"\n");
-    assert_eq!(detect_from_content(&script), Some(FileType::Shell));
+    for operand in [
+        &b"eval \"$a$b$c$d$e$f$g$h\"\n"[..],
+        &b"eval\t\"${a}${b}${c}${d}${e}${f}${g}${h}\";\r\n"[..],
+    ] {
+        let mut script = prefix.to_vec();
+        script.extend(operand);
+        assert_eq!(detect_from_content(&script), Some(FileType::Shell));
+    }
     let mut inert = prefix.to_vec();
     inert.extend(b"example=\"$a$b$c$d$e$f$g$h\"\n");
     assert_ne!(detect_from_content(&inert), Some(FileType::Shell));

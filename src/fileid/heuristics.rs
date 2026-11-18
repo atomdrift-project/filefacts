@@ -578,13 +578,21 @@ pub(super) fn head_scores(body: &[u8]) -> Scores {
 /// An eval whose operand is a long concatenation of simple shell variable
 /// expansions supplies the executable-language evidence that the fragments lack.
 fn looks_like_shell_fragment_eval(head: &[u8]) -> bool {
-    if !contains(head, b"eval ") || memchr::memmem::find_iter(head, b"='").take(8).count() < 8 {
+    if !contains(head, b"eval")
+        || memchr::memchr_iter(b'=', head)
+            .filter(|&offset| matches!(head.get(offset + 1), Some(b'\'' | b'"')))
+            .take(8)
+            .count()
+            < 8
+    {
         return false;
     }
     head.split(|&b| b == b'\n').any(|line| {
+        let line = line.trim_ascii();
+        let line = line.strip_suffix(b";").unwrap_or(line).trim_ascii_end();
         let Some(operand) = line
-            .trim_ascii()
-            .strip_prefix(b"eval ")
+            .strip_prefix(b"eval")
+            .filter(|rest| matches!(rest.first(), Some(b' ' | b'\t')))
             .and_then(|rest| rest.trim_ascii_start().strip_prefix(b"\"$"))
             .and_then(|rest| rest.strip_suffix(b"\""))
         else {
@@ -592,6 +600,10 @@ fn looks_like_shell_fragment_eval(head: &[u8]) -> bool {
         };
         let mut count = 0;
         for name in operand.split(|&b| b == b'$') {
+            let name = name
+                .strip_prefix(b"{")
+                .and_then(|rest| rest.strip_suffix(b"}"))
+                .unwrap_or(name);
             if !name
                 .first()
                 .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
