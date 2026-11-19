@@ -32,7 +32,7 @@ mod markup;
 mod vhd;
 
 use archive::{Inside, TAR_HEAD_LIMIT, TAR_PEEK_LIMIT, classify_pk, classify_tar, tar_layout};
-pub(super) use markup::WSH_SCRIPT_WINDOW;
+pub(super) use markup::{WSH_SCRIPT_WINDOW, classic_asp_server_object};
 use markup::{detect_xml, encoded_script, script_host_document};
 
 /// LNK shell link CLSID header (20 bytes).

@@ -3,6 +3,21 @@ use std::path::Path;
 use super::*;
 use crate::fileid::detect;
 
+#[test]
+fn classic_asp_server_object_identifies_renamed_page() {
+    let page = b"\r\n<OBJECT scope = 'page' RUNAT=server id=printer></object>\r\n<% Response.Write(\"preview\") %>";
+    assert_eq!(
+        detect(Path::new("renamed.a"), page).map(|d| d.file_type),
+        Some(FileType::Asp)
+    );
+    assert!(!classic_asp_server_object(
+        b"<object scope=\"page\" data=\"preview.svg\"></object><% preview %>"
+    ));
+    assert!(!classic_asp_server_object(
+        b"template = '<object scope=page runat=server></object><% preview %>'"
+    ));
+}
+
 /// A target in column zero is a target whatever ends its line: Windows
 /// editors write CRLF, and trailing blanks are common.
 #[test]

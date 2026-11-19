@@ -425,6 +425,19 @@ fn scan_scores(data: &[u8]) -> Scores {
         if m == b"===" && (prev == Some(b'=') || rest.first() == Some(&b'=')) {
             continue;
         }
+        // Hash-prefixed prose headings can use exactly three equals signs on
+        // each side. They are not JavaScript strict-equality expressions.
+        if m == b"==="
+            && before
+                .rsplit(|&b| b == b'\n')
+                .next()
+                .map(<[u8]>::trim_ascii_start)
+                .is_some_and(|line| {
+                    line.starts_with(b"#") && line.get(1).is_some_and(u8::is_ascii_whitespace)
+                })
+        {
+            continue;
+        }
         // `document.`/`window.` are JS DOM-global accesses only when a member
         // name follows (document.getElementById, window.location). English
         // prose ends sentences with "…this document." / "…the window.", where

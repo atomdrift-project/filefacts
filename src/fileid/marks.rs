@@ -2,7 +2,9 @@
 //! scorer, which a document quoting another language's keywords can fool.
 
 use super::{
-    FileType, scripts,
+    FileType,
+    magic::classic_asp_server_object,
+    scripts,
     sniff::Sniff,
     text::{Controls, contains, contains_ci, find_ci, is_binary, starts_ci},
 };
@@ -37,7 +39,7 @@ pub(super) fn unmistakable(sniff: &Sniff<'_>) -> Option<FileType> {
     // `<%@ Page Language="C#"` is ASP.NET. `<%@ page` / `<%@page` otherwise
     // is JSP. Classic ASP is `<%@ Language` with no `page` word. The ASP
     // forms have to win, or the shared `<%@ page` prefix swallows them.
-    if looks_like_asp_directive(head) {
+    if looks_like_asp_directive(head) || classic_asp_server_object(head) {
         return Some(FileType::Asp);
     }
     // A page directive is markup, so it opens a line; one quoted inside a

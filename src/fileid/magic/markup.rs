@@ -6,12 +6,35 @@ use std::path::Path;
 use super::{DetectionSource, FileType, Sniff};
 use crate::fileid::{
     ext::lowercase_ext,
-    text::{find_ci, strip_utf8_bom},
+    text::{contains_ci, find_ci, starts_ci, strip_utf8_bom},
 };
 
 /// How far into a Windows Script Host document the `<script>` element is
 /// looked for. Droppers pad the opening tags with whitespace.
 pub(in crate::fileid) const WSH_SCRIPT_WINDOW: usize = 64 * 1024;
+
+/// Classic ASP can open with a page-scoped server COM object in place of a
+/// page directive. Require a real opening object and a server script block.
+pub(in crate::fileid) fn classic_asp_server_object(head: &[u8]) -> bool {
+    let opening = head.trim_ascii_start();
+    if !starts_ci(opening, b"<object") || !opening.get(7).is_some_and(u8::is_ascii_whitespace) {
+        return false;
+    }
+    let Some(end) = memchr::memchr(b'>', opening) else {
+        return false;
+    };
+    let (tag, remainder) = opening.split_at(end);
+    let is_server =
+        attribute_value(tag, b"runat").is_some_and(|value| value.eq_ignore_ascii_case(b"server"));
+    let is_page_object =
+        attribute_value(tag, b"scope").is_some_and(|value| value.eq_ignore_ascii_case(b"page"));
+    is_server
+        && is_page_object
+        && contains_ci(remainder, b"</object>")
+        && find_ci(remainder, b"<%")
+            .and_then(|start| remainder.get(start + 2..))
+            .is_some_and(|script| contains_ci(script, b"%>"))
+}
 
 /// A `.wsf` / `.wsc` / `.sct` document, typed by the language of its first
 /// `<script>`: VBScript or JScript. The root element decides it is one --

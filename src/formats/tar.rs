@@ -155,10 +155,12 @@ fn walk_entries<R: Read>(
     // A damaged header ends the walk, but the members before it are still
     // reported; the error is returned after them.
     let mut walk_error = None;
+    let mut has_freebsd_manifest = false;
 
-    for entry in archive
+    for (index, entry) in archive
         .entries()
         .map_err(|e| Error::malformed_caused_by("tar", e))?
+        .enumerate()
     {
         let entry = match entry {
             Ok(entry) => entry,
@@ -207,6 +209,12 @@ fn walk_entries<R: Read>(
             .path()
             .ok()
             .map_or_else(String::new, |p| p.to_string_lossy().into_owned());
+        if file_type == FileType::PkgFreebsd && index == 0 && kind.is_file() {
+            has_freebsd_manifest = matches!(
+                path.trim_start_matches("./"),
+                "+COMPACT_MANIFEST" | "+MANIFEST"
+            );
+        }
         let member = ArchiveMember {
             mtime_unix: header.mtime().ok().map(u64::cast_signed),
             linkname,
@@ -219,7 +227,16 @@ fn walk_entries<R: Read>(
             ..ArchiveMember::new(path, header.size().unwrap_or(0), tar_entry_type(kind))
         };
 
-        let mut reading = Reading::of(&member);
+        // Keep the original path in the member listing. Classify FreeBSD
+        // installation paths relative to the package root for aggregates.
+        let mut reading = if has_freebsd_manifest {
+            Reading::of_path(
+                &member,
+                member.path.strip_prefix('/').unwrap_or(&member.path),
+            )
+        } else {
+            Reading::of(&member)
+        };
         reading.file = kind == tar::EntryType::Regular;
         reading.exec_mode = mode_octal.is_some_and(|m| m & 0o111 != 0);
         stats.observe(&member, &reading);

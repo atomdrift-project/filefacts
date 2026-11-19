@@ -150,7 +150,11 @@ impl Reading {
     /// The default reading: every non-directory is a file, and hidden-ness
     /// and content kind come from the name.
     pub(super) fn of(member: &ArchiveMember) -> Self {
-        let class = classify_filename(&member.path);
+        Self::of_path(member, &member.path)
+    }
+
+    pub(super) fn of_path(member: &ArchiveMember, path: &str) -> Self {
+        let class = classify_filename(path);
         Self {
             file: member.entry_type != EntryType::Directory,
             hidden: class.is_hidden,

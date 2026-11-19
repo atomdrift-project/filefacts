@@ -37,6 +37,15 @@ fn source_with_prose_comments_still_detects() {
     );
 }
 
+#[test]
+fn hash_prefixed_headings_do_not_make_text_javascript() {
+    let map = b"# === Level layout ===\nname:Example\nrows:2\nD:%#;...;/;;%\nD:%....#..;%\n";
+    assert_eq!(detect_from_content(map), None);
+
+    let code = b"if (left === right) {\n  console.log('match');\n}\n";
+    assert_eq!(detect_from_content(code), Some(FileType::JavaScript));
+}
+
 /// Both automata are built from static patterns, and a failure to build
 /// either must not pass as "no language here".
 #[test]

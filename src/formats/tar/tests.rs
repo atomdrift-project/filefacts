@@ -47,6 +47,43 @@ fn empty_input_returns_empty_member_list() {
 }
 
 #[test]
+fn freebsd_installation_paths_keep_their_listing_without_counting_as_traversal() {
+    let member = "/usr/local/share/example/readme.txt";
+    let mut archive = Builder::new(Vec::new());
+    for (path, body) in [
+        ("+COMPACT_MANIFEST", b"{}\n".as_slice()),
+        (member, b"Example package documentation.\n".as_slice()),
+    ] {
+        let mut header = Header::new_gnu();
+        header.set_mode(0o644);
+        header.set_size(body.len() as u64);
+        header.as_gnu_mut().unwrap().name[..path.len()].copy_from_slice(path.as_bytes());
+        header.set_cksum();
+        archive.append(&header, body).unwrap();
+    }
+    let bytes = archive.into_inner().unwrap();
+    for (kind, traversals) in [(FileType::PkgFreebsd, 0.0), (FileType::Tar, 1.0)] {
+        let mut values = Values::new();
+        let mut metrics = Metrics::new();
+        let mut members = Vec::new();
+        walk_entries(
+            &mut tar::Archive::new(bytes.as_slice()),
+            kind,
+            &mut values,
+            &mut metrics,
+            &mut members,
+            &mut Limits::default(),
+        )
+        .unwrap();
+        assert_eq!(members[1].path, member);
+        assert_eq!(
+            metrics.get("archive.path_traversal_count"),
+            Some(traversals)
+        );
+    }
+}
+
+#[test]
 fn surfaces_member_listing_and_metadata() {
     let tar = build_tar(&[
         (
