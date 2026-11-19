@@ -1479,6 +1479,8 @@ fn utf8_bom_html_is_detected_under_misleading_names() {
     for body in [
         "<!DOCTYPE html><html><body>page</body></html>",
         "  <HTML><body><script>document.write('x')</script></body></HTML>",
+        "<!-- saved page -->\n<!-- metadata -->\n<!doctype html><html><body>page</body></html>",
+        "<HEAD><meta charset=utf-8></HEAD>\n<BODY class=main>page</BODY>",
         "<script src='https://example.invalid/a.js'></script>\n<!doctype html><html>",
     ] {
         let mut data = UTF8_BOM.to_vec();

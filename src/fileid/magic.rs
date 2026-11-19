@@ -385,13 +385,41 @@ fn android_binary_xml(p: &Probe<'_, '_>) -> Option<Found> {
 /// magic deliberately. `<!DOCTYPE svg` and an `<?xml` prolog are unaffected:
 /// neither begins with either of these.
 fn html_document(p: &Probe<'_, '_>) -> Option<Found> {
-    let head = strip_utf8_bom(p.head).trim_ascii_start();
+    let mut head = strip_utf8_bom(p.head).trim_ascii_start();
+    // Saved pages and HTML templates may put several comments before the
+    // document root. Only complete leading comments can be skipped here.
+    while let Some(comment) = head.strip_prefix(b"<!--") {
+        let end = comment.windows(3).position(|window| window == b"-->")?;
+        head = comment.get(end + 3..)?.trim_ascii_start();
+    }
     let open = head.get(..5)?;
     let doctype_html = head
         .get(..14)
         .is_some_and(|tag| tag.eq_ignore_ascii_case(b"<!DOCTYPE html"));
     let html_root = open.eq_ignore_ascii_case(b"<html")
         && head.get(5).is_none_or(|c| !c.is_ascii_alphanumeric());
+    // A document may omit the opening <html> tag. Require both explicit
+    // head and body tags so a standalone head fragment remains a fragment.
+    let head_then_body = open.eq_ignore_ascii_case(b"<head")
+        && head
+            .get(5)
+            .is_some_and(|c| *c == b'>' || c.is_ascii_whitespace())
+        && head
+            .get(..2048)
+            .unwrap_or(head)
+            .windows(7)
+            .position(|tag| tag.eq_ignore_ascii_case(b"</head>"))
+            .is_some_and(|end| {
+                let Some(body) = head.get(end + 7..) else {
+                    return false;
+                };
+                let body = body.trim_ascii_start();
+                body.get(..5)
+                    .is_some_and(|tag| tag.eq_ignore_ascii_case(b"<body"))
+                    && body
+                        .get(5)
+                        .is_some_and(|c| *c == b'>' || c.is_ascii_whitespace())
+            });
     // Some compromised pages prepend a short external-script loader before
     // the doctype. The complete document root still provides stronger type
     // evidence than a hash-like or misleading filename. Keep this bounded
@@ -415,7 +443,7 @@ fn html_document(p: &Probe<'_, '_>) -> Option<Found> {
             && matches!((doctype, root, script_end), (Some(d), Some(r), Some(e)) if e < d && d < r)
             && root.is_some_and(|r| prefix.get(r + 5).is_none_or(|c| !c.is_ascii_alphanumeric()))
     };
-    (doctype_html || html_root || prefixed_html_document)
+    (doctype_html || html_root || head_then_body || prefixed_html_document)
         .then_some((FileType::Html, DetectionSource::Magic))
 }
 
