@@ -1394,11 +1394,24 @@ pub fn read_input(path: &Path, max_bytes: u64) -> Result<Vec<u8>, Error> {
 /// [`Error::InvalidQuery`], carrying the [`tree_sitter::QueryError`], when
 /// `query` does not compile against it.
 pub fn validate_source_query(language: &str, query: &str) -> Result<(), Error> {
+    compile_source_query(language, query).map(|_| ())
+}
+
+/// Return the grammar and compiled query so callers can run the query they validated.
+///
+/// # Errors
+///
+/// Returns [`Error::UnsupportedLanguage`] for an unknown grammar or
+/// [`Error::InvalidQuery`] if the query fails to compile.
+pub fn compile_source_query(
+    language: &str,
+    query: &str,
+) -> Result<(tree_sitter::Language, tree_sitter::Query), Error> {
     let unsupported = || Error::UnsupportedLanguage(language.to_string());
     let ts_lang = formats::source::tree_sitter_language_named(canonical_source_language(language))
         .ok_or_else(unsupported)?;
     tree_sitter::Query::new(&ts_lang, query)
-        .map(|_| ())
+        .map(|query| (ts_lang, query))
         .map_err(|source| Error::InvalidQuery {
             language: language.to_string(),
             source,

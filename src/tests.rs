@@ -98,6 +98,23 @@ fn validate_source_query_accepts_aliases() {
 }
 
 #[test]
+fn compiled_source_query_runs_with_its_returned_grammar() {
+    use tree_sitter::StreamingIterator;
+
+    let (language, query) = compile_source_query("js", "(identifier) @name").unwrap();
+    let source = b"let answer = 42;";
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&language).unwrap();
+    let tree = parser.parse(source, None).unwrap();
+    let mut cursor = tree_sitter::QueryCursor::new();
+    let mut matches = cursor.matches(&query, tree.root_node(), source.as_slice());
+    let capture = matches.next().unwrap().captures()[0];
+    assert_eq!(query.capture_names()[capture.index as usize], "name");
+    assert_eq!(&source[capture.node.byte_range()], b"answer");
+    assert!(matches.next().is_none());
+}
+
+#[test]
 fn validate_source_query_reports_unsupported_language() {
     let err = validate_source_query("cobol", "(_) @node").unwrap_err();
     assert!(matches!(&err, Error::UnsupportedLanguage(name) if name == "cobol"));
