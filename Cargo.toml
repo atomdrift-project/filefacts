@@ -357,6 +357,8 @@ debug = 2
 # block into its own manifest; without it, the build uses the unfixed crates.io
 # releases. Delete each entry once a release carries its fix.
 [patch.crates-io]
+# Inherited from a sibling by update-deps: [patch] applies only in the root.
+regex-syntax = { git = "https://github.com/tstromberg/regex" }
 # tree-sitter: lib/src/portable/endian.h has no branch for compilers that do
 # not predefine __illumos__ (stock toolchains generally don't), so an illumos
 # build stops at "#error platform not supported". The fork adds a __sun branch
