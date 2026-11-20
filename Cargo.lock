@@ -146,9 +146,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.11.2"
+version = "1.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33ef9e3e8154a45c7a95cff4c1299702106ad94062d7bb85fdc5d3a5afd91d45"
+checksum = "02f0e023adb368345ce0ca6cdfc0f24a06554468d0e8503e14a0841de79bfa69"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
@@ -1253,9 +1253,9 @@ dependencies = [
 
 [[package]]
 name = "psl"
-version = "2.1.258"
+version = "2.1.259"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3dd856c90936a531c75647b54c4222b4745ceedf60d0a0f14853bb9458d69af9"
+checksum = "7b85209e5945ce6d43ae3ac56491c30ac506db07108346758667a82bb2478c53"
 dependencies = [
  "psl-types",
 ]
@@ -1638,7 +1638,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stng"
 version = "3.0.0"
-source = "git+https://github.com/atomdrift-project/stng.git#f9decb24422adb2a54acc6d7bd2309112b7323a5"
+source = "git+https://github.com/atomdrift-project/stng.git#feb5925587d2967ff8e8b62a2535ecbdf004956b"
 dependencies = [
  "aho-corasick",
  "base64 0.22.1",
@@ -1925,7 +1925,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter"
 version = "0.28.0"
-source = "git+https://github.com/tstromberg/tree-sitter#932fc05167711cba9840516b19547328d024cbcb"
+source = "git+https://github.com/tstromberg/tree-sitter#c6a0d9ee7d699d570deec5d16a8ab1387a23ec7a"
 dependencies = [
  "cc",
  "regex",
@@ -2054,7 +2054,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-language"
 version = "0.1.8"
-source = "git+https://github.com/tstromberg/tree-sitter#932fc05167711cba9840516b19547328d024cbcb"
+source = "git+https://github.com/tstromberg/tree-sitter#c6a0d9ee7d699d570deec5d16a8ab1387a23ec7a"
 
 [[package]]
 name = "tree-sitter-lua"
@@ -2469,9 +2469,9 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "9.7.3"
+version = "9.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "63e50f7b2212e4635244be3c363b53273d159f2523eb7db3096c1d2861c1b603"
+checksum = "a9534624d547e3f516ecde0ed9a70d37788f01d340efcfdd03bf3ea8e163c1d0"
 dependencies = [
  "constant_time_eq",
  "crc32fast",
