@@ -361,6 +361,61 @@ fn python_prefixed_strings_are_literals_but_interpolations_flow() {
     );
 }
 
+/// The constant text around substitutions is a literal input of the
+/// interpolated string, as concatenated operands are: a sink fed
+/// `f"curl {host} | sh"` receives both `curl ` and ` | sh`.
+#[test]
+fn interpolated_string_constant_pieces_are_literal_inputs() {
+    fn pieces(flow: &Flow, sink: &str) -> Vec<String> {
+        let call = flow
+            .values
+            .iter()
+            .find(|v| v.target.as_deref() == Some(sink))
+            .unwrap();
+        let mut out: Vec<String> = flow
+            .origins(call.inputs[0], &[], 1000)
+            .values
+            .iter()
+            .filter_map(|o| match &flow.values[o.value].literal {
+                Some(Arg::String { value }) => Some(value.clone()),
+                _ => None,
+            })
+            .collect();
+        out.sort();
+        out
+    }
+    for (path, source, sink) in [
+        ("a.py", "h = host()\nrun(f\"curl {h}/p | sh\")\n", "run"),
+        ("a.js", "const h = host(); run(`curl ${h}/p | sh`);", "run"),
+        ("a.ts", "function m(){run(`curl ${host()}/p | sh`);}", "run"),
+    ] {
+        let flow = graph(path, source);
+        assert_eq!(
+            pieces(&flow, sink),
+            ["/p | sh", "curl "],
+            "{path}: {flow:?}"
+        );
+        assert!(reaches(&flow, sink, "host"), "{path}: {flow:?}");
+    }
+    // A constant string is still one complete literal, not pieces.
+    for (path, source) in [
+        ("a.py", "run(\"curl x | sh\")\n"),
+        ("a.js", "run(`curl x | sh`);"),
+    ] {
+        let flow = graph(path, source);
+        let call = flow
+            .values
+            .iter()
+            .find(|v| v.target.as_deref() == Some("run"))
+            .unwrap();
+        assert_eq!(
+            flow.values[call.inputs[0]].kind,
+            FlowKind::Literal,
+            "{path}"
+        );
+    }
+}
+
 #[test]
 fn javascript_template_substitutions_preserve_input_origins() {
     for path in ["a.js", "a.ts"] {

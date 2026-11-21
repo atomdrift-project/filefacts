@@ -59,6 +59,15 @@ impl Builder<'_> {
             _ => false,
         }
     }
+    /// A constant run of text inside an interpolated string, as a literal.
+    fn constant_piece(&mut self, node: Node<'_>) -> usize {
+        let value = self.text(node).to_string();
+        let id = self.add(FlowKind::Literal, node, Vec::new());
+        if let Some(entry) = self.flow.values.get_mut(id).filter(|_| id != 0) {
+            entry.literal = Some(Arg::String { value });
+        }
+        id
+    }
     fn add(&mut self, kind: FlowKind, node: Node<'_>, inputs: Vec<usize>) -> usize {
         if self.flow.values.len() >= NODE_LIMIT {
             self.flow.limitations.insert(Limitation::NodeBudget);
@@ -163,6 +172,21 @@ impl Builder<'_> {
         }
         if self.config.identifier_kinds.contains(&node.kind()) {
             return bindings.get(self.text(node)).unwrap_or(0);
+        }
+        if self.interpolates(node) {
+            // The constant pieces between substitutions are literals that
+            // contribute to the result as much as concatenated operands do;
+            // keep them beside the values the substitutions embed.
+            let inputs = named_children(node)
+                .filter_map(|child| match child.kind() {
+                    "string_content" | "string_fragment" => Some(self.constant_piece(child)),
+                    "interpolation" | "template_substitution" => {
+                        Some(self.eval(child, bindings, returns, depth + 1))
+                    }
+                    _ => None,
+                })
+                .collect();
+            return self.add(FlowKind::Merge, node, inputs);
         }
         let literal = ast_walk::build_arg(node, self.source, self.config);
         if matches!(
