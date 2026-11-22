@@ -347,6 +347,43 @@ impl Builder<'_> {
             }
             return id;
         }
+        if self.config.member_kinds.contains(&node.kind()) {
+            // A member read derives from its object, which it keeps as its
+            // input, and names its path: `el.value`, or `.value` off a
+            // computed object. Evaluating the property as a name would bind
+            // it to an unrelated local of the same spelling.
+            let inputs = node
+                .child_by_field_name(self.config.member_object_field)
+                .map(|object| self.eval(object, bindings, returns, depth + 1))
+                .into_iter()
+                .collect();
+            let mut target =
+                ast_walk::static_dotted_chain(node, self.source, self.config).or_else(|| {
+                    let property = self.config.member_property(node)?;
+                    property
+                        .kind()
+                        .ends_with("identifier")
+                        .then(|| format!(".{}", self.text(property)))
+                });
+            if let Some(expanded) = target.as_deref().and_then(|raw| {
+                expand_alias(raw, |head| {
+                    bindings
+                        .get(head)
+                        .is_none()
+                        .then(|| self.aliases.get(head).map(String::as_str))
+                        .flatten()
+                })
+            }) {
+                target = Some(expanded);
+            }
+            let id = self.add(FlowKind::Member, node, inputs);
+            if id != 0
+                && let Some(value) = self.flow.values.get_mut(id)
+            {
+                value.target = target;
+            }
+            return id;
+        }
         if self.config.object_kinds.contains(&node.kind()) || node.kind() == "keyword_argument" {
             let mut fields = BTreeMap::new();
             let entries = if node.kind() == "keyword_argument" {

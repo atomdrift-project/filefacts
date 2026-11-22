@@ -542,7 +542,9 @@ impl Flow {
                 // Keyword arguments require explicit projection by name. They
                 // are not positional object payloads (headers != data/json).
                 FlowKind::Keyword => {}
-                FlowKind::Merge | FlowKind::Concat | FlowKind::Alternative => {
+                // A member read derives from its object (a source-language
+                // member keeps it as its input; a CFML scope read has none).
+                FlowKind::Merge | FlowKind::Concat | FlowKind::Alternative | FlowKind::Member => {
                     next.extend(value.inputs.iter().copied());
                 }
                 FlowKind::Parameter => {
@@ -638,7 +640,7 @@ impl Flow {
                     }
                 }
                 FlowKind::Unknown => out.incomplete = true,
-                FlowKind::Literal | FlowKind::Member => {}
+                FlowKind::Literal => {}
             }
             pending.extend(
                 next.into_iter()
