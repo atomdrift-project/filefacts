@@ -1,6 +1,6 @@
 [package]
 name = "filefacts"
-version = "3.0.0"
+version = "3.1.0"
 edition = "2024"
 rust-version = "1.97"
 authors = ["The Atomdrift Project"]
