@@ -3,6 +3,33 @@
 All notable changes to filefacts. Versions follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
 The output schema is versioned separately by `filefacts::SCHEMA_VERSION`; a bump is noted with its new value.
 
+## 3.1.0 (2026-11-22)
+
+### Features
+
+- Report script sources, dynamic imports, module sources and workers in browser JavaScript and HTML as references.
+- Recover `.pyc` string constants as literals, and walk CPython 2.7 and 3.0 through 3.16 bytecode.
+- Add `SliceSymbols` so every universal Mach-O slice's imports and exports come from one extraction.
+- Add `compile_source_query` so callers run the Tree-sitter query they validated instead of compiling it twice.
+- Recognize MIME messages, Composer lockfiles and renamed go.sum files by content, not name.
+- Unwrap cabinets hidden behind a fake PNG prefix; `cab.png_prefix` records the disguise.
+- Follow source value flow through member reads and the constant pieces of template strings.
+- Prefer the host's own slice as a universal Mach-O's primary, falling back to x86-64, then arm64.
+
+### Fixes
+
+- Match PDF action keys by decoded name, so `/J#53` and similar escapes no longer hide JavaScript.
+- Report a PDF OpenAction only when a catalog carries one, including catalogs inside object streams.
+- Treat Excel 4.0 macro sheets named by `xlMacrosheet` relationships as macros, not just international ones.
+- Stop calling classic Mac resource forks Windows icons; the first icon entry must lie past the directory.
+- Detect HTML behind leading comments, classic ASP opening with a server object, and shell built by eval.
+
+### Optimizations
+
+- Read large Mach-O strings and structure in parallel, and hash code-signature pages across threads.
+- Scan only a DMG's stored bytes for strings, skipping seconds of compressed-chunk noise on large images.
+- Gather PNG stego samples once per traversal instead of once per mask and bit order.
+
 ## 3.0.0 (2026-11-17)
 
 ### Features
