@@ -336,6 +336,24 @@ fn extracted_round_trips_through_cache_json() {
     );
 }
 
+/// A universal Mach-O's per-slice imports and exports are part of the cached
+/// extraction: a cache hit must hand a consumer the other slices too, or it
+/// would report only the primary slice's imports on a second scan.
+#[test]
+fn slice_symbols_round_trip_through_cache_json() {
+    let bytes = zstd::decode_all(
+        &include_bytes!("../testdata/macho/lcg_xor_executable_constants.macho.zst")[..],
+    )
+    .expect("fixture decompresses");
+    let parsed = open(&bytes);
+    let original = parsed.extracted();
+    assert_eq!(original.slice_symbols.others().count(), 1);
+    assert!(original.slice_symbols.others().all(|(_, s)| !s.is_empty()));
+    let json = serde_json::to_vec(original).expect("serialize Extracted");
+    let restored: Extracted = serde_json::from_slice(&json).expect("deserialize Extracted");
+    assert_eq!(restored.slice_symbols, original.slice_symbols);
+}
+
 #[test]
 fn pe_instruction_xor_strings_keep_provenance_across_the_cache() {
     // Synthetic PE containing only a decoder and inert API-name strings.

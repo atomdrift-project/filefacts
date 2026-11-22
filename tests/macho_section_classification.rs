@@ -20,6 +20,16 @@ static FAT: std::sync::LazyLock<Vec<u8>> = std::sync::LazyLock::new(|| {
 fn thin() -> &'static [u8] {
     &FAT[0x4000..0x4000 + 48560]
 }
+/// The slice a parse of the whole file describes at its top level, and where
+/// it starts: this machine's, so the x86-64 slice or the arm64 one.
+fn primary() -> (usize, &'static [u8]) {
+    let at = open(&FAT)
+        .slice_symbols()
+        .primary()
+        .expect("a primary slice") as usize;
+    let len = if at == 0x4000 { 48560 } else { 85776 };
+    (at, &FAT[at..at + len])
+}
 fn word(b: &[u8], p: usize) -> u32 {
     u32::from_le_bytes(b[p..p + 4].try_into().unwrap())
 }
@@ -111,14 +121,55 @@ fn code_entropy_excludes_executable_constants_and_uses_real_file_spans() {
 #[test]
 fn fat_sections_are_rebased_once_without_changing_entropy() {
     let fat = open(&FAT);
-    let t = open(thin());
+    let (at, slice) = primary();
+    let t = open(slice);
     assert_eq!(fat.sections().len(), t.sections().len());
     for (f, s) in fat.sections().iter().zip(t.sections().iter()) {
         assert_eq!(f.name, s.name);
-        assert_eq!(f.file_offset, s.file_offset + 0x4000);
+        assert_eq!(f.file_offset, s.file_offset + at as u64);
         assert_eq!(f.file_size, s.file_size);
         assert_eq!(f.entropy, s.entropy);
     }
+}
+/// One parse of a universal file reads what each of its slices imports and
+/// exports: the primary slice's among the file's symbols, the other slice's
+/// beside them, and each the rows a parse of that slice alone gives. The
+/// primary is the slice this machine runs. A thin file has no other slices.
+#[test]
+fn one_parse_reads_every_slices_imports_and_exports() {
+    use filefacts::{Symbol, SymbolKind, Symbols};
+    let linked = |symbols: &Symbols| -> Vec<Symbol> {
+        let keep = |s: &&Symbol| matches!(s.kind(), SymbolKind::Import | SymbolKind::Export);
+        symbols.iter().filter(keep).cloned().collect()
+    };
+    let (x86_64, arm64) = ((0x4000, thin()), (65536, &FAT[65536..65536 + 85776]));
+    let (host, other) = if cfg!(target_arch = "aarch64") {
+        (arm64, x86_64)
+    } else {
+        (x86_64, arm64)
+    };
+    let fat = open(&FAT);
+    assert_eq!(fat.slice_symbols().primary(), Some(host.0));
+    assert_eq!(primary().0 as u64, host.0);
+    let alone = linked(open(host.1).symbols());
+    assert!(alone.iter().any(|s| s.kind() == SymbolKind::Import));
+    assert_eq!(linked(fat.symbols()), alone);
+
+    let others: Vec<_> = fat.slice_symbols().others().collect();
+    assert_eq!(others.len(), 1);
+    assert_eq!(others[0].0, other.0);
+    let alone = linked(open(other.1).symbols());
+    assert!(alone.iter().any(|s| s.kind() == SymbolKind::Import));
+    assert_eq!(linked(others[0].1), alone);
+    assert!(
+        others[0].1.iter_kind(SymbolKind::Function).next().is_none(),
+        "only imports and exports are kept for a slice that is not primary"
+    );
+    assert_eq!(fat.parse_count(), 1);
+
+    let thin = open(thin());
+    assert_eq!(thin.slice_symbols().primary(), None);
+    assert_eq!(thin.slice_symbols().others().count(), 0);
 }
 #[test]
 fn instruction_attributes_and_stub_type_work_without_conventional_names() {
@@ -157,7 +208,7 @@ fn zero_fill_sections_have_no_file_bytes_entropy_or_rebased_offset() {
     for flags in [1u32, 0xc, 0x12] {
         for fat in [false, true] {
             let mut b = if fat { FAT.to_vec() } else { thin().to_vec() };
-            let base = if fat { 0x4000 } else { 0 };
+            let base = if fat { primary().0 } else { 0 };
             let (_, h) = header(&b[base..], "__const");
             let h = h + base;
             b[h + 64..h + 68].copy_from_slice(&flags.to_le_bytes());
@@ -178,7 +229,7 @@ fn zero_fill_sections_have_no_file_bytes_entropy_or_rebased_offset() {
                     .unwrap()
                     .spans
                     .iter()
-                    .any(|s| s.offset == 0 || s.offset == 0x4000)
+                    .any(|s| s.offset == 0 || s.offset == base as u64)
             );
         }
     }

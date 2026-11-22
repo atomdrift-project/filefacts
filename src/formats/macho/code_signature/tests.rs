@@ -269,6 +269,36 @@ fn modified_code_page_is_reported() {
     assert_eq!(page_values(&values), (Some(false), Some(1), Some(2 * 4096)));
 }
 
+/// An image of many runs of pages, hashed on several threads, has each page
+/// checked against its own slot: it verifies as signed, and pages changed in
+/// the first run, a middle one and the short last page are each counted, the
+/// first of them named.
+#[test]
+fn pages_hashed_in_runs_keep_their_slots() {
+    let pages = 9 * PAGES_PER_RUN + 3;
+    let code: Vec<u8> = (0..(pages * 4096 - 1000) as u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+        .collect();
+    let cd = code_directory(&code, 12, "com.example.tool", &[]);
+    let values = signed(&code, &[(CSSLOT_CODEDIRECTORY, &cd)]);
+    assert_eq!(page_values(&values), (Some(true), None, None));
+
+    let changed = [7, 4 * PAGES_PER_RUN + 1, 4 * PAGES_PER_RUN + 2, pages - 1];
+    let mut tampered = code.clone();
+    for page in changed {
+        tampered[page * 4096 + 5] ^= 1;
+    }
+    let values = signed(&tampered, &[(CSSLOT_CODEDIRECTORY, &cd)]);
+    assert_eq!(page_values(&values), (Some(false), Some(4), Some(7 * 4096)));
+
+    // One change, in the last run alone.
+    let mut tampered = code.clone();
+    tampered[(pages - 2) * 4096] ^= 1;
+    let values = signed(&tampered, &[(CSSLOT_CODEDIRECTORY, &cd)]);
+    let at = ((pages - 2) * 4096) as u64;
+    assert_eq!(page_values(&values), (Some(false), Some(1), Some(at)));
+}
+
 /// A CodeDirectory that does not cover exactly the code it claims, or
 /// that uses a hash this cannot compute, verifies nothing.
 #[test]

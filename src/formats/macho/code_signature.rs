@@ -21,6 +21,7 @@
 //! **big-endian** — uniquely among Mach-O structures, which are
 //! otherwise host-endian.
 
+use rayon::prelude::*;
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 
@@ -296,6 +297,9 @@ struct CdCheck {
     special_ok: Option<bool>,
 }
 
+/// The fewest pages hashed as one run on one thread: 1 MiB of 4 KiB pages.
+const PAGES_PER_RUN: usize = 256;
+
 /// Page digests already computed, keyed by what determines them, so a
 /// signature listing the same CodeDirectory shape many times hashes the
 /// image once per shape.
@@ -346,8 +350,12 @@ fn check_code_directory(
                 let code = image.get(..cd.code_limit)?;
                 // Page size 0 makes the whole of `codeLimit` one page.
                 let page = page_size.unwrap_or(code.len()).max(1);
+                // Pages hash apart from one another, so a large image's are
+                // shared out, a run of them to a thread: a 150 MB slice's
+                // took 2 s on one. A small image is one run, on this thread.
                 let pages = code
-                    .chunks(page)
+                    .par_chunks(page)
+                    .with_min_len(PAGES_PER_RUN)
                     .map(|page| slot_digest(cd.hash_type, page).map(|(d, _)| d))
                     .collect::<Option<Vec<_>>>()?;
                 memo.push((key, pages));

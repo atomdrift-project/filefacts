@@ -7,9 +7,10 @@
 //! imports and exports, Go build info and similarity hashes.
 //!
 //! For FAT binaries, exposes per-arch slices under `macho.slices[]`
-//! and surfaces the preferred parseable slice's metadata (x86-64, else arm64,
-//! else one binform decodes, else the first) at the top level so simple
-//! consumers don't have to enumerate the array.
+//! and surfaces the preferred parseable slice's metadata (this machine's,
+//! else x86-64, else arm64, else one binform decodes, else the first) at the
+//! top level so simple consumers don't have to enumerate the array. What the
+//! other slices import and export is kept beside it ([`crate::SliceSymbols`]).
 
 mod bind;
 mod code_signature;
@@ -38,6 +39,7 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
         metrics,
         sections,
         symbols,
+        slice_symbols,
         errors,
         image_end,
         ..
@@ -105,48 +107,65 @@ pub(super) fn extract(bytes: &[u8], ctx: super::ExtractCtx<'_>) {
             (fits, arches, layouts)
         }
     };
-    // Reuse this parse for string extraction instead of having stng parse
-    // the binary a second time.
+    // stng reads the strings from this parse instead of parsing the binary a
+    // second time.
     let object = goblin::Object::Mach(parsed);
-    if fat_table_fits {
-        let shared: Vec<stng::Layout<'_, '_>> = fat::read(&layouts).collect();
-        extract_binary_strings_from_object(&object, &shared, bytes, strings, XorScan::Yes);
+    let mut read_strings = || {
+        if fat_table_fits {
+            let shared: Vec<stng::Layout<'_, '_>> = fat::read(&layouts).collect();
+            extract_binary_strings_from_object(&object, &shared, bytes, strings, XorScan::Yes);
+        } else {
+            extract_binary_strings(bytes, strings, XorScan::Yes);
+        }
+    };
+    let mut read_structure = || {
+        // Where the image the top-level views describe starts: the whole
+        // file, or a universal binary's primary slice. Functions are
+        // recovered from that image too, so their addresses fall in the
+        // sections listed.
+        let primary = match &object {
+            goblin::Object::Mach(Mach::Binary(macho)) => {
+                let sections = sections_of(macho);
+                single_arch(
+                    macho,
+                    &sections,
+                    fat::layout_at(&layouts, 0),
+                    bytes,
+                    &mut out,
+                );
+                *image_end = Some(image_end_of(macho, &sections));
+                go_build_info(macho, &sections, bytes, out.values, out.symbols);
+                Some(0)
+            }
+            _ => {
+                let analysed = fat::analyse(bytes, &arches, &layouts, &mut out);
+                *image_end = analysed.image_end;
+                *slice_symbols = crate::SliceSymbols::new(analysed.primary, analysed.others);
+                analysed.primary
+            }
+        };
+        if fat_table_fits {
+            let layout = primary.and_then(|at| fat::layout_at(&layouts, at));
+            recover_natively(layout, out.symbols, out.metrics);
+        }
+        super::upx::detect(bytes, out.values);
+    };
+    // The strings and the structure are read from the same bytes and write
+    // to views of their own, so a large binary reads both at once: on a
+    // 307 MB universal binary the strings took 4.5 s and the structure, with
+    // function recovery, 7 s, one after the other on one thread. A small one
+    // is done before a second thread could take half of it.
+    if bytes.len() >= SIDE_BY_SIDE_MIN_BYTES {
+        rayon::join(read_strings, read_structure);
     } else {
-        extract_binary_strings(bytes, strings, XorScan::Yes);
+        read_strings();
+        read_structure();
     }
-    // Constructed as `Object::Mach` above.
-    let goblin::Object::Mach(parsed) = object else {
-        return;
-    };
-    // Where the image the top-level views describe starts: the whole file,
-    // or a universal binary's primary slice. Functions are recovered from
-    // that image too, so their addresses fall in the sections listed.
-    let primary = match parsed {
-        Mach::Binary(macho) => {
-            let sections = sections_of(&macho);
-            single_arch(
-                &macho,
-                &sections,
-                fat::layout_at(&layouts, 0),
-                bytes,
-                &mut out,
-            );
-            *image_end = Some(image_end_of(&macho, &sections));
-            go_build_info(&macho, &sections, bytes, out.values, out.symbols);
-            Some(0)
-        }
-        Mach::Fat(_) => {
-            let analysed = fat::analyse(bytes, &arches, &layouts, &mut out);
-            *image_end = analysed.image_end;
-            analysed.primary
-        }
-    };
-    if fat_table_fits {
-        let layout = primary.and_then(|at| fat::layout_at(&layouts, at));
-        recover_natively(layout, out.symbols, out.metrics);
-    }
-    super::upx::detect(bytes, out.values);
 }
+
+/// The size from which a binary's strings and structure are read side by
+/// side. cleave's boundary for a large native file.
+const SIDE_BY_SIDE_MIN_BYTES: usize = 16 * 1024 * 1024;
 
 /// Where one image's extraction writes: the top-level views, or a
 /// non-primary fat slice's own.

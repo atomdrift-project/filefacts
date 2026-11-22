@@ -324,6 +324,39 @@ impl Symbol {
     }
 }
 
+/// The imports and exports of every slice of a universal Mach-O, from the one
+/// extraction of the file.
+///
+/// A file's [`Symbols`] describe its primary slice. A consumer that reports
+/// what any slice imports reads the other slices here, and never parses a
+/// slice on its own to learn it: the extraction already walked each one.
+/// Empty for a file that is not a universal Mach-O.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SliceSymbols {
+    primary: Option<u64>,
+    others: Vec<(u64, Symbols)>,
+}
+
+impl SliceSymbols {
+    pub(crate) fn new(primary: Option<u64>, others: Vec<(u64, Symbols)>) -> Self {
+        Self { primary, others }
+    }
+
+    /// Where the primary slice starts in the file: the slice the file's own
+    /// views describe. `None` when the file is not a universal Mach-O, or no
+    /// slice of it parsed.
+    pub fn primary(&self) -> Option<u64> {
+        self.primary
+    }
+
+    /// Each other slice that parsed, in header order: where it starts in the
+    /// file, and its imports and exports. Offsets in them are from the
+    /// slice's start, as the primary slice's are.
+    pub fn others(&self) -> impl Iterator<Item = (u64, &Symbols)> {
+        self.others.iter().map(|(at, symbols)| (*at, symbols))
+    }
+}
+
 /// All [`Symbol`] facts collected from a file, in extraction order.
 ///
 /// Read-only outside filefacts: iterate with [`Self::iter`] or `&symbols`.
@@ -382,6 +415,11 @@ impl Symbols {
 
     pub(crate) fn push(&mut self, symbol: Symbol) {
         self.0.push(symbol);
+    }
+
+    /// Keep only the symbols `keep` accepts.
+    pub(crate) fn retain(&mut self, keep: impl FnMut(&Symbol) -> bool) {
+        self.0.retain(keep);
     }
 
     /// Borrow the underlying slice.

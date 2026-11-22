@@ -63,7 +63,7 @@ pub use strings::{Comments, Literal, LiteralEncoding, LiteralMethod, Literals, T
 // so they can push to either tier without juggling two parameters.
 // Not part of the public schema.
 pub(crate) use strings::{ExtractedString, Strings};
-pub use symbols::{Arg, ArgShape, Symbol, SymbolKind, Symbols};
+pub use symbols::{Arg, ArgShape, SliceSymbols, Symbol, SymbolKind, Symbols};
 pub(crate) use value_keys::VALUE_CATALOG;
 pub(crate) use value_keys::{ValueKey, declared_value_key, value_key};
 pub use values::Values;

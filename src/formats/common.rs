@@ -168,6 +168,29 @@ pub(super) fn extract_text_strings(bytes: &[u8], strings: &mut Strings, xor: Xor
     push_stng_strings(stng::extract_strings_with_options(bytes, &opts), strings);
 }
 
+/// `strings(1)`-tier byte view of the `ranges` of `bytes`, for a container
+/// only parts of which are readable in place. Offsets are into `bytes`. A
+/// string does not run from one range into the next.
+pub(super) fn extract_text_strings_in(
+    bytes: &[u8],
+    ranges: &[std::ops::Range<usize>],
+    strings: &mut Strings,
+) {
+    let mut rows = Vec::new();
+    for range in ranges {
+        let Some(part) = bytes.get(range.clone()) else {
+            continue;
+        };
+        let opts = string_opts_for(XorScan::No, part);
+        let found = stng::extract_strings_with_options(part, &opts);
+        rows.extend(found.into_iter().map(|mut row| {
+            row.data_offset = row.data_offset.saturating_add(range.start as u64);
+            row
+        }));
+    }
+    push_stng_strings(rows, strings);
+}
+
 /// Convenience wrapper for emitting a string-typed value into `values` at a
 /// checked key from `value_key!`.
 pub(super) fn put_str(values: &mut Values, key: ValueKey, s: impl Into<String>) {

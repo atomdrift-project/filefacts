@@ -819,6 +819,112 @@ fn the_primary_slice_is_the_preferred_one_that_parses() {
     assert_eq!(primary(&[b"junk", &x86_64, &x86_64]), Some(0x2000));
     assert_eq!(primary(&[&unknown, &x86_64]), Some(0x2000));
     assert_eq!(primary(&[&unknown, &unknown]), Some(0x1000));
+
+    // Of an x86-64 and an arm64 image, the one this machine runs, wherever
+    // it sits in the file; either over an instruction set binform does not
+    // decode.
+    let mut arm64 = x86_64.clone();
+    arm64[4..8].copy_from_slice(&0x0100_000c_u32.to_le_bytes());
+    let (first, second) = if cfg!(target_arch = "aarch64") {
+        (0x2000, 0x1000)
+    } else {
+        (0x1000, 0x2000)
+    };
+    assert_eq!(primary(&[&x86_64, &arm64]), Some(first));
+    assert_eq!(primary(&[&arm64, &x86_64]), Some(second));
+    assert_eq!(primary(&[&unknown, &arm64]), Some(0x2000));
+    assert_eq!(primary(&[&arm64, &unknown, &arm64]), Some(0x1000));
+}
+
+/// One extraction of a universal file reads what every slice imports and
+/// exports: the primary slice's among the file's own symbols, each other
+/// slice's beside them, and both the rows a parse of the slice alone yields.
+/// A consumer reporting every slice's imports opens no slice of its own.
+#[test]
+fn every_slice_keeps_its_imports_and_exports() {
+    use crate::output::SymbolKind;
+    let linked = |symbols: &crate::Symbols| -> Vec<crate::Symbol> {
+        let linked =
+            |s: &&crate::Symbol| matches!(s.kind(), SymbolKind::Import | SymbolKind::Export);
+        symbols.iter().filter(linked).cloned().collect()
+    };
+    let slice = read_fixture("test.macho");
+    let alone = linked(&run_with_symbols(&slice).3);
+    assert!(alone.iter().any(|s| s.kind() == SymbolKind::Import));
+    assert!(alone.iter().any(|s| s.kind() == SymbolKind::Export));
+
+    // Two slices of the fixture, each past the other: `universal` gives a
+    // slice one page, and the fixture is longer.
+    let second = (0x1000 + slice.len()).next_multiple_of(0x1000);
+    let mut file = vec![0xca, 0xfe, 0xba, 0xbe, 0, 0, 0, 2];
+    for at in [0x1000, second] {
+        for word in [0x0100_0007_u32, 3, at as u32, slice.len() as u32, 12] {
+            file.extend_from_slice(&word.to_be_bytes());
+        }
+    }
+    for at in [0x1000, second] {
+        file.resize(at, 0);
+        file.extend_from_slice(&slice);
+    }
+    let mut out = crate::formats::Sinks::default();
+    extract(&file, out.ctx());
+    assert_eq!(out.slice_symbols.primary(), Some(0x1000));
+    assert_eq!(linked(&out.symbols), alone);
+    let others: Vec<_> = out.slice_symbols.others().collect();
+    assert_eq!(others.len(), 1, "one slice besides the primary");
+    assert_eq!(others[0].0, second as u64);
+    assert_eq!(others[0].1.as_slice(), alone);
+
+    let mut thin = crate::formats::Sinks::default();
+    extract(&slice, thin.ctx());
+    assert_eq!(thin.slice_symbols, crate::SliceSymbols::default());
+}
+
+/// A large binary's strings and structure are read side by side, a small
+/// one's in turn, and both ways give the same views: the same file, padded
+/// past the size where the two are read at once, reads as it did before, for
+/// a thin binary and a universal one.
+#[test]
+fn a_large_binary_read_side_by_side_gives_the_same_views() {
+    let slice = read_fixture("test.macho");
+    let second = (0x1000 + slice.len()).next_multiple_of(0x1000);
+    let mut fat = vec![0xca, 0xfe, 0xba, 0xbe, 0, 0, 0, 2];
+    for at in [0x1000, second] {
+        for word in [0x0100_0007_u32, 3, at as u32, slice.len() as u32, 12] {
+            fat.extend_from_slice(&word.to_be_bytes());
+        }
+    }
+    for at in [0x1000, second] {
+        fat.resize(at, 0);
+        fat.extend_from_slice(&slice);
+    }
+    for small in [slice, fat] {
+        assert!(small.len() < SIDE_BY_SIDE_MIN_BYTES);
+        let mut large = small.clone();
+        large.resize(SIDE_BY_SIDE_MIN_BYTES, 0);
+        let (mut in_turn, mut at_once) = (
+            crate::formats::Sinks::default(),
+            crate::formats::Sinks::default(),
+        );
+        extract(&small, in_turn.ctx());
+        extract(&large, at_once.ctx());
+        assert!(!in_turn.symbols.is_empty() && !in_turn.sections.is_empty());
+        assert!(!in_turn.strings.text.is_empty());
+        assert_eq!(at_once.symbols, in_turn.symbols);
+        assert_eq!(at_once.slice_symbols, in_turn.slice_symbols);
+        assert_eq!(at_once.sections, in_turn.sections);
+        assert_eq!(at_once.values.as_json(), in_turn.values.as_json());
+        assert_eq!(at_once.image_end, in_turn.image_end);
+        assert_eq!(
+            serde_json::to_value(&at_once.strings).unwrap(),
+            serde_json::to_value(&in_turn.strings).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&at_once.metrics).unwrap(),
+            serde_json::to_value(&in_turn.metrics).unwrap()
+        );
+        assert_eq!(at_once.errors.iter().count(), in_turn.errors.iter().count());
+    }
 }
 
 /// A straight chain of `depth` non-terminal nodes, each with one edge `a`, and

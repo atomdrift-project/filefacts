@@ -237,7 +237,7 @@ pub use output::{
     Comments, DependencyContext, DependencyScope, Diagnostic, DiagnosticKind, Errors, Fact,
     HashAlgo, Identity, Literal, LiteralEncoding, LiteralMethod, Literals, Metrics, Party,
     PartyRole, PinnedHash, RefKind, RefLocator, Reference, Section, SectionFlag, Sections, Signer,
-    Span, Stage, Symbol, SymbolKind, Symbols, Text, Trust, Url, UrlKind, Values,
+    SliceSymbols, Span, Stage, Symbol, SymbolKind, Symbols, Text, Trust, Url, UrlKind, Values,
 };
 // Key types and the templated metric-key constructors: only filefacts emits
 // keys, so none of these is public.
@@ -395,6 +395,7 @@ struct Extracted {
     archive_members: Vec<ArchiveMember>,
     sections: Sections,
     symbols: Symbols,
+    slice_symbols: SliceSymbols,
     identity: Identity,
     references: Vec<Reference>,
     errors: Errors,
@@ -516,6 +517,14 @@ impl<'a> ParsedFile<'a> {
     /// depends on the file type. Filter with [`Symbols::iter_kind`].
     pub fn symbols(&self) -> &Symbols {
         &self.extracted().symbols
+    }
+
+    /// What each slice of a universal Mach-O imports and exports, and which
+    /// slice [`symbols`](Self::symbols) and the other views describe. Read by
+    /// the same extraction as every other view, so a consumer that reports
+    /// every slice never opens one on its own.
+    pub fn slice_symbols(&self) -> &SliceSymbols {
+        &self.extracted().slice_symbols
     }
 
     /// Lazily compute format-neutral value relationships.
@@ -809,6 +818,7 @@ fn run_extraction(
     let mut sections: Vec<Section> = Vec::new();
     let mut image_end: Option<u64> = None;
     let mut symbols = Symbols::new();
+    let mut slice_symbols = SliceSymbols::default();
     let mut errors = Errors::new();
     if fileid.source() == fileid::DetectionSource::Failed {
         errors.record_panic(Stage::Identify, "file identification panicked");
@@ -878,6 +888,7 @@ fn run_extraction(
                 archive_members: &mut archive_members,
                 sections: &mut sections,
                 symbols: &mut symbols,
+                slice_symbols: &mut slice_symbols,
                 errors: &mut errors,
                 image_end: &mut image_end,
                 basename,
@@ -1019,6 +1030,7 @@ fn run_extraction(
         archive_members,
         sections,
         symbols,
+        slice_symbols,
         identity,
         references,
         errors,

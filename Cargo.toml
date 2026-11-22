@@ -97,6 +97,9 @@ gimli = { version = "0.32", default-features = false, features = ["read", "std"]
 # Cargo.lock. No default features: those build the `stng` command, not the
 # library.
 stng = { git = "https://github.com/atomdrift-project/stng.git", default-features = false }
+# Reads a large binary's strings and structure side by side. stng already
+# brings it in: this names the same crate, not a new one.
+rayon = "1"
 
 # Function recovery from machine code: boundaries, basic blocks, complexity
 # and calls, in-process; also the layout of every PE, ELF and Mach-O image,

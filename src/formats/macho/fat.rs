@@ -1,6 +1,6 @@
 //! FAT (universal) Mach-O: per-slice analysis into `macho.slices[]`, with the
-//! preferred slice that parses (x86-64, else arm64, else one binform
-//! decodes, else the first) also reported at the top level.
+//! preferred slice that parses (this machine's, else x86-64, else arm64, else
+//! one binform decodes, else the first) also reported at the top level.
 
 use goblin::mach::{MachO, fat::FatArch};
 use serde_json::Value as JsonValue;
@@ -31,6 +31,9 @@ pub(super) struct Analysed {
     /// Where the primary slice starts in the file; `None` when no slice
     /// parsed.
     pub(super) primary: Option<u64>,
+    /// Each other slice's start in the file with its imports and exports,
+    /// in header order.
+    pub(super) others: Vec<(u64, Symbols)>,
 }
 
 /// Analyse each slice of a fat binary once. Every slice gets the same
@@ -39,8 +42,9 @@ pub(super) struct Analysed {
 /// Of the slices that parse, the primary is the one [`preference`] ranks
 /// first: its extraction also fills the top-level values, metrics, sections
 /// and symbols, its `macho.*` subtree is its slice entry, and functions are
-/// recovered from it. What any slice's extraction records in `errors` is
-/// kept.
+/// recovered from it. Every other slice's imports and exports are kept
+/// beside it, so no consumer parses a slice again to read them. What any
+/// slice's extraction records in `errors` is kept.
 pub(super) fn analyse(
     bytes: &[u8],
     arches: &[FatArch],
@@ -52,6 +56,7 @@ pub(super) fn analyse(
     let mut analysed_out = Analysed {
         image_end: None,
         primary: None,
+        others: Vec::new(),
     };
     let mut images = Vec::new();
     // Slices of a real universal binary are disjoint. Each slice gets a full
@@ -146,7 +151,10 @@ pub(super) fn analyse(
             }
             entry
         } else {
-            analyse_slice(&macho, &sections, layout, slice_bytes, out.errors)
+            let (entry, symbols) =
+                analyse_slice(&macho, &sections, layout, slice_bytes, out.errors);
+            analysed_out.others.push((u64::from(arch.offset), symbols));
+            entry
         };
         if let JsonValue::Object(ref mut obj) = entry {
             obj.insert("file_offset".into(), JsonValue::Number(arch.offset.into()));
@@ -162,31 +170,43 @@ pub(super) fn analyse(
 }
 
 /// How strongly a slice is preferred as the primary, by the instruction set
-/// binform read in it (`layout`), lowest first: the one a 64-bit x86 host
-/// runs, else Apple silicon's, else another binform decodes, else any. The
-/// order binform itself reads a universal binary in; ties go to header
-/// order. A slice binform decodes yields functions, so the top-level views
-/// describe the image they come from.
+/// binform read in it (`layout`), lowest first: the one this machine runs,
+/// else a 64-bit x86 host's, else Apple silicon's, else another binform
+/// decodes, else any. The order binform itself reads a universal binary in;
+/// ties go to header order. A slice binform decodes yields functions, so the
+/// top-level views describe the image they come from. A machine on Apple
+/// silicon and one on x86-64 report different slices of the same file as
+/// its primary.
+// TODO: a universal binary holds several images, and none of them is the
+// file. Give each slice views of its own, as a member of the file, so no
+// consumer has to follow this order or work around it.
 fn preference(layout: Option<&binform::Binary<'_>>) -> u8 {
+    let host = if cfg!(target_arch = "aarch64") {
+        binform::Arch::Arm64
+    } else {
+        binform::Arch::X86_64
+    };
     match layout.and_then(|layout| layout.arch()) {
-        Some(binform::Arch::X86_64) => 0,
-        Some(binform::Arch::Arm64) => 1,
-        Some(_) => 2,
-        None => 3,
+        Some(arch) if arch == host => 0,
+        Some(binform::Arch::X86_64) => 1,
+        Some(binform::Arch::Arm64) => 2,
+        Some(_) => 3,
+        None => 4,
     }
 }
 
 /// Run the single-arch extraction on a non-primary slice into outputs of its
-/// own, and return its `macho.*` subtree as the slice's entry. The slice's
-/// metrics, sections and symbols are counted into the entry and otherwise
-/// dropped: the top-level views describe the primary slice.
+/// own, and return its `macho.*` subtree as the slice's entry with what the
+/// slice imports and exports. The slice's metrics, sections and other symbols
+/// are counted into the entry and otherwise dropped: the top-level views
+/// describe the primary slice.
 fn analyse_slice(
     macho: &MachO<'_>,
     macho_sections: &[super::MachSection<'_>],
     layout: Option<&binform::Binary<'_>>,
     slice_bytes: &[u8],
     errors: &mut Errors,
-) -> JsonValue {
+) -> (JsonValue, Symbols) {
     let mut values = Values::new();
     let mut sections: Vec<Section> = Vec::new();
     let mut slice_symbols = Symbols::new();
@@ -203,12 +223,14 @@ fn analyse_slice(
             errors,
         },
     );
-    slice_entry(
+    slice_symbols.retain(|s| matches!(s.kind(), SymbolKind::Import | SymbolKind::Export));
+    let entry = slice_entry(
         values.into_json().get_mut("macho").map(JsonValue::take),
         slice_symbols.iter_kind(SymbolKind::Import).count(),
         slice_symbols.iter_kind(SymbolKind::Export).count(),
         sections.len(),
-    )
+    );
+    (entry, slice_symbols)
 }
 
 /// binform's layout of each slice [`analyse`] will visit, by the slice's file

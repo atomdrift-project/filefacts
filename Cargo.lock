@@ -533,6 +533,7 @@ dependencies = [
  "p384",
  "plist",
  "png",
+ "rayon",
  "regex",
  "roxmltree",
  "rsa",

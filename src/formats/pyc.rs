@@ -1,11 +1,12 @@
 //! Python compiled bytecode (`.pyc`) extractor.
 //!
-//! Surfaces the fixed 16-byte header
-//! (magic + flags + timestamp/hash + source-size) and recovers
+//! Surfaces the header -- magic and mtime, plus the source size from 3.3 and
+//! PEP 552 flags (mtime or source hash) from 3.7 -- and recovers
 //! source-filename strings by scanning the body for ASCII byte
 //! runs ending in `.py` / `.pyx` / `.pyw` / `.pyi`. The marshal
-//! stream also supplies bounded code-object identifier tables for supported
-//! versions. Constant/documentation strings never become identifier facts.
+//! stream also supplies, for CPython 2.7 and 3.0-3.16, bounded code-object
+//! identifier tables and string constants: the constants are the module's
+//! string literals. Constants never become identifier facts.
 //!
 //! Schema:
 //!
@@ -24,9 +25,10 @@ use crate::value_key;
 use serde_json::Value as JsonValue;
 
 use crate::formats::common::{XorScan, extract_binary_strings, hex_encode, put_str};
+use crate::formats::marshal::Version;
 use crate::output::Stage;
 
-mod names;
+mod code_objects;
 
 /// Cap on body bytes scanned for source-filename strings. Real
 /// `co_filename` paths sit very early in the marshal stream; the
@@ -46,59 +48,82 @@ pub(super) fn extract(bytes: &[u8], ctx: ExtractCtx<'_>) {
     } = ctx;
     extract_binary_strings(bytes, strings, XorScan::No);
 
-    // PEP 3147+ magic ends in `0x0d 0x0a`.
-    let Some((header, rest)) = bytes
-        .split_first_chunk::<16>()
-        .filter(|(header, _)| header[2..4] == [0x0D, 0x0A])
+    // Every CPython magic ends in `0x0d 0x0a`.
+    let Some(magic) = bytes
+        .first_chunk::<4>()
+        .filter(|magic| magic[2..4] == [0x0D, 0x0A])
     else {
         tracing::debug!(
             target: "filefacts::pyc",
             stage = "header",
             len = bytes.len(),
-            "no 16-byte pyc header with a CRLF magic; no pyc facts"
+            "no pyc magic ending in CRLF; no pyc facts"
+        );
+        return;
+    };
+    let magic_word = u16::from_le_bytes([magic[0], magic[1]]);
+    let version = python_version_for_magic(magic_word);
+    // The header grew: magic and mtime; source size from 3.3; PEP 552 flags
+    // from 3.7. A magic this table does not know is taken as current.
+    let header_len = match version {
+        Some(v) if v < Version::three(3) => 8,
+        Some(v) if v < Version::three(7) => 12,
+        _ => 16,
+    };
+    let Some((header, rest)) = bytes.split_at_checked(header_len) else {
+        tracing::debug!(
+            target: "filefacts::pyc",
+            stage = "header",
+            len = bytes.len(),
+            header_len,
+            "pyc shorter than its header; no pyc facts"
         );
         return;
     };
 
-    let magic_word = u16::from_le_bytes([header[0], header[1]]);
-    let flags = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
-    let is_hash_based = (flags & 1) != 0;
-
     put_str(
         values,
         value_key!("pyc.magic"),
-        format!(
-            "{:08x}",
-            u32::from_le_bytes([header[0], header[1], header[2], header[3]])
-        ),
+        format!("{:08x}", u32::from_le_bytes(*magic)),
     );
-    if let Some(minor) = python3_minor_for_magic(magic_word) {
+    if let Some(version) = version {
         put_str(
             values,
             value_key!("pyc.python_version"),
-            format!("3.{minor}"),
+            format!("{}.{}", version.major, version.minor),
         );
-        if (8..=14).contains(&minor)
-            && let Err(message) = names::extract(rest, minor, symbols)
+        if version.walkable()
+            && let Err(message) =
+                code_objects::extract(rest, version, header_len, symbols, &mut strings.literals)
         {
             errors.record_malformed(Stage::FormatExtract, format!("Python marshal: {message}"));
         }
     }
-    if is_hash_based {
-        // A presence-only key rather than an `is_hash_based` bool:
-        // `exists: pyc.hash` flags the variant.
-        put_str(values, value_key!("pyc.hash"), hex_encode(&header[8..16]));
-    } else {
-        let ts = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
-        let sz = u32::from_le_bytes([header[12], header[13], header[14], header[15]]);
-        if ts != 0 {
-            metrics.insert(metric!("pyc.timestamp"), f64::from(ts));
-            put_str(values, value_key!("pyc.timestamp"), ts.to_string());
+    let word = |at: usize| crate::bytes::u32_le(header, at).unwrap_or(0);
+    // PEP 552: flags bit 0 marks a hash-based pyc, whose next 8 bytes are the
+    // source hash rather than an mtime and size.
+    let (timestamp_at, size_at) = match header_len {
+        16 if word(4) & 1 != 0 => {
+            // A presence-only key rather than an `is_hash_based` bool:
+            // `exists: pyc.hash` flags the variant.
+            put_str(
+                values,
+                value_key!("pyc.hash"),
+                hex_encode(header.get(8..16).unwrap_or_default()),
+            );
+            (None, None)
         }
-        if sz != 0 {
-            metrics.insert(metric!("pyc.source_size"), f64::from(sz));
-            put_str(values, value_key!("pyc.source_size"), sz.to_string());
-        }
+        16 => (Some(8), Some(12)),
+        12 => (Some(4), Some(8)),
+        _ => (Some(4), None),
+    };
+    if let Some(ts) = timestamp_at.map(word).filter(|&ts| ts != 0) {
+        metrics.insert(metric!("pyc.timestamp"), f64::from(ts));
+        put_str(values, value_key!("pyc.timestamp"), ts.to_string());
+    }
+    if let Some(sz) = size_at.map(word).filter(|&sz| sz != 0) {
+        metrics.insert(metric!("pyc.source_size"), f64::from(sz));
+        put_str(values, value_key!("pyc.source_size"), sz.to_string());
     }
 
     let body = rest.get(..MAX_BODY_SCAN).unwrap_or(rest);
@@ -112,21 +137,31 @@ pub(super) fn extract(bytes: &[u8], ctx: ExtractCtx<'_>) {
     }
 }
 
-/// Map a Python bytecode magic word to the minor version of its Python 3
-/// release. Values from CPython's `importlib._bootstrap_external`
-/// (canonical table). Unknown magics omit `pyc.python_version` rather than
-/// emit a stale label.
-pub(super) fn python3_minor_for_magic(magic: u16) -> Option<u8> {
+/// The CPython release a bytecode magic word belongs to. Each release owns
+/// the block of words its development used, from CPython's
+/// `importlib._bootstrap_external` table; from 3.11 a release reserves a
+/// block of fifty, which covers its alphas and betas too. Unknown magics
+/// omit `pyc.python_version` rather than emit a stale label.
+pub(super) fn python_version_for_magic(magic: u16) -> Option<Version> {
     Some(match magic {
-        3379 => 6,
-        3390..=3394 => 7,
-        3400..=3413 => 8,
-        3420..=3425 => 9,
-        3430..=3439 => 10,
-        3450..=3495 => 11,
-        3500..=3531 => 12,
-        3550..=3571 => 13,
-        3627 => 14,
+        62171..=62211 => Version { major: 2, minor: 7 },
+        3111..=3131 => Version::three(0),
+        3141..=3151 => Version::three(1),
+        3160..=3180 => Version::three(2),
+        3190..=3230 => Version::three(3),
+        3250..=3310 => Version::three(4),
+        3320..=3351 => Version::three(5),
+        3360..=3379 => Version::three(6),
+        3390..=3399 => Version::three(7),
+        3400..=3419 => Version::three(8),
+        3420..=3429 => Version::three(9),
+        3430..=3449 => Version::three(10),
+        3450..=3499 => Version::three(11),
+        3500..=3549 => Version::three(12),
+        3550..=3599 => Version::three(13),
+        3600..=3649 => Version::three(14),
+        3650..=3699 => Version::three(15),
+        3700..=3749 => Version::three(16),
         _ => return None,
     })
 }

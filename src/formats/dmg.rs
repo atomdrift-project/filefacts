@@ -33,13 +33,14 @@
 use crate::metric;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
+use std::ops::Range;
 
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use super::archive_stats::{Agg, ArchiveStats, Reading, Scope, member_value};
 use crate::bytes::{u32_be, u64_be, u64_le};
 use crate::error::Error;
-use crate::output::{ArchiveCompression, ArchiveMember, EntryType, Metrics, Values};
+use crate::output::{ArchiveCompression, ArchiveMember, EntryType, Metrics, Strings, Values};
 use crate::value_key;
 
 /// The shared aggregates over a disk image's partitions. A partition name
@@ -74,6 +75,7 @@ const MAC_EPOCH_OFFSET: i64 = 2_082_844_800;
 pub(super) fn extract(
     bytes: &[u8],
     values: &mut Values,
+    strings: &mut Strings,
     metrics: &mut Metrics,
     archive_members: &mut Vec<ArchiveMember>,
 ) -> Result<(), Error> {
@@ -115,7 +117,44 @@ pub(super) fn extract(
     // Volume superblock facts — best-effort, zlib/raw images only.
     volume_facts(bytes, &koly, &partitions, values, metrics);
 
+    // The strings readable in place. A compressed chunk is codec output:
+    // scanning it is 10 ms/MiB of noise (3 s of a 320 MB image's scan), and
+    // the files it holds are each scanned once extracted.
+    let stored = stored_ranges(bytes.len(), &koly, &partitions);
+    super::common::extract_text_strings_in(bytes, &stored, strings);
+
     Ok(())
+}
+
+/// The image's bytes outside its compressed chunks, in file order: stored
+/// (`raw`) chunks, the plist, the trailer, and whatever no chunk names. A
+/// chunk that runs past the end of the file is one no reader decodes, and
+/// leaves nothing out.
+fn stored_ranges(len: usize, koly: &Koly, partitions: &[Partition]) -> Vec<Range<usize>> {
+    let mut compressed: Vec<Range<usize>> = partitions
+        .iter()
+        .flat_map(|p| {
+            let fork_base = koly.data_fork_offset.saturating_add(p.data_offset);
+            p.chunks
+                .iter()
+                .filter(|c| Codec::of(c.entry_type).compresses())
+                .filter_map(move |c| chunk_range(len, fork_base, c))
+        })
+        .collect();
+    compressed.sort_unstable_by_key(|r| (r.start, r.end));
+
+    let mut stored = Vec::new();
+    let mut at = 0;
+    for chunk in compressed {
+        if chunk.start > at {
+            stored.push(at..chunk.start);
+        }
+        at = at.max(chunk.end);
+    }
+    if at < len {
+        stored.push(at..len);
+    }
+    stored
 }
 
 /// The fields of the `koly` (UDIFResourceFile) trailer we use.
@@ -283,11 +322,7 @@ fn emit_partitions(
             *codec_counts.entry(name).or_insert(0) += 1;
             *part_codecs.entry(name).or_insert(0) += 1;
             compressed = compressed.saturating_add(c.comp_length);
-            // Only these compress; the rest are raw, zero or structural.
-            if matches!(
-                codec,
-                Codec::Adc | Codec::Zlib | Codec::Bzip2 | Codec::Lzfse | Codec::Lzma
-            ) {
+            if codec.compresses() {
                 compressors.insert(name);
             }
         }
@@ -509,9 +544,15 @@ fn reconstruct_prefix(
 /// The compressed bytes chunk `c` decodes from, or `None` when they lie
 /// outside the image.
 fn chunk_source<'b>(bytes: &'b [u8], fork_base: u64, c: &Chunk) -> Option<&'b [u8]> {
+    bytes.get(chunk_range(bytes.len(), fork_base, c)?)
+}
+
+/// Where in an image of `len` bytes chunk `c`'s source lies, or `None` when
+/// any of it lies outside.
+fn chunk_range(len: usize, fork_base: u64, c: &Chunk) -> Option<Range<usize>> {
     let start = usize::try_from(fork_base.checked_add(c.comp_offset)?).ok()?;
-    let len = usize::try_from(c.comp_length).ok()?;
-    bytes.get(start..start.checked_add(len)?)
+    let end = start.checked_add(usize::try_from(c.comp_length).ok()?)?;
+    (end <= len).then_some(start..end)
 }
 
 /// Copy as much of `src` as fits into `buf` starting at `at`.
@@ -666,6 +707,15 @@ impl Codec {
             0xffff_ffff => Self::Last,
             _ => Self::Unknown,
         }
+    }
+
+    /// Whether the chunk's bytes are compressed. The rest are stored, zero
+    /// or structural.
+    fn compresses(self) -> bool {
+        matches!(
+            self,
+            Self::Adc | Self::Zlib | Self::Bzip2 | Self::Lzfse | Self::Lzma
+        )
     }
 
     /// The codec in filefacts' stable vocabulary.

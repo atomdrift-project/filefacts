@@ -468,7 +468,12 @@ struct Packing<'a> {
     reverse: bool,
 }
 
-fn bitstream(view: PixelView<'_>, packing: Packing<'_>, probe: &mut Probe) -> Vec<u8> {
+/// The samples a traversal reads, in the order it reads them: `offsets` of
+/// each pixel, for as many pixels as the narrowest mask needs to fill `cap`
+/// bytes a bit at a time. The mask and bit order play no part, so every one
+/// of them packs these samples and the pixels are visited once, not once for
+/// each.
+fn samples(view: PixelView<'_>, packing: Packing<'_>) -> Vec<u8> {
     let PixelView {
         pixels,
         width,
@@ -479,88 +484,96 @@ fn bitstream(view: PixelView<'_>, packing: Packing<'_>, probe: &mut Probe) -> Ve
         offsets,
         column,
         prime,
-        mask,
-        reverse,
         flip_x,
         flip_y,
         cap,
+        ..
     } = packing;
-    let total = width.saturating_mul(height);
-    let mut out = Vec::with_capacity(cap);
-    let (mut byte, mut used) = (0u16, 0u32);
-    // Every supported mask is a contiguous run (including a single bit).
-    // Append its packed sample in one operation instead of visiting each bit.
-    // At most seven pending bits plus eight new bits fit in the accumulator.
-    let bit_count = mask.count_ones();
-    let shift = mask.trailing_zeros();
-    // A full mask in stream order copies the sample byte as-is.
-    let whole_bytes = mask == 0xff && !reverse;
     let ordinary = 0..if prime.is_none() {
-        total.min(MAX_PIXELS)
+        width.saturating_mul(height).min(MAX_PIXELS)
     } else {
         0
     };
-    // Sequential indices step their coordinates instead of dividing; prime
-    // indices (sparse) still divide.
-    let (mut next_ordinary, mut cx, mut cy) = (0usize, 0usize, 0usize);
-    for index in ordinary.chain(prime.unwrap_or_default().iter().copied()) {
-        probe.steps += 1;
-        if probe.steps > MAX_STEPS {
-            probe.limited = true;
-            break;
-        }
-        let (x, y) = if index == next_ordinary {
-            let at = (cx, cy);
-            next_ordinary += 1;
-            if column {
-                cy += 1;
-                if cy == height {
-                    cy = 0;
-                    cx += 1;
-                }
-            } else {
-                cx += 1;
-                if cx == width {
-                    cx = 0;
-                    cy += 1;
-                }
-            }
-            at
-        } else if column {
+    let wanted = cap.saturating_mul(8).div_ceil(offsets.len().max(1));
+    let mut out = Vec::new();
+    for index in ordinary
+        .chain(prime.unwrap_or_default().iter().copied())
+        .take(wanted)
+    {
+        let (x, y) = if column {
             (index / height, index % height)
         } else {
             (index % width, index / width)
         };
         let x = if flip_x { width - 1 - x } else { x };
         let y = if flip_y { height - 1 - y } else { y };
-        let pixel = y * width + x;
+        let pixel = (y * width + x).saturating_mul(channels);
         for offset in offsets {
-            let Some(&value) = pixels.get(pixel.saturating_mul(channels).saturating_add(*offset))
-            else {
+            let Some(&value) = pixels.get(pixel.saturating_add(*offset)) else {
                 return out;
             };
-            if whole_bytes {
-                out.push(value);
-                if out.len() == cap {
-                    probe.limited |= index + 1 < total;
-                    return out;
-                }
-                continue;
-            }
-            byte = (byte << bit_count) | u16::from((value & mask) >> shift);
-            used += bit_count;
-            if used >= 8 {
-                used -= 8;
-                let [value, _] = (byte >> used).to_le_bytes();
-                out.push(if reverse { value.reverse_bits() } else { value });
-                if out.len() == cap {
-                    probe.limited |= index + 1 < total;
-                    return out;
-                }
+            out.push(value);
+        }
+    }
+    out
+}
+
+/// Pack `samples` (see [`samples`]) under the packing's mask and bit order,
+/// until `cap` bytes are full. The probe is charged a step for each pixel
+/// read, and stops reading at [`MAX_STEPS`], as if it had walked the image
+/// itself. `total` is how many pixels the image has.
+fn bitstream(samples: &[u8], total: usize, packing: Packing<'_>, probe: &mut Probe) -> Vec<u8> {
+    let Packing {
+        offsets,
+        prime,
+        mask,
+        reverse,
+        cap,
+        ..
+    } = packing;
+    // Every supported mask is a contiguous run (including a single bit), so
+    // a sample's bits are appended in one operation. At most seven pending
+    // bits plus eight new ones fit in the accumulator.
+    let bit_count = mask.count_ones();
+    let shift = mask.trailing_zeros();
+    let per_pixel = offsets.len().max(1);
+    // The pixels that fill `cap` bytes, the pixels there are, and the pixels
+    // the step budget still allows.
+    let wanted = cap
+        .saturating_mul(8)
+        .div_ceil(bit_count.max(1) as usize)
+        .div_ceil(per_pixel);
+    let present = samples.len() / per_pixel;
+    let allowed = MAX_STEPS.saturating_sub(probe.steps);
+    let read = wanted.min(present).min(allowed);
+    if read == wanted {
+        // Full: more of the image lies past the last pixel read, or does not.
+        let last = wanted.saturating_sub(1);
+        let index = prime.map_or(Some(last), |primes| primes.get(last).copied());
+        probe.steps += read;
+        probe.limited |= index.is_some_and(|index| index + 1 < total);
+    } else if allowed < present {
+        // The step that would read the next pixel is the one over budget.
+        probe.steps += read + 1;
+        probe.limited = true;
+    } else {
+        probe.steps += read;
+        probe.limited |= total > MAX_PIXELS;
+    }
+    let mut out = Vec::with_capacity(cap);
+    let (mut byte, mut used) = (0u16, 0u32);
+    for &value in samples.get(..read * per_pixel).unwrap_or(samples) {
+        byte = (byte << bit_count) | u16::from((value & mask) >> shift);
+        used += bit_count;
+        if used >= 8 {
+            used -= 8;
+            let [value, _] = (byte >> used).to_le_bytes();
+            out.push(if reverse { value.reverse_bits() } else { value });
+            if out.len() == cap {
+                break;
             }
         }
     }
-    probe.limited |= total > MAX_PIXELS;
     out
 }
 
@@ -654,31 +667,37 @@ pub(super) fn extract(
             }
             for prime in [false, true] {
                 for &(name, offsets) in layouts {
+                    let walk = Packing {
+                        offsets,
+                        column,
+                        prime: prime.then_some(primes.as_slice()),
+                        mask: 0xff,
+                        reverse: false,
+                        flip_x,
+                        flip_y,
+                        cap,
+                    };
+                    let read = samples(
+                        PixelView {
+                            pixels,
+                            width,
+                            height,
+                            channels,
+                        },
+                        walk,
+                    );
                     for mask in MASKS {
                         for reverse in [false, true] {
                             if probe.steps >= MAX_STEPS || probe.found.len() >= MAX_PAYLOADS {
                                 probe.limited = true;
                                 break 'probes;
                             }
-                            let data = bitstream(
-                                PixelView {
-                                    pixels,
-                                    width,
-                                    height,
-                                    channels,
-                                },
-                                Packing {
-                                    offsets,
-                                    column,
-                                    prime: prime.then_some(primes.as_slice()),
-                                    mask,
-                                    reverse,
-                                    flip_x,
-                                    flip_y,
-                                    cap,
-                                },
-                                &mut probe,
-                            );
+                            let packing = Packing {
+                                mask,
+                                reverse,
+                                ..walk
+                            };
+                            let data = bitstream(&read, width * height, packing, &mut probe);
                             let x = if flip_x { 'X' } else { 'x' };
                             let y = if flip_y { 'Y' } else { 'y' };
                             let order = if column {

@@ -16,7 +16,9 @@
 
 use crate::error::Error;
 use crate::fileid::FileType;
-use crate::output::{ArchiveMember, Errors, Metrics, Section, Strings, Symbols, Values};
+use crate::output::{
+    ArchiveMember, Errors, Metrics, Section, SliceSymbols, Strings, Symbols, Values,
+};
 use crate::value_key;
 
 mod ani;
@@ -132,6 +134,9 @@ pub(crate) struct ExtractCtx<'a> {
     pub(crate) archive_members: &'a mut Vec<ArchiveMember>,
     pub(crate) sections: &'a mut Vec<Section>,
     pub(crate) symbols: &'a mut Symbols,
+    /// What a universal Mach-O's slices import and export (see
+    /// [`SliceSymbols`]). No other extractor writes it.
+    pub(crate) slice_symbols: &'a mut SliceSymbols,
     pub(crate) errors: &'a mut Errors,
     /// End of the executable image in file offsets, for formats whose
     /// image extends past its last section (Mach-O `__LINKEDIT`, the ELF
@@ -158,6 +163,7 @@ impl ExtractCtx<'_> {
             archive_members: self.archive_members,
             sections: self.sections,
             symbols: self.symbols,
+            slice_symbols: self.slice_symbols,
             errors: self.errors,
             image_end: self.image_end,
             basename: self.basename,
@@ -177,6 +183,7 @@ pub(crate) struct Sinks {
     pub(crate) archive_members: Vec<ArchiveMember>,
     pub(crate) sections: Vec<Section>,
     pub(crate) symbols: Symbols,
+    pub(crate) slice_symbols: SliceSymbols,
     pub(crate) errors: Errors,
     pub(crate) image_end: Option<u64>,
 }
@@ -193,6 +200,7 @@ impl Sinks {
             archive_members: &mut self.archive_members,
             sections: &mut self.sections,
             symbols: &mut self.symbols,
+            slice_symbols: &mut self.slice_symbols,
             errors: &mut self.errors,
             image_end: &mut self.image_end,
             basename: None,
@@ -615,7 +623,13 @@ pub(crate) fn extract(
         }
         FileType::Rpm => rpm::extract(bytes, ctx.reborrow()),
         FileType::Deb => deb::extract(bytes, ctx.values, ctx.metrics, ctx.errors),
-        FileType::Dmg => dmg::extract(bytes, ctx.values, ctx.metrics, ctx.archive_members),
+        FileType::Dmg => dmg::extract(
+            bytes,
+            ctx.values,
+            ctx.strings,
+            ctx.metrics,
+            ctx.archive_members,
+        ),
         FileType::Iso => {
             iso::extract(bytes, ctx.values, ctx.metrics, ctx.archive_members);
             Ok(())
@@ -788,7 +802,14 @@ pub(crate) fn extract(
         FileType::Gz | FileType::Bz2 | FileType::Xz | FileType::Lzma | FileType::Zst
     ) || container
         .is_some_and(|c| c.compression != crate::fileid::Compression::None);
-    if !file_type.is_structured_data() && !compressed_stream && ctx.strings.text.is_empty() {
+    // A disk image that parsed has read the strings outside its compressed
+    // chunks, few or none as they may be.
+    let read_in_parts = file_type == FileType::Dmg && result.is_ok();
+    if !file_type.is_structured_data()
+        && !compressed_stream
+        && !read_in_parts
+        && ctx.strings.text.is_empty()
+    {
         // This is the fallback path — everything without its own format
         // handler. stng's XOR auto-detect scan is expensive and FP-prone, so it
         // runs only for source/script that shows XOR intent (`^` operator or

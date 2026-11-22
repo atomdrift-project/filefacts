@@ -62,9 +62,10 @@ impl Recovery {
     fn normalize(&self) -> Result<RecoveredPyc, &'static str> {
         let magic = self.python_magic.ok_or("missing CPython magic")?;
         let word = u16::from_le_bytes([magic[0], magic[1]]);
-        let minor = super::pyc::python3_minor_for_magic(word)
-            .filter(|&minor| minor >= 8)
-            .ok_or("unsupported CPython marshal version")?;
+        let minor = super::pyc::python_version_for_magic(word)
+            .filter(|v| v.major == 3 && v.minor >= 8)
+            .ok_or("unsupported CPython marshal version")?
+            .minor;
         let body = self.container.get(32..).ok_or("truncated outer header")?;
         let mut recovered = marshal::normalize(body, minor, &self.key)?;
         let mut data = Vec::with_capacity(16 + recovered.data.len());

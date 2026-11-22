@@ -75,7 +75,7 @@ fn run(bytes: &[u8]) -> (Values, Metrics, Vec<ArchiveMember>) {
     let mut v = Values::new();
     let mut m = Metrics::new();
     let mut members = Vec::new();
-    extract(bytes, &mut v, &mut m, &mut members).unwrap();
+    extract(bytes, &mut v, &mut Strings::default(), &mut m, &mut members).unwrap();
     (v, m, members)
 }
 
@@ -344,7 +344,16 @@ fn non_dmg_bytes_error() {
     let mut v = Values::new();
     let mut m = Metrics::new();
     let mut members = Vec::new();
-    assert!(extract(b"not a dmg at all", &mut v, &mut m, &mut members).is_err());
+    assert!(
+        extract(
+            b"not a dmg at all",
+            &mut v,
+            &mut Strings::default(),
+            &mut m,
+            &mut members
+        )
+        .is_err()
+    );
 }
 
 /// The resource-fork plist is attacker bytes: a binary plist whose shared
@@ -357,4 +366,229 @@ fn blkx_plist_reference_expansion_is_refused() {
         ..koly_at_zero()
     };
     assert!(parse_blkx(&xml, &koly).is_empty());
+}
+
+const RAW: u32 = 0x0000_0001;
+const ZLIB: u32 = 0x8000_0005;
+
+/// A single-partition image whose data fork is `chunks` end to end, each
+/// stored under its entry type, and where in the file each chunk lies.
+fn image_of(chunks: &[(u32, &[u8])]) -> (Vec<u8>, Vec<Range<usize>>) {
+    let mut fork = Vec::new();
+    let mut table = Vec::new();
+    let mut at = Vec::new();
+    for (index, (entry_type, data)) in chunks.iter().enumerate() {
+        table.extend_from_slice(&entry_type.to_be_bytes());
+        table.extend_from_slice(&[0; 4]);
+        table.extend_from_slice(&(index as u64).to_be_bytes()); // sector number
+        table.extend_from_slice(&1u64.to_be_bytes()); // sector count
+        table.extend_from_slice(&(fork.len() as u64).to_be_bytes());
+        table.extend_from_slice(&(data.len() as u64).to_be_bytes());
+        at.push(fork.len()..fork.len() + data.len());
+        fork.extend_from_slice(data);
+    }
+    let mut mish = vec![0u8; 204];
+    mish[0..4].copy_from_slice(b"mish");
+    mish[16..24].copy_from_slice(&(chunks.len() as u64).to_be_bytes());
+    mish[200..204].copy_from_slice(&(chunks.len() as u32).to_be_bytes());
+    mish.extend_from_slice(&table);
+
+    let mut entry = plist::Dictionary::new();
+    entry.insert(
+        "Name".into(),
+        plist::Value::String("disk image (Apple_HFS : 4)".into()),
+    );
+    entry.insert("Data".into(), plist::Value::Data(mish));
+    let mut rf = plist::Dictionary::new();
+    rf.insert(
+        "blkx".into(),
+        plist::Value::Array(vec![plist::Value::Dictionary(entry)]),
+    );
+    let mut root = plist::Dictionary::new();
+    root.insert("resource-fork".into(), plist::Value::Dictionary(rf));
+    let mut xml = Vec::new();
+    plist::to_writer_xml(&mut xml, &plist::Value::Dictionary(root)).unwrap();
+
+    let mut out = fork;
+    let fork_len = out.len() as u64;
+    out.extend_from_slice(&xml);
+    let mut koly = vec![0u8; KOLY_LEN];
+    koly[0..4].copy_from_slice(b"koly");
+    koly[4..8].copy_from_slice(&4u32.to_be_bytes());
+    koly[8..12].copy_from_slice(&512u32.to_be_bytes()); // header size
+    koly[32..40].copy_from_slice(&fork_len.to_be_bytes());
+    koly[216..224].copy_from_slice(&fork_len.to_be_bytes());
+    koly[224..232].copy_from_slice(&(xml.len() as u64).to_be_bytes());
+    koly[492..500].copy_from_slice(&(chunks.len() as u64).to_be_bytes());
+    out.extend_from_slice(&koly);
+    (out, at)
+}
+
+/// Text that deflates to a stream with printable runs in it: stored blocks
+/// would hold the text itself, so this is compressed at the default level.
+fn zlib_of_text() -> Vec<u8> {
+    use std::io::Write;
+    let text: String = (0..4000)
+        .map(|i| format!("line {i} of a file inside the volume\n"))
+        .collect();
+    let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    enc.write_all(text.as_bytes()).unwrap();
+    enc.finish().unwrap()
+}
+
+fn chunk(entry_type: u32, comp_offset: u64, comp_length: u64) -> Chunk {
+    Chunk {
+        entry_type,
+        sector_number: 0,
+        sector_count: 1,
+        comp_offset,
+        comp_length,
+    }
+}
+
+fn partition(data_offset: u64, chunks: Vec<Chunk>) -> Partition {
+    Partition {
+        name: String::new(),
+        sector_count: 0,
+        data_offset,
+        chunks,
+    }
+}
+
+/// The stored ranges are the file less its compressed chunks: chunks of
+/// every compressing codec, in any order, overlapping, across partitions,
+/// offset by the data fork and the partition, and cut at the end of the file.
+#[test]
+fn stored_ranges_are_the_file_less_its_compressed_chunks() {
+    let koly = |data_fork_offset| Koly {
+        data_fork_offset,
+        ..koly_at_zero()
+    };
+    // Each range as its start and end.
+    let ranges = |len, fork, parts: Vec<Partition>| -> Vec<(usize, usize)> {
+        stored_ranges(len, &koly(fork), &parts)
+            .into_iter()
+            .map(|range| (range.start, range.end))
+            .collect()
+    };
+
+    // No chunks, or none that compress: the whole file.
+    assert_eq!(ranges(100, 0, vec![]), [(0, 100)]);
+    let plain = vec![
+        chunk(RAW, 0, 40),
+        chunk(0, 40, 0),
+        chunk(0xffff_ffff, 40, 0),
+    ];
+    assert_eq!(ranges(100, 0, vec![partition(0, plain)]), [(0, 100)]);
+    assert!(ranges(0, 0, vec![]).is_empty());
+
+    // Every compressing codec is left out; raw chunks between them stay.
+    let codecs = vec![
+        chunk(0x8000_0004, 10, 10), // adc
+        chunk(ZLIB, 20, 10),
+        chunk(RAW, 30, 10),
+        chunk(0x8000_0006, 40, 10), // bzip2
+        chunk(0x8000_0007, 60, 10), // lzfse
+        chunk(0x8000_0008, 70, 10), // lzma
+    ];
+    assert_eq!(
+        ranges(100, 0, vec![partition(0, codecs)]),
+        [(0, 10), (30, 40), (50, 60), (80, 100)]
+    );
+
+    // Out of order and overlapping, one inside another.
+    let tangled = vec![chunk(ZLIB, 50, 30), chunk(ZLIB, 10, 30), chunk(ZLIB, 20, 5)];
+    assert_eq!(
+        ranges(100, 0, vec![partition(0, tangled)]),
+        [(0, 10), (40, 50), (80, 100)]
+    );
+
+    // Offsets count from the data fork and the partition's base in it.
+    let parts = vec![
+        partition(0, vec![chunk(ZLIB, 0, 10)]),
+        partition(30, vec![chunk(ZLIB, 5, 10)]),
+    ];
+    assert_eq!(ranges(100, 20, parts), [(0, 20), (30, 55), (65, 100)]);
+
+    // A chunk running off the end, past it, or at an offset that overflows
+    // is one no reader decodes: it leaves nothing out.
+    let wild = vec![
+        chunk(ZLIB, 90, 1000),
+        chunk(ZLIB, 500, 10),
+        chunk(ZLIB, u64::MAX, 10),
+        chunk(ZLIB, 10, u64::MAX),
+        chunk(ZLIB, 95, 5),
+    ];
+    assert_eq!(ranges(100, 0, vec![partition(0, wild)]), [(0, 95)]);
+    let wild = vec![chunk(ZLIB, 90, 1000), chunk(ZLIB, u64::MAX - 5, 10)];
+    assert_eq!(ranges(100, 0, vec![partition(u64::MAX, wild)]), [(0, 100)]);
+}
+
+/// A compressed image's strings are those readable in place: a stored
+/// chunk's, at their offsets in the file, and the plist's. None is read out
+/// of a compressed chunk, whose stream holds printable runs by chance.
+#[test]
+fn strings_are_read_outside_the_compressed_chunks() {
+    let packed = zlib_of_text();
+    let stored = b"\0\0\0\0a stored chunk is readable in place\0\0\0\0";
+    let (dmg, at) = image_of(&[(ZLIB, &packed), (RAW, stored), (ZLIB, &packed)]);
+
+    // The stream does hold printable runs: read whole, the file yields some.
+    let whole = stng::extract_strings_with_options(&dmg, &stng::ExtractOptions::new(4));
+    let inside = |offset: u64| {
+        let offset = offset as usize;
+        at[0].contains(&offset) || at[2].contains(&offset)
+    };
+    assert!(whole.iter().any(|row| inside(row.data_offset)));
+
+    let parsed = crate::open(&dmg);
+    assert_eq!(parsed.fileid.file_type(), crate::FileType::Dmg);
+    let rows = parsed.text().rows();
+    assert!(!rows.iter().any(|row| inside(row.data_offset)), "{rows:?}");
+    let found = rows
+        .iter()
+        .find(|row| row.value == "a stored chunk is readable in place")
+        .expect("the stored chunk's string");
+    assert_eq!(found.data_offset as usize, at[1].start + 4);
+    assert!(rows.iter().any(|row| row.value.contains("resource-fork")));
+}
+
+/// An image with no compressed chunk is read whole, as before.
+#[test]
+fn a_stored_image_is_read_whole() {
+    let (dmg, _) = image_of(&[
+        (RAW, b"first stored chunk\0"),
+        (RAW, b"second stored chunk\0"),
+    ]);
+    let opts = crate::formats::common::string_opts_for(crate::formats::common::XorScan::No, &dmg);
+    let whole: Vec<(String, u64)> = stng::extract_strings_with_options(&dmg, &opts)
+        .into_iter()
+        .map(|row| (row.value, row.data_offset))
+        .collect();
+    let parsed = crate::open(&dmg);
+    let read: Vec<(String, u64)> = parsed
+        .text()
+        .rows()
+        .iter()
+        .map(|row| (row.value.clone(), row.data_offset))
+        .collect();
+    assert_eq!(read, whole);
+    assert!(read.iter().any(|(value, _)| value == "second stored chunk"));
+}
+
+/// A file named as an image that has no trailer names no chunks: it is
+/// read whole, by the shared fallback.
+#[test]
+fn a_file_without_a_trailer_is_read_whole() {
+    let bytes: Vec<u8> = (0..8)
+        .flat_map(|i| format!("\0\0\0\0not an image, only named as one: {i}\0\0\0\0").into_bytes())
+        .collect();
+    let fileid = crate::FileId::from_path_and_bytes(std::path::Path::new("x.dmg"), &bytes);
+    assert_eq!(fileid.file_type(), crate::FileType::Dmg);
+    let parsed = crate::ParsedFile::new(&bytes, fileid, None);
+    let rows = parsed.text().rows();
+    for i in 0..8 {
+        let line = format!("not an image, only named as one: {i}");
+        assert!(rows.iter().any(|row| row.value == line), "{line}: {rows:?}");
+    }
 }

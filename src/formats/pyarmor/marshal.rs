@@ -186,7 +186,7 @@ pub(super) fn normalize(
         decrypted_regions: 0,
         limitations: Vec::new(),
     };
-    let walker = marshal::walk(body, minor, |walker, code| {
+    let walker = marshal::walk(body, marshal::Version::three(minor), |walker, code| {
         normalizer.code(walker, body, code)
     })?;
     if walker.values.iter().any(|value| {

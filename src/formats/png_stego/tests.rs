@@ -121,7 +121,12 @@ fn packed_samples_preserve_bitstreams_and_work_bounds() {
                                                 ..Probe::default()
                                             };
                                             assert_eq!(
-                                                bitstream(view, packing, &mut actual),
+                                                bitstream(
+                                                    &samples(view, packing),
+                                                    width * height,
+                                                    packing,
+                                                    &mut actual
+                                                ),
                                                 reference_bitstream(view, packing, &mut expected),
                                                 "{width}x{height} channels={channels} mask={mask} cap={cap}"
                                             );
