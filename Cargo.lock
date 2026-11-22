@@ -90,7 +90,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 [[package]]
 name = "binform"
 version = "0.9.1"
-source = "git+https://github.com/atomdrift-project/binform.git#8a7713e7e52760ef69fc83301524e698c037f9b8"
+source = "git+https://github.com/atomdrift-project/binform.git#c12b1d6a0864c1c0f3ed7a8328c09311f01e9e9b"
 dependencies = [
  "gimli",
  "iced-x86",
@@ -732,9 +732,9 @@ dependencies = [
 
 [[package]]
 name = "hashbrown"
-version = "0.17.1"
+version = "0.17.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+checksum = "735eaa21a6a5ffb2e84362faaeb90c05ba8e19797ca30428478cb6ea3a4921bc"
 
 [[package]]
 name = "hkdf"
@@ -1639,7 +1639,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stng"
 version = "3.0.0"
-source = "git+https://github.com/atomdrift-project/stng.git#d1aeaeef38ee8f1196ffafcedbb109abd57a4f22"
+source = "git+https://github.com/atomdrift-project/stng.git#b35bf3576d0a0536fe1a058d7de004b887d21adb"
 dependencies = [
  "aho-corasick",
  "base64 0.22.1",
