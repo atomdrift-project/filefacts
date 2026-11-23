@@ -38,6 +38,10 @@ pub(super) struct CertInfo {
     pub(super) verified: bool,
     /// The leaf's Extended Key Usage names `codeSigning`.
     code_signing: bool,
+    /// The leaf's Extended Key Usage names Apple's installer-package signing
+    /// purpose, which `Developer ID Installer` certificates carry in place
+    /// of `codeSigning`.
+    package_signing: bool,
     /// The platform root the verified chain ends at (`chain_anchor`).
     anchor: Option<Vendor>,
     signed_at: Option<String>,
@@ -66,6 +70,10 @@ impl CertInfo {
             issuer: sig.issuer.clone(),
             verified: sig.is_verified(),
             code_signing: sig.eku_code_signing == Some(true),
+            package_signing: sig
+                .extended_key_usage
+                .iter()
+                .any(|oid| oid == APPLE_PACKAGE_SIGNING_EKU),
             anchor: sig.chain_anchor,
             signed_at: sig.signing_time.clone(),
         })
@@ -95,6 +103,11 @@ pub(super) fn signer_struct(ci: CertInfo, source: &str) -> Signer {
 pub(super) const APPLE_CODE_SIGNING_CAS: &[&str] =
     &["76843e4c6e3acb216134a57ba8aff512e394672b3966b996da80f009ee7b4645"];
 
+/// Apple's EKU for signing installer packages (`productsign`), the purpose
+/// of a `Developer ID Installer` leaf. Only Apple's root issues it, so it
+/// counts as a signing purpose only under that root.
+const APPLE_PACKAGE_SIGNING_EKU: &str = "1.2.840.113635.100.4.13";
+
 /// Trust tier of one signature object.
 ///
 /// Only cryptography lifts a signature above `Unverified`: `verified` must be
@@ -104,8 +117,9 @@ pub(super) const APPLE_CODE_SIGNING_CAS: &[&str] =
 /// certificate's names decide nothing on their own,
 /// since anyone minting a certificate chooses them, so the vendor tiers also
 /// require `chain_anchor` — a verified chain ending at the vendor's own root —
-/// and a leaf whose Extended Key Usage names `codeSigning`, since a vendor
-/// root also issues certificates for TLS, mail and timestamping. Within such
+/// and a leaf whose Extended Key Usage names `codeSigning` (or, under
+/// Apple's root, [`APPLE_PACKAGE_SIGNING_EKU`]), since a vendor root also
+/// issues certificates for TLS, mail and timestamping. Within such
 /// a chain the leaf's names then pick the tier, by exact match: Apple's
 /// `Developer ID ` certificates are `DeveloperId`, and a leaf whose
 /// organization is the vendor itself is `Platform` — for Apple, only when
@@ -124,7 +138,9 @@ pub(super) fn cert_trust(ci: &CertInfo) -> Trust {
         return Trust::SelfSigned;
     }
     let organization = ci.o.as_deref();
-    match ci.anchor.filter(|_| ci.code_signing) {
+    let signing_purpose =
+        |vendor: &Vendor| ci.code_signing || (*vendor == Vendor::Apple && ci.package_signing);
+    match ci.anchor.filter(signing_purpose) {
         Some(Vendor::Apple)
             if ci
                 .cn

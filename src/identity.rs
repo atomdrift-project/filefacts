@@ -65,6 +65,7 @@ pub(crate) fn derive(file_type: FileType, bytes: &[u8], values: &Values) -> Iden
         FileType::ApkAndroid => apk_android(values, &mut id),
         FileType::Iso => iso(values, &mut id),
         FileType::Dmg => dmg(values, &mut id),
+        FileType::PkgMacos => pkg_macos(values, &mut id),
         FileType::Tar | FileType::TarGz | FileType::TarBz2 | FileType::TarXz | FileType::TarZst => {
             tar(values, &mut id);
         }
@@ -350,6 +351,24 @@ fn iso(values: &Values, id: &mut Identity) {
     }
 }
 
+/// A macOS installer package's identity is its signer: `productsign` signs
+/// the xar TOC checksum with an Apple-issued `Developer ID Installer`
+/// certificate. The first published signature (CMS when present) is the one
+/// read; it is proven only when the checksum it signs is this TOC's hash
+/// (`digest_matches`), since one lifted from another package with its
+/// checksum verifies perfectly over that package.
+fn pkg_macos(values: &Values, id: &mut Identity) {
+    let signature = values
+        .lookup_at(value_key!("xar.signatures"), "[0]")
+        .and_then(signature);
+    if let Some(sig) = &signature
+        && let Some(mut ci) = CertInfo::from_signature(sig)
+    {
+        ci.verified &= sig.digest_matches == Some(true);
+        record_signer(id, ci, "xar.signatures[0]");
+    }
+}
+
 /// A disk image names its volume and records the tool that formatted it --
 /// the closest thing a DMG has to provenance, since UDIF itself carries no
 /// publisher field and the image need not be signed.
@@ -577,6 +596,18 @@ fn xpi(values: &Values, id: &mut Identity) {
     push_people(id, values, value_key!("xpi.authors"), PartyRole::Author);
     if let Some(home) = str_value(values, value_key!("xpi.homepage")) {
         push_url(id, UrlKind::Homepage, home, "xpi.homepage");
+    }
+    // The PKCS #7 signer, AMO's for a listed add-on. As with an APK, the
+    // block signs only `mozilla.sf`; the signer is proven only when that
+    // file binds the manifest and the manifest every member.
+    let signature = values
+        .lookup_at(value_key!("xpi.signatures"), "[0]")
+        .and_then(signature);
+    if let Some(sig) = &signature
+        && let Some(mut ci) = CertInfo::from_signature(sig)
+    {
+        ci.verified &= sig.digest_matches == Some(true);
+        record_signer(id, ci, "xpi.signatures[0]");
     }
 }
 

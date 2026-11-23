@@ -13,7 +13,7 @@ use x509_cert::Certificate;
 /// A digest algorithm a SignerInfo, a certificate signature, or an
 /// Authenticode structure can name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum DigestAlg {
+pub(crate) enum DigestAlg {
     Md5,
     Sha1,
     Sha256,
@@ -53,7 +53,7 @@ impl DigestAlg {
     }
 
     /// Shorthand consumers see (`sha256`, `sha1`, …).
-    pub(super) fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Md5 => "md5",
             Self::Sha1 => "sha1",
@@ -63,7 +63,7 @@ impl DigestAlg {
         }
     }
 
-    pub(super) fn digest(self, data: &[u8]) -> Vec<u8> {
+    pub(crate) fn digest(self, data: &[u8]) -> Vec<u8> {
         match self {
             Self::Md5 => md5::Md5::digest(data).to_vec(),
             Self::Sha1 => Sha1::digest(data).to_vec(),
@@ -261,6 +261,9 @@ pub(crate) enum Failure {
     /// the signature file leaves out, one whose digest differs, or a name
     /// the archive holds twice.
     JarMemberMismatch,
+    /// A xar archive whose TOC checksum, the value its signatures sign, is
+    /// not the hash of its table of contents.
+    TocChecksumMismatch,
 }
 
 impl Failure {
@@ -274,6 +277,7 @@ impl Failure {
             Self::ImageDigestMissing => "image_digest_missing",
             Self::JarManifestMismatch => "jar_manifest_mismatch",
             Self::JarMemberMismatch => "jar_member_mismatch",
+            Self::TocChecksumMismatch => "toc_checksum_mismatch",
         }
     }
 }
@@ -404,6 +408,41 @@ pub(super) fn verify_signature(
         Some(Scheme::Rsa) => verify_rsa(cert, digest, message, signature),
         Some(Scheme::Ecdsa) => verify_ecdsa(cert, digest, message, signature),
         None => Verdict::Unsupported,
+    }
+}
+
+/// Verify an RSA PKCS #1 v1.5 `signature` made over `digest`, a value
+/// already hashed under `alg`, with `cert`'s public key: a signature over a
+/// precomputed hash rather than over content (a xar archive's TOC checksum).
+pub(super) fn verify_rsa_prehashed(
+    cert: &Certificate,
+    alg: DigestAlg,
+    digest: &[u8],
+    signature: &[u8],
+) -> Verdict {
+    use rsa::pkcs1::DecodeRsaPublicKey;
+    use rsa::{Pkcs1v15Sign, RsaPublicKey};
+    use sha2::{Sha384, Sha512};
+
+    let scheme = match alg {
+        DigestAlg::Sha1 => Pkcs1v15Sign::new::<Sha1>(),
+        DigestAlg::Sha256 => Pkcs1v15Sign::new::<Sha256>(),
+        DigestAlg::Sha384 => Pkcs1v15Sign::new::<Sha384>(),
+        DigestAlg::Sha512 => Pkcs1v15Sign::new::<Sha512>(),
+        DigestAlg::Md5 => return Verdict::Unsupported,
+    };
+    let spk_bits = cert
+        .tbs_certificate
+        .subject_public_key_info
+        .subject_public_key
+        .raw_bytes();
+    let Ok(public_key) = RsaPublicKey::from_pkcs1_der(spk_bits) else {
+        return Verdict::Unsupported;
+    };
+    if public_key.verify(scheme, digest, signature).is_ok() {
+        Verdict::Verified
+    } else {
+        Verdict::Failed(Failure::Signature)
     }
 }
 

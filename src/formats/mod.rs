@@ -63,6 +63,7 @@ mod image_stats;
 pub(crate) mod installer;
 pub(crate) mod iso;
 mod jar;
+mod jar_signature;
 mod jpeg;
 pub(crate) mod jphp;
 mod lnk;
@@ -121,6 +122,7 @@ pub(crate) mod vba_symbols;
 mod vsix;
 mod wasm;
 mod whl;
+mod xar;
 mod xpi;
 mod zip;
 
@@ -621,6 +623,12 @@ pub(crate) fn extract(
             pyc::extract(bytes, ctx.reborrow());
             Ok(())
         }
+        // A macOS installer package is a xar archive: its signer, from the
+        // signatures over the TOC. Unpacking the members is the caller's.
+        FileType::PkgMacos => {
+            xar::extract(bytes, ctx.values, ctx.errors);
+            Ok(())
+        }
         FileType::Rpm => rpm::extract(bytes, ctx.reborrow()),
         FileType::Deb => deb::extract(bytes, ctx.values, ctx.metrics, ctx.errors),
         FileType::Dmg => dmg::extract(
@@ -756,7 +764,6 @@ pub(crate) fn extract(
         | FileType::GoMod
         | FileType::GoSum
         | FileType::StaticLib
-        | FileType::PkgMacos
         | FileType::Vhd
         | FileType::SquashFs
         | FileType::Snap

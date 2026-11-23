@@ -4,8 +4,8 @@
 //! emits member listings and the broad signing-shape markers
 //! (`archive.signing.mozilla_extension_shape`,
 //! `archive.signing.jar_signed_shape`). This module layers XPI-specific
-//! facts derived from filename presence in the central directory — no
-//! decompression of member bodies.
+//! facts derived from filename presence in the central directory, the
+//! WebExtension manifest's identity, and the PKCS #7 signer.
 //!
 //! Emitted keys:
 //!
@@ -22,11 +22,17 @@
 //! - `xpi.unsigned_shape` — true when `manifest.json` is present but
 //!   no signing scheme files are. Distinguishes development/sideloaded
 //!   XPIs from AMO-signed ones.
+//! - `xpi.signatures[]` — the `META-INF/mozilla.rsa` signer, in the
+//!   `android.signatures[]` shape. PKCS #7 add-on signing is JAR v1 signing
+//!   (see [`super::jar_signature`]): `verified` holds only when the block
+//!   signs `mozilla.sf`, its digest matches `META-INF/manifest.mf`, and the
+//!   manifest digests every member. The COSE signature is not read.
 
 use serde_json::Value as JsonValue;
 use std::io::{Read, Seek};
 
 use super::bounded::Limits;
+use super::jar_signature::{self, Scheme};
 use super::zip::JarSigning;
 use crate::output::{Errors, Values};
 use crate::value_key;
@@ -102,16 +108,26 @@ pub(super) fn extract_from_archive<R: Read + Seek>(
         values.insert_key(value_key!("xpi.unsigned_shape"), JsonValue::Bool(true));
     }
 
+    let mut limits = Limits::default();
     // The WebExtension manifest declares the add-on's author and name —
     // the human identity behind a (possibly self-signed) XPI.
-    if has_manifest_json {
-        let mut limits = Limits::default();
-        let manifest = super::crx::read_browser_manifest(zip, &mut limits, errors);
-        limits.emit(values, value_key!("xpi.limits"));
-        if let Some(manifest) = manifest {
-            super::crx::emit_web_extension_identity(&manifest, &super::crx::XPI_KEYS, values);
+    if has_manifest_json
+        && let Some(manifest) = super::crx::read_browser_manifest(zip, &mut limits, errors)
+    {
+        super::crx::emit_web_extension_identity(&manifest, &super::crx::XPI_KEYS, values);
+    }
+    // Who signed it. A block without its `.SF` still names a signer, one
+    // that reads as unverified.
+    if has_mozilla_rsa {
+        let signed = jar_signature::read(zip, Scheme::Mozilla, &mut limits, errors);
+        if !signed.signatures.is_empty() {
+            values.insert_key(
+                value_key!("xpi.signatures"),
+                JsonValue::Array(signed.signatures),
+            );
         }
     }
+    limits.emit(values, value_key!("xpi.limits"));
 }
 
 #[cfg(test)]

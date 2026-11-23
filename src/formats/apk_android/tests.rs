@@ -1,4 +1,6 @@
 use super::*;
+use crate::formats::jar_signature::MAX_SIGNATURE_BLOCKS;
+use crate::output::Stage;
 use std::io::{Cursor, Write};
 use zip::write::SimpleFileOptions;
 

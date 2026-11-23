@@ -17,6 +17,8 @@ Never execute a fixture.
 | `rtf/obfuscated-object.sample.zst` | real specimen | [`rtf/README.md`](rtf/README.md) |
 | `apk/CERT.SF`, `apk/CERT.RSA`, `apk/BOUND.MF`, `apk/BOUND.SF`, `apk/BOUND.RSA` | generated | [`apk/generate.sh`](apk/generate.sh) (throwaway key) |
 | `chains/*` | generated | [`chains/generate.sh`](chains/generate.sh) (throwaway keys) |
+| `xpi/manifest.mf`, `xpi/mozilla.sf`, `xpi/mozilla.rsa` | generated | [`xpi/generate.sh`](xpi/generate.sh) (throwaway key) |
+| `xar/rsa-sha256.xar` | generated | [`xar/generate.sh`](xar/generate.sh) (throwaway key) |
 
 ## Other fixtures
 
@@ -29,5 +31,6 @@ Never execute a fixture.
 | `macho-darwin-variant-symbols.dylib.zst` | `87c5d0c93b80acf61d24e7aaf0faae231ab507ca45483ad3d441b5d1acebc43c` (uncompressed) | Real, already-public Mach-O malware whose `LC_SYMTAB` records libc calls under Darwin's `$`-variant names. |
 | `managed-signed.dll`, `managed-unsigned.dll` | `07dee31dfb5dc246d558ab61c6bedd2a230b3aa5a86ce3e0a44f06ed8ba3da2b`, `12e477ab6a025ca701babb7ff902d485ad83f6b59aeff1fb838ece5eecd04202` | Tiny C# libraries built from one source, with and without `csc /keyfile`, for CLR strong-name extraction. |
 | `test.exe`, `test.elf`, `test.macho` | `bc457d403feeab416d25aebaecf35b7d91aa9675a587eefe6ed237de290d5718`, `42308b675105f49b6ac8041d97a2fb3e34d94b12c4ab4da9d8cfcffb62c9033e`, `9752ef8af4114557677eb990ff6ba47d55ae58058591bc3993b88824b7e690bb` | Small benign executables (PE32+ x86-64, ELF x86-64 shared object, Mach-O x86-64) used as well-formed baselines and as the base for mutation tests. |
+| `xar/developer-id-installer-prefix.pkg` | `f0549afb1e1d3ec04e7eb265309fd1d9a34ff3b430d35d64441e493228d34c1c` | The first 15,345 bytes of a real, benign Developer ID-signed and notarized macOS installer package: the xar header, TOC and the heap through its RSA and CMS signatures over the TOC checksum, chaining to Apple Root CA. The payload is cut off. |
 | `crx/test-rsa1024.pk8.der` | `01180fee1d7aa8e30a190706703bcb9b5b5e98ed09708611818a9c0f16529f19` | Throwaway RSA-1024 private key used only to sign CRX fixtures built in tests. |
 | `../data/certificate-signature.sig` | `122f60c45a53704462050457d7639598e54741bbfa6c9b3f70407cd16e052eea` | A certificate-framed signature file of the kind shipped beside a signed library (`libwidevinecdm.dylib.sig`); must not be mistaken for OpenPGP. |

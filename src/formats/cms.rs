@@ -1,5 +1,6 @@
 //! CMS / PKCS#7 `SignedData` signatures: PE Authenticode, cabinets, Mach-O
-//! code signatures and APK v1 signature blocks all carry one.
+//! code signatures, JAR v1 signature blocks (APK, XPI) and xar archives all
+//! carry one.
 //!
 //! Each signature is reported as a [`Signature`]: the *primary signer*'s
 //! certificate fields plus the digest algorithms, enough to answer "who
@@ -44,11 +45,11 @@ pub(crate) use chain::Vendor;
 use chain::{cert_bag, find_signer_cert, thumbprint_sha256, verified_chain};
 pub(crate) use timestamp::TimeSource;
 use timestamp::signing_time;
+pub(crate) use verify::{DigestAlg, Failure, Verdict};
 use verify::{
-    DigestAlg, Scheme, SignedContent, key_scheme, public_key_bits, signature_algorithm,
+    Scheme, SignedContent, key_scheme, public_key_bits, signature_algorithm, verify_rsa_prehashed,
     verify_signer,
 };
-pub(crate) use verify::{Failure, Verdict};
 
 /// Most signatures parsed from one certificate table or CMS blob, nested
 /// signatures included. Real binaries carry one to three; the cap bounds the
@@ -63,7 +64,8 @@ const MIN_RSA_BITS: u32 = 2048;
 const MIN_EC_BITS: u32 = 256;
 
 /// One parsed signature, as published under `pe.signatures[]`,
-/// `cab.signatures[]`, `macho.code_signature.cms` and `android.signatures[]`.
+/// `cab.signatures[]`, `macho.code_signature.cms`, `android.signatures[]`,
+/// `xpi.signatures[]` and `xar.signatures[]`.
 ///
 /// Fields absent from the blob are absent from the output. The PE-only
 /// fields (`unsigned_trailing_bytes`, `signed_within_validity`) are filled
@@ -431,6 +433,57 @@ pub(crate) fn parse_detached_cms(der_bytes: &[u8], content: &[u8]) -> Option<Sig
 /// since nothing shows it was made over this file.
 pub(crate) fn parse_unbound_cms_blob(der_bytes: &[u8]) -> Option<Signature> {
     parse_pkcs7(der_bytes, Signs::Unbound)
+}
+
+/// Parse a bare RSA PKCS #1 v1.5 `signature` over `digest`, a hash computed
+/// under `alg`, as a [`Signature`]: what a xar archive's `<signature
+/// style="RSA">` holds. `certificates` are DER, the signer's first and its
+/// issuers after it; the chain is walked through them as through a CMS
+/// certificate bag. `None` when the signer's certificate does not decode.
+pub(crate) fn parse_prehashed_rsa(
+    certificates: &[Vec<u8>],
+    alg: DigestAlg,
+    digest: &[u8],
+    signature: &[u8],
+) -> Option<Signature> {
+    let (leaf, issuers) = certificates.split_first()?;
+    let leaf = Certificate::from_der(leaf)
+        .inspect_err(|e| {
+            tracing::debug!(
+                target: "filefacts::cms",
+                stage = "certificate",
+                error = %e,
+                "raw RSA signer certificate undecodable"
+            );
+        })
+        .ok()?;
+    let issuers: Vec<Certificate> = issuers
+        .iter()
+        .filter_map(|der| Certificate::from_der(der).ok())
+        .collect();
+    let bag: Vec<&Certificate> = std::iter::once(&leaf).chain(&issuers).collect();
+    let mut sig = Signature {
+        digest_algorithm: alg.label().to_string(),
+        signer_count: 1,
+        cert_bag_size: Some(bag.len()),
+        ..Signature::default()
+    };
+    sig.note_weak(alg);
+    certificate_fields(&leaf, &mut sig);
+    let chain = verified_chain(&bag, &leaf);
+    sig.chain_sha256 = Some(chain.thumbprints);
+    sig.chain_anchor = chain.anchor;
+    let verdict = verify_rsa_prehashed(&leaf, alg, digest, signature);
+    if let Verdict::Failed(why) = verdict {
+        tracing::debug!(
+            target: "filefacts::cms",
+            stage = "verify",
+            failure = why.label(),
+            "raw RSA signature did not verify"
+        );
+    }
+    sig.verified = Some(verdict);
+    Some(sig)
 }
 
 /// Signatures left to parse for one certificate table or blob.

@@ -1,16 +1,20 @@
-//! APK v1 (JAR) signature binding: whether a signature block that verified
-//! over its `.SF` signature file reaches the members.
+//! JAR v1 signature binding: whether a signature block that verified over
+//! its `.SF` signature file reaches the members.
 //!
-//! The block signs only the `.SF`. The `.SF` digests `META-INF/MANIFEST.MF`,
-//! as a whole (`<alg>-Digest-Manifest`) or, when that digest is absent or
-//! does not match, section by section (`<alg>-Digest` of each manifest
-//! section it lists), and the manifest digests each member. A block and `.SF`
-//! lifted from another app verify perfectly over that app, so a signature
-//! is bound to this archive only when every link holds and every member
-//! that needs a digest (all but directories and the signing files under
-//! `META-INF/`) is listed in the manifest and in the `.SF`, as apksig
-//! requires. Every algorithm a section names must match, at least one of
-//! SHA-1, SHA-256, SHA-384 and SHA-512 (the ones Android checks).
+//! The block signs only the `.SF`. The `.SF` digests the manifest as a whole
+//! (`<alg>-Digest-Manifest`), and the manifest digests each member. A block
+//! and `.SF` lifted from another archive verify perfectly over that archive,
+//! so a signature is bound to this one only when every link holds and every
+//! member that needs a digest (all but directories and the signing files
+//! under `META-INF/`) is listed in the manifest.
+//!
+//! Android ([`Scheme::Android`]) reads `META-INF/MANIFEST.MF`, falls back to
+//! the `.SF`'s per-section digests (`<alg>-Digest` of each manifest section
+//! it lists) when the whole-manifest digest is absent or does not match, and
+//! requires the `.SF` to list every member too, as apksig does. Firefox
+//! ([`Scheme::Mozilla`]) reads `META-INF/manifest.mf` and only the
+//! whole-manifest digest. Every algorithm a section names must match, at
+//! least one of SHA-1, SHA-256, SHA-384 and SHA-512 (the ones both check).
 //!
 //! Members are hashed as the `zip` crate inflates them, CRC-checked, against
 //! a byte budget shared by every signature in the archive; a check the
@@ -28,11 +32,38 @@ use sha1::Sha1;
 use sha2::digest::DynDigest;
 use sha2::{Digest, Sha256, Sha384, Sha512};
 
+use super::Scheme;
 use crate::formats::cms::Failure;
 use crate::formats::zip::{MemberError, read_member};
 
-/// The JAR manifest, by the exact name Android reads it under.
-const MANIFEST: &str = "META-INF/MANIFEST.MF";
+impl Scheme {
+    /// The JAR manifest, by the exact name the platform reads it under.
+    fn manifest(self) -> &'static str {
+        match self {
+            Self::Android => "META-INF/MANIFEST.MF",
+            Self::Mozilla => "META-INF/manifest.mf",
+        }
+    }
+
+    /// Whether member `name` must be digested in the manifest.
+    fn needs_digest(self, name: &str) -> bool {
+        match self {
+            Self::Android => needs_digest(name),
+            // Firefox exempts directories and its three signing files, by
+            // the exact names it reads them under; any other `META-INF/`
+            // member, the COSE signature included, must be digested.
+            Self::Mozilla => {
+                !name.ends_with('/')
+                    && ![
+                        "META-INF/manifest.mf",
+                        "META-INF/mozilla.sf",
+                        "META-INF/mozilla.rsa",
+                    ]
+                    .contains(&name)
+            }
+        }
+    }
+}
 /// Manifest bytes read. The manifest holds a section per member, so it grows
 /// with the archive; this is well past what the member cap allows for.
 const MAX_MANIFEST_BYTES: u64 = 32 * 1024 * 1024;
@@ -57,14 +88,17 @@ pub(super) enum Binding {
 /// Checks v1 signature files against one archive, reading and hashing its
 /// manifest and members once for all of them.
 pub(super) struct Verifier {
+    scheme: Scheme,
     budget: u64,
     archive: Option<Result<Archive, Binding>>,
 }
 
 impl Verifier {
-    /// A verifier that hashes at most `budget` bytes per algorithm.
-    pub(super) fn new(budget: u64) -> Self {
+    /// A verifier under `scheme` that hashes at most `budget` bytes per
+    /// algorithm.
+    pub(super) fn new(scheme: Scheme, budget: u64) -> Self {
         Self {
+            scheme,
             budget,
             archive: None,
         }
@@ -76,8 +110,12 @@ impl Verifier {
         zip: &mut ::zip::ZipArchive<R>,
         signature_file: &[u8],
     ) -> Binding {
-        let Self { budget, archive } = self;
-        match archive.get_or_insert_with(|| Archive::read(zip, budget)) {
+        let Self {
+            scheme,
+            budget,
+            archive,
+        } = self;
+        match archive.get_or_insert_with(|| Archive::read(zip, *scheme, budget)) {
             Ok(archive) => match archive.binds(signature_file, budget) {
                 Binding::Bound => archive.members,
                 broken => broken,
@@ -89,6 +127,7 @@ impl Verifier {
 
 /// The archive's manifest, and whether it binds the members.
 struct Archive {
+    scheme: Scheme,
     manifest: Vec<u8>,
     /// The manifest's member sections; the main section is left out.
     sections: Vec<Section>,
@@ -103,13 +142,14 @@ struct Archive {
 impl Archive {
     fn read<R: Read + Seek>(
         zip: &mut ::zip::ZipArchive<R>,
+        scheme: Scheme,
         budget: &mut u64,
     ) -> Result<Self, Binding> {
         let manifest_broken = Binding::Broken(Failure::JarManifestMismatch);
         if zip.has_duplicate_names() {
             return Err(Binding::Broken(Failure::JarMemberMismatch));
         }
-        let manifest = match read_member(zip, MANIFEST, MAX_MANIFEST_BYTES) {
+        let manifest = match read_member(zip, scheme.manifest(), MAX_MANIFEST_BYTES) {
             Ok(Some(manifest)) => manifest,
             Ok(None) => return Err(manifest_broken),
             Err(MemberError::TooLarge { .. }) => {
@@ -131,10 +171,11 @@ impl Archive {
         let needed: Vec<String> = zip
             .file_names()
             .filter_map(Result::ok)
-            .filter(|name| needs_digest(name))
+            .filter(|name| scheme.needs_digest(name))
             .map(|name| name.to_string())
             .collect();
         let mut archive = Self {
+            scheme,
             manifest,
             sections,
             by_name,
@@ -180,8 +221,8 @@ impl Archive {
         Binding::Bound
     }
 
-    /// Whether `signature_file` binds this manifest and lists every needed
-    /// member.
+    /// Whether `signature_file` binds this manifest and, for Android, lists
+    /// every needed member.
     fn binds(&self, signature_file: &[u8], budget: &mut u64) -> Binding {
         let broken = Binding::Broken(Failure::JarManifestMismatch);
         let Some(mut entries) = sections(signature_file) else {
@@ -201,6 +242,8 @@ impl Archive {
         match whole {
             Check::Match => {}
             Check::OverBudget => return Binding::Unverifiable("hash budget spent"),
+            // Firefox reads only the whole-manifest digest.
+            Check::Absent | Check::Mismatch if self.scheme == Scheme::Mozilla => return broken,
             // Android and apksig fall back to the per-section digests.
             Check::Absent | Check::Mismatch => {
                 for entry in &entries {
@@ -218,10 +261,11 @@ impl Archive {
                 }
             }
         }
-        if self
-            .needed
-            .iter()
-            .any(|name| !listed.contains(name.as_bytes()))
+        if self.scheme == Scheme::Android
+            && self
+                .needed
+                .iter()
+                .any(|name| !listed.contains(name.as_bytes()))
         {
             return Binding::Broken(Failure::JarMemberMismatch);
         }
@@ -229,9 +273,9 @@ impl Archive {
     }
 }
 
-/// Whether member `name` must be digested in the manifest: everything but
-/// directories and the signing files directly under `META-INF/` (apksig's
-/// rule).
+/// Whether member `name` of an APK must be digested in the manifest:
+/// everything but directories and the signing files directly under
+/// `META-INF/` (apksig's rule).
 fn needs_digest(name: &str) -> bool {
     if name.ends_with('/') {
         return false;
@@ -260,12 +304,12 @@ fn hash_member<R: Read + Seek>(
     budget: &mut u64,
 ) -> Result<(), &'static str> {
     let mut entry = zip.by_name(name).map_err(|e| {
-        tracing::debug!(target: "filefacts::apk_android", stage = "v1-binding", member = name, error = %e, "member will not open");
+        tracing::debug!(target: "filefacts::jar_signature", stage = "v1-binding", member = name, error = %e, "member will not open");
         "member unreadable"
     })?;
     loop {
         let n = entry.read(buf).map_err(|e| {
-            tracing::debug!(target: "filefacts::apk_android", stage = "v1-binding", member = name, error = %e, "member will not inflate");
+            tracing::debug!(target: "filefacts::jar_signature", stage = "v1-binding", member = name, error = %e, "member will not inflate");
             "member unreadable"
         })?;
         if n == 0 {

@@ -595,6 +595,56 @@ mod trust_tests {
         assert_eq!(id.organization.map(|o| o.verified), Some(true));
     }
 
+    /// An installer package's and an add-on's signer is proven only when
+    /// the signature binds this archive (`digest_matches`): the xar TOC
+    /// checksum is this TOC's hash, the XPI `.SF` binds the manifest and
+    /// the manifest every member.
+    #[test]
+    fn package_signers_need_their_archive_binding() {
+        for (file_type, key) in [
+            (FileType::PkgMacos, "xar.signatures"),
+            (FileType::Xpi, "xpi.signatures"),
+        ] {
+            for (digest_matches, trust) in [(true, Trust::CaSigned), (false, Trust::Unverified)] {
+                let mut sig = signature("Example Corp", "Example", true, None);
+                sig["digest_matches"] = json!(digest_matches);
+                let mut values = Values::default();
+                values.insert(key, JsonValue::Array(vec![sig]));
+                let id = derive(file_type, &[], &values);
+                assert_eq!(id.trust, trust, "{key}");
+                assert_eq!(id.organization.map(|o| o.verified), Some(digest_matches));
+                assert_eq!(
+                    id.signer.map(|s| s.source),
+                    Some(format!("{key}[0]")),
+                    "{key}"
+                );
+            }
+        }
+    }
+
+    /// A `Developer ID Installer` leaf carries Apple's package-signing EKU
+    /// instead of `codeSigning`; under Apple's root it is Developer ID, and
+    /// under any other chain the EKU is just a name.
+    #[test]
+    fn developer_id_installer_is_developer_id_under_apples_root() {
+        let installer = |anchor: Option<&str>| {
+            let mut sig = signature(
+                "Example Corp",
+                "Developer ID Installer: Example Corp (TEAMID1234)",
+                true,
+                anchor,
+            );
+            sig["eku_code_signing"] = json!(false);
+            sig["extended_key_usage"] = json!(["1.2.840.113635.100.4.13"]);
+            let mut values = Values::default();
+            values.insert("xar.signatures", JsonValue::Array(vec![sig]));
+            derive(FileType::PkgMacos, &[], &values).trust
+        };
+        assert_eq!(installer(Some("apple")), Trust::DeveloperId);
+        assert_eq!(installer(Some("microsoft")), Trust::CaSigned);
+        assert_eq!(installer(None), Trust::CaSigned);
+    }
+
     fn macho_trust(platform: u64, cms: Option<JsonValue>) -> Trust {
         let mut values = Values::default();
         values.insert("macho.code_signature.cdhash", json!("00"));

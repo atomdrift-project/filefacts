@@ -20,7 +20,7 @@ fn bound(budget: u64) -> Binding {
         ("classes.dex", b"dex\n035\0"),
         ("META-INF/MANIFEST.MF", BOUND_MF),
     ]);
-    Verifier::new(budget).bind(&mut zip, BOUND_SF)
+    Verifier::new(Scheme::Android, budget).bind(&mut zip, BOUND_SF)
 }
 
 #[test]
@@ -119,5 +119,28 @@ fn signing_files_need_no_digest() {
         "meta-inf/CERT.SF",
     ] {
         assert!(needs_digest(name), "{name}");
+    }
+}
+
+/// Firefox exempts its three signing files, by the names it reads them
+/// under, and nothing else: the COSE signature must be digested.
+#[test]
+fn firefox_exempts_only_its_own_signing_files() {
+    for name in [
+        "META-INF/manifest.mf",
+        "META-INF/mozilla.sf",
+        "META-INF/mozilla.rsa",
+        "icons/",
+    ] {
+        assert!(!Scheme::Mozilla.needs_digest(name), "{name}");
+    }
+    for name in [
+        "META-INF/cose.sig",
+        "META-INF/cose.manifest",
+        "META-INF/MANIFEST.MF",
+        "META-INF/CERT.RSA",
+        "background.js",
+    ] {
+        assert!(Scheme::Mozilla.needs_digest(name), "{name}");
     }
 }

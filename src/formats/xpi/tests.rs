@@ -200,3 +200,93 @@ fn signing_member_names_ignore_case() {
     let names: Vec<&str> = schemes.iter().filter_map(|x| x.as_str()).collect();
     assert_eq!(names, vec!["pkcs7", "cose"]);
 }
+
+const MANIFEST_JSON: &[u8] = br#"{"manifest_version":2,"name":"fixture","version":"1.0"}"#;
+const BACKGROUND_JS: &[u8] = br#"console.log("fixture");"#;
+const SIGNED_MF: &[u8] = include_bytes!("../../../tests/fixtures/xpi/manifest.mf");
+const SIGNED_SF: &[u8] = include_bytes!("../../../tests/fixtures/xpi/mozilla.sf");
+const SIGNED_RSA: &[u8] = include_bytes!("../../../tests/fixtures/xpi/mozilla.rsa");
+
+/// The add-on `xpi/generate.sh` signed, with `replace` members put in place
+/// of (or beside) its own.
+fn signed_xpi(replace: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut members: Vec<(&str, &[u8])> = vec![
+        ("manifest.json", MANIFEST_JSON),
+        ("background.js", BACKGROUND_JS),
+        ("META-INF/manifest.mf", SIGNED_MF),
+        ("META-INF/mozilla.sf", SIGNED_SF),
+        ("META-INF/mozilla.rsa", SIGNED_RSA),
+    ];
+    for &(name, body) in replace {
+        match members.iter_mut().find(|(n, _)| *n == name) {
+            Some(member) => *member = (name, body),
+            None => members.push((name, body)),
+        }
+    }
+    stored_zip(&members)
+}
+
+fn signature(v: &Values) -> serde_json::Map<String, JsonValue> {
+    let sigs = v.get("xpi.signatures").and_then(|x| x.as_array()).unwrap();
+    assert_eq!(sigs.len(), 1);
+    sigs[0].as_object().unwrap().clone()
+}
+
+/// AMO's layout: the block signs `mozilla.sf`, which digests only the whole
+/// manifest, and the manifest digests every member.
+#[test]
+fn an_amo_style_signature_verifies_its_signer() {
+    let sig = signature(&run(&signed_xpi(&[])));
+    assert_eq!(sig["verified"], JsonValue::Bool(true), "{sig:?}");
+    assert_eq!(sig["digest_matches"], JsonValue::Bool(true));
+    assert_eq!(sig["member"], "META-INF/mozilla.rsa");
+    assert_eq!(sig["signed_member"], "META-INF/mozilla.sf");
+    assert_eq!(
+        sig["subject"],
+        "O=Filefacts Fixtures,CN=filefacts xpi fixture"
+    );
+}
+
+/// A member replaced or added after signing, or a manifest Firefox would
+/// not read, leaves the signer named but not proven.
+#[test]
+fn a_tampered_xpi_does_not_verify() {
+    let mut extra_section = SIGNED_MF.to_vec();
+    extra_section.extend_from_slice(b"Name: payload.js\nSHA256-Digest: AAAA\n\n");
+    for (case, replace) in [
+        (
+            "replaced member",
+            vec![("background.js", &b"fetch(evil)"[..])],
+        ),
+        ("added member", vec![("payload.js", &b"fetch(evil)"[..])]),
+        (
+            "edited manifest",
+            vec![("META-INF/manifest.mf", extra_section.as_slice())],
+        ),
+    ] {
+        let sig = signature(&run(&signed_xpi(&replace)));
+        assert_eq!(sig["verified"], JsonValue::Bool(false), "{case}: {sig:?}");
+        assert_eq!(sig["digest_matches"], JsonValue::Bool(false), "{case}");
+    }
+    // Firefox reads the manifest only as `META-INF/manifest.mf`.
+    let renamed = stored_zip(&[
+        ("manifest.json", MANIFEST_JSON),
+        ("background.js", BACKGROUND_JS),
+        ("META-INF/MANIFEST.MF", SIGNED_MF),
+        ("META-INF/mozilla.sf", SIGNED_SF),
+        ("META-INF/mozilla.rsa", SIGNED_RSA),
+    ]);
+    let sig = signature(&run(&renamed));
+    assert_ne!(sig["verified"], JsonValue::Bool(true), "{sig:?}");
+}
+
+/// Only the `mozilla` block is Firefox's; another base name is not read.
+#[test]
+fn other_signature_blocks_are_not_the_add_on_signer() {
+    let xpi = stored_zip(&[
+        ("manifest.json", MANIFEST_JSON),
+        ("META-INF/cert.sf", SIGNED_SF),
+        ("META-INF/cert.rsa", SIGNED_RSA),
+    ]);
+    assert!(run(&xpi).get("xpi.signatures").is_none());
+}
