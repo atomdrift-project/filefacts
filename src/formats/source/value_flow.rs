@@ -631,10 +631,17 @@ pub(super) fn build(root: Node<'_>, source: &str, config: &LangConfig, symbols: 
                 builder.in_function = true;
                 if let Some(params) = field_nested(node, "parameters") {
                     for param in named_children(params) {
+                        // Python's `typed_parameter` (`url: str`) has no name
+                        // field: its identifier is the first named child.
                         let pattern = param
                             .child_by_field_name("pattern")
                             .or_else(|| param.child_by_field_name("name"))
                             .or_else(|| param.child_by_field_name("declarator"))
+                            .or_else(|| {
+                                (param.kind() == "typed_parameter")
+                                    .then(|| param.named_child(0))
+                                    .flatten()
+                            })
                             .unwrap_or(param);
                         let id = builder.add(FlowKind::Parameter, param, Vec::new());
                         builder.bind(pattern, id, &mut bindings);

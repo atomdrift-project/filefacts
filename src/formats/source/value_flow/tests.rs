@@ -184,6 +184,15 @@ fn shared_assignment_and_helper_contract() {
             "a.py",
             "def identity(x):\n return x\ndef main():\n value=acquire()\n send(identity(value))\n",
         ),
+        // Annotated parameters: `typed_parameter` carries no name field.
+        (
+            "b.py",
+            "def identity(x: str) -> str:\n return x\ndef main():\n value=acquire()\n send(identity(value))\n",
+        ),
+        (
+            "c.py",
+            "def identity(x: str = ''):\n return x\ndef main():\n value=acquire()\n send(identity(value))\n",
+        ),
         (
             "a.js",
             "function identity(x){return x} function main(){let value=acquire();send(identity(value));}",
