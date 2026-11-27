@@ -582,10 +582,12 @@ fn detect_from_extension(path: &Path) -> Option<Claim> {
         "desktop" => FileType::DesktopEntry,
         "svg" => FileType::Svg,
         // Interface Builder sources (.xib, .storyboard) are XML; their
-        // compiled form is `Nib`.
+        // compiled form is `Nib`. Explorer opens the Windows shell documents
+        // (.settingcontent-ms, .library-ms, .searchconnector-ms) by
+        // extension, whatever precedes their root element.
         "xml" | "csproj" | "vbproj" | "fsproj" | "proj" | "props" | "targets" | "vcxproj"
         | "xaml" | "config" | "settings" | "nuspec" | "wsdl" | "xsd" | "xsl" | "xslt" | "xib"
-        | "storyboard" => FileType::Xml,
+        | "storyboard" | "settingcontent-ms" | "library-ms" | "searchconnector-ms" => FileType::Xml,
         // VS Code multi-root workspace files are JSONC (comments, trailing
         // commas) and can carry a `tasks` block with `runOn: folderOpen`, the
         // same autorun surface as `.vscode/tasks.json`, so they are typed as
@@ -760,7 +762,7 @@ pub(super) struct LowercaseExt {
 impl LowercaseExt {
     /// Longest extension kept. Every extension the tables name is shorter, so
     /// a longer one is treated as absent.
-    const MAX_LEN: usize = 16;
+    const MAX_LEN: usize = 24;
 }
 
 impl std::ops::Deref for LowercaseExt {

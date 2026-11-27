@@ -339,6 +339,24 @@ fn xml_prolog_without_svg_stays_xml() {
     assert_detect("noext", b"<?xml version=\"1.0\"?>\n<root/>", FileType::Xml);
 }
 
+#[test]
+fn windows_shell_documents_by_ext() {
+    assert_ext("789545656.pdf.SettingContent-ms", FileType::Xml);
+    assert_ext("Documents.library-ms", FileType::Xml);
+    assert_ext("share.searchConnector-ms", FileType::Xml);
+}
+
+/// No prolog, and decoy comments past the root sniff: the name still
+/// decides, as it does for Explorer.
+#[test]
+fn padded_settings_shortcut_is_xml() {
+    let data = format!(
+        "{}<PCSettings/>",
+        "<!-- 1 0 obj << /Type /Catalog >> endobj -->\n".repeat(64)
+    );
+    assert_detect("a.pdf.SettingContent-ms", data.as_bytes(), FileType::Xml);
+}
+
 // ── Other formats ────────────────────────────────────────────────
 
 #[test]

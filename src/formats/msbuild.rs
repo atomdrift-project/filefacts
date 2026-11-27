@@ -1,12 +1,10 @@
-//! MSBuild projects: the project's element tree, and bounded, non-executing
-//! property provenance for DownloadFile tasks. Only known literal/property
-//! values and the MachineName property function are expanded. Unknown inputs
-//! stay opaque; no environment is read.
+//! MSBuild projects: bounded, non-executing property provenance for
+//! DownloadFile tasks. Only known literal/property values and the
+//! MachineName property function are expanded. Unknown inputs stay opaque;
+//! no environment is read. The project's element tree is built in `xml`.
 use std::collections::HashMap;
 
-use serde_json::{Map, Value as JsonValue};
-
-use crate::output::{Errors, Values};
+use crate::output::Values;
 use crate::value_key;
 
 #[derive(Clone, Debug)]
@@ -118,131 +116,9 @@ fn hostname_query_authority(parts: &[Part]) -> Option<String> {
     None
 }
 
-/// Whether the document element of the XML `text` is named `Project` (in
-/// any namespace), read from the prolog without parsing the document: the
-/// declaration, comments, processing instructions and a DOCTYPE are
-/// stepped over to the first start tag.
-fn root_is_project(text: &str) -> bool {
-    let mut rest = text;
-    loop {
-        rest = rest.trim_start();
-        let skip_to = |close: &str, rest: &str| rest.find(close).map(|at| at + close.len());
-        let step = if rest.starts_with("<?") {
-            skip_to("?>", rest)
-        } else if rest.starts_with("<!--") {
-            skip_to("-->", rest)
-        } else if rest.starts_with("<!") {
-            skip_to(">", rest)
-        } else if let Some(tag) = rest.strip_prefix('<') {
-            let name = tag
-                .split(|c: char| c.is_whitespace() || c == '>' || c == '/')
-                .next()
-                .unwrap_or_default();
-            return name.rsplit(':').next() == Some("Project");
-        } else {
-            return false;
-        };
-        let Some(step) = step else {
-            return false;
-        };
-        rest = rest.get(step..).unwrap_or_default();
-    }
-}
-
-/// Elements nested deeper than this become `null`: the tree is built and
-/// dropped recursively, and real project files sit far below it.
-const MAX_TREE_DEPTH: usize = 256;
-
-/// An element as a value tree, so a rule addresses a project by path
-/// (`Project.UsingTask.@TaskFactory`, `Project.Target[*].Exec.@Command`):
-///
-/// - attributes are `@`-prefixed keys, and a namespace declaration appears
-///   as `@xmlns` / `@xmlns:<prefix>` only on the element that declares it;
-/// - a child element is a key named for its local name, and siblings that
-///   share a name become an array in document order;
-/// - text (CDATA included) is trimmed, joined with spaces, and becomes the
-///   element's value when it has no attributes or children, else its
-///   `_text` key.
-fn element_tree(node: roxmltree::Node<'_, '_>, depth: usize) -> JsonValue {
-    if depth >= MAX_TREE_DEPTH {
-        return JsonValue::Null;
-    }
-    let mut map = Map::new();
-    for attr in node.attributes() {
-        map.insert(
-            format!("@{}", attr.name()),
-            JsonValue::String(attr.value().to_string()),
-        );
-    }
-    let parent = node.parent();
-    for ns in node.namespaces() {
-        let inherited = parent
-            .and_then(|p| p.lookup_namespace_uri(ns.name()))
-            .is_some_and(|uri| uri == ns.uri());
-        if inherited {
-            continue;
-        }
-        let key = ns
-            .name()
-            .map_or_else(|| "@xmlns".to_string(), |prefix| format!("@xmlns:{prefix}"));
-        map.entry(key)
-            .or_insert_with(|| JsonValue::String(ns.uri().to_string()));
-    }
-    let mut text: Vec<&str> = Vec::new();
-    for child in node.children() {
-        if child.is_element() {
-            let value = element_tree(child, depth + 1);
-            match map.get_mut(child.tag_name().name()) {
-                None => {
-                    map.insert(child.tag_name().name().to_string(), value);
-                }
-                Some(JsonValue::Array(siblings)) => siblings.push(value),
-                Some(existing) => {
-                    let first = std::mem::replace(existing, JsonValue::Null);
-                    *existing = JsonValue::Array(vec![first, value]);
-                }
-            }
-        } else if child.is_text()
-            && let Some(t) = child.text().map(str::trim).filter(|t| !t.is_empty())
-        {
-            text.push(t);
-        }
-    }
-    if text.is_empty() {
-        return JsonValue::Object(map);
-    }
-    let text = JsonValue::String(text.join(" "));
-    if map.is_empty() {
-        return text;
-    }
-    map.insert("_text".to_string(), text);
-    JsonValue::Object(map)
-}
-
-pub(super) fn extract(bytes: &[u8], values: &mut Values, errors: &mut Errors) {
-    if bytes.len() > 8 * 1024 * 1024 {
-        return;
-    }
-    let Ok(text) = std::str::from_utf8(bytes) else {
-        return;
-    };
-    let text = text.trim_start_matches('\u{feff}');
-    // Most XML is not an MSBuild project: look at the root's name before
-    // building a tree of the whole document.
-    if !root_is_project(text) {
-        return;
-    }
-    let options = roxmltree::ParsingOptions {
-        nodes_limit: 100_000,
-        ..Default::default()
-    };
-    let Ok(doc) = roxmltree::Document::parse_with_options(text, options) else {
-        return;
-    };
-    let project = doc.root_element();
-    if !project.has_tag_name("Project") {
-        return;
-    }
+/// The DownloadFile tasks of an MSBuild `project` element, as
+/// `msbuild.downloads`.
+pub(super) fn extract(project: roxmltree::Node<'_, '_>, values: &mut Values) {
     let mut globals = Properties::new();
     for group in project
         .children()
@@ -305,12 +181,6 @@ pub(super) fn extract(bytes: &[u8], values: &mut Values, errors: &mut Errors) {
             serde_json::json!(downloads),
         );
     }
-    let mut tree = Map::new();
-    tree.insert(
-        project.tag_name().name().to_string(),
-        element_tree(project, 0),
-    );
-    super::structured::merge_document(JsonValue::Object(tree), values, errors);
 }
 
 #[cfg(test)]

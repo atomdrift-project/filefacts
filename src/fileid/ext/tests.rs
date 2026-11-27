@@ -672,10 +672,14 @@ fn lowercase_ext_fits_the_stack_buffer() {
     let ext = |name: &str| lowercase_ext(Path::new(name)).map(|e| e.to_string());
     assert_eq!(ext("Setup.EXE").as_deref(), Some("exe"));
     assert_eq!(
-        ext("x.ABCDEFGHIJKLMNOP").as_deref(),
-        Some("abcdefghijklmnop")
+        ext("a.pdf.SettingContent-ms").as_deref(),
+        Some("settingcontent-ms")
     );
-    assert_eq!(ext("x.abcdefghijklmnopq"), None);
+    assert_eq!(
+        ext("x.ABCDEFGHIJKLMNOPQRSTUVWX").as_deref(),
+        Some("abcdefghijklmnopqrstuvwx")
+    );
+    assert_eq!(ext("x.abcdefghijklmnopqrstuvwxy"), None);
     assert_eq!(ext("Makefile"), None);
     assert_eq!(ext(".npmrc"), None);
 }

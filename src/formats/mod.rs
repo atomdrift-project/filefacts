@@ -123,6 +123,7 @@ mod vsix;
 mod wasm;
 mod whl;
 mod xar;
+mod xml;
 mod xpi;
 mod zip;
 
@@ -735,9 +736,9 @@ pub(crate) fn extract(
             dex::extract(bytes, ctx.symbols, &mut ctx.strings.literals, ctx.values);
             Ok(())
         }
-        // An MSBuild project, or Android binary XML.
+        // A Windows document's element tree, or Android binary XML.
         FileType::Xml => {
-            msbuild::extract(bytes, ctx.values, ctx.errors);
+            xml::extract(bytes, ctx.values, ctx.errors);
             if axml::looks_like_axml(bytes) {
                 axml::extract_values(bytes, ctx.values);
             }
