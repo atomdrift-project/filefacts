@@ -282,6 +282,7 @@ fn root_under(base: &Path, adopt: bool) -> Option<PathBuf> {
     };
     let root = base.join(ROOT_NAME);
     // Readable and writable by this user alone, whatever the umask.
+    #[cfg_attr(not(unix), expect(unused_mut, reason = "only unix sets a mode"))]
     let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);

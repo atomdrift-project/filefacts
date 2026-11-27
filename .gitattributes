@@ -1,4 +1,6 @@
-* text=auto
+# LF on every checkout, Windows included: tests compare committed text
+# (Cargo.lock, docs/file-groups.json) byte for byte.
+* text=auto eol=lf
 testdata/** -text
 # Signed fixtures: line-ending normalization would invalidate the signatures.
 tests/fixtures/apk/** -text

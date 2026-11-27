@@ -3,6 +3,22 @@
 All notable changes to filefacts. Versions follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
 The output schema is versioned separately by `filefacts::SCHEMA_VERSION`; a bump is noted with its new value.
 
+## 3.1.1 (2026-11-27)
+
+### Features
+
+- Read macOS installer package signatures into `xar.signatures`, verified only when they sign this package's own TOC.
+- Trust Developer ID Installer certificates chaining to Apple's root, so signed packages finally name their developer.
+- Report Firefox add-on signers in `xpi.signatures`; a member added or swapped after signing leaves them unverified.
+- Parse Task Scheduler tasks, `.SettingContent-ms` shortcuts, libraries, search connectors and contacts into element trees, not just MSBuild.
+
+### Fixes
+
+- Type Windows shell documents by extension, as Explorer does, whatever decoy junk precedes their root element.
+- Decode UTF-16 XML, as `schtasks` and Notepad write it, instead of silently skipping the document.
+- Stop comments from splitting XML element text, so commands chopped up with `<!-- -->` read whole.
+- Follow values through annotated Python parameters; `def f(x: str)` no longer breaks the trail.
+
 ## 3.1.0 (2026-11-22)
 
 ### Features

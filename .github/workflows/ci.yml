@@ -117,12 +117,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-      - run: rustup toolchain install nightly --profile minimal --component clippy && rustup default nightly
+      # Nightly only for cargo-fuzz's sanitizer flags. The fuzz crate is linted
+      # on stable by the test job; nightly clippy's still-moving lints would
+      # fail this job for code no one changed.
+      - run: rustup toolchain install nightly --profile minimal && rustup default nightly
       - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
         with:
           tool: cargo-fuzz
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - run: cargo clippy -p filefacts-fuzz --all-targets --locked -- -D warnings
       - run: cargo fuzz build
 
   slow:

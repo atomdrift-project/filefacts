@@ -31,10 +31,8 @@ pub(super) fn is_data_only(root: Node<'_>, source: &str, lang: Lang) -> bool {
     }
     if lang.is_ecmascript() {
         ecmascript(&statements, source)
-    } else if lang == Lang::Python {
-        statements.into_iter().all(python_statement)
     } else {
-        false
+        lang == Lang::Python && statements.into_iter().all(python_statement)
     }
 }
 

@@ -459,7 +459,8 @@ fn apply_side_effects<'a>(
                 stack.values.push(value);
             }
         }
-        b'q' | b'r' | b'p' => {
+        // PUT, BINPUT, LONG_BINPUT.
+        b'p'..=b'r' => {
             if let Some(index) = index {
                 stack.memo_put(index);
             }

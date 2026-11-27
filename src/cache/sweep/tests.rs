@@ -155,15 +155,11 @@ fn symlinked_root_is_not_swept() {
 fn relative_root_is_not_swept() {
     // `HOME=.` makes a cache root relative: it would name whatever tree the
     // process runs in, such as the samples under analysis.
-    let tmp = tempfile::tempdir().unwrap();
+    // Under the working directory: on Windows the system temp directory may
+    // sit on another drive, which no relative path can reach.
+    let tmp = tempfile::tempdir_in(".").unwrap();
     let precious = write_aged(&shard(tmp.path()).join("precious.bin"), 10, day(400));
-    let cwd = std::env::current_dir().unwrap();
-    let relative: PathBuf = cwd
-        .components()
-        .skip(1)
-        .map(|_| std::path::Component::ParentDir)
-        .chain(tmp.path().components().skip(1))
-        .collect();
+    let relative = Path::new(".").join(tmp.path().file_name().unwrap());
     assert!(relative.join("ab").join("precious.bin").exists());
     sweep(&relative, evict_all());
     assert!(precious.exists());
