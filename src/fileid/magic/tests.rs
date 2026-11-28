@@ -1906,3 +1906,29 @@ fn damaged_pe_requires_stored_executable_entry() {
         b"MZ = 8    # ordinary text\n"
     ));
 }
+
+// ── gguf ──
+#[test]
+fn gguf_header_is_gguf_under_any_name() {
+    let data = *b"GGUF\x03\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00";
+    for path in ["model.gguf", "Qwen3-Q4_K_M.bin", "sample"] {
+        assert_eq!(
+            detect_from_content(Path::new(path), &data).map(|(ft, _)| ft),
+            Some(FileType::Gguf)
+        );
+    }
+    for bad in [
+        &b"GGUF\x00\x00\x00\x03"[..],
+        b"GGUF\x07\x00\x00\x00",
+        b"GGUF\x03\x00",
+    ] {
+        assert_ne!(
+            detect_from_content(Path::new("model.gguf"), bad).map(|(ft, _)| ft),
+            Some(FileType::Gguf)
+        );
+    }
+    assert_eq!(
+        detect_from_content(Path::new("a.gif"), b"GIF89a\x01\x00").map(|(ft, _)| ft),
+        Some(FileType::Gif)
+    );
+}

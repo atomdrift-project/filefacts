@@ -52,12 +52,14 @@ pub(crate) mod headerless_pe;
 mod heuristics;
 pub(crate) mod image4_trustcache;
 mod magic;
+use magic::is_program;
 mod markdown;
 mod marks;
 mod package_layout;
 mod perl_shell_shim;
 pub(crate) mod phar;
 mod php_tag;
+mod raw_deflate;
 mod resolve;
 mod scripts;
 mod shebang;
@@ -1245,11 +1247,14 @@ fn headerless_program(sniff: &Sniff<'_>) -> Option<FileType> {
 }
 
 /// [`headerless_program`] once a DOS COM is ruled out: a known data shape
-/// with no type of its own, or position-independent code.
+/// with no type of its own, a raw deflate stream holding a program, or
+/// position-independent code.
 fn headerless_binary(data: &[u8]) -> Option<FileType> {
     if let Some(shape) = data_shapes::shape_of(data) {
         tracing::debug!(target: "filefacts::fileid", shape, "known headerless data shape");
         Some(FileType::Data)
+    } else if raw_deflate::holds_program(data) {
+        Some(FileType::Deflate)
     } else if shellcode::detect(data).is_some() {
         Some(FileType::Shellcode)
     } else {

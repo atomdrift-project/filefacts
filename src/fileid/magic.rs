@@ -144,20 +144,35 @@ const RULES: &[fn(&Probe<'_, '_>) -> Option<Found>] = &[
 
 /// The signature stage: the first content rule that claims the bytes.
 pub(super) fn detect_from_sniff(sniff: &Sniff<'_>) -> Option<Found> {
-    let data = sniff.data;
-    let &[first, second, ..] = data else {
-        return None;
-    };
-    let probe = Probe {
-        sniff,
-        path: sniff.path,
-        data,
-        first,
-        second,
-        text: head_is_text(data),
-        head: data.trim_ascii_start(),
-    };
+    let probe = Probe::new(sniff)?;
     RULES.iter().find_map(|rule| rule(&probe))
+}
+
+/// Whether `data` opens with a program the operating system runs as it
+/// stands: a PE, ELF or Mach-O image, or a `#!` script (see
+/// [`executable_head`]). Only that one signature rule runs.
+pub(super) fn is_program(data: &[u8]) -> bool {
+    let sniff = Sniff::new(Path::new(""), data);
+    Probe::new(&sniff).is_some_and(|probe| executable_head(&probe).is_some())
+}
+
+impl<'s, 'a> Probe<'s, 'a> {
+    /// The probe over a sniff of at least two bytes.
+    fn new(sniff: &'s Sniff<'a>) -> Option<Self> {
+        let data = sniff.data;
+        let &[first, second, ..] = data else {
+            return None;
+        };
+        Some(Self {
+            sniff,
+            path: sniff.path,
+            data,
+            first,
+            second,
+            text: head_is_text(data),
+            head: data.trim_ascii_start(),
+        })
+    }
 }
 
 /// A program the operating system runs as it stands: a PE, ELF or Mach-O
@@ -652,8 +667,15 @@ fn first_byte_signature(p: &Probe<'_, '_>) -> Option<Found> {
             .starts_with(b"\x89PNG\r\n\x1a\n")
             .then_some((FileType::Png, DetectionSource::Magic)),
         // GIF87a / GIF89a.
-        b'G' => (data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a"))
-            .then_some((FileType::Gif, DetectionSource::Magic)),
+        b'G' => {
+            if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
+                Some((FileType::Gif, DetectionSource::Magic))
+            } else if crate::formats::gguf::is_gguf(data) {
+                Some((FileType::Gguf, DetectionSource::Magic))
+            } else {
+                None
+            }
+        }
         // OpenType with CFF outlines: the sfnt version is the tag `OTTO`.
         b'O' => data
             .starts_with(b"OTTO")

@@ -40,6 +40,11 @@ pub(super) fn extract(bytes: &[u8], metrics: &mut Metrics) {
     }
 }
 
+/// Record only `file.size`, for formats whose bulk is not worth a byte pass.
+pub(super) fn extract_size(bytes: &[u8], metrics: &mut Metrics) {
+    metrics.insert(metric!("file.size"), bytes.len() as f64);
+}
+
 /// Record the key of a PE hidden under a repeating XOR key, which
 /// identification recovered (see [`crate::FileId::xor_pe_key`]).
 ///

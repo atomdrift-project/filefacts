@@ -496,6 +496,10 @@ file_types! {
         Lzma => "lzma", Compressed, Named;
         /// Zstandard-compressed single file (.zst, not a tar)
         Zst => "zst", Compressed, Named;
+        /// Raw deflate stream: zip and gzip's codec with no header, as .NET's
+        /// `DeflateStream` writes it. Recognized only when it inflates to a
+        /// program, the one evidence a headerless stream offers.
+        Deflate => "deflate", Compressed, Named;
         /// 7-Zip archive (.7z)
         SevenZ => "7z", Archives, Container => SevenZip;
         /// RAR archive (.rar)
@@ -708,6 +712,9 @@ file_types! {
         /// .NET Remoting Binary Format stream (MS-NRBF): `BinaryFormatter`
         /// output, opened by a `SerializedStreamHeader` record.
         Nrbf => "nrbf", Serialized, Named;
+        /// GGUF model file (`.gguf`): llama.cpp's metadata table, tensor index
+        /// and weights. Only the header is read; the weights are never scanned.
+        Gguf => "gguf", Serialized, Named;
         /// Apple Image4 payload (`IM4P`) of type `trca` holding a version-2
         /// trust-cache table of code-directory hashes.
         Image4TrustCache => "image4_trustcache", Signatures, Named;

@@ -77,7 +77,8 @@
       "bz2",
       "xz",
       "lzma",
-      "zst"
+      "zst",
+      "deflate"
     ],
     "config": [
       "package.json",
@@ -176,7 +177,8 @@
     ],
     "serialized": [
       "pickle",
-      "nrbf"
+      "nrbf",
+      "gguf"
     ],
     "signatures": [
       "image4_trustcache",

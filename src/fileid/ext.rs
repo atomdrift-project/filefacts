@@ -650,6 +650,7 @@ fn detect_from_extension(path: &Path) -> Option<Claim> {
         // Sphinx caches parsed document trees as protocol pickle streams with
         // the canonical `.doctree` suffix under its build directory.
         "pkl" | "pickle" | "joblib" | "debug_pkl" | "doctree" => FileType::Pickle,
+        "gguf" => FileType::Gguf,
         // Image4 payloads and trust caches: content names the trust-cache
         // table, and every other payload stays opaque data.
         "trustcache" | "im4p" => FileType::Data,

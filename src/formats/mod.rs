@@ -55,6 +55,7 @@ mod embedded_php;
 mod font;
 mod gem;
 mod generic;
+pub(crate) mod gguf;
 mod go_buildinfo;
 mod go_pclntab;
 pub(crate) mod goblin_safe;
@@ -263,8 +264,13 @@ pub(crate) fn extract(
 ) -> Result<(), Error> {
     // Every file gets the generic byte-level metrics. Format-specific
     // extractors layer on top of (and may shadow with more accurate
-    // values) what generic emits.
-    generic::extract(bytes, ctx.metrics);
+    // values) what generic emits. A model file's weights are gigabytes whose
+    // entropy says nothing about the file, so it gets its size alone.
+    if file_type == FileType::Gguf {
+        generic::extract_size(bytes, ctx.metrics);
+    } else {
+        generic::extract(bytes, ctx.metrics);
+    }
     if let Some(key) = ctx.xor_pe_key {
         generic::extract_xor_pe(key, ctx.values, ctx.metrics);
     }
@@ -561,6 +567,10 @@ pub(crate) fn extract(
             pickle::extract(bytes, ctx.values, ctx.strings, ctx.metrics, ctx.symbols);
             Ok(())
         }
+        FileType::Gguf => {
+            gguf::extract(bytes, ctx.values, ctx.metrics);
+            Ok(())
+        }
         FileType::Font => {
             font::extract(bytes, ctx.values, ctx.strings, ctx.metrics);
             Ok(())
@@ -758,6 +768,7 @@ pub(crate) fn extract(
         | FileType::Xz
         | FileType::Lzma
         | FileType::Zst
+        | FileType::Deflate
         | FileType::Beam
         | FileType::RequirementsTxt
         | FileType::GemfileLock
@@ -807,15 +818,25 @@ pub(crate) fn extract(
     // the report-wide strip/rescue passes.
     let compressed_stream = matches!(
         file_type,
-        FileType::Gz | FileType::Bz2 | FileType::Xz | FileType::Lzma | FileType::Zst
+        FileType::Gz
+            | FileType::Bz2
+            | FileType::Xz
+            | FileType::Lzma
+            | FileType::Zst
+            | FileType::Deflate
     ) || container
         .is_some_and(|c| c.compression != crate::fileid::Compression::None);
     // A disk image that parsed has read the strings outside its compressed
     // chunks, few or none as they may be.
     let read_in_parts = file_type == FileType::Dmg && result.is_ok();
+    // A model file is gigabytes of tensor weights: the header extractor read
+    // the parts worth reading, and a byte scan of the weights is noise at
+    // tens of milliseconds per MiB.
+    let model_weights = file_type == FileType::Gguf;
     if !file_type.is_structured_data()
         && !compressed_stream
         && !read_in_parts
+        && !model_weights
         && ctx.strings.text.is_empty()
     {
         // This is the fallback path — everything without its own format
