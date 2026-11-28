@@ -563,8 +563,10 @@ fn detect_from_extension(path: &Path) -> Option<Claim> {
         // without one is typed by its content and reported as a mismatch.
         "reg" => FileType::Reg,
         "vbs" | "vbe" | "wsf" | "wsc" | "wsh" => FileType::Vbs,
-        "c" | "h" | "cpp" | "hpp" | "cc" | "cxx" | "hxx" | "hh" | "pas" | "dpr" | "asm" | "s"
-        | "nasm" => FileType::C,
+        // `.inl` holds C++ inline/template definitions included from headers
+        // (glm, pybind11); without it the content heuristic can say JavaScript.
+        "c" | "h" | "cpp" | "hpp" | "cc" | "cxx" | "hxx" | "hh" | "inl" | "pas" | "dpr" | "asm"
+        | "s" | "nasm" => FileType::C,
         // Microsoft Interface Definition Language is C-like source; treating it as C
         // enables source facts even when content heuristics do not recognize MIDL syntax.
         "idl" => FileType::C,
